@@ -41,7 +41,7 @@ void get_cpu_info() {
     
     // command to get cpu freq
     command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq; ";
-    command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/cpu4/cpufreq/scaling_cur_freq; ";
+    command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/cpu6/cpufreq/scaling_cur_freq; ";
     command += "\""; // postfix
 
     // only execution
