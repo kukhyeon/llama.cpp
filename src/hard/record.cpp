@@ -124,8 +124,10 @@ std::vector<std::string> get_hard_records(const DVFS& dvfs) {
 	// GPU clock info
     if (device_name == "Pixel9"){
         command += "awk '{print \\$1}' /sys/devices/platform/1f000000.mali/scaling_min_freq; awk '{print \\$1}' /sys/devices/platform/1f000000.mali/scaling_max_freq; "; //gpu clock
-    } else { // S24
+    } else if (device_name == "S24"){ // S24
 	    command += "awk '{print \\$1}' /sys/kernel/gpu/gpu_min_clock; awk '{print \\$1}' /sys/kernel/gpu/gpu_max_clock; ";
+    } else if (device_name == "S25"){ // S25
+        command += "awk '{print \\$1}' /sys/class/kgsl/kgsl-3d0/devfreq/min_freq; awk '{print \\$1}' /sys/class/kgsl/kgsl-3d0/devfreq/max_freq; ";
     }
 
     // CPU clock info
@@ -142,13 +144,13 @@ std::vector<std::string> get_hard_records(const DVFS& dvfs) {
     if (device_name == "Pixel9"){
         command += "awk '{print}' /sys/class/power_supply/battery/current_now; ";
         command += "awk '{print}' /sys/class/power_supply/battery/voltage_now; ";
-    } else {
+    } else { // S24, S25
         command += "awk '{print}' /sys/class/power_supply/battery/power_now; "; // pixel does not contain
         command += "awk '{print}' /sys/class/power_supply/battery/current_now; ";
         command += "awk '{print}' /sys/class/power_supply/battery/voltage_now; ";
     }
 
-    // RAM clock info (S24/Pixel9)
+    // RAM clock info (S24/Pixel9/S25)
     if (device_name == "Pixel9"){
         command += "awk '{print \\$1/1000}' /sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/max_freq; ";
         command += "awk '{print \\$1/1000}' /sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/scaling_devfreq_min; ";
@@ -157,7 +159,7 @@ std::vector<std::string> get_hard_records(const DVFS& dvfs) {
         command += "awk '{print \\$1/1000}' /sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/scaling_devfreq_max; ";
         command += "awk '{print \\$1/1000}' /sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/scaling_devfreq_min; ";
         command += "awk '{print \\$1/1000}' /sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/cur_freq; ";
-    }
+    } // S25 is held
 
 
     // closing quote
@@ -184,8 +186,10 @@ std::vector<std::string> get_hard_records_wo_systime(const DVFS& dvfs){
 	// GPU clock info
     if (device_name == "Pixel9"){
         command += "awk '{print \\$1}' /sys/devices/platform/1f000000.mali/scaling_min_freq; awk '{print \\$1}' /sys/devices/platform/1f000000.mali/scaling_max_freq; "; //gpu clock
-    } else { // S24
+    } else if (device_name == "S24") { // S24
 	    command += "awk '{print \\$1}' /sys/kernel/gpu/gpu_min_clock; awk '{print \\$1}' /sys/kernel/gpu/gpu_max_clock; ";
+    } else if (device_name == "S25") {
+        command += "awk '{print \\$1}' /sys/class/kgsl/kgsl-3d0/devfreq/min_freq; awk '{print \\$1}' /sys/class/kgsl/kgsl-3d0/devfreq/max_freq; "
     }
 
     // CPU clock info
@@ -202,13 +206,13 @@ std::vector<std::string> get_hard_records_wo_systime(const DVFS& dvfs){
     if (device_name == "Pixel9"){
         command += "awk '{print}' /sys/class/power_supply/battery/current_now; ";
         command += "awk '{print}' /sys/class/power_supply/battery/voltage_now; ";
-    } else {
+    } else { // S24, S25
         command += "awk '{print}' /sys/class/power_supply/battery/power_now; "; // pixel does not contain
         command += "awk '{print}' /sys/class/power_supply/battery/current_now; ";
         command += "awk '{print}' /sys/class/power_supply/battery/voltage_now; ";
     }
 
-    // RAM clock info (S24/Pixel9)
+    // RAM clock info (S24/Pixel9/S25)
     if (device_name == "Pixel9"){
         command += "awk '{print \\$1/1000}' /sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/max_freq; ";
         command += "awk '{print \\$1/1000}' /sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/scaling_devfreq_min; ";
@@ -217,7 +221,7 @@ std::vector<std::string> get_hard_records_wo_systime(const DVFS& dvfs){
         command += "awk '{print \\$1/1000}' /sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/scaling_devfreq_max; ";
         command += "awk '{print \\$1/1000}' /sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/scaling_devfreq_min; ";
         command += "awk '{print \\$1/1000}' /sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/cur_freq; ";
-    }
+    } // S25 is held
 
 
     // closing quote
