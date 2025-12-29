@@ -71,8 +71,8 @@ int DVFS::set_cpu_freq(const std::vector<int>& freq_indices){
 		int idx = this->cluster_indices[i];
         int freq_idx = freq_indices[i];
 		int clk = this->cpufreq.at(this->device).at(idx)[freq_idx];
-		command += std::string("echo ") + std::to_string(clk)+ std::string(" > /sys/devices/system/cpu/cpu") + std::to_string(idx) + std::string("/cpufreq/scaling_max_freq; ");
-		command += std::string("echo ") + std::to_string(clk)+ std::string(" > /sys/devices/system/cpu/cpu") + std::to_string(idx) + std::string("/cpufreq/scaling_min_freq; ");
+		command += std::string("echo ") + std::to_string(clk)+ std::string(" > /sys/devices/system/cpu/cpufreq/policy") + std::to_string(idx) + std::string("/scaling_max_freq; ");
+		command += std::string("echo ") + std::to_string(clk)+ std::string(" > /sys/devices/system/cpu/cpufreq/policy") + std::to_string(idx) + std::string("/scaling_min_freq; ");
 	}
 	command += "\""; // closing quote
 	
@@ -87,8 +87,8 @@ int DVFS::unset_cpu_freq(){
         int min_clk = this->cpufreq.at(this->device).at(idx)[0];
         int max_clk = this->cpufreq.at(this->device).at(idx)[this->cpufreq.at(this->device).at(idx).size()-1];
 
-		command += std::string("echo ") + std::to_string(max_clk)+ std::string(" > /sys/devices/system/cpu/cpu") + std::to_string(idx) + std::string("/cpufreq/scaling_max_freq; ");
-		command += std::string("echo ") + std::to_string(min_clk)+ std::string(" > /sys/devices/system/cpu/cpu") + std::to_string(idx) + std::string("/cpufreq/scaling_min_freq; ");
+		command += std::string("echo ") + std::to_string(max_clk)+ std::string(" > /sys/devices/system/cpu/cpufreq/policy") + std::to_string(idx) + std::string("/scaling_max_freq; ");
+		command += std::string("echo ") + std::to_string(min_clk)+ std::string(" > /sys/devices/system/cpu/cpufreq/policy") + std::to_string(idx) + std::string("/scaling_min_freq; ");
 	}
 	command += "\""; // closing quote
 	
