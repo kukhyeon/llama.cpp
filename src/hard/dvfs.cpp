@@ -338,7 +338,6 @@ int DVFS::set_ram_freq(const int freq_idx) {
     if (freq_idx < 0 || freq_idx >= (int)table.size()) return 1;
 
     int clk = table[freq_idx];
-    this->cur_ram_clk = clk;
 
     if (this->get_device_name() == "S25") {
         std::string command = "su -c \"";
