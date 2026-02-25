@@ -33,8 +33,8 @@ const std::string get_records_names(const DVFS& dvfs);
 std::vector<std::string> get_hard_records(const DVFS& dvfs);
 
 // write function
-void write_file(const std::vector<std::string>& data);
-void write_file(const std::string& data);
+void write_file(const std::vector<std::string>& data, std::string output);
+void write_file(const std::string& data, std::string output);
 void record_hard(std::atomic<bool>& sigterm, const DVFS& dvfs); 
 
 #endif

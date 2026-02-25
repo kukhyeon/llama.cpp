@@ -14,6 +14,28 @@ static std::vector<std::string> split_string(const std::string& str){
 
     return result;
 }
+
+static std::string execute_cmd(const char* cmd){
+    // command execution
+    FILE* pipe = popen(cmd, "r");
+    
+    // check pipe open
+    if (!pipe) { 
+        std::cerr << "failed to pipe open (record.cpp)\n"; 
+        return "";
+    }
+
+    // get output from buffer
+    std::ostringstream result;
+    char buff[8192];
+    while (fgets(buff, sizeof(buff), pipe) != nullptr){
+        result << buff;
+    }
+
+    // close pipe
+    pclose(pipe); 
+    return result.str();
+}
 // test function
 void get_cpu_info() {
     std::string command = "su -c \""; //prefix
@@ -289,7 +311,7 @@ void write_file(const std::string& data, std::string output){
  * 
  * */
 void record_hard(std::atomic<bool>& sigterm, const DVFS& dvfs){
-    pin_current({2}); // silver core for agent
+    // pin_current({2}); // silver core for agent - removed for conservative approach
     sigterm = false;
     std::string filename = dvfs.output_filename;
 
