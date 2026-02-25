@@ -18,3 +18,4 @@ const std::vector<int> Device::get_cluster_indices() const{
 const std::string Device::get_device_name() const{
     return this->device;
 }
+

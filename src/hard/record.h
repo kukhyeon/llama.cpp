@@ -1,4 +1,3 @@
-
 #ifndef RECORD
 #define RECORD
 
@@ -39,3 +38,4 @@ void write_file(const std::string& data);
 void record_hard(std::atomic<bool>& sigterm, const DVFS& dvfs); 
 
 #endif
+

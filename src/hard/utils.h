@@ -9,3 +9,5 @@ std::vector<std::vector<std::string>> readCSV(const std::string& filename);
 std::string replace(std::string origin, std::string target, std::string destination);
 
 #endif // UTILS_H
+
+#endif // HARD_UTILS_H
