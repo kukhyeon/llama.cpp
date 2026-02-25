@@ -16,13 +16,13 @@ echo "CPU Governor (policy6): $(cat /sys/devices/system/cpu/cpufreq/policy6/scal
 sleep 3
 
 ./build/bin/ignite \
-    -m ~/.cache/llama.cpp/tensorblock_Qwen1.5-0.5B-GGUF_Qwen1.5-0.5B-Q4_K.gguf \ 
+    -m models/qwen-1.5-0.5b-chat-q4_k_m.gguf \
     -i -cnv -tb 1 -t 4 -ub 512 -b 512 \
     -c 1024 \
     --temp 0 \
     --top-k 1 \
     --device-name S25 \
-    --output-dir outputs/ \
+    --output-dir output/ \
     --json-path dataset/hotpot_qa_30.json \
     --strict on \
     --strict-length 64 \
