@@ -42,7 +42,7 @@ RAM_FREQ=${2:-0}  # Default to 0 if not provided
 
 ./build/bin/ignite \
     -m ./models/qwen-1.5-0.5b-chat-q4_k_m.gguf \
-    -cnv -i -tb 1 -t 4 -ub 512 -b512 \
+    -cnv -i -tb 1 -t 4 -ub 512 -b 512 \
     --temp 0 \
     --top-k 1 \
     --device-name "$DEV" \
