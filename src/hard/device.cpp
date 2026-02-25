@@ -8,6 +8,7 @@ Device::Device(const std::string& device_name) : device(device_name){
 	    cluster_indices = {0, 4, 7, 9};
     } else if (device_name == "S25"){
         cluster_indices = {0, 6};
+    }
 }
 
 const std::vector<int> Device::get_cluster_indices() const{
