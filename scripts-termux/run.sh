@@ -1,4 +1,3 @@
-#!/bin/bash
 # This script should be run on llama.cpp/ dir.
 
 # Device detection (currently set to Pixel9, can be auto-detected)
@@ -11,8 +10,8 @@ echo "Device: $DEV"
 if [ "$DEV" = "Pixel9" ]; then
   # Pixel9
   su -c "echo 0 > /sys/class/backlight/panel0-backlight/brightness"
-elif [ "$DEV" = "S24" ] || [ "$DEV" = "S25" ]; then
-  # S24, S25
+elif [ "$DEV" = "S25" ]; then
+  # S25
   su -c "echo 0 > /sys/class/backlight/panel0-backlight/brightness"
 else
   # Default 
@@ -41,7 +40,7 @@ fi
 CPU_FREQ=${1:-0}  # Default to 0 if not provided
 RAM_FREQ=${2:-0}  # Default to 0 if not provided
 
-./build/bin-arm/ignite \
+./build/bin/ignite \
     -m ./models/qwen-1.5-0.5b-chat-q4_k_m.gguf \
     -cnv \
     --temp 0 \
@@ -73,7 +72,7 @@ fi
 # Turn-on screen (device-specific brightness restoration)
 if [ "$DEV" = "Pixel9" ]; then
   su -c "echo 1023 > /sys/class/backlight/panel0-backlight/brightness"
-elif [ "$DEV" = "S24" ] || [ "$DEV" = "S25" ]; then
+elif [ "$DEV" = "S25" ]; then
   su -c "echo 1023 > /sys/class/backlight/panel0-backlight/brightness"
 else
   su -c "echo 1023 > /sys/class/backlight/panel/brightness"
