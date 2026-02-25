@@ -212,6 +212,13 @@ int DVFS::init_fd_cache() {
     }
 
     // MIF(devfreq) fds (RAM)
+    if (get_device_name() == "S25") {
+        // S25 uses system() calls for RAM control, so we skip FD initialization for MIF.
+        // We set fd_ready to true because CPU FDs are ready and RAM control doesn't need FDs.
+        fd_ready = true;
+        return 0;
+    }
+
     // Pixel 9 and S24 have same base path
     mif_fds.base = "/sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif";
     {
