@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <string.h>
 #include <stdio.h>
+#include <cstdlib>
 
 #include <map>
 #include <cmath>

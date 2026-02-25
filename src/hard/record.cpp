@@ -63,6 +63,11 @@ const std::string get_records_names(const DVFS& dvfs) {
 		}
 	}
 
+    // [ADD] LLCC clock info (Only for S25)
+    if (dvfs.get_device_name() == "S25") {
+        names += "llcc_prime_cur_freq,llcc_gold_cur_freq,llcc_gold_compute_cur_freq,llcc_cur_freq,bwmon_llcc_gold_cur_freq,bwmon_llcc_prime_cur_freq,";
+    }
+
 	return names;
 }
 
@@ -111,15 +116,33 @@ std::vector<std::string> get_hard_records(const DVFS& dvfs) {
         command += "awk '{print}' /sys/class/power_supply/battery/voltage_now; ";
     }
 
-    // RAM clock info (S24/Pixel9)
+    // RAM clock info (S24/Pixel9/S25)
     if (device_name == "Pixel9"){
         command += "awk '{print \\$1/1000}' /sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/max_freq; ";
         command += "awk '{print \\$1/1000}' /sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/scaling_devfreq_min; ";
         command += "awk '{print \\$1/1000}' /sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/cur_freq; ";
-    } else { // S24
+    } else if (device_name == "S24") { // S24
         command += "awk '{print \\$1/1000}' /sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/scaling_devfreq_max; ";
         command += "awk '{print \\$1/1000}' /sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/scaling_devfreq_min; ";
         command += "awk '{print \\$1/1000}' /sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/cur_freq; ";
+    } else if (device_name == "S25") { // S25 is held
+        command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/bus_dcvs/DDR/soc:qcom,memlat:ddr:prime-latfloor/max_freq; ";
+        command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/bus_dcvs/DDR/soc:qcom,memlat:ddr:prime-latfloor/min_freq; ";
+        command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/bus_dcvs/DDR/cur_freq; ";
+
+        // [ADD] LLCC info for S25
+        // 1. memlat:llcc:prime
+        command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/bus_dcvs/LLCC/soc:qcom,memlat:llcc:prime/cur_freq; ";
+        // 2. memlat:llcc:gold
+        command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/bus_dcvs/LLCC/soc:qcom,memlat:llcc:gold/cur_freq; ";
+        // 3. memlat:llcc:gold-compute
+        command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/bus_dcvs/LLCC/soc:qcom,memlat:llcc:gold-compute/cur_freq; ";
+        // 4. LLCC cur_freq (General)
+        command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/bus_dcvs/LLCC/cur_freq; ";
+        // 5. bwmon-llcc-gold
+        command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/bus_dcvs/LLCC/240b3400.qcom,bwmon-llcc-gold/cur_freq; ";
+        // 6. bwmon-llcc-prime 
+        command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/bus_dcvs/LLCC/240b7400.qcom,bwmon-llcc-prime/cur_freq; "; 
     }
 
 
@@ -170,15 +193,33 @@ std::vector<std::string> get_hard_records_wo_systime(const DVFS& dvfs){
         command += "awk '{print}' /sys/class/power_supply/battery/voltage_now; ";
     }
 
-    // RAM clock info (S24/Pixel9)
+    // RAM clock info (S24/Pixel9/S25)
     if (device_name == "Pixel9"){
         command += "awk '{print \\$1/1000}' /sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/max_freq; ";
         command += "awk '{print \\$1/1000}' /sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/scaling_devfreq_min; ";
         command += "awk '{print \\$1/1000}' /sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/cur_freq; ";
-    } else { // S24
+    } else if (device_name == "S24") { // S24
         command += "awk '{print \\$1/1000}' /sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/scaling_devfreq_max; ";
         command += "awk '{print \\$1/1000}' /sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/scaling_devfreq_min; ";
         command += "awk '{print \\$1/1000}' /sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/cur_freq; ";
+    } else if (device_name == "S25") { // S25 is held
+        command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/bus_dcvs/DDR/soc:qcom,memlat:ddr:prime-latfloor/max_freq; ";
+        command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/bus_dcvs/DDR/soc:qcom,memlat:ddr:prime-latfloor/min_freq; ";
+        command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/bus_dcvs/DDR/cur_freq; ";
+
+        // [ADD] LLCC info for S25
+        // 1. memlat:llcc:prime
+        command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/bus_dcvs/LLCC/soc:qcom,memlat:llcc:prime/cur_freq; ";
+        // 2. memlat:llcc:gold
+        command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/bus_dcvs/LLCC/soc:qcom,memlat:llcc:gold/cur_freq; ";
+        // 3. memlat:llcc:gold-compute
+        command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/bus_dcvs/LLCC/soc:qcom,memlat:llcc:gold-compute/cur_freq; ";
+        // 4. LLCC cur_freq (General)
+        command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/bus_dcvs/LLCC/cur_freq; ";
+        // 5. bwmon-llcc-gold
+        command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/bus_dcvs/LLCC/240b3400.qcom,bwmon-llcc-gold/cur_freq; ";
+        // 6. bwmon-llcc-prime 
+        command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/bus_dcvs/LLCC/240b7400.qcom,bwmon-llcc-prime/cur_freq; "; 
     }
 
 
