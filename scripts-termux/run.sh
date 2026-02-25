@@ -42,15 +42,15 @@ CPU_FREQ=${1:-0}  # Default to 0 if not provided
 RAM_FREQ=${2:-0}  # Default to 0 if not provided
 
 ./build/bin-arm/ignite \
-    -m models/tensorblock_Qwen1.5-0.5B-GGUF_Qwen1.5-0.5B-Q4_K.gguf \
+    -m ./models/qwen-1.5-0.5b-chat-q4_k_m.gguf \
     -cnv \
     --temp 0 \
     -p "You're a helpful assistant." \
     -i \
     --top-k 5 \
-    --threads 1 \
+    --threads 4 \
     --device-name "$DEV" \
-    --output-path outputs/hotpot_0_0.csv \
+    --output-path output/hotpot_0_0.csv \
     --json-path dataset/hotpot_qa_30.json \
     --cpu-freq "$CPU_FREQ" \
     --ram-freq "$RAM_FREQ"
