@@ -23,9 +23,9 @@ sleep 3
     --top-k 1 \
     --device-name S25 \
     --output-dir output/ \
-    --json-path dataset/hotpot_qa_30.json \
+    --input-path dataset/hotpot_qa_30.json \
     --strict on \
-    --strict-length 64 \
+    --strict-limit 64 \
     --max-query-number 30 \
     --cpu-p 15 \
     --ram-d 9 \
