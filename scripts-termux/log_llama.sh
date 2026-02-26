@@ -166,6 +166,7 @@ su -p -c "taskset f0 setenforce 0 && \
         --strict 1 \
         --strict-limit 64 \
         -c 1024 \
+        --cpu-mask 0xfc \
         --device HTP0"
 
 echo "[inference] done."
@@ -190,7 +191,7 @@ fi
 # ---- Copy trace to output/ ----
 su -c "chmod 644 $TRACE_TMP" 2>/dev/null || true
 su -c "cp $TRACE_TMP $TRACE_PUBLIC && chmod 644 $TRACE_PUBLIC" 2>/dev/null || true
-cp -f "$TRACE_PUBLIC" "$TRACE_OUT" 2>/dev/null || true
+su -c "cp $TRACE_PUBLIC /data/local/tmp/llama.cpp/$TRACE_OUT && chmod 644 /data/local/tmp/llama.cpp/$TRACE_OUT" 2>/dev/null || true
 
 # ---- Cleanup ----
 rm -f "$PERFETTO_CFG_LOCAL" "$LOG_SCRIPT"
