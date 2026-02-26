@@ -1,6 +1,7 @@
 #!/bin/sh
-# log_llama.sh - S25 NPU inference with HW logging + Perfetto
+# log_llama.sh - S25 NPU inference with HW logging (thermal/clock/power/CPU util)
 # Run from: /data/local/tmp/llama.cpp
+# Usage: su -c "sh log_llama.sh"
 
 # ---- Pin this shell to CPU0 ----
 taskset -p 0x01 $$
@@ -21,7 +22,6 @@ su -c "echo performance > /sys/devices/system/cpu/cpufreq/policy6/scaling_govern
 su -c "chmod 644 /sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq"
 su -c "echo $CLK0 > /sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq"
 su -c "chmod 444 /sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq"
-
 su -c "chmod 644 /sys/devices/system/cpu/cpufreq/policy0/scaling_min_freq"
 su -c "echo $CLK0 > /sys/devices/system/cpu/cpufreq/policy0/scaling_min_freq"
 su -c "chmod 444 /sys/devices/system/cpu/cpufreq/policy0/scaling_min_freq"
@@ -29,7 +29,6 @@ su -c "chmod 444 /sys/devices/system/cpu/cpufreq/policy0/scaling_min_freq"
 su -c "chmod 644 /sys/devices/system/cpu/cpufreq/policy6/scaling_max_freq"
 su -c "echo $CLK6 > /sys/devices/system/cpu/cpufreq/policy6/scaling_max_freq"
 su -c "chmod 444 /sys/devices/system/cpu/cpufreq/policy6/scaling_max_freq"
-
 su -c "chmod 644 /sys/devices/system/cpu/cpufreq/policy6/scaling_min_freq"
 su -c "echo $CLK6 > /sys/devices/system/cpu/cpufreq/policy6/scaling_min_freq"
 su -c "chmod 444 /sys/devices/system/cpu/cpufreq/policy6/scaling_min_freq"
@@ -40,17 +39,7 @@ sleep 2
 # ---- Output paths ----
 mkdir -p output
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-TRACE_BASENAME="npu_llama_cpp_cpu_p0_12_p6_12_${TIMESTAMP}.perfetto-trace"
 LOG_FILE="output/npu_llama_cpp_cpu_p0_12_p6_12_${TIMESTAMP}.csv"
-TRACE_OUT="output/${TRACE_BASENAME}"
-
-# perfetto는 /data/misc/perfetto-traces/ 에 먼저 저장 후 output/으로 복사
-TRACE_TMP="/data/misc/perfetto-traces/${TRACE_BASENAME}"
-TRACE_PUBLIC="/data/local/tmp/${TRACE_BASENAME}"
-
-# config/pid 파일은 /data/local/tmp/ 에 (root 접근 가능)
-PERFETTO_CFG_LOCAL="/data/local/tmp/perfetto_cfg_$$.pbtxt"
-PERFETTO_PID_FILE="/data/local/tmp/perfetto_pid_$$.txt"
 LOG_SCRIPT="/data/local/tmp/hw_log_cmd_$$.sh"
 
 # ---- CSV header ----
@@ -62,11 +51,12 @@ printf "gpu_min_clock,gpu_max_clock," >> "$LOG_FILE"
 printf "cpu0_max_freq,cpu0_cur_freq,cpu6_max_freq,cpu6_cur_freq," >> "$LOG_FILE"
 printf "%s" "$MEMINFO_NAMES" >> "$LOG_FILE"
 printf "power_now,current_now,voltage_now," >> "$LOG_FILE"
-printf "ddr_cur_freq\n" >> "$LOG_FILE"
+printf "ddr_cur_freq," >> "$LOG_FILE"
+printf "cpu0_util,cpu1_util,cpu2_util,cpu3_util,cpu4_util,cpu5_util,cpu6_util,cpu7_util\n" >> "$LOG_FILE"
 
 echo "[log] CSV: $LOG_FILE"
 
-# ---- Write logging helper script ----
+# ---- Write logging helper script (sysfs reads, run as root) ----
 cat > "$LOG_SCRIPT" << 'EOF'
 awk '{printf "%s,", $1/1000}' /sys/devices/virtual/thermal/thermal_zone*/temp
 awk '{printf "%s,", $1}' /sys/class/kgsl/kgsl-3d0/devfreq/min_freq
@@ -79,70 +69,36 @@ awk '{printf "%s,", $2/1024}' /proc/meminfo
 awk '{printf "%s,", $1}' /sys/class/power_supply/battery/power_now
 awk '{printf "%s,", $1}' /sys/class/power_supply/battery/current_now
 awk '{printf "%s,", $1}' /sys/class/power_supply/battery/voltage_now
-awk '{printf "%s", $1/1000}' /sys/devices/system/cpu/bus_dcvs/DDR/cur_freq
-printf "\n"
+awk '{printf "%s,", $1/1000}' /sys/devices/system/cpu/bus_dcvs/DDR/cur_freq
 EOF
 
-# ---- Perfetto config ----
-cat > "$PERFETTO_CFG_LOCAL" << 'EOF'
-buffers { size_kb: 512000 fill_policy: RING_BUFFER }
-data_sources {
-  config {
-    name: "linux.ftrace"
-    ftrace_config {
-      compact_sched { enabled: true }
-      ftrace_events: "sched/sched_switch"
-      ftrace_events: "sched/sched_wakeup"
-      ftrace_events: "sched/sched_migrate_task"
-      ftrace_events: "power/cpu_frequency"
-      ftrace_events: "power/cpu_idle"
-      ftrace_events: "clk/clk_set_rate"
-    }
-  }
-}
-data_sources {
-  config {
-    name: "linux.sys_stats"
-    sys_stats_config {
-      meminfo_period_ms: 1000
-      cpufreq_period_ms: 100
-      devfreq_period_ms: 100
-      psi_period_ms: 1000
-    }
-  }
-}
-data_sources {
-  config {
-    name: "linux.process_stats"
-    process_stats_config {
-      scan_all_processes_on_start: true
-      proc_stats_poll_ms: 1000
-      record_process_runtime: true
-    }
-  }
-}
-data_sources {
-  config { name: "linux.system_info" }
-}
-EOF
-
-su -c "mkdir -p /data/misc/perfetto-traces"
-su -c "chmod 644 $PERFETTO_CFG_LOCAL"
-
-# ---- Start Perfetto: root 쉘 안에서 백그라운드, PID 저장 ----
-su -c "/system/bin/perfetto --txt -c $PERFETTO_CFG_LOCAL -o $TRACE_TMP >/data/local/tmp/perfetto_$$.log 2>&1 & echo \$! > $PERFETTO_PID_FILE"
-sleep 0.5
-echo "[perfetto] started (PID=$(su -c "cat $PERFETTO_PID_FILE" 2>/dev/null)), trace: $TRACE_TMP"
-
-# ---- Start HW logging loop (background) ----
+# ---- HW logging loop (background, CPU util from /proc/stat - no su needed) ----
 START_MS=$(date +%s%3N)
 
 hw_log_loop() {
+    PREV_STAT=$(grep '^cpu[0-9]' /proc/stat)
     while true; do
         NOW_MS=$(date +%s%3N)
         ELAPSED=$(awk "BEGIN {printf \"%.3f\", ($NOW_MS - $START_MS) / 1000.0}")
+
         ROW=$(su -c "sh $LOG_SCRIPT" 2>/dev/null)
-        printf "%s,%s\n" "$ELAPSED" "$ROW" >> "$LOG_FILE"
+
+        CURR_STAT=$(grep '^cpu[0-9]' /proc/stat)
+        CPU_UTIL=$(printf "%s\n%s" "$PREV_STAT" "$CURR_STAT" | awk '
+        {
+            core=$1; idle=$5; total=0
+            for(i=2;i<=NF;i++) total+=$i
+            if(seen[core]) {
+                d_idle  = idle - prev_idle[core]
+                d_total = total - prev_total[core]
+                util = (d_total > 0) ? (d_total - d_idle) / d_total * 100 : 0
+                printf "%.1f,", util
+            }
+            prev_idle[core]=idle; prev_total[core]=total; seen[core]=1
+        }')
+        PREV_STAT=$CURR_STAT
+
+        printf "%s,%s%s\n" "$ELAPSED" "$ROW" "$CPU_UTIL" >> "$LOG_FILE"
         sleep 0.3
     done
 }
@@ -174,31 +130,9 @@ echo "[inference] done."
 # ---- Stop logging ----
 kill "$LOG_PID" 2>/dev/null
 wait "$LOG_PID" 2>/dev/null
+rm -f "$LOG_SCRIPT"
 
-# ---- Stop perfetto (SIGINT for graceful flush) ----
-PERF_PID=$(su -c "cat $PERFETTO_PID_FILE" 2>/dev/null)
-if [ -n "$PERF_PID" ]; then
-    su -c "kill -INT $PERF_PID" 2>/dev/null
-    # flush 대기
-    i=0
-    while [ $i -lt 50 ]; do
-        su -c "kill -0 $PERF_PID" 2>/dev/null || break
-        sleep 0.1
-        i=$((i+1))
-    done
-fi
-
-# ---- Copy trace to output/ ----
-su -c "chmod 644 $TRACE_TMP" 2>/dev/null || true
-su -c "cp $TRACE_TMP $TRACE_PUBLIC && chmod 644 $TRACE_PUBLIC" 2>/dev/null || true
-su -c "cp $TRACE_PUBLIC /data/local/tmp/llama.cpp/$TRACE_OUT && chmod 644 /data/local/tmp/llama.cpp/$TRACE_OUT" 2>/dev/null || true
-
-# ---- Cleanup ----
-rm -f "$PERFETTO_CFG_LOCAL" "$LOG_SCRIPT"
-su -c "rm -f $PERFETTO_PID_FILE /data/local/tmp/perfetto_$$.log" 2>/dev/null || true
-
-echo "[result] HW log  : $LOG_FILE"
-echo "[result] Perfetto: $TRACE_OUT"
+echo "[result] HW log: $LOG_FILE"
 
 # ---- Restore CPU freq ----
 su -c "chmod 644 /sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq"
@@ -213,7 +147,6 @@ su -c "echo 1017600 > /sys/devices/system/cpu/cpufreq/policy6/scaling_min_freq"
 
 su -c "echo walt > /sys/devices/system/cpu/cpufreq/policy0/scaling_governor"
 su -c "echo walt > /sys/devices/system/cpu/cpufreq/policy6/scaling_governor"
-
 echo "[restore] CPU freq/governor restored"
 
 # ---- Screen on ----
