@@ -28,8 +28,8 @@ sleep 3
     --strict-limit 64 \
     --max-query-number 30 \
     --cpu-p 15 \
-    --ram-d 9 \
-    --cpu-p 15 \
+    --ram-p 9 \
+    --cpu-d 15 \
     --ram-d 9
 
 # --layer-pause LP[ms]
