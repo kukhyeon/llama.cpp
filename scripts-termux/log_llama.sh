@@ -6,6 +6,17 @@
 # ---- Pin this shell to CPU0 ----
 taskset -p 0x01 $$
 
+
+# ---- Cleanup on exit (normal/SIGINT/SIGTERM) ----
+cleanup() {
+    kill "$LOG_PID" 2>/dev/null
+    wait "$LOG_PID" 2>/dev/null
+    # su 자식 프로세스(sh hw_log_cmd, awk 등)는 root 소유 -> su -c pkill로 정리
+    su -c "pkill -f hw_log_cmd" 2>/dev/null
+    su -c "pkill -f 'awk.*thermal'" 2>/dev/null
+    rm -f "$LOG_SCRIPT" 2>/dev/null
+}
+trap cleanup EXIT INT TERM
 # ---- S25 CPU freq (kHz) ----
 CLK0=2918400
 CLK6=3840000
@@ -32,6 +43,10 @@ su -c "chmod 444 /sys/devices/system/cpu/cpufreq/policy6/scaling_max_freq"
 su -c "chmod 644 /sys/devices/system/cpu/cpufreq/policy6/scaling_min_freq"
 su -c "echo $CLK6 > /sys/devices/system/cpu/cpufreq/policy6/scaling_min_freq"
 su -c "chmod 444 /sys/devices/system/cpu/cpufreq/policy6/scaling_min_freq"
+su -c "chmod 644 /sys/devices/system/cpu/bus_dcvs/DDR/boost_freq"
+su -c "echo 4761000 > /sys/devices/system/cpu/bus_dcvs/DDR/boost_freq"
+su -c "chmod 444 /sys/devices/system/cpu/bus_dcvs/DDR/boost_freq"
+echo "[setup] DDR boost_freq: $(su -c 'cat /sys/devices/system/cpu/bus_dcvs/DDR/boost_freq')"
 
 echo "[setup] CPU gov: $(su -c 'cat /sys/devices/system/cpu/cpufreq/policy0/scaling_governor') / $(su -c 'cat /sys/devices/system/cpu/cpufreq/policy6/scaling_governor')"
 sleep 2
@@ -127,10 +142,6 @@ su -p -c "taskset f0 setenforce 0 && \
 
 echo "[inference] done."
 
-# ---- Stop logging ----
-kill "$LOG_PID" 2>/dev/null
-wait "$LOG_PID" 2>/dev/null
-rm -f "$LOG_SCRIPT"
 
 echo "[result] HW log: $LOG_FILE"
 
@@ -147,6 +158,10 @@ su -c "echo 1017600 > /sys/devices/system/cpu/cpufreq/policy6/scaling_min_freq"
 
 su -c "echo walt > /sys/devices/system/cpu/cpufreq/policy0/scaling_governor"
 su -c "echo walt > /sys/devices/system/cpu/cpufreq/policy6/scaling_governor"
+su -c "chmod 644 /sys/devices/system/cpu/bus_dcvs/DDR/boost_freq"
+su -c "echo 5470000 > /sys/devices/system/cpu/bus_dcvs/DDR/boost_freq"
+su -c "chmod 444 /sys/devices/system/cpu/bus_dcvs/DDR/boost_freq"
+echo "[restore] DDR boost_freq restored"
 echo "[restore] CPU freq/governor restored"
 
 # ---- Screen on ----
