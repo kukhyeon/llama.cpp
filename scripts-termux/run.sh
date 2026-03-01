@@ -17,19 +17,18 @@ sleep 3
 
 ./build/bin/ignite \
     -m models/qwen-1.5-0.5b-chat-q4_k_m.gguf \
-    -i -cnv -tb 1 -t 4 -ub 512 -b 512 \
+    -i -cnv -tb 4 -t 1 -ub 512 -b 512 \
     -c 1024 \
     --temp 0 \
     --top-k 1 \
     --device-name S25 \
     --output-dir output/ \
     --input-path dataset/hotpot_qa_30.json \
-    --strict on \
-    --strict-limit 64 \
+    -fa off \
     --max-query-number 30 \
-    --cpu-p 15 \
+    --cpu-p 0 \
     --ram-p 9 \
-    --cpu-d 15 \
+    --cpu-d 0 \
     --ram-d 9
 
 # --layer-pause LP[ms]
