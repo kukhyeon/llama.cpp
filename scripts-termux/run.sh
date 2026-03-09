@@ -16,19 +16,20 @@ echo "CPU Governor (policy6): $(cat /sys/devices/system/cpu/cpufreq/policy6/scal
 sleep 3
 
 ./build/bin/ignite \
-    -m models/qwen-1.5-0.5b-chat-q4_k_m.gguf \
-    -i -cnv -tb 4 -t 1 -ub 512 -b 512 \
+    -m models/qwen-1.5-1.8b-chat-q4_k_m.gguf \
+    -i -cnv -tb 5 -t 5 -i -ub 512 -b 512 \
     -c 1024 \
     --temp 0 \
     --top-k 1 \
     --device-name S25 \
     --output-dir output/ \
-    --input-path dataset/hotpot_qa_30.json \
+    --input-path data/64_qa_20.json \
     -fa off \
-    --max-query-number 30 \
-    --cpu-p 0 \
+    --strict on \
+    --strict-limit 256 \
+    --cpu-p 15 \
     --ram-p 9 \
-    --cpu-d 0 \
+    --cpu-d 15 \
     --ram-d 9
 
 # --layer-pause LP[ms]
