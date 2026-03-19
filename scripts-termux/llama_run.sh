@@ -23,7 +23,7 @@ sleep 3
     --top-k 1 \
     --device-name S25 \
     --output-dir output/ \
-    --input-path data/llama32_prefill_64.json \
+    --input-path data/llama32_prefill_256.json \
     -fa off \
     --strict on \
     --strict-limit 2 \
