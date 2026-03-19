@@ -27,6 +27,7 @@ sleep 3
     -fa off \
     --strict on \
     --strict-limit 2 \
+    --max-query-number 20 \
     --cpu-p 15 \
     --ram-p 9 \
     --cpu-d 15 \
