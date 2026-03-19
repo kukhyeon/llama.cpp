@@ -16,14 +16,14 @@ echo "CPU Governor (policy6): $(cat /sys/devices/system/cpu/cpufreq/policy6/scal
 sleep 3
 
 ./build/bin/ignite \
-    -m models/qwen-1.5-1.8b-chat-q4_k_m.gguf \
+    -m models/qwen-1.5-0.5b-chat-q4_k_m.gguf \
     -i -cnv -tb 5 -t 5 -ub 512 -b 512 \
     -c 1024 \
     --temp 0 \
     --top-k 1 \
     --device-name S25 \
     --output-dir output/ \
-    --input-path data/query_test.json \
+    --input-path data/qwen15_query_test.json \
     -fa off \
     --strict on \
     --strict-limit 2 \
