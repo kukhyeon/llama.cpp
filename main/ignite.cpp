@@ -347,7 +347,7 @@ int main(int argc, char ** argv) {
     
     std::thread record_thread = std::thread(record_hard, std::ref(sigterm), std::ref(dvfs));
     auto start_sys_time = std::chrono::system_clock::now();
-    pin_current({4,5,6,7}); // generally gold/prime cores on mobile
+    // pin_current({4,5,6,7}); // generally gold/prime cores on mobile
 // ----------------------------------------------------------------
 #else
     DVFS dvfs(device_name);

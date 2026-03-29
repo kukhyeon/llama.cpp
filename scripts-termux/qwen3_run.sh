@@ -26,8 +26,8 @@ sleep 3
     --input-path data/qwen3_prefill_64.json \
     -fa off \
     --strict on \
-    --strict-limit 2 \
-    --max-query-number 3 \
+    --strict-limit 128 \
+    --max-query-number 30 \
     --cpu-p 15 \
     --ram-p 9 \
     --cpu-d 15 \
