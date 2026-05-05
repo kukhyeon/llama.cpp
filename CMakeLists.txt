@@ -262,6 +262,11 @@ if (LLAMA_BUILD_COMMON)
     install(TARGETS llama-common LIBRARY)
 endif()
 
+if (TARGET dvfs AND LLAMA_BUILD_IGNITE)
+    # ignite and llama-ignite-npu link against dvfs at runtime.
+    install(TARGETS dvfs LIBRARY RUNTIME ARCHIVE)
+endif()
+
 configure_package_config_file(
         ${CMAKE_CURRENT_SOURCE_DIR}/cmake/llama-config.cmake.in
         ${CMAKE_CURRENT_BINARY_DIR}/llama-config.cmake

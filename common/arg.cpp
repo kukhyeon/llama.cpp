@@ -1162,6 +1162,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.strict_limit_length = value;
         }
     ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
+        {"--output-dir"}, "PATH",
+        "result output directory for ignite hardware and inference logs",
+        [](common_params & params, const std::string & value) {
+            params.output_dir = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
 
     add_opt(common_arg(
         {"-h", "--help", "--usage"},
