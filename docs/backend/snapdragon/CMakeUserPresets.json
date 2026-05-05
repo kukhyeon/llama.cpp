@@ -25,6 +25,9 @@
             "GGML_OPENCL":      "ON",
             "GGML_HEXAGON":     "ON",
             "GGML_HEXAGON_FP32_QUANTIZE_GROUP_SIZE": "128",
+            "LLAMA_BUILD_IGNITE": "ON",
+            "LLAMA_IGNITE_INSTALL": "ON",
+            "IGNITE_USE_SYSTEM_DVFS": "ON",
             "LLAMA_OPENSSL":    "OFF"
         }
     },
