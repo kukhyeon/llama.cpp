@@ -1,0 +1,10 @@
+find_package(Threads REQUIRED)
+llama_add_compile_flags()
+
+set(TARGET ignite)
+add_executable(${TARGET} ignite.cpp)
+target_link_libraries(${TARGET} PRIVATE llama-common llama dvfs ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
+if (LLAMA_IGNITE_INSTALL)
+    install(TARGETS ${TARGET} RUNTIME)
+endif()

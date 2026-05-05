@@ -112,6 +112,11 @@ option(LLAMA_BUILD_WEBUI    "llama: build the embedded Web UI for server"  ON)
 option(LLAMA_TOOLS_INSTALL  "llama: install tools"        ${LLAMA_TOOLS_INSTALL_DEFAULT})
 option(LLAMA_TESTS_INSTALL  "llama: install tests"        ON)
 
+# IGNITE artifacts
+option(LLAMA_BUILD_IGNITE    "llama: build ignite executables" OFF)
+option(LLAMA_IGNITE_INSTALL  "llama: install ignite executables" OFF)
+option(IGNITE_USE_SYSTEM_DVFS "ignite: use system DVFS controls" OFF)
+
 # 3rd party libs
 option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" ON)
 option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured output in common utils" OFF)
@@ -213,6 +218,10 @@ endif()
 
 if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS)
     add_subdirectory(tools)
+endif()
+
+if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_IGNITE)
+    add_subdirectory(main)
 endif()
 
 # Automatically add all files from the 'licenses' directory

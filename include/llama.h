@@ -429,6 +429,50 @@ extern "C" {
     // lora adapter
     struct llama_adapter_lora;
 
+    // used by IGNITE runtime controls
+    typedef struct llama_igparams {
+        bool     is_ignite_active;
+        bool     ignite_verbose;
+        uint16_t layer_pause;
+        bool     backend_compute_profile;
+        bool     backend_op_breakdown;
+
+        bool strict_limit;
+        int  strict_limit_length;
+        bool enable_thinking;
+
+        int    phase_pause;
+        int    token_pause;
+        int    query_interval;
+        bool   prefill_phase;
+        double prefill_speed;
+        double decode_speed;
+
+        int  max_query_number;
+        char output_csv_path[128];
+        char input_path[128];
+        char output_dir[128];
+        char output_path_hard[128];
+        char output_path_infer[128];
+
+        char device_name[32];
+        int  cpu_clk_idx_p;
+        int  ram_clk_idx_p;
+        int  cpu_clk_idx_d;
+        int  ram_clk_idx_d;
+        bool fixed_config;
+
+        double time_slot;
+        double temp_threshold;
+        double temp_history[64];
+        int    temp_cap;
+        double temp_alpha;
+        int    max_cpu_clk_idx;
+        int    cur_cpu_clk_idx;
+        int    max_ram_clk_idx;
+        int    cur_ram_clk_idx;
+    } llama_igparams;
+
     // Helpers for getting default parameters
     // TODO: update API to start accepting pointers to params structs (https://github.com/ggml-org/llama.cpp/discussions/9172)
     LLAMA_API struct llama_model_params          llama_model_default_params(void);
@@ -1527,6 +1571,19 @@ extern "C" {
     LLAMA_API struct llama_perf_sampler_data llama_perf_sampler      (const struct llama_sampler * chain);
     LLAMA_API void                           llama_perf_sampler_print(const struct llama_sampler * chain);
     LLAMA_API void                           llama_perf_sampler_reset(      struct llama_sampler * chain);
+
+    //
+    // IGNITE
+    //
+
+    LLAMA_API void llama_ignite_set_active(struct llama_context * ctx, bool active);
+    LLAMA_API bool llama_ignite_get_active(struct llama_context * ctx);
+    LLAMA_API void llama_ignite_set_layer_pause(struct llama_context * ctx, uint16_t ms);
+    LLAMA_API uint16_t llama_ignite_get_layer_pause(struct llama_context * ctx);
+    LLAMA_API bool init_ignite_params(struct llama_context * ctx, llama_igparams * igparams);
+    LLAMA_API bool init_ignite_filename(struct llama_context * ctx);
+    LLAMA_API llama_igparams * get_ignite_params(struct llama_context * ctx);
+    LLAMA_API void ignite_params_system_info(const llama_igparams * igparams);
 
     //
     // training

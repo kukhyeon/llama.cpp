@@ -14,6 +14,7 @@
 #include <climits>
 #include <cmath>
 #include <chrono>
+#include <cstdio>
 #include <cstdarg>
 #include <cstring>
 #include <ctime>
@@ -375,6 +376,60 @@ void common_init() {
 #endif
 
     LOG_DBG("build: %d (%s) with %s for %s%s\n", llama_build_number(), llama_commit(), llama_compiler(), llama_build_target(), build_type);
+}
+
+static void common_ignite_copy(char * dst, size_t dst_size, const std::string & src) {
+    if (dst_size == 0) {
+        return;
+    }
+    std::snprintf(dst, dst_size, "%s", src.c_str());
+}
+
+void common_ignite_init(llama_context * ctx, common_params & params) {
+    if (!ctx) {
+        return;
+    }
+
+    llama_igparams ig{};
+
+    ig.max_query_number    = params.max_query_number;
+    ig.strict_limit        = params.strict_limit;
+    ig.strict_limit_length = params.strict_limit_length;
+    ig.enable_thinking     = params.enable_thinking;
+    ig.layer_pause         = params.layer_pause;
+    ig.phase_pause         = params.phase_pause;
+    ig.token_pause         = params.token_pause;
+    ig.query_interval      = params.query_interval;
+    ig.prefill_phase       = params.prefill_phase;
+    ig.prefill_speed       = params.prefill_speed;
+    ig.decode_speed        = params.decode_speed;
+    ig.backend_compute_profile = params.backend_compute_profile;
+    ig.backend_op_breakdown    = params.backend_op_breakdown;
+
+    common_ignite_copy(ig.input_path,        sizeof(ig.input_path),        params.input_path);
+    common_ignite_copy(ig.output_dir,        sizeof(ig.output_dir),        params.output_dir);
+    common_ignite_copy(ig.output_path_hard,  sizeof(ig.output_path_hard),  params.output_path_hard);
+    common_ignite_copy(ig.output_path_infer, sizeof(ig.output_path_infer), params.output_path_infer);
+
+    common_ignite_copy(ig.device_name, sizeof(ig.device_name), params.device_name);
+    ig.is_ignite_active = params.is_ignite_active;
+    ig.ignite_verbose   = params.ignite_verbose;
+    ig.cpu_clk_idx_p    = params.cpu_clk_idx_p;
+    ig.ram_clk_idx_p    = params.ram_clk_idx_p;
+    ig.cpu_clk_idx_d    = params.cpu_clk_idx_d;
+    ig.ram_clk_idx_d    = params.ram_clk_idx_d;
+    ig.fixed_config     = params.fixed_config;
+
+    ig.time_slot       = params.time_slot;
+    ig.temp_threshold  = params.temp_threshold;
+    ig.temp_cap        = params.temp_cap;
+    ig.temp_alpha      = params.temp_alpha;
+    ig.max_cpu_clk_idx = params.max_cpu_clk_idx;
+    ig.cur_cpu_clk_idx = params.cur_cpu_clk_idx;
+    ig.max_ram_clk_idx = params.max_ram_clk_idx;
+    ig.cur_ram_clk_idx = params.cur_ram_clk_idx;
+
+    init_ignite_params(ctx, &ig);
 }
 
 std::string common_params_get_system_info(const common_params & params) {
@@ -1280,6 +1335,8 @@ common_init_result_ptr common_init_from_params(common_params & params) {
         LOG_ERR("%s: failed to create context with model '%s'\n", __func__, params.model.path.c_str());
         return res;
     }
+
+    common_ignite_init(lctx, params);
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
 

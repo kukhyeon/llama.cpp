@@ -12,10 +12,13 @@
 #include "llama.h"
 
 #include <cinttypes>
+#include <chrono>
 #include <cmath>
 #include <cstring>
+#include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <thread>
 
 //
 // llama_context
@@ -1065,6 +1068,21 @@ void llama_context::set_warmup(bool value) {
     //sched_need_reserve = true;
 }
 
+void llama_context::set_ignite_params(
+            const llama_igparams * cfg) {
+    LLAMA_LOG_DEBUG("%s: call\n", __func__);
+    if (!cfg) {
+        return;
+    }
+
+    igparams = *cfg;
+    lp_enable = igparams.layer_pause > 0;
+}
+
+struct llama_igparams * llama_context::get_ignite_params() {
+    return &igparams;
+}
+
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
@@ -1174,6 +1192,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
+
+    lp_is_prefill = (ubatch.n_tokens > 1);
 
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
@@ -2188,6 +2208,12 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
+    if (igparams.is_ignite_active && lp_enable && batched) {
+        ggml_backend_sched_set_eval_callback(sched.get(), lp_eval_callback, this);
+    } else {
+        ggml_backend_sched_set_eval_callback(sched.get(), nullptr, nullptr);
+    }
+
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
@@ -2196,6 +2222,54 @@ ggml_status llama_context::graph_compute(
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 
     return status;
+}
+
+bool llama_context::lp_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
+    auto * ctx = static_cast<llama_context *>(user_data);
+
+    if (!ctx->lp_enable || !ctx->lp_is_prefill) {
+        return ask ? false : true;
+    }
+
+    const char * n = ggml_get_name(t);
+    if (!n || !n[0]) {
+        return ask ? false : true;
+    }
+
+    const bool is_attn_out = strncmp(n, "attn_out", 8) == 0;
+    const bool is_kqv_out  = strncmp(n, "kqv_out",  7) == 0;
+    const bool is_ffn      = strncmp(n, "ffn_out",  7) == 0 || strncmp(n, "ffn_mlp", 7) == 0;
+    const bool is_mha      = is_attn_out || is_kqv_out;
+
+    if (ask) {
+        if (is_attn_out) {
+            ctx->lp_mha_key = llama_context::lp_mha_key_t::attn_out;
+        } else if (is_kqv_out && ctx->lp_mha_key == llama_context::lp_mha_key_t::none) {
+            ctx->lp_mha_key = llama_context::lp_mha_key_t::kqv_out;
+        }
+        return is_mha || is_ffn;
+    }
+
+    if (is_attn_out && ctx->lp_mha_key == llama_context::lp_mha_key_t::attn_out) {
+        if (ctx->igparams.ignite_verbose) {
+            std::cout << std::flush << "<mha:" << ctx->igparams.layer_pause << ">";
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(ctx->igparams.layer_pause));
+    } else if (is_kqv_out && ctx->lp_mha_key == llama_context::lp_mha_key_t::kqv_out) {
+        if (ctx->igparams.ignite_verbose) {
+            std::cout << std::flush << "<kqv:" << ctx->igparams.layer_pause << ">";
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(ctx->igparams.layer_pause));
+    }
+
+    if (is_ffn) {
+        if (ctx->igparams.ignite_verbose) {
+            std::cout << std::flush << "<ffn:" << ctx->igparams.layer_pause << ">";
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(ctx->igparams.layer_pause));
+    }
+
+    return is_mha || is_ffn;
 }
 
 llm_graph_cb llama_context::graph_get_cb() const {
