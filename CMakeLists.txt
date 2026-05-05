@@ -262,7 +262,7 @@ if (LLAMA_BUILD_COMMON)
     install(TARGETS llama-common LIBRARY)
 endif()
 
-if (TARGET dvfs AND LLAMA_BUILD_IGNITE)
+if (TARGET dvfs)
     # ignite and llama-ignite-npu link against dvfs at runtime.
     install(TARGETS dvfs LIBRARY RUNTIME ARCHIVE)
 endif()
