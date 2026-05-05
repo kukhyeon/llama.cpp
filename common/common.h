@@ -688,11 +688,58 @@ struct common_params {
     llama_progress_callback load_progress_callback = NULL;
     void *                  load_progress_callback_user_data = NULL;
     bool no_alloc = false; // Don't allocate model buffers
+
+    // IGNITE controls
+    bool strict_limit = false;
+    int  strict_limit_length = 0;
+    bool enable_thinking = false;
+
+    std::string device_name = "S25";
+    int cpu_clk_idx_p = -1;
+    int ram_clk_idx_p = -1;
+    int cpu_clk_idx_d = -1;
+    int ram_clk_idx_d = -1;
+
+    int phase_pause = 0; // ms
+    int token_pause = 0; // ms
+    int layer_pause = 0; // ms
+    int query_interval = 0; // ms
+    bool backend_compute_profile = false;
+    bool backend_op_breakdown = false;
+    bool prefill_phase = true;
+    double prefill_speed = 0.0;
+    double decode_speed = 0.0;
+#if defined(IGNITE_USE_SYSTEM_DVFS)
+    bool is_ignite_active = true;
+    bool ignite_verbose = false;
+#else
+    bool is_ignite_active = false;
+    bool ignite_verbose = false;
+#endif
+
+    int max_query_number = -1;
+    std::string json_path = "questions.json"; // deprecated, use input_path
+    std::string input_path = "";
+    std::string output_dir = "";
+    std::string output_path_hard = "";
+    std::string output_path_infer = "";
+
+    bool fixed_config = false;
+    double time_slot = 0.5;
+    double temp_threshold = 80.0;
+    std::vector<double> temp_history = {};
+    int temp_cap = 10;
+    double temp_alpha = 0.6;
+    int max_cpu_clk_idx = 0;
+    int cur_cpu_clk_idx = 0;
+    int max_ram_clk_idx = 0;
+    int cur_ram_clk_idx = 0;
 };
 
 // call once at the start of a program if it uses libcommon
 // initializes the logging system and prints info about the build
 void common_init();
+void common_ignite_init(llama_context * ctx, common_params & params);
 
 std::string common_params_get_system_info(const common_params & params);
 

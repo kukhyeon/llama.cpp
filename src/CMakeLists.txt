@@ -21,6 +21,7 @@ add_library(llama
             llama-graph.cpp
             llama-hparams.cpp
             llama-impl.cpp
+            llama-ignite.cpp
             llama-io.cpp
             llama-kv-cache.cpp
             llama-kv-cache-iswa.cpp
@@ -38,7 +39,22 @@ add_library(llama
             unicode-data.cpp
             unicode.cpp
             unicode.h
+            hard/utils.cpp
+            hard/utils.h
             ${LLAMA_MODELS_SOURCES}
+            )
+
+add_library(dvfs
+            hard/device.cpp
+            hard/device.h
+            hard/dvfs.cpp
+            hard/dvfs.h
+            hard/record.cpp
+            hard/record.h
+            hard/utils.cpp
+            hard/utils.h
+            hard/affinity.cpp
+            hard/affinity.h
             )
 
 set_target_properties(llama PROPERTIES
@@ -49,9 +65,21 @@ set_target_properties(llama PROPERTIES
 
 target_include_directories(llama PRIVATE .)
 target_include_directories(llama PUBLIC ../include)
+target_include_directories(llama PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../vendor")
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
+
+target_include_directories(dvfs PRIVATE .)
+target_include_directories(dvfs PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(dvfs PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/../vendor")
+target_compile_features   (dvfs PRIVATE cxx_std_17) # don't bump
+target_link_libraries(dvfs PUBLIC ggml)
+if (IGNITE_USE_SYSTEM_DVFS)
+    target_compile_definitions(dvfs PUBLIC IGNITE_USE_SYSTEM_DVFS=1)
+else()
+    target_compile_definitions(dvfs PUBLIC IGNITE_USE_SYSTEM_DVFS=0)
+endif()
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)

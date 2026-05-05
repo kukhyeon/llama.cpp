@@ -1047,6 +1047,106 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     };
 
+    // IGNITE options
+    add_opt(common_arg(
+        {"--json-path"}, "FNAME",
+        "path to JSON input file for ignite",
+        [](common_params & params, const std::string & value) {
+            params.json_path = value;
+            params.input_path = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
+        {"--input-path"}, "FNAME",
+        "path to ignite input file (.csv or .json)",
+        [](common_params & params, const std::string & value) {
+            params.input_path = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
+        {"--max-query-number"}, "N",
+        "maximum number of ignite queries to process (default: unlimited)",
+        [](common_params & params, int value) {
+            params.max_query_number = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
+        {"--device-name", "--dvfs-device"}, "NAME",
+        "DVFS target device name",
+        [](common_params & params, const std::string & value) {
+            params.device_name = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
+        {"--cpu-p"}, "IDX",
+        "prefill CPU DVFS index",
+        [](common_params & params, int value) {
+            params.cpu_clk_idx_p = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
+        {"--ram-p"}, "IDX",
+        "prefill RAM DVFS index",
+        [](common_params & params, int value) {
+            params.ram_clk_idx_p = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
+        {"--cpu-d"}, "IDX",
+        "decode CPU DVFS index",
+        [](common_params & params, int value) {
+            params.cpu_clk_idx_d = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
+        {"--ram-d"}, "IDX",
+        "decode RAM DVFS index",
+        [](common_params & params, int value) {
+            params.ram_clk_idx_d = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
+        {"--phase-pause"}, "MS",
+        "pause between prefill and decode phases in milliseconds",
+        [](common_params & params, int value) {
+            params.phase_pause = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
+        {"--token-pause"}, "MS",
+        "pause between generated tokens in milliseconds",
+        [](common_params & params, int value) {
+            params.token_pause = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
+        {"--layer-pause"}, "MS",
+        "pause selected graph layer boundaries in milliseconds",
+        [](common_params & params, int value) {
+            params.layer_pause = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
+        {"--ignite-verbose"},
+        "enable verbose ignite markers",
+        [](common_params & params) {
+            params.ignite_verbose = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
+        {"--strict"}, "on|off",
+        "enable ignite strict generation limit",
+        [](common_params & params, const std::string & value) {
+            params.strict_limit = is_truthy(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
+        {"--strict-limit"}, "N",
+        "set ignite strict generation limit length",
+        [](common_params & params, int value) {
+            params.strict_limit_length = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
 
     add_opt(common_arg(
         {"-h", "--help", "--usage"},
