@@ -17,17 +17,17 @@ sleep 3
 
 ./build/bin/ignite \
     -m models/Llama-3.2-1B-Instruct-Q4_K_M.gguf \
-    -i -cnv -tb 5 -t 5 -ub 512 -b 512 \
+    -i -cnv -tb 6 -t 6 -ub 512 -b 512 \
     -c 1024 \
     --temp 0 \
     --top-k 1 \
     --device-name S25 \
     --output-dir output/ \
-    --input-path data/llama32_prefill_128.json \
+    --input-path data/llama32_prefill_64.json \
     -fa off \
     --strict on \
-    --strict-limit 2 \
-    --max-query-number 1 \
+    --strict-limit 128 \
+    --max-query-number 30 \
     --cpu-p 15 \
     --ram-p 9 \
     --cpu-d 15 \
