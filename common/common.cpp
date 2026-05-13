@@ -1198,6 +1198,17 @@ struct common_init_result::impl {
 
 common_init_result::common_init_result(common_params & params) :
     pimpl(new impl{}) {
+    // Load the process-global placement policy before model creation so weight
+    // rules are available while tensors are assigned to backend buffers.
+    if (!params.backend_policy_path.empty()) {
+        if (!llama_backend_policy_load(params.backend_policy_path.c_str(), params.backend_policy_weights, params.backend_policy_ops)) {
+            LOG_ERR("%s: failed to load backend policy '%s'\n", __func__, params.backend_policy_path.c_str());
+            return;
+        }
+    } else {
+        llama_backend_policy_clear();
+    }
+
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 

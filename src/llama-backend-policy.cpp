@@ -1,0 +1,579 @@
+#include "llama-backend-policy.h"
+
+#include "llama-impl.h"
+#include "llama.h"
+
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <mutex>
+#include <regex>
+#include <stdexcept>
+#include <unordered_set>
+
+namespace {
+
+using json = nlohmann::ordered_json;
+
+// A single selector/action entry from weights.rules or ops.rules.
+// Not every field is meaningful for both sections:
+// - weights use tensor/pattern/layer selectors and buffer-type backends.
+// - ops use name/name_regex/op/phase/layer selectors and execution backends.
+struct policy_rule {
+    std::string tensor;
+    std::string pattern;
+    std::string name;
+    std::string name_regex;
+    std::string op;
+    std::string phase;
+    int layer = -2;
+    int layer_start = -2;
+    int layer_end = -2;
+    std::vector<std::string> backends;
+    std::string source;
+};
+
+// Process-global policy state. The policy is loaded once before model loading
+// and then queried from the model loader and graph callback paths.
+struct policy_state {
+    bool loaded = false;
+    bool enabled = false;
+    bool weights_enabled = false;
+    bool ops_enabled = false;
+    std::string path;
+    std::vector<std::string> fallback_priority;
+    std::vector<std::string> default_weight_backends;
+    std::vector<policy_rule> weight_rules;
+    std::vector<policy_rule> op_rules;
+};
+
+std::mutex g_policy_mutex;
+policy_state g_policy;
+
+std::string lower(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return (char) std::tolower(c);
+    });
+    return s;
+}
+
+bool str_eq_ci(const std::string & a, const std::string & b) {
+    return lower(a) == lower(b);
+}
+
+bool str_contains_ci(const std::string & haystack, const std::string & needle) {
+    return lower(haystack).find(lower(needle)) != std::string::npos;
+}
+
+std::vector<std::string> parse_backend_list(const json & obj) {
+    std::vector<std::string> result;
+
+    if (obj.contains("backend") && obj["backend"].is_string()) {
+        result.push_back(obj["backend"].get<std::string>());
+    }
+
+    if (obj.contains("backends") && obj["backends"].is_array()) {
+        for (const auto & item : obj["backends"]) {
+            if (!item.is_string()) {
+                throw std::runtime_error("backend list entries must be strings");
+            }
+            result.push_back(item.get<std::string>());
+        }
+    }
+
+    return result;
+}
+
+std::vector<std::string> parse_string_array(const json & obj, const char * key) {
+    std::vector<std::string> result;
+    if (!obj.contains(key)) {
+        return result;
+    }
+    if (!obj[key].is_array()) {
+        throw std::runtime_error(std::string(key) + " must be an array");
+    }
+    for (const auto & item : obj[key]) {
+        if (!item.is_string()) {
+            throw std::runtime_error(std::string(key) + " entries must be strings");
+        }
+        result.push_back(item.get<std::string>());
+    }
+    return result;
+}
+
+void append_unique(std::vector<std::string> & dst, const std::vector<std::string> & src) {
+    std::unordered_set<std::string> seen;
+    for (const auto & s : dst) {
+        seen.insert(lower(s));
+    }
+    for (const auto & s : src) {
+        if (seen.insert(lower(s)).second) {
+            dst.push_back(s);
+        }
+    }
+}
+
+std::vector<std::string> with_fallbacks(const std::vector<std::string> & primary, const std::vector<std::string> & fallback) {
+    std::vector<std::string> result = primary;
+    append_unique(result, fallback);
+    return result;
+}
+
+// Weight names use "blk.N.*"; graph nodes use callback names with a "-N"
+// suffix. Supporting both lets the same layer/layer_range selectors work in
+// weights.rules and ops.rules.
+int layer_from_name(const char * name) {
+    if (name == nullptr) {
+        return -1;
+    }
+
+    int il = -1;
+    if (std::sscanf(name, "blk.%d.", &il) == 1) {
+        return il;
+    }
+
+    const char * dash = std::strrchr(name, '-');
+    if (dash != nullptr && dash[1] != '\0') {
+        char * end = nullptr;
+        const long value = std::strtol(dash + 1, &end, 10);
+        if (end != dash + 1 && *end == '\0') {
+            return (int) value;
+        }
+    }
+
+    return -1;
+}
+
+bool layer_matches(const policy_rule & rule, int il) {
+    if (rule.layer != -2 && il != rule.layer) {
+        return false;
+    }
+    if (rule.layer_start != -2) {
+        if (il < rule.layer_start) {
+            return false;
+        }
+        if (rule.layer_end != -2 && il > rule.layer_end) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool regex_search_safe(const std::string & value, const std::string & pattern) {
+    try {
+        return std::regex_search(value, std::regex(pattern));
+    } catch (const std::regex_error & e) {
+        LLAMA_LOG_WARN("backend_policy: invalid regex '%s': %s\n", pattern.c_str(), e.what());
+        return false;
+    }
+}
+
+bool weight_rule_matches(const policy_rule & rule, const std::string & tensor_name) {
+    if (!layer_matches(rule, layer_from_name(tensor_name.c_str()))) {
+        return false;
+    }
+
+    bool has_selector = false;
+    if (!rule.tensor.empty()) {
+        has_selector = true;
+        if (tensor_name != rule.tensor) {
+            return false;
+        }
+    }
+
+    if (!rule.pattern.empty()) {
+        has_selector = true;
+        if (!regex_search_safe(tensor_name, rule.pattern)) {
+            return false;
+        }
+    }
+
+    return has_selector || rule.layer != -2 || rule.layer_start != -2;
+}
+
+bool phase_matches(const std::string & phase, bool is_prefill) {
+    if (phase.empty() || str_eq_ci(phase, "all")) {
+        return true;
+    }
+    if (str_eq_ci(phase, "prefill")) {
+        return is_prefill;
+    }
+    if (str_eq_ci(phase, "decode")) {
+        return !is_prefill;
+    }
+    return false;
+}
+
+bool op_rule_matches(
+        const policy_rule & rule,
+        const std::string & base_name,
+        const std::string & tensor_name,
+        enum ggml_op op,
+        int il,
+        bool is_prefill) {
+    // The policy intentionally checks both the stable callback name and the
+    // final tensor name. This allows broad rules like name="Qcur" and exact
+    // layer-aware rules like name_regex="^Qcur-12$".
+    if (!phase_matches(rule.phase, is_prefill)) {
+        return false;
+    }
+    if (!layer_matches(rule, il)) {
+        return false;
+    }
+
+    bool has_selector = false;
+    if (!rule.name.empty()) {
+        has_selector = true;
+        if (base_name != rule.name && tensor_name != rule.name) {
+            return false;
+        }
+    }
+
+    if (!rule.name_regex.empty()) {
+        has_selector = true;
+        if (!regex_search_safe(base_name, rule.name_regex) && !regex_search_safe(tensor_name, rule.name_regex)) {
+            return false;
+        }
+    }
+
+    if (!rule.op.empty()) {
+        has_selector = true;
+        const std::string op_name = ggml_op_name(op);
+        if (!str_eq_ci(rule.op, op_name) && !str_eq_ci(rule.op, std::string("GGML_OP_") + op_name)) {
+            return false;
+        }
+    }
+
+    return has_selector || rule.layer != -2 || rule.layer_start != -2 || !rule.phase.empty();
+}
+
+// Parse one rule while preserving its JSON array location. That source string
+// is emitted in debug logs so a log line can be traced back to config quickly.
+policy_rule parse_rule(const json & obj, const std::string & source) {
+    if (!obj.is_object()) {
+        throw std::runtime_error(source + " entries must be objects");
+    }
+
+    policy_rule rule;
+    rule.source = source;
+    if (obj.contains("tensor")) {
+        rule.tensor = obj["tensor"].get<std::string>();
+    }
+    if (obj.contains("pattern")) {
+        rule.pattern = obj["pattern"].get<std::string>();
+    }
+    if (obj.contains("name")) {
+        rule.name = obj["name"].get<std::string>();
+    }
+    if (obj.contains("name_regex")) {
+        rule.name_regex = obj["name_regex"].get<std::string>();
+    }
+    if (obj.contains("op")) {
+        rule.op = obj["op"].get<std::string>();
+    }
+    if (obj.contains("phase")) {
+        rule.phase = obj["phase"].get<std::string>();
+    }
+    if (obj.contains("layer")) {
+        rule.layer = obj["layer"].get<int>();
+    }
+    if (obj.contains("layer_range")) {
+        if (!obj["layer_range"].is_array() || obj["layer_range"].size() != 2) {
+            throw std::runtime_error(source + ".layer_range must be [start, end]");
+        }
+        rule.layer_start = obj["layer_range"][0].get<int>();
+        rule.layer_end = obj["layer_range"][1].get<int>();
+    }
+
+    rule.backends = parse_backend_list(obj);
+    append_unique(rule.backends, parse_string_array(obj, "fallback_priority"));
+    return rule;
+}
+
+void parse_rules(const json & section, const char * section_name, std::vector<policy_rule> & out) {
+    if (!section.contains("rules")) {
+        return;
+    }
+    if (!section["rules"].is_array()) {
+        throw std::runtime_error(std::string(section_name) + ".rules must be an array");
+    }
+
+    int i = 0;
+    for (const auto & item : section["rules"]) {
+        out.push_back(parse_rule(item, std::string(section_name) + ".rules[" + std::to_string(i) + "]"));
+        ++i;
+    }
+}
+
+bool name_matches_backend_type(ggml_backend_dev_t dev, const std::string & backend_name) {
+    if (dev == nullptr) {
+        return false;
+    }
+
+    const auto type = ggml_backend_dev_type(dev);
+    if (str_eq_ci(backend_name, "cpu") && type == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return true;
+    }
+    if (str_eq_ci(backend_name, "gpu") && type == GGML_BACKEND_DEVICE_TYPE_GPU) {
+        return true;
+    }
+    if (str_eq_ci(backend_name, "accel") && type == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+        return true;
+    }
+    if (str_eq_ci(backend_name, "htp") && str_contains_ci(ggml_backend_dev_name(dev), "htp")) {
+        return true;
+    }
+
+    return false;
+}
+
+bool extra_buft_matches(ggml_backend_dev_t dev, const std::string & backend_name) {
+    if (dev == nullptr) {
+        return false;
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return false;
+    }
+
+    auto get_extra_bufts = (ggml_backend_dev_get_extra_bufts_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+    if (get_extra_bufts == nullptr) {
+        return false;
+    }
+
+    ggml_backend_buffer_type_t * extra_bufts = get_extra_bufts(dev);
+    while (extra_bufts && *extra_bufts) {
+        if (str_eq_ci(backend_name, ggml_backend_buft_name(*extra_bufts))) {
+            return true;
+        }
+        ++extra_bufts;
+    }
+
+    return false;
+}
+
+} // namespace
+
+bool llama_backend_policy_load(const char * path, bool enable_weights, bool enable_ops) {
+    std::lock_guard<std::mutex> lock(g_policy_mutex);
+
+    policy_state next;
+    next.path = path ? path : "";
+
+    try {
+        // Build a new state first and publish it only after full validation.
+        // This avoids leaving a partially parsed policy active on parse errors.
+        std::ifstream file(next.path);
+        if (!file) {
+            LLAMA_LOG_ERROR("backend_policy: failed to open '%s'\n", next.path.c_str());
+            return false;
+        }
+
+        json root;
+        file >> root;
+
+        next.loaded = true;
+        next.enabled = root.value("enabled", true);
+
+        if (root.contains("devices") && root["devices"].is_object()) {
+            next.fallback_priority = parse_string_array(root["devices"], "fallback_priority");
+        }
+        if (next.fallback_priority.empty()) {
+            next.fallback_priority = parse_string_array(root, "fallback_priority");
+        }
+        if (next.fallback_priority.empty()) {
+            next.fallback_priority = {"CPU"};
+        }
+
+        if (root.contains("weights") && root["weights"].is_object()) {
+            const auto & weights = root["weights"];
+            next.weights_enabled = next.enabled && enable_weights && weights.value("enabled", true);
+            if (weights.contains("default")) {
+                if (weights["default"].is_string()) {
+                    next.default_weight_backends.push_back(weights["default"].get<std::string>());
+                } else if (weights["default"].is_array()) {
+                    for (const auto & item : weights["default"]) {
+                        next.default_weight_backends.push_back(item.get<std::string>());
+                    }
+                } else {
+                    throw std::runtime_error("weights.default must be a string or an array");
+                }
+            }
+            parse_rules(weights, "weights", next.weight_rules);
+        }
+
+        if (root.contains("ops") && root["ops"].is_object()) {
+            const auto & ops = root["ops"];
+            next.ops_enabled = next.enabled && enable_ops && ops.value("enabled", true);
+            parse_rules(ops, "ops", next.op_rules);
+        }
+
+        if (!root.contains("weights")) {
+            next.weights_enabled = false;
+        }
+        if (!root.contains("ops")) {
+            next.ops_enabled = false;
+        }
+
+        g_policy = std::move(next);
+
+        LLAMA_LOG_INFO("backend_policy: loaded '%s' (weights=%s, weight_rules=%zu, ops=%s, op_rules=%zu)\n",
+                g_policy.path.c_str(),
+                g_policy.weights_enabled ? "on" : "off", g_policy.weight_rules.size(),
+                g_policy.ops_enabled ? "on" : "off", g_policy.op_rules.size());
+        return true;
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("backend_policy: failed to parse '%s': %s\n", next.path.c_str(), e.what());
+        return false;
+    }
+}
+
+void llama_backend_policy_clear(void) {
+    std::lock_guard<std::mutex> lock(g_policy_mutex);
+    g_policy = {};
+}
+
+bool llama_backend_policy_weights_enabled() {
+    std::lock_guard<std::mutex> lock(g_policy_mutex);
+    return g_policy.loaded && g_policy.weights_enabled;
+}
+
+bool llama_backend_policy_ops_enabled() {
+    std::lock_guard<std::mutex> lock(g_policy_mutex);
+    return g_policy.loaded && g_policy.ops_enabled;
+}
+
+bool llama_backend_policy_match_weight(const char * tensor_name, llama_backend_policy_match & out) {
+    std::lock_guard<std::mutex> lock(g_policy_mutex);
+    out = {};
+
+    if (!g_policy.loaded || !g_policy.weights_enabled || tensor_name == nullptr) {
+        return false;
+    }
+
+    const std::string name = tensor_name;
+    if (!g_policy.default_weight_backends.empty()) {
+        out.matched = true;
+        out.backends = g_policy.default_weight_backends;
+        out.source = "weights.default";
+    }
+
+    // Later matching rules override earlier ones. This mirrors override-tensor
+    // style use cases where a broad default can be followed by precise
+    // exceptions for a tensor family or layer range.
+    for (const auto & rule : g_policy.weight_rules) {
+        if (weight_rule_matches(rule, name)) {
+            out.matched = true;
+            out.backends = rule.backends;
+            out.source = rule.source;
+        }
+    }
+
+    if (!out.matched || out.backends.empty()) {
+        out = {};
+        return false;
+    }
+
+    out.backends = with_fallbacks(out.backends, g_policy.fallback_priority);
+    return true;
+}
+
+bool llama_backend_policy_match_op(
+        const char * base_name,
+        const char * tensor_name,
+        enum ggml_op op,
+        int il,
+        bool is_prefill,
+        llama_backend_policy_match & out) {
+    std::lock_guard<std::mutex> lock(g_policy_mutex);
+    out = {};
+
+    if (!g_policy.loaded || !g_policy.ops_enabled) {
+        return false;
+    }
+
+    const std::string base = base_name ? base_name : "";
+    const std::string name = tensor_name ? tensor_name : "";
+
+    // Later matching rules override earlier ones, so configs can combine broad
+    // op rules with narrower name/layer exceptions.
+    for (const auto & rule : g_policy.op_rules) {
+        if (op_rule_matches(rule, base, name, op, il, is_prefill)) {
+            out.matched = true;
+            out.backends = rule.backends;
+            out.source = rule.source;
+        }
+    }
+
+    if (!out.matched || out.backends.empty()) {
+        out = {};
+        return false;
+    }
+
+    out.backends = with_fallbacks(out.backends, g_policy.fallback_priority);
+    return true;
+}
+
+bool llama_backend_policy_buft_matches(
+        ggml_backend_dev_t dev,
+        ggml_backend_buffer_type_t buft,
+        const std::string & backend_name) {
+    if (buft == nullptr || backend_name.empty()) {
+        return false;
+    }
+
+    if (str_eq_ci(backend_name, ggml_backend_buft_name(buft))) {
+        return true;
+    }
+
+    // CPU/GPU/HTP aliases intentionally map only to each device's default
+    // buffer. Extra buffer types such as HTP0-REPACK must match by exact name.
+    if (dev != nullptr) {
+        if (str_eq_ci(backend_name, ggml_backend_dev_name(dev))) {
+            return buft == ggml_backend_dev_buffer_type(dev);
+        }
+        if (name_matches_backend_type(dev, backend_name)) {
+            return buft == ggml_backend_dev_buffer_type(dev);
+        }
+    } else if (str_eq_ci(backend_name, "cpu")) {
+        return buft == ggml_backend_cpu_buffer_type();
+    }
+
+    return false;
+}
+
+bool llama_backend_policy_backend_matches(
+        ggml_backend_t backend,
+        const std::string & backend_name) {
+    if (backend == nullptr || backend_name.empty()) {
+        return false;
+    }
+
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr) {
+        return false;
+    }
+
+    if (str_eq_ci(backend_name, ggml_backend_dev_name(dev))) {
+        return true;
+    }
+    if (name_matches_backend_type(dev, backend_name)) {
+        return true;
+    }
+
+    // Allow op rules to refer to an extra buffer name such as HTP0-REPACK and
+    // still resolve to the owning execution backend when needed.
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
+    if (buft != nullptr && str_eq_ci(backend_name, ggml_backend_buft_name(buft))) {
+        return true;
+    }
+
+    return extra_buft_matches(dev, backend_name);
+}

@@ -3,6 +3,7 @@
 #include "ggml-alloc.h"
 #include "ggml.h"
 #include "gguf.h"
+#include "llama-backend-policy.h"
 #include "llama-hparams.h"
 
 #include <algorithm>
@@ -1042,6 +1043,81 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
     return nullptr;
 }
 
+static void add_policy_buft(buft_list_t & buft_list, ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
+    if (buft == nullptr) {
+        return;
+    }
+
+    for (const auto & cur : buft_list) {
+        if (cur.first == dev && cur.second == buft) {
+            return;
+        }
+    }
+
+    buft_list.emplace_back(dev, buft);
+}
+
+static buft_list_t collect_policy_buft_list() {
+    buft_list_t buft_list;
+
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        add_policy_buft(buft_list, dev, ggml_backend_dev_buffer_type(dev));
+        add_policy_buft(buft_list, dev, ggml_backend_dev_host_buffer_type(dev));
+
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        if (reg == nullptr) {
+            continue;
+        }
+
+        auto get_extra_bufts = (ggml_backend_dev_get_extra_bufts_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+        if (get_extra_bufts == nullptr) {
+            continue;
+        }
+
+        ggml_backend_buffer_type_t * extra_bufts = get_extra_bufts(dev);
+        while (extra_bufts && *extra_bufts) {
+            add_policy_buft(buft_list, dev, *extra_bufts);
+            ++extra_bufts;
+        }
+    }
+
+    ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    add_policy_buft(buft_list, cpu_dev, ggml_backend_cpu_buffer_type());
+
+    return buft_list;
+}
+
+static ggml_backend_buffer_type_t select_policy_weight_buft(
+        const llama_hparams & hparams,
+        ggml_tensor * tensor,
+        ggml_op op,
+        const llama_backend_policy_match & policy_match) {
+    // Weight policy resolves to buffer types, not backend instances. Try the
+    // requested names in order and keep the first candidate that the owning
+    // backend can actually use for this tensor/op.
+    const buft_list_t buft_list = collect_policy_buft_list();
+
+    for (const std::string & backend_name : policy_match.backends) {
+        for (const auto & cur : buft_list) {
+            ggml_backend_dev_t cur_dev = cur.first;
+            ggml_backend_buffer_type_t cur_buft = cur.second;
+            if (!llama_backend_policy_buft_matches(cur_dev, cur_buft, backend_name)) {
+                continue;
+            }
+            if (cur_dev == nullptr) {
+                cur_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+            }
+            if (cur_dev != nullptr && weight_buft_supported(hparams, tensor, op, cur_buft, cur_dev)) {
+                return cur_buft;
+            }
+        }
+    }
+
+    return nullptr;
+}
+
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
@@ -1176,6 +1252,25 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                             ggml_nbytes(t_meta) / 1024 / 1024, ggml_type_name(t_meta->type),
                             ggml_backend_buft_name(buft));
                     break;
+                }
+            }
+        }
+
+        if (!buft && llama_backend_policy_weights_enabled()) {
+            llama_backend_policy_match policy_match;
+            const std::string tensor_name = tn.str();
+            if (llama_backend_policy_match_weight(tensor_name.c_str(), policy_match)) {
+                // Policy is consulted after upstream --override-tensor and
+                // before the default llama.cpp layer placement heuristics.
+                buft = select_policy_weight_buft(hparams, t_meta, op, policy_match);
+                if (buft) {
+                    LLAMA_LOG_DEBUG("backend_policy: tensor %s (%zu MiB %s) matched %s, using %s\n",
+                            tensor_name.c_str(),
+                            ggml_nbytes(t_meta) / 1024 / 1024, ggml_type_name(t_meta->type),
+                            policy_match.source.c_str(), ggml_backend_buft_name(buft));
+                } else {
+                    LLAMA_LOG_WARN("backend_policy: tensor %s matched %s, but no requested/fallback backend supports it\n",
+                            tensor_name.c_str(), policy_match.source.c_str());
                 }
             }
         }
