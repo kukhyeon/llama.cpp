@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "llama-arch.h"
+#include "llama-backend-policy.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
@@ -2302,6 +2303,36 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
             ggml_set_name(cur, name);
+        }
+
+        if (llama_backend_policy_ops_enabled()) {
+            llama_backend_policy_match policy_match;
+            if (llama_backend_policy_match_op(name, ggml_get_name(cur), cur->op, il, lp_is_prefill, policy_match)) {
+                // Op policy is a scheduling hint. Each requested backend is
+                // checked for op support first; unsupported requests fall
+                // through to the next policy fallback or to the stock scheduler.
+                for (const std::string & backend_name : policy_match.backends) {
+                    for (const auto & backend : backends) {
+                        ggml_backend_t backend_ptr = backend.get();
+                        if (!llama_backend_policy_backend_matches(backend_ptr, backend_name)) {
+                            continue;
+                        }
+                        if (ggml_backend_supports_op(backend_ptr, cur)) {
+                            ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend_ptr);
+                            LLAMA_LOG_DEBUG("backend_policy: op %s (%s, il=%d, phase=%s) matched %s, using %s\n",
+                                    ggml_get_name(cur), ggml_op_name(cur->op), il,
+                                    lp_is_prefill ? "prefill" : "decode",
+                                    policy_match.source.c_str(),
+                                    ggml_backend_dev_name(ggml_backend_get_device(backend_ptr)));
+                            return;
+                        }
+                    }
+                }
+                LLAMA_LOG_DEBUG("backend_policy: op %s (%s, il=%d, phase=%s) matched %s, but no requested/fallback backend supports it\n",
+                        ggml_get_name(cur), ggml_op_name(cur->op), il,
+                        lp_is_prefill ? "prefill" : "decode",
+                        policy_match.source.c_str());
+            }
         }
 
         // norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends

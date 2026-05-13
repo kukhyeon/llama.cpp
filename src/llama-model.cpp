@@ -1,6 +1,7 @@
 #include "llama-model.h"
 
 #include "llama-arch.h"
+#include "llama-backend-policy.h"
 #include "llama-ext.h"
 #include "llama-hparams.h"
 #include "llama-impl.h"
@@ -958,7 +959,10 @@ struct llama_model::impl {
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
-    pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
+    // Weight policy can place tensors on non-default buffers, so treat it like
+    // explicit tensor overrides and disable assumptions that require uniform
+    // default layer placement.
+    pimpl->has_tensor_overrides = (params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern) || llama_backend_policy_weights_enabled();
 }
 
 llama_model::~llama_model() {

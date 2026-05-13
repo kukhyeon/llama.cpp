@@ -488,6 +488,11 @@ extern "C" {
     // Call once at the end of the program - currently only used for MPI
     LLAMA_API void llama_backend_free(void);
 
+    // Experimental backend placement policy used by custom Ignite builds.
+    // The policy is process-global and is consulted during model loading and graph construction.
+    LLAMA_API bool llama_backend_policy_load(const char * path, bool enable_weights, bool enable_ops);
+    LLAMA_API void llama_backend_policy_clear(void);
+
     //optional:
     LLAMA_API void llama_numa_init(enum ggml_numa_strategy numa);
 

@@ -1149,6 +1149,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
     add_opt(common_arg(
+        {"--backend-policy"}, "FNAME",
+        "path to backend placement policy JSON for weight tensors and graph ops",
+        [](common_params & params, const std::string & value) {
+            params.backend_policy_path = value;
+        }
+    ).set_env("LLAMA_ARG_BACKEND_POLICY"));
+    add_opt(common_arg(
+        {"--backend-policy-weights"}, "on|off",
+        "enable weight tensor placement rules from --backend-policy",
+        [](common_params & params, const std::string & value) {
+            params.backend_policy_weights = is_truthy(value);
+        }
+    ).set_env("LLAMA_ARG_BACKEND_POLICY_WEIGHTS"));
+    add_opt(common_arg(
+        {"--backend-policy-ops"}, "on|off",
+        "enable weightless op placement rules from --backend-policy",
+        [](common_params & params, const std::string & value) {
+            params.backend_policy_ops = is_truthy(value);
+        }
+    ).set_env("LLAMA_ARG_BACKEND_POLICY_OPS"));
+    add_opt(common_arg(
         {"--strict"}, "on|off",
         "enable ignite strict generation limit",
         [](common_params & params, const std::string & value) {
