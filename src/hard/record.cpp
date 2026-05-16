@@ -1,5 +1,156 @@
 #include "record.h"
 #include <algorithm>
+#include <cerrno>
+#include <cctype>
+#include <cstdlib>
+#include <cstring>
+
+namespace {
+
+bool env_flag_enabled(const char * name, bool fallback = false) {
+    const char * value = std::getenv(name);
+    if (value == nullptr) {
+        return fallback;
+    }
+
+    std::string s = value;
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return (char) std::tolower(c);
+    });
+    return s == "1" || s == "true" || s == "on" || s == "yes";
+}
+
+std::string env_string(const char * name, const std::string & fallback = {}) {
+    const char * value = std::getenv(name);
+    return value ? value : fallback;
+}
+
+int env_int(const char * name, int fallback) {
+    const char * value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return fallback;
+    }
+    return std::atoi(value);
+}
+
+long long env_ll(const char * name, long long fallback) {
+    const char * value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return fallback;
+    }
+    return std::atoll(value);
+}
+
+long long read_int_file(const std::string & path) {
+    std::ifstream file(path);
+    if (!file) {
+        return -1;
+    }
+
+    long long value = -1;
+    file >> value;
+    return value;
+}
+
+bool write_signal_file(const std::string & path, const std::string & value) {
+    if (path.empty()) {
+        return false;
+    }
+
+    std::ofstream file(path, std::ios::trunc);
+    if (!file) {
+        std::cerr << "[record] failed to write thermal signal file: " << path
+                  << " (" << std::strerror(errno) << ")" << std::endl;
+        return false;
+    }
+
+    file << value << "\n";
+    return true;
+}
+
+struct thermal_signal_detector {
+    bool enabled = false;
+    bool latched = false;
+    bool verbose = false;
+    int prime_cpu = 6;
+    int debounce = 1;
+    int drop_count = 0;
+    long long high_water_khz = 0;
+    long long tolerance_khz = 0;
+    std::string cur_path;
+    std::string signal_file;
+    std::string cool_state = "cool";
+    std::string throttled_state = "throttling";
+
+    explicit thermal_signal_detector(const DVFS & dvfs) {
+        enabled = env_flag_enabled("IGNITE_THERMAL_SIGNAL", false);
+        if (!enabled) {
+            return;
+        }
+
+        const auto clusters = dvfs.get_cluster_indices();
+        if (!clusters.empty()) {
+            prime_cpu = clusters.back();
+        }
+        prime_cpu = env_int("IGNITE_THERMAL_PRIME_CPU", prime_cpu);
+        debounce = std::max(1, env_int("IGNITE_THERMAL_DEBOUNCE", debounce));
+        tolerance_khz = std::max(0LL, env_ll("IGNITE_THERMAL_TOLERANCE_KHZ", tolerance_khz));
+        verbose = env_flag_enabled("IGNITE_THERMAL_VERBOSE", false);
+
+        cur_path = env_string("IGNITE_THERMAL_CUR_FREQ_PATH",
+                "/sys/devices/system/cpu/cpu" + std::to_string(prime_cpu) + "/cpufreq/scaling_cur_freq");
+        signal_file = env_string("IGNITE_THERMAL_SIGNAL_FILE",
+                env_string("LLAMA_BACKEND_POLICY_THERMAL_STATE_FILE", "./thermal_state.txt"));
+        cool_state = env_string("IGNITE_THERMAL_STATE_COOL", cool_state);
+        throttled_state = env_string("IGNITE_THERMAL_STATE_THROTTLED", throttled_state);
+
+        if (env_flag_enabled("IGNITE_THERMAL_CLEAR_ON_START", true)) {
+            write_signal_file(signal_file, cool_state);
+        }
+
+        if (verbose) {
+            std::cerr << "[record] thermal signal enabled: cpu=" << prime_cpu
+                      << ", mode=scaling_cur_freq_drop"
+                      << ", tolerance_khz=" << tolerance_khz
+                      << ", debounce=" << debounce
+                      << ", file=" << signal_file << std::endl;
+        }
+    }
+
+    void poll() {
+        if (!enabled || latched) {
+            return;
+        }
+
+        const long long cur_khz = read_int_file(cur_path);
+        if (cur_khz <= 0) {
+            return;
+        }
+
+        if (high_water_khz <= 0 || cur_khz > high_water_khz) {
+            high_water_khz = cur_khz;
+            drop_count = 0;
+            return;
+        }
+
+        if (cur_khz + tolerance_khz < high_water_khz) {
+            drop_count++;
+        } else {
+            drop_count = 0;
+        }
+
+        if (drop_count >= debounce) {
+            latched = true;
+            write_signal_file(signal_file, throttled_state);
+            std::cerr << "[record] thermal throttling detected on cpu" << prime_cpu
+                      << ": cur_khz=" << cur_khz
+                      << ", previous_high_khz=" << high_water_khz
+                      << " -> " << signal_file << "=" << throttled_state << std::endl;
+        }
+    }
+};
+
+} // namespace
 
 // test function
 void get_cpu_info() {
@@ -283,6 +434,7 @@ void record_hard(std::atomic<bool>& sigterm, const DVFS& dvfs){
     // pin_current({2}); // generally silver core on mobile
     sigterm = false;
     std::string filename = dvfs.output_filename;
+    thermal_signal_detector thermal_signal(dvfs);
 
 
 	// insert hard names
@@ -297,6 +449,8 @@ void record_hard(std::atomic<bool>& sigterm, const DVFS& dvfs){
     }
 
     do{
+        thermal_signal.poll();
+
         // get records
 		records = get_hard_records(dvfs);
         auto now = std::chrono::system_clock::now();

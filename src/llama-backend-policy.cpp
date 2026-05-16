@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <mutex>
 #include <regex>
 #include <stdexcept>
@@ -38,6 +39,14 @@ struct policy_rule {
     std::string source;
 };
 
+struct profile_policy {
+    bool weights_enabled = false;
+    bool ops_enabled = false;
+    std::vector<std::string> default_weight_backends;
+    std::vector<policy_rule> weight_rules;
+    std::vector<policy_rule> op_rules;
+};
+
 // Process-global policy state. The policy is loaded once before model loading
 // and then queried from the model loader and graph callback paths.
 struct policy_state {
@@ -50,6 +59,22 @@ struct policy_state {
     std::vector<std::string> default_weight_backends;
     std::vector<policy_rule> weight_rules;
     std::vector<policy_rule> op_rules;
+
+    bool residency_enabled = false;
+    std::vector<policy_rule> residency_rules;
+
+    bool stage_switch_enabled = false;
+    bool thermal_switch_enabled = false;
+    std::string default_profile;
+    std::string prefill_profile;
+    std::string decode_profile;
+    std::string cool_profile;
+    std::string hot_profile;
+    std::string critical_profile;
+    std::string thermal_state_file;
+    std::string active_profile;
+    uint64_t profile_generation = 0;
+    std::map<std::string, profile_policy> profiles;
 };
 
 std::mutex g_policy_mutex;
@@ -59,6 +84,15 @@ std::string lower(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
         return (char) std::tolower(c);
     });
+    return s;
+}
+
+std::string trim(std::string s) {
+    auto not_space = [](unsigned char c) {
+        return !std::isspace(c);
+    };
+    s.erase(s.begin(), std::find_if(s.begin(), s.end(), not_space));
+    s.erase(std::find_if(s.rbegin(), s.rend(), not_space).base(), s.end());
     return s;
 }
 
@@ -86,7 +120,46 @@ std::vector<std::string> parse_backend_list(const json & obj) {
         }
     }
 
+    if (obj.contains("copies") && obj["copies"].is_array()) {
+        for (const auto & item : obj["copies"]) {
+            if (!item.is_string()) {
+                throw std::runtime_error("copies entries must be strings");
+            }
+            result.push_back(item.get<std::string>());
+        }
+    }
+
     return result;
+}
+
+bool env_enabled(const char * name, bool fallback) {
+    const char * value = getenv(name);
+    if (!value) {
+        return fallback;
+    }
+    const std::string s = lower(value);
+    return s == "1" || s == "true" || s == "on" || s == "yes";
+}
+
+std::string env_string(const char * name) {
+    const char * value = getenv(name);
+    return value ? value : "";
+}
+
+std::string read_text_file_first_line(const std::string & path) {
+    if (path.empty()) {
+        return {};
+    }
+
+    std::ifstream file(path);
+    if (!file) {
+        LLAMA_LOG_DEBUG("backend_policy: failed to read thermal state file '%s'\n", path.c_str());
+        return {};
+    }
+
+    std::string line;
+    std::getline(file, line);
+    return trim(line);
 }
 
 std::vector<std::string> parse_string_array(const json & obj, const char * key) {
@@ -310,6 +383,96 @@ void parse_rules(const json & section, const char * section_name, std::vector<po
     }
 }
 
+void parse_profile_section(const json & root, const std::string & profile_name, profile_policy & out) {
+    if (root.contains("weights") && root["weights"].is_object()) {
+        const auto & weights = root["weights"];
+        out.weights_enabled = weights.value("enabled", true);
+        if (weights.contains("default")) {
+            if (weights["default"].is_string()) {
+                out.default_weight_backends.push_back(weights["default"].get<std::string>());
+            } else if (weights["default"].is_array()) {
+                for (const auto & item : weights["default"]) {
+                    out.default_weight_backends.push_back(item.get<std::string>());
+                }
+            } else {
+                throw std::runtime_error("profiles." + profile_name + ".weights.default must be a string or an array");
+            }
+        }
+        parse_rules(weights, ("profiles." + profile_name + ".weights").c_str(), out.weight_rules);
+    }
+
+    if (root.contains("ops") && root["ops"].is_object()) {
+        const auto & ops = root["ops"];
+        out.ops_enabled = ops.value("enabled", true);
+        parse_rules(ops, ("profiles." + profile_name + ".ops").c_str(), out.op_rules);
+    }
+}
+
+bool match_weight_rules(
+        const std::vector<std::string> & default_backends,
+        const std::vector<policy_rule> & rules,
+        const std::vector<std::string> & fallback_priority,
+        const std::string & tensor_name,
+        const char * default_source,
+        llama_backend_policy_match & out) {
+    out = {};
+
+    if (!default_backends.empty()) {
+        out.matched = true;
+        out.backends = default_backends;
+        out.source = default_source;
+    }
+
+    // Later matching rules override earlier ones. This mirrors override-tensor
+    // style use cases where a broad default can be followed by precise
+    // exceptions for a tensor family or layer range.
+    for (const auto & rule : rules) {
+        if (weight_rule_matches(rule, tensor_name)) {
+            out.matched = true;
+            out.backends = rule.backends;
+            out.source = rule.source;
+        }
+    }
+
+    if (!out.matched || out.backends.empty()) {
+        out = {};
+        return false;
+    }
+
+    out.backends = with_fallbacks(out.backends, fallback_priority);
+    return true;
+}
+
+bool match_op_rules(
+        const std::vector<policy_rule> & rules,
+        const std::vector<std::string> & fallback_priority,
+        const std::string & base,
+        const std::string & name,
+        enum ggml_op op,
+        int il,
+        bool is_prefill,
+        llama_backend_policy_match & out) {
+    out = {};
+
+    // Later matching rules override earlier ones, so configs can combine broad
+    // op rules with narrower name/layer exceptions.
+    for (const auto & rule : rules) {
+        if (op_rule_matches(rule, base, name, op, il, is_prefill)) {
+            out.matched = true;
+            out.backends = rule.backends;
+            out.source = rule.source;
+        }
+    }
+
+    if (!out.matched || out.backends.empty()) {
+        out = {};
+        return false;
+    }
+
+    out.backends = with_fallbacks(out.backends, fallback_priority);
+    return true;
+}
+
 bool name_matches_backend_type(ggml_backend_dev_t dev, const std::string & backend_name) {
     if (dev == nullptr) {
         return false;
@@ -415,6 +578,44 @@ bool llama_backend_policy_load(const char * path, bool enable_weights, bool enab
             parse_rules(ops, "ops", next.op_rules);
         }
 
+        if (root.contains("residency") && root["residency"].is_object()) {
+            const auto & residency = root["residency"];
+            next.residency_enabled = next.enabled && residency.value("enabled", false);
+            parse_rules(residency, "residency", next.residency_rules);
+        }
+
+        if (root.contains("runtime") && root["runtime"].is_object()) {
+            const auto & runtime = root["runtime"];
+            next.default_profile = runtime.value("default_profile", std::string());
+        }
+
+        if (root.contains("stage_switch") && root["stage_switch"].is_object()) {
+            const auto & stage = root["stage_switch"];
+            next.stage_switch_enabled = next.enabled && stage.value("enabled", false);
+            next.prefill_profile = stage.value("prefill_profile", std::string());
+            next.decode_profile = stage.value("decode_profile", std::string());
+        }
+
+        if (root.contains("thermal_switch") && root["thermal_switch"].is_object()) {
+            const auto & thermal = root["thermal_switch"];
+            next.thermal_switch_enabled = next.enabled && thermal.value("enabled", false);
+            next.cool_profile = thermal.value("cool_profile", std::string());
+            next.hot_profile = thermal.value("hot_profile", std::string());
+            next.critical_profile = thermal.value("critical_profile", std::string());
+            next.thermal_state_file = thermal.value("state_file", std::string());
+        }
+
+        if (root.contains("profiles") && root["profiles"].is_object()) {
+            for (auto it = root["profiles"].begin(); it != root["profiles"].end(); ++it) {
+                if (!it.value().is_object()) {
+                    throw std::runtime_error("profiles entries must be objects");
+                }
+                profile_policy profile;
+                parse_profile_section(it.value(), it.key(), profile);
+                next.profiles.emplace(it.key(), std::move(profile));
+            }
+        }
+
         if (!root.contains("weights")) {
             next.weights_enabled = false;
         }
@@ -424,10 +625,12 @@ bool llama_backend_policy_load(const char * path, bool enable_weights, bool enab
 
         g_policy = std::move(next);
 
-        LLAMA_LOG_INFO("backend_policy: loaded '%s' (weights=%s, weight_rules=%zu, ops=%s, op_rules=%zu)\n",
+        LLAMA_LOG_INFO("backend_policy: loaded '%s' (weights=%s, weight_rules=%zu, ops=%s, op_rules=%zu, residency=%s, residency_rules=%zu, profiles=%zu)\n",
                 g_policy.path.c_str(),
                 g_policy.weights_enabled ? "on" : "off", g_policy.weight_rules.size(),
-                g_policy.ops_enabled ? "on" : "off", g_policy.op_rules.size());
+                g_policy.ops_enabled ? "on" : "off", g_policy.op_rules.size(),
+                g_policy.residency_enabled ? "on" : "off", g_policy.residency_rules.size(),
+                g_policy.profiles.size());
         return true;
     } catch (const std::exception & e) {
         LLAMA_LOG_ERROR("backend_policy: failed to parse '%s': %s\n", next.path.c_str(), e.what());
@@ -447,7 +650,79 @@ bool llama_backend_policy_weights_enabled() {
 
 bool llama_backend_policy_ops_enabled() {
     std::lock_guard<std::mutex> lock(g_policy_mutex);
-    return g_policy.loaded && g_policy.ops_enabled;
+    if (!g_policy.loaded) {
+        return false;
+    }
+    if (g_policy.ops_enabled) {
+        return true;
+    }
+    for (const auto & kv : g_policy.profiles) {
+        if (kv.second.ops_enabled) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool llama_backend_policy_residency_enabled() {
+    std::lock_guard<std::mutex> lock(g_policy_mutex);
+    return g_policy.loaded && env_enabled("LLAMA_BACKEND_POLICY_RESIDENCY", g_policy.residency_enabled);
+}
+
+bool llama_backend_policy_update_runtime_profile(bool is_prefill) {
+    std::lock_guard<std::mutex> lock(g_policy_mutex);
+
+    if (!g_policy.loaded || !g_policy.enabled) {
+        return false;
+    }
+
+    std::string next_profile = env_string("LLAMA_BACKEND_POLICY_ACTIVE_PROFILE");
+
+    const bool thermal_enabled = env_enabled("LLAMA_BACKEND_POLICY_THERMAL_SWITCH", g_policy.thermal_switch_enabled);
+    if (next_profile.empty() && thermal_enabled) {
+        std::string state = trim(env_string("LLAMA_BACKEND_POLICY_THERMAL_STATE"));
+        if (state.empty()) {
+            std::string state_file = env_string("LLAMA_BACKEND_POLICY_THERMAL_STATE_FILE");
+            if (state_file.empty()) {
+                state_file = g_policy.thermal_state_file;
+            }
+            state = read_text_file_first_line(state_file);
+        }
+        state = lower(state);
+        if ((state == "critical" || state == "throttle" || state == "throttled" || state == "throttling") && !g_policy.critical_profile.empty()) {
+            next_profile = g_policy.critical_profile;
+        } else if ((state == "hot" || state == "warm") && !g_policy.hot_profile.empty()) {
+            next_profile = g_policy.hot_profile;
+        } else if (!g_policy.cool_profile.empty()) {
+            next_profile = g_policy.cool_profile;
+        }
+    }
+
+    const bool stage_enabled = env_enabled("LLAMA_BACKEND_POLICY_STAGE_SWITCH", g_policy.stage_switch_enabled);
+    if (next_profile.empty() && stage_enabled) {
+        next_profile = is_prefill ? g_policy.prefill_profile : g_policy.decode_profile;
+    }
+
+    if (next_profile.empty()) {
+        next_profile = g_policy.default_profile;
+    }
+
+    if (next_profile == g_policy.active_profile) {
+        return false;
+    }
+
+    LLAMA_LOG_DEBUG("backend_policy: active profile changed '%s' -> '%s'\n",
+            g_policy.active_profile.c_str(), next_profile.c_str());
+    g_policy.active_profile = std::move(next_profile);
+    g_policy.profile_generation++;
+    return true;
+}
+
+const char * llama_backend_policy_active_profile() {
+    static thread_local std::string profile;
+    std::lock_guard<std::mutex> lock(g_policy_mutex);
+    profile = g_policy.active_profile;
+    return profile.c_str();
 }
 
 bool llama_backend_policy_match_weight(const char * tensor_name, llama_backend_policy_match & out) {
@@ -458,31 +733,69 @@ bool llama_backend_policy_match_weight(const char * tensor_name, llama_backend_p
         return false;
     }
 
-    const std::string name = tensor_name;
-    if (!g_policy.default_weight_backends.empty()) {
-        out.matched = true;
-        out.backends = g_policy.default_weight_backends;
-        out.source = "weights.default";
-    }
+    return match_weight_rules(
+            g_policy.default_weight_backends,
+            g_policy.weight_rules,
+            g_policy.fallback_priority,
+            tensor_name,
+            "weights.default",
+            out);
+}
 
-    // Later matching rules override earlier ones. This mirrors override-tensor
-    // style use cases where a broad default can be followed by precise
-    // exceptions for a tensor family or layer range.
-    for (const auto & rule : g_policy.weight_rules) {
-        if (weight_rule_matches(rule, name)) {
-            out.matched = true;
-            out.backends = rule.backends;
-            out.source = rule.source;
-        }
-    }
+bool llama_backend_policy_match_residency(const char * tensor_name, llama_backend_policy_match & out) {
+    std::lock_guard<std::mutex> lock(g_policy_mutex);
+    out = {};
 
-    if (!out.matched || out.backends.empty()) {
-        out = {};
+    if (!g_policy.loaded || !env_enabled("LLAMA_BACKEND_POLICY_RESIDENCY", g_policy.residency_enabled) || tensor_name == nullptr) {
         return false;
     }
 
-    out.backends = with_fallbacks(out.backends, g_policy.fallback_priority);
-    return true;
+    return match_weight_rules(
+            {},
+            g_policy.residency_rules,
+            {},
+            tensor_name,
+            "residency.default",
+            out);
+}
+
+bool llama_backend_policy_match_profile_weight(
+        const char * tensor_name,
+        bool is_prefill,
+        llama_backend_policy_match & out) {
+    std::lock_guard<std::mutex> lock(g_policy_mutex);
+    out = {};
+
+    if (!g_policy.loaded || tensor_name == nullptr) {
+        return false;
+    }
+
+    std::string profile_name = g_policy.active_profile;
+    if (profile_name.empty()) {
+        const bool stage_enabled = env_enabled("LLAMA_BACKEND_POLICY_STAGE_SWITCH", g_policy.stage_switch_enabled);
+        if (stage_enabled) {
+            profile_name = is_prefill ? g_policy.prefill_profile : g_policy.decode_profile;
+        } else {
+            profile_name = g_policy.default_profile;
+        }
+    }
+
+    if (profile_name.empty()) {
+        return false;
+    }
+
+    auto it = g_policy.profiles.find(profile_name);
+    if (it == g_policy.profiles.end() || !it->second.weights_enabled) {
+        return false;
+    }
+
+    return match_weight_rules(
+            it->second.default_weight_backends,
+            it->second.weight_rules,
+            g_policy.fallback_priority,
+            tensor_name,
+            ("profiles." + profile_name + ".weights.default").c_str(),
+            out);
 }
 
 bool llama_backend_policy_match_op(
@@ -495,30 +808,25 @@ bool llama_backend_policy_match_op(
     std::lock_guard<std::mutex> lock(g_policy_mutex);
     out = {};
 
-    if (!g_policy.loaded || !g_policy.ops_enabled) {
+    if (!g_policy.loaded) {
         return false;
     }
 
     const std::string base = base_name ? base_name : "";
     const std::string name = tensor_name ? tensor_name : "";
 
-    // Later matching rules override earlier ones, so configs can combine broad
-    // op rules with narrower name/layer exceptions.
-    for (const auto & rule : g_policy.op_rules) {
-        if (op_rule_matches(rule, base, name, op, il, is_prefill)) {
-            out.matched = true;
-            out.backends = rule.backends;
-            out.source = rule.source;
+    if (!g_policy.active_profile.empty()) {
+        auto it = g_policy.profiles.find(g_policy.active_profile);
+        if (it != g_policy.profiles.end() && it->second.ops_enabled) {
+            return match_op_rules(it->second.op_rules, g_policy.fallback_priority, base, name, op, il, is_prefill, out);
         }
     }
 
-    if (!out.matched || out.backends.empty()) {
-        out = {};
+    if (!g_policy.ops_enabled) {
         return false;
     }
 
-    out.backends = with_fallbacks(out.backends, g_policy.fallback_priority);
-    return true;
+    return match_op_rules(g_policy.op_rules, g_policy.fallback_priority, base, name, op, il, is_prefill, out);
 }
 
 bool llama_backend_policy_buft_matches(

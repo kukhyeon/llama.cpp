@@ -14,6 +14,7 @@
 #include <map>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 
 using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
 
@@ -112,6 +113,12 @@ struct llama_model_loader {
 
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
 
+    // Optional backend-policy residency copies. These tensors share the same
+    // logical GGUF tensor name as the primary tensor, but live in alternate
+    // backend buffers such as CPU or HTP0-REPACK.
+    std::unordered_set<ggml_tensor *> residency_tensors;
+    std::unordered_map<std::string, std::vector<ggml_tensor *>> residency_tensors_by_name;
+
     // track tensors that had to be moved for debugging:
     size_t n_tensors_moved = 0;
     std::string first_tensor_moved_name;
@@ -180,7 +187,11 @@ struct llama_model_loader {
 
     struct ggml_tensor * create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
-        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+        const buft_list_t * buft_list_layer, const buft_list_t * buft_list_all, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+
+    bool is_residency_tensor(const ggml_tensor * tensor) const {
+        return residency_tensors.find(const_cast<ggml_tensor *>(tensor)) != residency_tensors.end();
+    }
 
     struct ggml_tensor * create_tensor_as_view(struct ggml_context * ctx, struct ggml_tensor * base, const std::string & name, const std::initializer_list<int64_t> & ne, size_t offset, bool required = true);
 

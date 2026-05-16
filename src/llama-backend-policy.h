@@ -17,11 +17,31 @@ struct llama_backend_policy_match {
 
 bool llama_backend_policy_weights_enabled();
 bool llama_backend_policy_ops_enabled();
+bool llama_backend_policy_residency_enabled();
+
+// Update the process-global runtime profile from the current execution phase
+// and optional environment/config driven switches. Returns true when the active
+// profile changed and any reusable graph should be rebuilt.
+bool llama_backend_policy_update_runtime_profile(bool is_prefill);
+const char * llama_backend_policy_active_profile();
 
 // Match a model weight tensor name against weights.default / weights.rules.
 // The returned backend names are buffer-type oriented, e.g. HTP0-REPACK or CPU.
 bool llama_backend_policy_match_weight(
         const char * tensor_name,
+        llama_backend_policy_match & out);
+
+// Match a tensor against residency.rules. The returned backend names are the
+// copies that should be created at model-load time, e.g. CPU and HTP0-REPACK.
+bool llama_backend_policy_match_residency(
+        const char * tensor_name,
+        llama_backend_policy_match & out);
+
+// Match the active profile's weight rules for graph-time source selection.
+// This does not affect the primary tensor placement chosen at model load.
+bool llama_backend_policy_match_profile_weight(
+        const char * tensor_name,
+        bool is_prefill,
         llama_backend_policy_match & out);
 
 // Match a graph op against ops.rules. base_name is the callback name before

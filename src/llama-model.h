@@ -608,6 +608,9 @@ struct llama_model {
     bool has_tensor_overrides() const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
+    struct ggml_tensor * get_backend_policy_residency_tensor(
+            const struct ggml_tensor * tensor,
+            const std::vector<std::string> & backends) const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;

@@ -33,6 +33,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
@@ -945,6 +946,7 @@ struct llama_model::impl {
 
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
+    buft_list_t all_buft_list;
 
     struct layer_dev {
         ggml_backend_dev_t dev;
@@ -956,6 +958,8 @@ struct llama_model::impl {
     std::vector<layer_dev> dev_layer;
 
     bool has_tensor_overrides;
+
+    std::unordered_map<std::string, std::vector<ggml_tensor *>> backend_policy_residency_tensors;
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -1182,10 +1186,27 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // build a list of buffer types for the CPU and GPU devices
     pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
+    auto add_all_buft = [&](ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
+        if (buft == nullptr) {
+            return;
+        }
+        for (const auto & cur : pimpl->all_buft_list) {
+            if (cur.first == dev && cur.second == buft) {
+                return;
+            }
+        }
+        pimpl->all_buft_list.emplace_back(dev, buft);
+    };
+    for (const auto & cur : pimpl->cpu_buft_list) {
+        add_all_buft(cur.first, cur.second);
+    }
     for (const auto & dev : devices) {
         buft_list_t buft_list = make_gpu_buft_list(dev.dev, split_mode, tensor_split);
         // add CPU buffer types as a fallback
         buft_list.insert(buft_list.end(), pimpl->cpu_buft_list.begin(), pimpl->cpu_buft_list.end());
+        for (const auto & cur : buft_list) {
+            add_all_buft(cur.first, cur.second);
+        }
         pimpl->gpu_buft_list.emplace(dev.dev, std::move(buft_list));
     }
 
@@ -1405,10 +1426,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     ml.done_getting_tensors();
+    pimpl->backend_policy_residency_tensors = ml.residency_tensors_by_name;
 
     // populate tensors_by_name
     for (auto & [_, ctx_ptr] : ml.ctx_map) {
         for (auto * cur = ggml_get_first_tensor(ctx_ptr.get()); cur != NULL; cur = ggml_get_next_tensor(ctx_ptr.get(), cur)) {
+            if (ml.is_residency_tensor(cur)) {
+                continue;
+            }
             tensors_by_name.emplace_back(ggml_get_name(cur), cur);
         }
     }
@@ -1555,7 +1580,7 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
     return ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
-        tn, ne, flags);
+        &pimpl->all_buft_list, tn, ne, flags);
 }
 
 std::string llama_model::arch_name() const {
@@ -1889,6 +1914,50 @@ const ggml_tensor * llama_model::get_tensor(const char * name) const {
     }
 
     return it->second;
+}
+
+ggml_tensor * llama_model::get_backend_policy_residency_tensor(
+        const ggml_tensor * tensor,
+        const std::vector<std::string> & backends) const {
+    if (tensor == nullptr || backends.empty()) {
+        return nullptr;
+    }
+
+    const char * name_c = ggml_get_name(tensor);
+    if (name_c == nullptr || name_c[0] == '\0') {
+        return nullptr;
+    }
+
+    auto tensor_matches = [](const ggml_tensor * cur, const std::string & backend_name) {
+        if (cur == nullptr || cur->buffer == nullptr) {
+            return false;
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(cur->buffer);
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        return llama_backend_policy_buft_matches(dev, buft, backend_name);
+    };
+
+    for (const std::string & backend_name : backends) {
+        if (tensor_matches(tensor, backend_name)) {
+            return const_cast<ggml_tensor *>(tensor);
+        }
+
+        auto it = pimpl->backend_policy_residency_tensors.find(name_c);
+        if (it == pimpl->backend_policy_residency_tensors.end()) {
+            continue;
+        }
+
+        for (ggml_tensor * candidate : it->second) {
+            if (candidate->type != tensor->type || !ggml_are_same_shape(candidate, tensor)) {
+                continue;
+            }
+            if (tensor_matches(candidate, backend_name)) {
+                return candidate;
+            }
+        }
+    }
+
+    return nullptr;
 }
 
 float llama_model::get_rope_freq_base (const llama_cparams & cparams, int il) const {
