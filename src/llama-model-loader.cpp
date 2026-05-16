@@ -1120,7 +1120,7 @@ static ggml_backend_buffer_type_t select_policy_weight_buft(
 
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
-        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+        const buft_list_t * buft_list_layer, const buft_list_t * buft_list_all, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
@@ -1369,6 +1369,50 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, cur);
     ggml_set_name(tensor, ggml_get_name(cur));
+
+    if (llama_backend_policy_residency_enabled() && buft_list_all != nullptr) {
+        llm_tensor residency_tn_tensor = tn.tensor;
+        if (tn.tensor == LLM_TENSOR_TOKEN_EMBD && (flags & TENSOR_DUPLICATED)) {
+            residency_tn_tensor = LLM_TENSOR_OUTPUT;
+        }
+        const llm_tensor_info residency_info = llm_tensor_info_for(residency_tn_tensor);
+        const bool residency_bias = tn.suffix != nullptr && strcmp(tn.suffix, "bias") == 0;
+        const ggml_op residency_op = residency_bias
+            ? (residency_info.op == GGML_OP_MUL_MAT_ID ? GGML_OP_ADD_ID : GGML_OP_ADD)
+            : residency_info.op;
+
+        llama_backend_policy_match residency_match;
+        const char * tensor_name = ggml_get_name(tensor);
+        if (llama_backend_policy_match_residency(tensor_name, residency_match)) {
+            for (const std::string & backend_name : residency_match.backends) {
+                llama_backend_policy_match copy_match;
+                copy_match.matched = true;
+                copy_match.backends = { backend_name };
+                copy_match.source = residency_match.source;
+
+                ggml_backend_buffer_type_t copy_buft = select_policy_weight_buft(hparams, t_meta, residency_op, copy_match);
+                if (copy_buft == nullptr || copy_buft == buft) {
+                    continue;
+                }
+
+                ggml_context * copy_ctx = ctx_for_buft(copy_buft);
+                if (ggml_get_tensor(copy_ctx, tensor_name) != nullptr) {
+                    continue;
+                }
+
+                ggml_tensor * copy = ggml_dup_tensor(copy_ctx, cur);
+                ggml_set_name(copy, tensor_name);
+                residency_tensors.insert(copy);
+                residency_tensors_by_name[tensor_name].push_back(copy);
+                size_data += ggml_nbytes(cur);
+
+                LLAMA_LOG_DEBUG("backend_policy: residency tensor %s (%zu MiB %s) matched %s, adding %s copy\n",
+                        tensor_name,
+                        ggml_nbytes(cur) / 1024 / 1024, ggml_type_name(cur->type),
+                        residency_match.source.c_str(), ggml_backend_buft_name(copy_buft));
+            }
+        }
+    }
 
     if (duplicated) {
         size_data += ggml_nbytes(cur);

@@ -1196,6 +1196,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     lp_is_prefill = (ubatch.n_tokens > 1);
+    if (llama_backend_policy_update_runtime_profile(lp_is_prefill)) {
+        gf_res_prev->reset();
+    }
     if (igparams.backend_compute_profile) {
         ggml_backend_sched_profile_set_phase(lp_is_prefill ? GGML_BACKEND_SCHED_PROFILE_PREFILL : GGML_BACKEND_SCHED_PROFILE_DECODE);
     }
@@ -2129,6 +2132,8 @@ ggml_cgraph * llama_context::graph_reserve(
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
     GGML_ASSERT(n_outputs >= 1);
 
+    llama_backend_policy_update_runtime_profile(n_tokens > 1);
+
     if (n_tokens % n_seqs != 0) {
         n_tokens = ((n_tokens + (n_seqs - 1)) / n_seqs) * n_seqs; // round to next multiple of n_seqs
         n_outputs = std::max(n_outputs, n_tokens);
@@ -2303,6 +2308,31 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
             ggml_set_name(cur, name);
+        }
+
+        if (llama_backend_policy_residency_enabled()) {
+            for (int i = 0; i < GGML_MAX_SRC; ++i) {
+                ggml_tensor * src = cur->src[i];
+                if (src == nullptr || src->buffer == nullptr) {
+                    continue;
+                }
+                if (ggml_backend_buffer_get_usage(src->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                    continue;
+                }
+
+                llama_backend_policy_match weight_match;
+                if (!llama_backend_policy_match_profile_weight(ggml_get_name(src), lp_is_prefill, weight_match)) {
+                    continue;
+                }
+
+                ggml_tensor * replacement = model.get_backend_policy_residency_tensor(src, weight_match.backends);
+                if (replacement != nullptr && replacement != src) {
+                    LLAMA_LOG_DEBUG("backend_policy: op %s src[%d] weight %s switched via %s to %s\n",
+                            ggml_get_name(cur), i, ggml_get_name(src), weight_match.source.c_str(),
+                            ggml_backend_buft_name(ggml_backend_buffer_get_type(replacement->buffer)));
+                    cur->src[i] = replacement;
+                }
+            }
         }
 
         if (llama_backend_policy_ops_enabled()) {
