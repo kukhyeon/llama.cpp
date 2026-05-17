@@ -2130,6 +2130,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     if (wo) {
         cur = build_lora_mm(wo, cur, wo_s);
+        cb(cur, "kqv_wo", il);
     }
 
     if (wo_b) {

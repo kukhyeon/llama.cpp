@@ -383,10 +383,16 @@ void parse_rules(const json & section, const char * section_name, std::vector<po
     }
 }
 
-void parse_profile_section(const json & root, const std::string & profile_name, profile_policy & out) {
+void parse_profile_section(
+        const json & root,
+        const std::string & profile_name,
+        bool policy_enabled,
+        bool enable_weights,
+        bool enable_ops,
+        profile_policy & out) {
     if (root.contains("weights") && root["weights"].is_object()) {
         const auto & weights = root["weights"];
-        out.weights_enabled = weights.value("enabled", true);
+        out.weights_enabled = policy_enabled && enable_weights && weights.value("enabled", true);
         if (weights.contains("default")) {
             if (weights["default"].is_string()) {
                 out.default_weight_backends.push_back(weights["default"].get<std::string>());
@@ -403,7 +409,7 @@ void parse_profile_section(const json & root, const std::string & profile_name, 
 
     if (root.contains("ops") && root["ops"].is_object()) {
         const auto & ops = root["ops"];
-        out.ops_enabled = ops.value("enabled", true);
+        out.ops_enabled = policy_enabled && enable_ops && ops.value("enabled", true);
         parse_rules(ops, ("profiles." + profile_name + ".ops").c_str(), out.op_rules);
     }
 }
@@ -611,7 +617,7 @@ bool llama_backend_policy_load(const char * path, bool enable_weights, bool enab
                     throw std::runtime_error("profiles entries must be objects");
                 }
                 profile_policy profile;
-                parse_profile_section(it.value(), it.key(), profile);
+                parse_profile_section(it.value(), it.key(), next.enabled, enable_weights, enable_ops, profile);
                 next.profiles.emplace(it.key(), std::move(profile));
             }
         }
