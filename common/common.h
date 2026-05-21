@@ -702,8 +702,10 @@ struct common_params {
     std::string device_name = "S25";
     int cpu_clk_idx_p = -1;
     int ram_clk_idx_p = -1;
+    int gpu_clk_idx_p = -1;
     int cpu_clk_idx_d = -1;
     int ram_clk_idx_d = -1;
+    int gpu_clk_idx_d = -1;
 
     int phase_pause = 0; // ms
     int token_pause = 0; // ms

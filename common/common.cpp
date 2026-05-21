@@ -416,8 +416,10 @@ void common_ignite_init(llama_context * ctx, common_params & params) {
     ig.ignite_verbose   = params.ignite_verbose;
     ig.cpu_clk_idx_p    = params.cpu_clk_idx_p;
     ig.ram_clk_idx_p    = params.ram_clk_idx_p;
+    ig.gpu_clk_idx_p    = params.gpu_clk_idx_p;
     ig.cpu_clk_idx_d    = params.cpu_clk_idx_d;
     ig.ram_clk_idx_d    = params.ram_clk_idx_d;
+    ig.gpu_clk_idx_d    = params.gpu_clk_idx_d;
     ig.fixed_config     = params.fixed_config;
 
     ig.time_slot       = params.time_slot;

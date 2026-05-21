@@ -38,6 +38,10 @@ const std::map<std::string, std::vector<int>> DVFS::ddrfreq = {
     { "Pixel9", { 421000, 546000, 676000, 845000, 1014000, 1352000, 1539000, 1716000, 2028000, 2288000, 2730000, 3172000, 3744000 } }
 };
 
+const std::map<std::string, std::vector<int>> DVFS::gpufreq = {
+    { "S25", { 160000000, 222000000, 342000000, 389000000, 443000000, 525000000, 607000000, 660000000, 734000000, 832000000, 900000000, 967000000, 1050000000, 1100000000, 1200000000 } }
+};
+
 
 const std::map<std::string, std::vector<std::string>> DVFS::empty_thermal = {
     { "S22_Ultra", { "sdr0-pa0", "sdr1-pa0", "pm8350b_tz", "pm8350b-ibat-lvl0", "pm8350b-ibat-lvl1", "pm8350b-bcl-lvl0", "pm8350b-bcl-lvl1", "pm8350b-bcl-lvl2", "socd", "pmr735b_tz"}},
@@ -62,6 +66,10 @@ const std::vector<std::string>& DVFS::get_empty_thermal() const {
 
 const std::vector<int>& DVFS::get_ddr_freq() const {
     return ddrfreq.at(device);
+}
+
+const std::vector<int>& DVFS::get_gpu_freq() const {
+    return gpufreq.at(device);
 }
 
 std::vector<int> DVFS::get_cpu_freqs_conf(int prime_cpu_index){
@@ -232,6 +240,10 @@ int DVFS::init_fd_cache() {
         s25_ram_fds.ddrqos_prime_min_fd = open_wr("/sys/devices/system/cpu/bus_dcvs/DDRQOS/soc:qcom,memlat:ddrqos:prime/min_freq");
         s25_ram_fds.ddrqos_prime_max_fd = open_wr("/sys/devices/system/cpu/bus_dcvs/DDRQOS/soc:qcom,memlat:ddrqos:prime/max_freq");
 
+        gpu_fds.base = "/sys/class/devfreq/3d00000.qcom,kgsl-3d0";
+        gpu_fds.min_fd = open_wr(gpu_fds.base + "/min_freq");
+        gpu_fds.max_fd = open_wr(gpu_fds.base + "/max_freq");
+
         if (s25_ram_fds.ddr_boost_fd < 0 ||
             s25_ram_fds.ddrqos_boost_fd < 0 ||
             s25_ram_fds.ddr_gold_min_fd < 0 ||
@@ -243,8 +255,10 @@ int DVFS::init_fd_cache() {
             s25_ram_fds.ddrqos_gold_min_fd < 0 ||
             s25_ram_fds.ddrqos_gold_max_fd < 0 ||
             s25_ram_fds.ddrqos_prime_min_fd < 0 ||
-            s25_ram_fds.ddrqos_prime_max_fd < 0) {
-            fprintf(stderr, "[DVFS] S25 RAM voter open failed (need root?)\n");
+            s25_ram_fds.ddrqos_prime_max_fd < 0 ||
+            gpu_fds.min_fd < 0 ||
+            gpu_fds.max_fd < 0) {
+            fprintf(stderr, "[DVFS] S25 RAM/GPU voter open failed (need root?)\n");
             close_fd_cache_nolock();
             fd_ready = false;
             return -2;
@@ -313,6 +327,8 @@ void DVFS::close_fd_cache_nolock() {
 
     close_fd(mif_fds.min_fd);
     close_fd(mif_fds.max_fd);
+    close_fd(gpu_fds.min_fd);
+    close_fd(gpu_fds.max_fd);
     close_fd(s25_ram_fds.ddr_boost_fd);
     close_fd(s25_ram_fds.ddrqos_boost_fd);
     close_fd(s25_ram_fds.ddr_gold_min_fd);
@@ -456,5 +472,57 @@ int DVFS::unset_ram_freq() {
 
     if (write_fd_int(mif_fds.max_fd, max_clk) != 0) return 3;
     if (write_fd_int(mif_fds.min_fd, min_clk) != 0) return 4;
+    return 0;
+}
+
+int DVFS::set_gpu_freq(const int freq_idx) {
+    std::lock_guard<std::mutex> lk(io_mu);
+
+    if (!fd_ready) {
+        fprintf(stderr, "[DVFS] fd cache not ready. call init_fd_cache() first.\n");
+        return 2;
+    }
+
+    auto it = gpufreq.find(device);
+    if (it == gpufreq.end()) {
+        fprintf(stderr, "[DVFS] GPU DVFS table not found for %s\n", device.c_str());
+        return 1;
+    }
+
+    const auto& table = it->second;
+    if (freq_idx < 0 || freq_idx >= (int)table.size()) return 3;
+    if (gpu_fds.min_fd < 0 || gpu_fds.max_fd < 0) return 4;
+
+    const int min_clk = table.front();
+    const int max_clk = table.back();
+    const int clk = table[freq_idx];
+
+    // Open the constraint window before pinning the target. This avoids min > max
+    // failures when switching from a high fixed clock to a lower one.
+    if (write_fd_int(gpu_fds.min_fd, min_clk) != 0) return 5;
+    if (write_fd_int(gpu_fds.max_fd, max_clk) != 0) return 6;
+    if (write_fd_int(gpu_fds.max_fd, clk) != 0) return 7;
+    if (write_fd_int(gpu_fds.min_fd, clk) != 0) return 8;
+    return 0;
+}
+
+int DVFS::unset_gpu_freq() {
+    std::lock_guard<std::mutex> lk(io_mu);
+
+    if (!fd_ready) {
+        fprintf(stderr, "[DVFS] fd cache not ready. call init_fd_cache() first.\n");
+        return 2;
+    }
+
+    auto it = gpufreq.find(device);
+    if (it == gpufreq.end()) {
+        return 0;
+    }
+
+    const auto& table = it->second;
+    if (gpu_fds.min_fd < 0 || gpu_fds.max_fd < 0) return 3;
+
+    if (write_fd_int(gpu_fds.max_fd, table.back()) != 0) return 4;
+    if (write_fd_int(gpu_fds.min_fd, table.front()) != 0) return 5;
     return 0;
 }

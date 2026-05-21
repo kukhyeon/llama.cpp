@@ -56,6 +56,7 @@ class DVFS : public Device {
 private:
     static const std::map<std::string, std::map<int, std::vector<int>>> cpufreq;
     static const std::map<std::string, std::vector<int>> ddrfreq;
+    static const std::map<std::string, std::vector<int>> gpufreq;
     static const std::map<std::string, std::vector<std::string>> empty_thermal;
 
 private:
@@ -69,6 +70,12 @@ private:
     struct MifFD {
         int min_fd = -1; // scaling_devfreq_min (or min_freq)
         int max_fd = -1; // scaling_devfreq_max (or max_freq)
+        std::string base;
+    };
+
+    struct GpuFD {
+        int min_fd = -1; // min_freq
+        int max_fd = -1; // max_freq
         std::string base;
     };
 
@@ -91,6 +98,7 @@ private:
 
     std::vector<CpuPolicyFD> cpu_fds;
     MifFD mif_fds;
+    GpuFD gpu_fds;
     S25RamFD s25_ram_fds;
     bool fd_ready = false;
     std::mutex io_mu; // mutex lock guard for fd cache I/O
@@ -106,12 +114,15 @@ public:
 
     const std::map<int, std::vector<int>>& get_cpu_freq() const;
     const std::vector<int>& get_ddr_freq() const;
+    const std::vector<int>& get_gpu_freq() const;
 	const std::vector<std::string>& get_empty_thermal() const;
 
 	int set_cpu_freq(const std::vector<int>&);
     int unset_cpu_freq();
     int set_ram_freq(const int freq_idx);
     int unset_ram_freq();
+    int set_gpu_freq(const int freq_idx);
+    int unset_gpu_freq();
 
     std::vector<int> get_cpu_freqs_conf(int prime_cpu_index);
 

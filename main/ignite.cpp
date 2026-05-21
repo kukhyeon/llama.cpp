@@ -318,12 +318,22 @@ int main(int argc, char ** argv) {
 
     auto ig = get_ignite_params(ctx); // ignite parameters
     dvfs.output_filename = std::string(ig->output_path_hard);
+    const bool want_cpu_dvfs = params.cpu_clk_idx_p >= 0 || params.cpu_clk_idx_d >= 0;
+    const bool want_ram_dvfs = params.ram_clk_idx_p >= 0 || params.ram_clk_idx_d >= 0;
+    const bool want_gpu_dvfs = params.gpu_clk_idx_p >= 0 || params.gpu_clk_idx_d >= 0;
     //printf("%s: hard output path: %s\n", __func__, ig->output_path_hard); // debug
     // [26.01.21] now, inference result path is set by ig->output_path_infer. (see #L1074)
     // set cpu & ram freqs
-    std::vector<int> cpu_freq_indices = dvfs.get_cpu_freqs_conf(params.cpu_clk_idx_p);
-    dvfs.set_cpu_freq(cpu_freq_indices);
-    dvfs.set_ram_freq(params.ram_clk_idx_p);
+    if (params.cpu_clk_idx_p >= 0) {
+        std::vector<int> cpu_freq_indices = dvfs.get_cpu_freqs_conf(params.cpu_clk_idx_p);
+        dvfs.set_cpu_freq(cpu_freq_indices);
+    }
+    if (params.ram_clk_idx_p >= 0) {
+        dvfs.set_ram_freq(params.ram_clk_idx_p);
+    }
+    if (params.gpu_clk_idx_p >= 0) {
+        dvfs.set_gpu_freq(params.gpu_clk_idx_p);
+    }
 // --------------------------------------------------
 
     
@@ -834,9 +844,16 @@ int main(int argc, char ** argv) {
                     // prefill phase
                     if (!prefill_active && ig->is_ignite_active) {
                         #if IGNITE_USE_SYSTEM_DVFS
-                        std::vector<int> cpu_freq_indices = dvfs.get_cpu_freqs_conf(ig->cpu_clk_idx_p);
-                        dvfs.set_cpu_freq(cpu_freq_indices);
-                        dvfs.set_ram_freq(ig->ram_clk_idx_p);
+                        if (ig->cpu_clk_idx_p >= 0) {
+                            std::vector<int> cpu_freq_indices = dvfs.get_cpu_freqs_conf(ig->cpu_clk_idx_p);
+                            dvfs.set_cpu_freq(cpu_freq_indices);
+                        }
+                        if (ig->ram_clk_idx_p >= 0) {
+                            dvfs.set_ram_freq(ig->ram_clk_idx_p);
+                        }
+                        if (ig->gpu_clk_idx_p >= 0) {
+                            dvfs.set_gpu_freq(ig->gpu_clk_idx_p);
+                        }
                         #endif // IGNITE_USE_SYSTEM_DVFS
                         // std::cout << std::flush << "<prefill_setup>";
                     }
@@ -848,9 +865,16 @@ int main(int argc, char ** argv) {
                     // decode phase
                     if (!decode_active && ig->is_ignite_active) {
                         #if IGNITE_USE_SYSTEM_DVFS
-                        std::vector<int> cpu_freq_indices = dvfs.get_cpu_freqs_conf(ig->cpu_clk_idx_d);
-                        dvfs.set_cpu_freq(cpu_freq_indices);
-                        dvfs.set_ram_freq(ig->ram_clk_idx_d);
+                        if (ig->cpu_clk_idx_d >= 0) {
+                            std::vector<int> cpu_freq_indices = dvfs.get_cpu_freqs_conf(ig->cpu_clk_idx_d);
+                            dvfs.set_cpu_freq(cpu_freq_indices);
+                        }
+                        if (ig->ram_clk_idx_d >= 0) {
+                            dvfs.set_ram_freq(ig->ram_clk_idx_d);
+                        }
+                        if (ig->gpu_clk_idx_d >= 0) {
+                            dvfs.set_gpu_freq(ig->gpu_clk_idx_d);
+                        }
                         #endif // IGNITE_USE_SYSTEM_DVFS
                         // std::cout << std::flush << "<decode_setup>";
                     }
@@ -1249,8 +1273,15 @@ int main(int argc, char ** argv) {
 // ------------------------------------------------
 // Stream termination
     sigterm = true;
-    dvfs.unset_cpu_freq();
-    dvfs.unset_ram_freq();
+    if (want_cpu_dvfs) {
+        dvfs.unset_cpu_freq();
+    }
+    if (want_ram_dvfs) {
+        dvfs.unset_ram_freq();
+    }
+    if (want_gpu_dvfs) {
+        dvfs.unset_gpu_freq();
+    }
     record_thread.join();
 // ------------------------------------------------
 #endif
