@@ -1092,6 +1092,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
     add_opt(common_arg(
+        {"--gpu-p"}, "IDX",
+        "prefill GPU DVFS index",
+        [](common_params & params, int value) {
+            params.gpu_clk_idx_p = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
         {"--cpu-d"}, "IDX",
         "decode CPU DVFS index",
         [](common_params & params, int value) {
@@ -1103,6 +1110,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "decode RAM DVFS index",
         [](common_params & params, int value) {
             params.ram_clk_idx_d = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
+        {"--gpu-d"}, "IDX",
+        "decode GPU DVFS index",
+        [](common_params & params, int value) {
+            params.gpu_clk_idx_d = value;
         }
     ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
     add_opt(common_arg(

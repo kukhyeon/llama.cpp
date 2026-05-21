@@ -53,7 +53,9 @@ bool init_ignite_filename(struct llama_context * ctx) {
     struct llama_igparams * _cp = ctx->get_ignite_params();
 
     // variable initialization: For File Naming
-    bool fixed_config = (_cp->cpu_clk_idx_p == _cp->cpu_clk_idx_d) && (_cp->ram_clk_idx_p == _cp->ram_clk_idx_d);
+    bool fixed_config = (_cp->cpu_clk_idx_p == _cp->cpu_clk_idx_d) &&
+                        (_cp->ram_clk_idx_p == _cp->ram_clk_idx_d) &&
+                        (_cp->gpu_clk_idx_p == _cp->gpu_clk_idx_d);
     bool tp = (_cp->token_pause > 0);
     bool pp = (_cp->phase_pause > 0);
     bool lp = (_cp->layer_pause > 0);
@@ -158,8 +160,8 @@ void ignite_params_system_info(const llama_igparams* igparams) {
     printf("%s: ignite active status\t\t= %s\n\r", __func__, igparams->is_ignite_active ? "ON" : "OFF");
     printf("%s: strict generation\t\t= %s\n\r", __func__, igparams->strict_limit ? "ON" : "OFF");
     printf("%s: enable thinking\t\t= %s\n\r", __func__, igparams->enable_thinking ? "ON" : "OFF");
-    printf("%s: prefill CPU/RAM clock idx\t= %d / %d\n\r", __func__, igparams->cpu_clk_idx_p, igparams->ram_clk_idx_p);
-    printf("%s: decode CPU/RAM clock idx\t= %d / %d\n\r", __func__, igparams->cpu_clk_idx_d, igparams->ram_clk_idx_d);
+    printf("%s: prefill CPU/RAM/GPU clock idx\t= %d / %d / %d\n\r", __func__, igparams->cpu_clk_idx_p, igparams->ram_clk_idx_p, igparams->gpu_clk_idx_p);
+    printf("%s: decode CPU/RAM/GPU clock idx\t= %d / %d / %d\n\r", __func__, igparams->cpu_clk_idx_d, igparams->ram_clk_idx_d, igparams->gpu_clk_idx_d);
     printf("%s: input dataset path\t\t= %s\n\r", __func__, igparams->input_path);
     printf("%s: resource output file\t\t= %s\n\r", __func__, igparams->output_path_hard);
     printf("%s: llm output file\t\t= %s\n\r", __func__, igparams->output_path_infer);

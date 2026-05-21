@@ -458,8 +458,10 @@ extern "C" {
         char device_name[32];
         int  cpu_clk_idx_p;
         int  ram_clk_idx_p;
+        int  gpu_clk_idx_p;
         int  cpu_clk_idx_d;
         int  ram_clk_idx_d;
+        int  gpu_clk_idx_d;
         bool fixed_config;
 
         double time_slot;

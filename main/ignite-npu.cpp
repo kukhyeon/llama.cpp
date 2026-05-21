@@ -640,8 +640,11 @@ int main(int argc, char ** argv) {
     dvfs.control_start_point = start_sys_time;
     dvfs.output_filename = params.output_dir + "/hardware_stats.csv";
 
-    const bool want_prefill_dvfs = ig->cpu_clk_idx_p >= 0 || ig->ram_clk_idx_p >= 0;
-    const bool want_decode_dvfs  = ig->cpu_clk_idx_d >= 0 || ig->ram_clk_idx_d >= 0;
+    const bool want_cpu_dvfs = ig->cpu_clk_idx_p >= 0 || ig->cpu_clk_idx_d >= 0;
+    const bool want_ram_dvfs = ig->ram_clk_idx_p >= 0 || ig->ram_clk_idx_d >= 0;
+    const bool want_gpu_dvfs = ig->gpu_clk_idx_p >= 0 || ig->gpu_clk_idx_d >= 0;
+    const bool want_prefill_dvfs = ig->cpu_clk_idx_p >= 0 || ig->ram_clk_idx_p >= 0 || ig->gpu_clk_idx_p >= 0;
+    const bool want_decode_dvfs  = ig->cpu_clk_idx_d >= 0 || ig->ram_clk_idx_d >= 0 || ig->gpu_clk_idx_d >= 0;
     bool runtime_dvfs_ready = false;
 
     if (want_prefill_dvfs || want_decode_dvfs) {
@@ -652,7 +655,7 @@ int main(int argc, char ** argv) {
         }
     }
 
-    auto apply_dvfs = [&](int cpu_idx, int ram_idx) {
+    auto apply_dvfs = [&](int cpu_idx, int ram_idx, int gpu_idx) {
         if (!runtime_dvfs_ready) {
             return;
         }
@@ -669,14 +672,27 @@ int main(int argc, char ** argv) {
                 LOG_WRN("%s: failed to set RAM DVFS index %d\n", __func__, ram_idx);
             }
         }
+
+        if (gpu_idx >= 0) {
+            if (dvfs.set_gpu_freq(gpu_idx) != 0) {
+                LOG_WRN("%s: failed to set GPU DVFS index %d\n", __func__, gpu_idx);
+            }
+        }
     };
 
     auto reset_dvfs = [&]() {
         if (!runtime_dvfs_ready) {
             return;
         }
-        dvfs.unset_cpu_freq();
-        dvfs.unset_ram_freq();
+        if (want_cpu_dvfs) {
+            dvfs.unset_cpu_freq();
+        }
+        if (want_ram_dvfs) {
+            dvfs.unset_ram_freq();
+        }
+        if (want_gpu_dvfs) {
+            dvfs.unset_gpu_freq();
+        }
     };
 
     #if IGNITE_USE_SYSTEM_DVFS
@@ -960,7 +976,7 @@ int main(int argc, char ** argv) {
                 if (!generation_started) {
                     // prefill phase
                     if (!prefill_active && ig->is_ignite_active) {
-                        apply_dvfs(ig->cpu_clk_idx_p, ig->ram_clk_idx_p);
+                        apply_dvfs(ig->cpu_clk_idx_p, ig->ram_clk_idx_p, ig->gpu_clk_idx_p);
                     }
                     if (!prefill_active) {
                         prefill_active = true;
@@ -969,7 +985,7 @@ int main(int argc, char ** argv) {
                 } else {
                     // decode phase
                     if (!decode_active && ig->is_ignite_active) {
-                        apply_dvfs(ig->cpu_clk_idx_d, ig->ram_clk_idx_d);
+                        apply_dvfs(ig->cpu_clk_idx_d, ig->ram_clk_idx_d, ig->gpu_clk_idx_d);
                     }
                     if (!decode_active) {
                         prefill_active = false;

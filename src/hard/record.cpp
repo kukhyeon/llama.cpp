@@ -243,6 +243,8 @@ std::vector<std::string> get_hard_records(const DVFS& dvfs) {
 	// GPU clock info
     if (device_name == "Pixel9"){
         command += "awk '{print \\$1}' /sys/devices/platform/1f000000.mali/scaling_min_freq; awk '{print \\$1}' /sys/devices/platform/1f000000.mali/scaling_max_freq; "; //gpu clock
+    } else if (device_name == "S25") {
+        command += "awk '{print \\$1}' /sys/class/devfreq/3d00000.qcom,kgsl-3d0/min_freq; awk '{print \\$1}' /sys/class/devfreq/3d00000.qcom,kgsl-3d0/max_freq; ";
     } else { // S24
 	    command += "awk '{print \\$1}' /sys/kernel/gpu/gpu_min_clock; awk '{print \\$1}' /sys/kernel/gpu/gpu_max_clock; ";
     }
@@ -320,6 +322,8 @@ std::vector<std::string> get_hard_records_wo_systime(const DVFS& dvfs){
 	// GPU clock info
     if (device_name == "Pixel9"){
         command += "awk '{print \\$1}' /sys/devices/platform/1f000000.mali/scaling_min_freq; awk '{print \\$1}' /sys/devices/platform/1f000000.mali/scaling_max_freq; "; //gpu clock
+    } else if (device_name == "S25") {
+        command += "awk '{print \\$1}' /sys/class/devfreq/3d00000.qcom,kgsl-3d0/min_freq; awk '{print \\$1}' /sys/class/devfreq/3d00000.qcom,kgsl-3d0/max_freq; ";
     } else { // S24
 	    command += "awk '{print \\$1}' /sys/kernel/gpu/gpu_min_clock; awk '{print \\$1}' /sys/kernel/gpu/gpu_max_clock; ";
     }

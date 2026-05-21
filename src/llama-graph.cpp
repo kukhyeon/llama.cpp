@@ -2134,10 +2134,6 @@ ggml_tensor * llm_graph_context::build_attn(
     }
 
     if (wo_b) {
-        //cb(cur, "kqv_wo", il);
-    }
-
-    if (wo_b) {
         cur = ggml_add(ctx0, cur, wo_b);
     }
 
@@ -2237,11 +2233,13 @@ ggml_tensor * llm_graph_context::build_attn(
             // GLM4, GLM4_MOE, and JAIS2 seem to have numerical issues with half-precision accumulators
             cur = build_lora_mm(wo, cur);
             ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
+            cb(cur, "kqv_wo", il);
             if (wo_s) {
                 cur = ggml_mul(ctx0, cur, wo_s);
             }
         } else {
             cur = build_lora_mm(wo, cur, wo_s);
+            cb(cur, "kqv_wo", il);
         }
     }
 
@@ -2324,11 +2322,13 @@ ggml_tensor * llm_graph_context::build_attn(
             // GLM4 and GLM4_MOE seem to have numerical issues with half-precision accumulators
             cur = build_lora_mm(wo, cur);
             ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
+            cb(cur, "kqv_wo", il);
             if (wo_s) {
                 cur = ggml_mul(ctx0, cur, wo_s);
             }
         } else {
             cur = build_lora_mm(wo, cur, wo_s);
+            cb(cur, "kqv_wo", il);
         }
     }
 
@@ -2413,10 +2413,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     if (wo) {
         cur = build_lora_mm(wo, cur, wo_s);
-    }
-
-    if (wo_b) {
-        //cb(cur, "kqv_wo", il);
+        cb(cur, "kqv_wo", il);
     }
 
     if (wo_b) {
@@ -2469,10 +2466,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     if (wo) {
         cur = build_lora_mm(wo, cur, wo_s);
-    }
-
-    if (wo_b) {
-        //cb(cur, "kqv_wo", il);
+        cb(cur, "kqv_wo", il);
     }
 
     if (wo_b) {
