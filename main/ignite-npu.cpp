@@ -695,6 +695,10 @@ int main(int argc, char ** argv) {
         }
     };
 
+    if (ig->is_ignite_active && want_prefill_dvfs) {
+        apply_dvfs(ig->cpu_clk_idx_p, ig->ram_clk_idx_p, ig->gpu_clk_idx_p);
+    }
+
     #if IGNITE_USE_SYSTEM_DVFS
     std::thread record_thread = std::thread(record_hard, std::ref(sigterm), std::ref(dvfs));
     #endif

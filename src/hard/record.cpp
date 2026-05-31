@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 
 namespace {
 
@@ -50,6 +51,138 @@ long long read_int_file(const std::string & path) {
     long long value = -1;
     file >> value;
     return value;
+}
+
+std::string read_token_file(const std::string & path, const std::string & fallback = "0") {
+    std::ifstream file(path);
+    if (!file) {
+        return fallback;
+    }
+
+    std::string value;
+    file >> value;
+    return value.empty() ? fallback : value;
+}
+
+std::string format_number(double value) {
+    std::ostringstream ss;
+    ss << value;
+    return ss.str();
+}
+
+std::string read_scaled_file(const std::string & path, double divisor, const std::string & fallback = "0") {
+    std::ifstream file(path);
+    if (!file) {
+        return fallback;
+    }
+
+    double value = 0.0;
+    file >> value;
+    if (!file) {
+        return fallback;
+    }
+
+    return format_number(value / divisor);
+}
+
+std::string strip_colon(std::string value) {
+    if (!value.empty() && value.back() == ':') {
+        value.pop_back();
+    }
+    return value;
+}
+
+struct thermal_zone_info {
+    std::string dir;
+    std::string name;
+};
+
+std::vector<thermal_zone_info> list_thermal_zones(const DVFS & dvfs) {
+    std::vector<thermal_zone_info> zones;
+    const std::string thermal_root = "/sys/devices/virtual/thermal";
+
+    std::vector<std::string> empty_thermal = dvfs.get_empty_thermal();
+
+    std::error_code ec;
+    for (const auto & entry : std::filesystem::directory_iterator(thermal_root, ec)) {
+        if (ec) {
+            break;
+        }
+        if (!entry.is_directory()) {
+            continue;
+        }
+
+        const std::string dir = entry.path().string();
+        const std::string base = entry.path().filename().string();
+        if (base.rfind("thermal_zone", 0) != 0) {
+            continue;
+        }
+
+        std::string name = read_token_file(dir + "/type", "");
+        if (name.empty()) {
+            continue;
+        }
+
+        if (name == "qcom,secure-non") {
+            name = "secure-non";
+        } else if (std::find(empty_thermal.begin(), empty_thermal.end(), name) != empty_thermal.end()) {
+            continue;
+        }
+
+        zones.push_back({ dir, name });
+    }
+
+    std::sort(zones.begin(), zones.end(), [](const thermal_zone_info & a, const thermal_zone_info & b) {
+        return a.dir < b.dir;
+    });
+
+    return zones;
+}
+
+std::vector<std::string> read_meminfo_names() {
+    std::vector<std::string> names;
+    std::ifstream file("/proc/meminfo");
+    std::string key;
+    while (file >> key) {
+        std::string rest;
+        std::getline(file, rest);
+        names.push_back(strip_colon(key));
+    }
+    return names;
+}
+
+std::vector<std::string> read_meminfo_values_mib() {
+    std::vector<std::string> values;
+    std::ifstream file("/proc/meminfo");
+    std::string key;
+    double value_kib = 0.0;
+    std::string unit;
+
+    while (file >> key >> value_kib) {
+        std::getline(file, unit);
+        values.push_back(format_number(value_kib / 1024.0));
+    }
+
+    return values;
+}
+
+void append_value(std::vector<std::string> & records, const std::string & path) {
+    records.push_back(read_token_file(path));
+}
+
+void append_scaled_value(std::vector<std::string> & records, const std::string & path, double divisor) {
+    records.push_back(read_scaled_file(path, divisor));
+}
+
+void write_csv_row(std::ostream & out, const std::vector<std::string> & data) {
+    for (const auto & v : data) {
+        out << v << ",";
+    }
+    out << "\n";
+}
+
+void write_csv_row(std::ostream & out, const std::string & data) {
+    out << data << "\n";
 }
 
 bool write_signal_file(const std::string & path, const std::string & value) {
@@ -154,27 +287,17 @@ struct thermal_signal_detector {
 
 // test function
 void get_cpu_info() {
-    std::string command = "su -c \""; //prefix
-    
-    // command to get cpu freq
-    command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq; ";
-    command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/cpu4/cpufreq/scaling_cur_freq; ";
-    command += "\""; // postfix
-
-    // only execution
-    system(command.c_str());
-    //std::string output = execute_cmd(command.c_str());
-    //std::cout << execute_cmd(command.c_str())[0] << std::endl;
+    std::cout << read_scaled_file("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq", 1000.0) << std::endl;
+    std::cout << read_scaled_file("/sys/devices/system/cpu/cpu4/cpufreq/scaling_cur_freq", 1000.0) << std::endl;
 }
 
 const std::string get_records_names(const DVFS& dvfs) {
     std::string names = "Time,";
-    
+
     // thermal info
-    std::string command = "su -c \"cat /sys/devices/virtual/thermal/thermal_zone*/type\"";
-    std::string temp_record = execute_cmd(command.c_str());
-    std::replace(temp_record.begin(), temp_record.end(), '\n', ',');
-    names += temp_record;
+    for (const auto & zone : list_thermal_zones(dvfs)) {
+        names += zone.name + ",";
+    }
 
     // gpu info
     names += "gpu_min_clock,gpu_max_clock,";
@@ -185,11 +308,9 @@ const std::string get_records_names(const DVFS& dvfs) {
     }
 
     // mem info
-    command = "su -c \"awk '{print \\$1}' /proc/meminfo\"";
-    temp_record = execute_cmd(command.c_str());
-    std::replace(temp_record.begin(), temp_record.end(), ':', '\0');
-    std::replace(temp_record.begin(), temp_record.end(), '\n', ',');
-    names += temp_record;
+    for (const auto & name : read_meminfo_names()) {
+        names += name + ",";
+    }
 
     // power
     if (dvfs.get_device_name() == "Pixel9") names += "current_now,voltage_now,";
@@ -197,22 +318,6 @@ const std::string get_records_names(const DVFS& dvfs) {
 
     // RAM clock info
     names += "scaling_devfreq_max,scaling_devfreq_min,cur_freq,";
-
-    // remove emptyThermal 
-	for (std::string empty : dvfs.get_empty_thermal()){
-		if (empty == "qcom,secure-non"){
-			std::size_t p = 0;
-			while( (p = names.find(empty, p)) != std::string::npos ){
-				names.replace(p, empty.length(), "secure-non");
-			}
-		    continue;
-		}
-		std::string temp = empty + ",";
-		std::size_t pos = 0;
-		while( (pos = names.find(temp, pos)) != std::string::npos){
-			names.replace(pos, temp.length(), ""); // string replace
-		}
-	}
 
     // [ADD] LLCC clock info (Only for S25)
     if (dvfs.get_device_name() == "S25") {
@@ -234,159 +339,75 @@ const std::string get_records_names(const DVFS& dvfs) {
 std::vector<std::string> get_hard_records(const DVFS& dvfs) {
     std::vector<int> cluster_indices = dvfs.get_cluster_indices();
     std::string device_name = dvfs.get_device_name();
+    std::vector<std::string> records;
 
-    std::string command = "su -c \""; // prefix
-    
     // thermal info
-    command += "awk '{print \\$1/1000}' /sys/devices/virtual/thermal/thermal_zone*/temp; ";
-	      
-	// GPU clock info
+    for (const auto & zone : list_thermal_zones(dvfs)) {
+        append_scaled_value(records, zone.dir + "/temp", 1000.0);
+    }
+
+    // GPU clock info
     if (device_name == "Pixel9"){
-        command += "awk '{print \\$1}' /sys/devices/platform/1f000000.mali/scaling_min_freq; awk '{print \\$1}' /sys/devices/platform/1f000000.mali/scaling_max_freq; "; //gpu clock
+        append_value(records, "/sys/devices/platform/1f000000.mali/scaling_min_freq");
+        append_value(records, "/sys/devices/platform/1f000000.mali/scaling_max_freq");
     } else if (device_name == "S25") {
-        command += "awk '{print \\$1}' /sys/class/devfreq/3d00000.qcom,kgsl-3d0/min_freq; awk '{print \\$1}' /sys/class/devfreq/3d00000.qcom,kgsl-3d0/max_freq; ";
+        append_value(records, "/sys/class/devfreq/3d00000.qcom,kgsl-3d0/min_freq");
+        append_value(records, "/sys/class/devfreq/3d00000.qcom,kgsl-3d0/max_freq");
     } else { // S24
-	    command += "awk '{print \\$1}' /sys/kernel/gpu/gpu_min_clock; awk '{print \\$1}' /sys/kernel/gpu/gpu_max_clock; ";
+        append_value(records, "/sys/kernel/gpu/gpu_min_clock");
+        append_value(records, "/sys/kernel/gpu/gpu_max_clock");
     }
 
     // CPU clock info
     for (std::size_t i=0; i<cluster_indices.size(); ++i){
         int idx = cluster_indices[i];
-        command += std::string("awk '{print \\$1/1000}' /sys/devices/system/cpu/cpu")+std::to_string(idx)+std::string("/cpufreq/scaling_max_freq; ") +
-		   std::string("awk '{print \\$1/1000}' /sys/devices/system/cpu/cpu")+std::to_string(idx)+std::string("/cpufreq/scaling_cur_freq; ");
+        const std::string base = "/sys/devices/system/cpu/cpu" + std::to_string(idx) + "/cpufreq/";
+        append_scaled_value(records, base + "scaling_max_freq", 1000.0);
+        append_scaled_value(records, base + "scaling_cur_freq", 1000.0);
     }
 
 	// RAM info
-    command += "awk '{print \\$2/1024}' /proc/meminfo; ";
+    const auto meminfo_values = read_meminfo_values_mib();
+    records.insert(records.end(), meminfo_values.begin(), meminfo_values.end());
 
     // Power Consumption info
     if (device_name == "Pixel9"){
-        command += "awk '{print}' /sys/class/power_supply/battery/current_now; ";
-        command += "awk '{print}' /sys/class/power_supply/battery/voltage_now; ";
+        append_value(records, "/sys/class/power_supply/battery/current_now");
+        append_value(records, "/sys/class/power_supply/battery/voltage_now");
     } else {
-        command += "awk '{print}' /sys/class/power_supply/battery/power_now; "; // pixel does not contain
-        command += "awk '{print}' /sys/class/power_supply/battery/current_now; ";
-        command += "awk '{print}' /sys/class/power_supply/battery/voltage_now; ";
+        append_value(records, "/sys/class/power_supply/battery/power_now"); // pixel does not contain
+        append_value(records, "/sys/class/power_supply/battery/current_now");
+        append_value(records, "/sys/class/power_supply/battery/voltage_now");
     }
 
     // RAM clock info (S24/Pixel9/S25)
     if (device_name == "Pixel9"){
-        command += "awk '{print \\$1/1000}' /sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/max_freq; ";
-        command += "awk '{print \\$1/1000}' /sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/scaling_devfreq_min; ";
-        command += "awk '{print \\$1/1000}' /sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/cur_freq; ";
+        append_scaled_value(records, "/sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/max_freq", 1000.0);
+        append_scaled_value(records, "/sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/scaling_devfreq_min", 1000.0);
+        append_scaled_value(records, "/sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/cur_freq", 1000.0);
     } else if (device_name == "S24") { // S24
-        command += "awk '{print \\$1/1000}' /sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/scaling_devfreq_max; ";
-        command += "awk '{print \\$1/1000}' /sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/scaling_devfreq_min; ";
-        command += "awk '{print \\$1/1000}' /sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/cur_freq; ";
+        append_scaled_value(records, "/sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/scaling_devfreq_max", 1000.0);
+        append_scaled_value(records, "/sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/scaling_devfreq_min", 1000.0);
+        append_scaled_value(records, "/sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/cur_freq", 1000.0);
     } else if (device_name == "S25") { // S25 is held
-        command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/bus_dcvs/DDR/soc:qcom,memlat:ddr:prime-latfloor/max_freq; ";
-        command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/bus_dcvs/DDR/soc:qcom,memlat:ddr:prime-latfloor/min_freq; ";
-        command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/bus_dcvs/DDR/cur_freq; ";
+        append_scaled_value(records, "/sys/devices/system/cpu/bus_dcvs/DDR/soc:qcom,memlat:ddr:prime-latfloor/max_freq", 1000.0);
+        append_scaled_value(records, "/sys/devices/system/cpu/bus_dcvs/DDR/soc:qcom,memlat:ddr:prime-latfloor/min_freq", 1000.0);
+        append_scaled_value(records, "/sys/devices/system/cpu/bus_dcvs/DDR/cur_freq", 1000.0);
 
         // [ADD] LLCC info for S25
-        // 1. memlat:llcc:prime
-        command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/bus_dcvs/LLCC/soc:qcom,memlat:llcc:prime/cur_freq; ";
-        // 2. memlat:llcc:gold
-        command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/bus_dcvs/LLCC/soc:qcom,memlat:llcc:gold/cur_freq; ";
-        // 3. memlat:llcc:gold-compute
-        command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/bus_dcvs/LLCC/soc:qcom,memlat:llcc:gold-compute/cur_freq; ";
-        // 4. LLCC cur_freq (General)
-        command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/bus_dcvs/LLCC/cur_freq; ";
-        // 5. bwmon-llcc-gold
-        command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/bus_dcvs/LLCC/240b3400.qcom,bwmon-llcc-gold/cur_freq; ";
-        // 6. bwmon-llcc-prime 
-        command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/bus_dcvs/LLCC/240b7400.qcom,bwmon-llcc-prime/cur_freq; "; 
+        append_scaled_value(records, "/sys/devices/system/cpu/bus_dcvs/LLCC/soc:qcom,memlat:llcc:prime/cur_freq", 1000.0);
+        append_scaled_value(records, "/sys/devices/system/cpu/bus_dcvs/LLCC/soc:qcom,memlat:llcc:gold/cur_freq", 1000.0);
+        append_scaled_value(records, "/sys/devices/system/cpu/bus_dcvs/LLCC/soc:qcom,memlat:llcc:gold-compute/cur_freq", 1000.0);
+        append_scaled_value(records, "/sys/devices/system/cpu/bus_dcvs/LLCC/cur_freq", 1000.0);
+        append_scaled_value(records, "/sys/devices/system/cpu/bus_dcvs/LLCC/240b3400.qcom,bwmon-llcc-gold/cur_freq", 1000.0);
+        append_scaled_value(records, "/sys/devices/system/cpu/bus_dcvs/LLCC/240b7400.qcom,bwmon-llcc-prime/cur_freq", 1000.0);
     }
 
-
-    // closing quote
-    command += "\"";
-    // execute command and get output
-    std::string output = execute_cmd(command.c_str());
-    
-
-	//std::cout << command << std::endl; // test
-    // string post-processing
-    return split_string(output);
+    return records;
 }
 
 std::vector<std::string> get_hard_records_wo_systime(const DVFS& dvfs){
-    std::vector<int> cluster_indices = dvfs.get_cluster_indices();
-    std::string device_name = dvfs.get_device_name();
-
-    std::string command = "su -c \""; // prefix
-    
-    // thermal info
-    command += "awk '{print \\$1/1000}' /sys/devices/virtual/thermal/thermal_zone*/temp; ";
-	      
-	// GPU clock info
-    if (device_name == "Pixel9"){
-        command += "awk '{print \\$1}' /sys/devices/platform/1f000000.mali/scaling_min_freq; awk '{print \\$1}' /sys/devices/platform/1f000000.mali/scaling_max_freq; "; //gpu clock
-    } else if (device_name == "S25") {
-        command += "awk '{print \\$1}' /sys/class/devfreq/3d00000.qcom,kgsl-3d0/min_freq; awk '{print \\$1}' /sys/class/devfreq/3d00000.qcom,kgsl-3d0/max_freq; ";
-    } else { // S24
-	    command += "awk '{print \\$1}' /sys/kernel/gpu/gpu_min_clock; awk '{print \\$1}' /sys/kernel/gpu/gpu_max_clock; ";
-    }
-
-    // CPU clock info
-    for (std::size_t i=0; i<cluster_indices.size(); ++i){
-        int idx = cluster_indices[i];
-        command += std::string("awk '{print \\$1/1000}' /sys/devices/system/cpu/cpu")+std::to_string(idx)+std::string("/cpufreq/scaling_max_freq; ") +
-		   std::string("awk '{print \\$1/1000}' /sys/devices/system/cpu/cpu")+std::to_string(idx)+std::string("/cpufreq/scaling_cur_freq; ");
-    }
-
-	// RAM info
-    command += "awk '{print \\$2/1024}' /proc/meminfo; ";
-
-    // Power Consumption info
-    if (device_name == "Pixel9"){
-        command += "awk '{print}' /sys/class/power_supply/battery/current_now; ";
-        command += "awk '{print}' /sys/class/power_supply/battery/voltage_now; ";
-    } else {
-        command += "awk '{print}' /sys/class/power_supply/battery/power_now; "; // pixel does not contain
-        command += "awk '{print}' /sys/class/power_supply/battery/current_now; ";
-        command += "awk '{print}' /sys/class/power_supply/battery/voltage_now; ";
-    }
-
-    // RAM clock info (S24/Pixel9/S25)
-    if (device_name == "Pixel9"){
-        command += "awk '{print \\$1/1000}' /sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/max_freq; ";
-        command += "awk '{print \\$1/1000}' /sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/scaling_devfreq_min; ";
-        command += "awk '{print \\$1/1000}' /sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/cur_freq; ";
-    } else if (device_name == "S24") { // S24
-        command += "awk '{print \\$1/1000}' /sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/scaling_devfreq_max; ";
-        command += "awk '{print \\$1/1000}' /sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/scaling_devfreq_min; ";
-        command += "awk '{print \\$1/1000}' /sys/devices/platform/17000010.devfreq_mif/devfreq/17000010.devfreq_mif/cur_freq; ";
-    } else if (device_name == "S25") { // S25 is held
-        command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/bus_dcvs/DDR/soc:qcom,memlat:ddr:prime-latfloor/max_freq; ";
-        command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/bus_dcvs/DDR/soc:qcom,memlat:ddr:prime-latfloor/min_freq; ";
-        command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/bus_dcvs/DDR/cur_freq; ";
-
-        // [ADD] LLCC info for S25
-        // 1. memlat:llcc:prime
-        command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/bus_dcvs/LLCC/soc:qcom,memlat:llcc:prime/cur_freq; ";
-        // 2. memlat:llcc:gold
-        command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/bus_dcvs/LLCC/soc:qcom,memlat:llcc:gold/cur_freq; ";
-        // 3. memlat:llcc:gold-compute
-        command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/bus_dcvs/LLCC/soc:qcom,memlat:llcc:gold-compute/cur_freq; ";
-        // 4. LLCC cur_freq (General)
-        command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/bus_dcvs/LLCC/cur_freq; ";
-        // 5. bwmon-llcc-gold
-        command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/bus_dcvs/LLCC/240b3400.qcom,bwmon-llcc-gold/cur_freq; ";
-        // 6. bwmon-llcc-prime 
-        command += "awk '{print \\$1/1000}' /sys/devices/system/cpu/bus_dcvs/LLCC/240b7400.qcom,bwmon-llcc-prime/cur_freq; "; 
-    }
-
-
-    // closing quote
-    command += "\"";
-    // execute command and get output
-    std::string output = execute_cmd(command.c_str());
-    
-
-	//std::cout << command << std::endl; // test
-    // string post-processing
-    return split_string(output);
+    return get_hard_records(dvfs);
 }
 
 void write_file(const std::vector<std::string>& data, std::string output){
@@ -401,7 +422,7 @@ void write_file(const std::vector<std::string>& data, std::string output){
 	}
 
 	// wrtie file
-	for (const auto v : data){
+	for (const auto & v : data){
 		file << v << ",";
 	}
 	file << "\n";
@@ -442,11 +463,15 @@ void record_hard(std::atomic<bool>& sigterm, const DVFS& dvfs){
 
 
 	// insert hard names
-	write_file(get_records_names(dvfs), filename);
+    std::ofstream file(filename, std::ios::app);
+    if (!file) {
+        std::cerr << "failed to open file: " << filename << std::endl;
+        return;
+    }
 
-	
-	int test_index = 0;
-	std::vector<std::string> records;
+    write_csv_row(file, get_records_names(dvfs));
+
+    std::vector<std::string> records;
     auto start_sys_time = std::chrono::system_clock::now();
     if (dvfs.control_start_point != dvfs.zero_start_point) {
         start_sys_time = dvfs.control_start_point;
@@ -460,16 +485,10 @@ void record_hard(std::atomic<bool>& sigterm, const DVFS& dvfs){
         auto now = std::chrono::system_clock::now();
 		auto sys_time = std::chrono::duration_cast<std::chrono::milliseconds>(now-start_sys_time).count(); // ms base
 		records.insert(records.begin(), std::to_string(sys_time)); // insert systime into firstrecord element
-		
-		// File write record
-		write_file(records, filename);
+        // File write record
+        write_csv_row(file, records);
         // wait
         //std::this_thread::sleep_for(std::chrono::milliseconds(170));
-
-// tester code: start
-//		test_index++;
-//		if (test_index == 3) sigterm = true;
-// tester code: end
 
     }while(sigterm != true);
 }
