@@ -1138,10 +1138,26 @@ struct ggml_backend_op_load_profile_state {
     bool enabled = false;
     ggml_backend_sched_profile_phase phase = GGML_BACKEND_SCHED_PROFILE_PREFILL;
     ggml_backend_op_load_profile_data out = {};
+    std::vector<std::string> name_patterns;
+    std::vector<std::string> name_labels;
     std::mutex mutex;
 };
 
 static ggml_backend_op_load_profile_state g_op_load_profile;
+
+static void ggml_op_load_profile_copy_name(char * dst, const std::string & src) {
+    snprintf(dst, GGML_BACKEND_OP_LOAD_PROFILE_NAME_LEN, "%s", src.c_str());
+}
+
+static void ggml_op_load_profile_sync_name_groups_locked(void) {
+    g_op_load_profile.out.n_name_groups = (uint32_t) std::min(
+            g_op_load_profile.name_labels.size(),
+            (size_t) GGML_BACKEND_OP_LOAD_PROFILE_MAX_GROUPS);
+
+    for (uint32_t i = 0; i < g_op_load_profile.out.n_name_groups; ++i) {
+        ggml_op_load_profile_copy_name(g_op_load_profile.out.name_groups[i], g_op_load_profile.name_labels[i]);
+    }
+}
 
 static void ggml_op_load_profile_sync_ops_enabled_locked(void) {
     bool any = false;
@@ -1167,6 +1183,7 @@ static void ggml_op_load_profile_clear_accum_locked(void) {
     g_op_load_profile.out = {};
     memcpy(g_op_load_profile.out.ops_enabled, ops_enabled, sizeof(ops_enabled));
     ggml_op_load_profile_sync_ops_enabled_locked();
+    ggml_op_load_profile_sync_name_groups_locked();
 }
 
 static bool ggml_op_load_profile_op_from_name(const std::string & name, enum ggml_op & op_out) {
@@ -1195,6 +1212,74 @@ static std::string ggml_op_load_profile_trim_token(const char * begin, const cha
     }
 
     return std::string(begin, end);
+}
+
+static bool ggml_op_load_profile_wildcard_match(const char * pattern, const char * text) {
+    const char * star = nullptr;
+    const char * retry = nullptr;
+
+    while (*text != '\0') {
+        if (*pattern == '?' || *pattern == *text) {
+            ++pattern;
+            ++text;
+        } else if (*pattern == '*') {
+            star = pattern++;
+            retry = text;
+        } else if (star != nullptr) {
+            pattern = star + 1;
+            text = ++retry;
+        } else {
+            return false;
+        }
+    }
+
+    while (*pattern == '*') {
+        ++pattern;
+    }
+
+    return *pattern == '\0';
+}
+
+static std::string ggml_op_load_profile_label_from_pattern(const std::string & pattern) {
+    std::string label = pattern;
+    const size_t eq = label.find('=');
+    if (eq != std::string::npos) {
+        label = ggml_op_load_profile_trim_token(label.c_str(), label.c_str() + eq);
+    } else {
+        while (!label.empty() && (label.back() == '*' || label.back() == '-' || label.back() == '_' || label.back() == '.')) {
+            label.pop_back();
+        }
+    }
+
+    for (char & c : label) {
+        if (!std::isalnum((unsigned char) c) && c != '_') {
+            c = '_';
+        }
+    }
+
+    if (label.empty()) {
+        label = "node";
+    }
+
+    if (label.size() >= GGML_BACKEND_OP_LOAD_PROFILE_NAME_LEN) {
+        label.resize(GGML_BACKEND_OP_LOAD_PROFILE_NAME_LEN - 1);
+    }
+
+    return label;
+}
+
+static int ggml_op_load_profile_match_name(const char * name) {
+    if (name == nullptr || name[0] == '\0') {
+        return -1;
+    }
+
+    for (size_t i = 0; i < g_op_load_profile.name_patterns.size(); ++i) {
+        if (ggml_op_load_profile_wildcard_match(g_op_load_profile.name_patterns[i].c_str(), name)) {
+            return (int) i;
+        }
+    }
+
+    return -1;
 }
 
 void ggml_backend_op_load_profile_set_enabled(bool enabled) {
@@ -1251,12 +1336,66 @@ void ggml_backend_op_load_profile_set_ops_from_env(const char * ops_csv) {
     ggml_op_load_profile_clear_accum_locked();
 }
 
+void ggml_backend_op_load_profile_set_patterns_from_env(const char * patterns_csv) {
+    std::lock_guard<std::mutex> lock(g_op_load_profile.mutex);
+
+    g_op_load_profile.name_patterns.clear();
+    g_op_load_profile.name_labels.clear();
+
+    if (patterns_csv != nullptr && patterns_csv[0] != '\0') {
+        const char * token_begin = patterns_csv;
+        const char * p = patterns_csv;
+        while (true) {
+            if (*p == ',' || *p == '\0') {
+                std::string token = ggml_op_load_profile_trim_token(token_begin, p);
+                if (!token.empty()) {
+                    if (g_op_load_profile.name_patterns.size() >= GGML_BACKEND_OP_LOAD_PROFILE_MAX_GROUPS) {
+                        GGML_LOG_WARN("%s: ignoring pattern '%s'; max groups is %d\n",
+                                __func__, token.c_str(), GGML_BACKEND_OP_LOAD_PROFILE_MAX_GROUPS);
+                    } else {
+                        std::string label = ggml_op_load_profile_label_from_pattern(token);
+                        std::string pattern = token;
+                        const size_t eq = token.find('=');
+                        if (eq != std::string::npos) {
+                            pattern = ggml_op_load_profile_trim_token(token.c_str() + eq + 1, token.c_str() + token.size());
+                        }
+
+                        if (!pattern.empty()) {
+                            g_op_load_profile.name_patterns.push_back(pattern);
+                            g_op_load_profile.name_labels.push_back(label);
+                        }
+                    }
+                }
+
+                if (*p == '\0') {
+                    break;
+                }
+                token_begin = p + 1;
+            }
+            ++p;
+        }
+    }
+
+    ggml_op_load_profile_clear_accum_locked();
+}
+
 bool ggml_backend_op_load_profile_is_op_enabled(enum ggml_op op) {
     if (!g_op_load_profile.enabled || op < 0 || op >= GGML_OP_COUNT) {
         return false;
     }
 
     return g_op_load_profile.out.ops_enabled[op] != 0;
+}
+
+bool ggml_backend_op_load_profile_should_measure(enum ggml_op op, const char * name) {
+    if (!g_op_load_profile.enabled) {
+        return false;
+    }
+    if (op >= 0 && op < GGML_OP_COUNT && g_op_load_profile.out.ops_enabled[op]) {
+        return true;
+    }
+
+    return ggml_op_load_profile_match_name(name) >= 0;
 }
 
 void ggml_backend_op_load_profile_reset(void) {
@@ -1329,6 +1468,78 @@ void ggml_backend_op_load_profile_add_ms(enum ggml_backend_op_load_profile_backe
 
 void ggml_backend_op_load_profile_add_us(enum ggml_backend_op_load_profile_backend backend, enum ggml_op op, double usec) {
     ggml_backend_op_load_profile_add_ms(backend, op, usec / 1000.0);
+}
+
+void ggml_backend_op_load_profile_add_tensor_ms(
+        enum ggml_backend_op_load_profile_backend backend,
+        enum ggml_op op,
+        const char * name,
+        double ms) {
+    ggml_backend_op_load_profile_add_ms(backend, op, ms);
+
+    if (!g_op_load_profile.enabled ||
+            backend < 0 || backend >= GGML_BACKEND_OP_LOAD_PROFILE_COUNT) {
+        return;
+    }
+
+    const int group = ggml_op_load_profile_match_name(name);
+    if (group < 0 || group >= (int) GGML_BACKEND_OP_LOAD_PROFILE_MAX_GROUPS) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_op_load_profile.mutex);
+
+    double * ms_by_name = nullptr;
+    uint64_t * count_by_name = nullptr;
+
+    if (g_op_load_profile.phase == GGML_BACKEND_SCHED_PROFILE_PREFILL) {
+        switch (backend) {
+            case GGML_BACKEND_OP_LOAD_PROFILE_CPU:
+                ms_by_name    = g_op_load_profile.out.prefill_cpu_ms_by_name;
+                count_by_name = g_op_load_profile.out.prefill_cpu_count_by_name;
+                break;
+            case GGML_BACKEND_OP_LOAD_PROFILE_HTP:
+                ms_by_name    = g_op_load_profile.out.prefill_htp_ms_by_name;
+                count_by_name = g_op_load_profile.out.prefill_htp_count_by_name;
+                break;
+            case GGML_BACKEND_OP_LOAD_PROFILE_GPU:
+                ms_by_name    = g_op_load_profile.out.prefill_gpu_ms_by_name;
+                count_by_name = g_op_load_profile.out.prefill_gpu_count_by_name;
+                break;
+            case GGML_BACKEND_OP_LOAD_PROFILE_COUNT:
+                break;
+        }
+    } else {
+        switch (backend) {
+            case GGML_BACKEND_OP_LOAD_PROFILE_CPU:
+                ms_by_name    = g_op_load_profile.out.decode_cpu_ms_by_name;
+                count_by_name = g_op_load_profile.out.decode_cpu_count_by_name;
+                break;
+            case GGML_BACKEND_OP_LOAD_PROFILE_HTP:
+                ms_by_name    = g_op_load_profile.out.decode_htp_ms_by_name;
+                count_by_name = g_op_load_profile.out.decode_htp_count_by_name;
+                break;
+            case GGML_BACKEND_OP_LOAD_PROFILE_GPU:
+                ms_by_name    = g_op_load_profile.out.decode_gpu_ms_by_name;
+                count_by_name = g_op_load_profile.out.decode_gpu_count_by_name;
+                break;
+            case GGML_BACKEND_OP_LOAD_PROFILE_COUNT:
+                break;
+        }
+    }
+
+    if (ms_by_name != nullptr && count_by_name != nullptr) {
+        ms_by_name[group] += ms;
+        count_by_name[group]++;
+    }
+}
+
+void ggml_backend_op_load_profile_add_tensor_us(
+        enum ggml_backend_op_load_profile_backend backend,
+        enum ggml_op op,
+        const char * name,
+        double usec) {
+    ggml_backend_op_load_profile_add_tensor_ms(backend, op, name, usec / 1000.0);
 }
 
 struct ggml_backend_op_load_profile_data ggml_backend_op_load_profile_get(void) {
