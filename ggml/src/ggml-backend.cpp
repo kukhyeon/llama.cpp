@@ -833,13 +833,19 @@ struct ggml_backend_sched {
 //
 // This profiling path is intentionally coarse-grained:
 // - phase split: prefill vs decode
-// - backend split: CPU vs HTP
+// - backend split: CPU vs HTP vs GPU
 // - attribution: per-graph wall-time buckets and per-op counters
 //
 // It is currently implemented as process-global mutable state, so it is
 // intended for single-run instrumentation and is not thread-safe.
 
 static ggml_backend_sched_profile_phase g_sched_profile_phase = GGML_BACKEND_SCHED_PROFILE_PREFILL;
+
+enum ggml_sched_profile_backend_kind {
+    GGML_SCHED_PROFILE_BACKEND_CPU,
+    GGML_SCHED_PROFILE_BACKEND_HTP,
+    GGML_SCHED_PROFILE_BACKEND_GPU,
+};
 
 struct ggml_backend_sched_profile_state {
     bool enabled = false;
@@ -850,8 +856,10 @@ struct ggml_backend_sched_profile_state {
     // counting repeated ops from the same layer.
     std::vector<uint8_t> prefill_cpu_layers;
     std::vector<uint8_t> prefill_htp_layers;
+    std::vector<uint8_t> prefill_gpu_layers;
     std::vector<uint8_t> decode_cpu_layers;
     std::vector<uint8_t> decode_htp_layers;
+    std::vector<uint8_t> decode_gpu_layers;
 };
 
 static ggml_backend_sched_profile_state g_sched_profile;
@@ -862,6 +870,22 @@ static bool ggml_sched_profile_enabled(void) {
 
 static inline int64_t ggml_sched_profile_time_us(void) {
     return ggml_sched_profile_enabled() ? ggml_time_us() : 0;
+}
+
+static ggml_sched_profile_backend_kind ggml_sched_profile_backend_bucket(ggml_backend_t backend) {
+    if (backend != nullptr) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            return GGML_SCHED_PROFILE_BACKEND_CPU;
+        }
+
+        const char * name = ggml_backend_name(backend);
+        if (name != nullptr && strncmp(name, "HTP", 3) == 0) {
+            return GGML_SCHED_PROFILE_BACKEND_HTP;
+        }
+    }
+
+    return GGML_SCHED_PROFILE_BACKEND_GPU;
 }
 
 static void ggml_sched_profile_mark_layer(std::vector<uint8_t> & seen, uint32_t & count, int layer_id) {
@@ -938,7 +962,7 @@ static int ggml_sched_profile_extract_layer_id(const char * name) {
     return -1;
 }
 
-static void ggml_sched_profile_note_layers(const ggml_cgraph & graph, bool is_cpu) {
+static void ggml_sched_profile_note_layers(const ggml_cgraph & graph, ggml_sched_profile_backend_kind bucket) {
     if (!ggml_sched_profile_enabled()) {
         return;
     }
@@ -951,22 +975,34 @@ static void ggml_sched_profile_note_layers(const ggml_cgraph & graph, bool is_cp
         }
 
         if (g_sched_profile_phase == GGML_BACKEND_SCHED_PROFILE_PREFILL) {
-            if (is_cpu) {
-                ggml_sched_profile_mark_layer(g_sched_profile.prefill_cpu_layers, g_sched_profile.out.prefill_cpu_layers, layer_id);
-            } else {
-                ggml_sched_profile_mark_layer(g_sched_profile.prefill_htp_layers, g_sched_profile.out.prefill_htp_layers, layer_id);
+            switch (bucket) {
+                case GGML_SCHED_PROFILE_BACKEND_CPU:
+                    ggml_sched_profile_mark_layer(g_sched_profile.prefill_cpu_layers, g_sched_profile.out.prefill_cpu_layers, layer_id);
+                    break;
+                case GGML_SCHED_PROFILE_BACKEND_HTP:
+                    ggml_sched_profile_mark_layer(g_sched_profile.prefill_htp_layers, g_sched_profile.out.prefill_htp_layers, layer_id);
+                    break;
+                case GGML_SCHED_PROFILE_BACKEND_GPU:
+                    ggml_sched_profile_mark_layer(g_sched_profile.prefill_gpu_layers, g_sched_profile.out.prefill_gpu_layers, layer_id);
+                    break;
             }
         } else {
-            if (is_cpu) {
-                ggml_sched_profile_mark_layer(g_sched_profile.decode_cpu_layers, g_sched_profile.out.decode_cpu_layers, layer_id);
-            } else {
-                ggml_sched_profile_mark_layer(g_sched_profile.decode_htp_layers, g_sched_profile.out.decode_htp_layers, layer_id);
+            switch (bucket) {
+                case GGML_SCHED_PROFILE_BACKEND_CPU:
+                    ggml_sched_profile_mark_layer(g_sched_profile.decode_cpu_layers, g_sched_profile.out.decode_cpu_layers, layer_id);
+                    break;
+                case GGML_SCHED_PROFILE_BACKEND_HTP:
+                    ggml_sched_profile_mark_layer(g_sched_profile.decode_htp_layers, g_sched_profile.out.decode_htp_layers, layer_id);
+                    break;
+                case GGML_SCHED_PROFILE_BACKEND_GPU:
+                    ggml_sched_profile_mark_layer(g_sched_profile.decode_gpu_layers, g_sched_profile.out.decode_gpu_layers, layer_id);
+                    break;
             }
         }
     }
 }
 
-static inline void ggml_sched_profile_add_op_type_count(enum ggml_op op, bool is_cpu) {
+static inline void ggml_sched_profile_add_op_type_count(enum ggml_op op, ggml_sched_profile_backend_kind bucket) {
     if (!ggml_sched_profile_enabled()) {
         return;
     }
@@ -976,21 +1012,33 @@ static inline void ggml_sched_profile_add_op_type_count(enum ggml_op op, bool is
     }
 
     if (g_sched_profile_phase == GGML_BACKEND_SCHED_PROFILE_PREFILL) {
-        if (is_cpu) {
-            g_sched_profile.out.prefill_cpu_ops_by_type[op]++;
-        } else {
-            g_sched_profile.out.prefill_htp_ops_by_type[op]++;
+        switch (bucket) {
+            case GGML_SCHED_PROFILE_BACKEND_CPU:
+                g_sched_profile.out.prefill_cpu_ops_by_type[op]++;
+                break;
+            case GGML_SCHED_PROFILE_BACKEND_HTP:
+                g_sched_profile.out.prefill_htp_ops_by_type[op]++;
+                break;
+            case GGML_SCHED_PROFILE_BACKEND_GPU:
+                g_sched_profile.out.prefill_gpu_ops_by_type[op]++;
+                break;
         }
     } else {
-        if (is_cpu) {
-            g_sched_profile.out.decode_cpu_ops_by_type[op]++;
-        } else {
-            g_sched_profile.out.decode_htp_ops_by_type[op]++;
+        switch (bucket) {
+            case GGML_SCHED_PROFILE_BACKEND_CPU:
+                g_sched_profile.out.decode_cpu_ops_by_type[op]++;
+                break;
+            case GGML_SCHED_PROFILE_BACKEND_HTP:
+                g_sched_profile.out.decode_htp_ops_by_type[op]++;
+                break;
+            case GGML_SCHED_PROFILE_BACKEND_GPU:
+                g_sched_profile.out.decode_gpu_ops_by_type[op]++;
+                break;
         }
     }
 }
 
-static inline void ggml_sched_profile_add_graph_op_type_counts(const ggml_cgraph & graph, bool is_cpu) {
+static inline void ggml_sched_profile_add_graph_op_type_counts(const ggml_cgraph & graph, ggml_sched_profile_backend_kind bucket) {
     if (!ggml_sched_profile_enabled()) {
         return;
     }
@@ -1000,7 +1048,7 @@ static inline void ggml_sched_profile_add_graph_op_type_counts(const ggml_cgraph
         if (t == nullptr) {
             continue;
         }
-        ggml_sched_profile_add_op_type_count(t->op, is_cpu);
+        ggml_sched_profile_add_op_type_count(t->op, bucket);
     }
 }
 
@@ -1016,8 +1064,10 @@ void ggml_backend_sched_profile_reset(void) {
     g_sched_profile.out = {};
     g_sched_profile.prefill_cpu_layers.clear();
     g_sched_profile.prefill_htp_layers.clear();
+    g_sched_profile.prefill_gpu_layers.clear();
     g_sched_profile.decode_cpu_layers.clear();
     g_sched_profile.decode_htp_layers.clear();
+    g_sched_profile.decode_gpu_layers.clear();
 }
 
 void ggml_backend_sched_profile_set_phase(enum ggml_backend_sched_profile_phase phase) {
@@ -1805,9 +1855,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
-        const bool split_is_cpu = ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
+        const ggml_sched_profile_backend_kind split_bucket = ggml_sched_profile_backend_bucket(split_backend);
 
-        ggml_sched_profile_note_layers(split->graph, split_is_cpu);
+        ggml_sched_profile_note_layers(split->graph, split_bucket);
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1991,31 +2041,45 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        auto prof_add = [&](int n_nodes, int64_t dt_us) {
+        auto prof_add = [&](const ggml_cgraph & graph, int64_t dt_us) {
             if (!ggml_sched_profile_enabled()) {
                 return;
             }
 
             const double dt_ms = (double) dt_us / 1000.0;
-            g_sched_profile.out.total_ops += (uint64_t) n_nodes;
+            g_sched_profile.out.total_ops += (uint64_t) graph.n_nodes;
 
-            ggml_sched_profile_add_graph_op_type_counts(split->graph, split_is_cpu);
+            ggml_sched_profile_add_graph_op_type_counts(graph, split_bucket);
 
             if (g_sched_profile_phase == GGML_BACKEND_SCHED_PROFILE_PREFILL) {
-                if (split_is_cpu) {
-                    g_sched_profile.out.prefill_cpu_ops += (uint64_t) n_nodes;
-                    g_sched_profile.out.prefill_cpu_ms  += dt_ms;
-                } else {
-                    g_sched_profile.out.prefill_htp_ops += (uint64_t) n_nodes;
-                    g_sched_profile.out.prefill_htp_ms  += dt_ms;
+                switch (split_bucket) {
+                    case GGML_SCHED_PROFILE_BACKEND_CPU:
+                        g_sched_profile.out.prefill_cpu_ops += (uint64_t) graph.n_nodes;
+                        g_sched_profile.out.prefill_cpu_ms  += dt_ms;
+                        break;
+                    case GGML_SCHED_PROFILE_BACKEND_HTP:
+                        g_sched_profile.out.prefill_htp_ops += (uint64_t) graph.n_nodes;
+                        g_sched_profile.out.prefill_htp_ms  += dt_ms;
+                        break;
+                    case GGML_SCHED_PROFILE_BACKEND_GPU:
+                        g_sched_profile.out.prefill_gpu_ops += (uint64_t) graph.n_nodes;
+                        g_sched_profile.out.prefill_gpu_ms  += dt_ms;
+                        break;
                 }
             } else {
-                if (split_is_cpu) {
-                    g_sched_profile.out.decode_cpu_ops += (uint64_t) n_nodes;
-                    g_sched_profile.out.decode_cpu_ms  += dt_ms;
-                } else {
-                    g_sched_profile.out.decode_htp_ops += (uint64_t) n_nodes;
-                    g_sched_profile.out.decode_htp_ms  += dt_ms;
+                switch (split_bucket) {
+                    case GGML_SCHED_PROFILE_BACKEND_CPU:
+                        g_sched_profile.out.decode_cpu_ops += (uint64_t) graph.n_nodes;
+                        g_sched_profile.out.decode_cpu_ms  += dt_ms;
+                        break;
+                    case GGML_SCHED_PROFILE_BACKEND_HTP:
+                        g_sched_profile.out.decode_htp_ops += (uint64_t) graph.n_nodes;
+                        g_sched_profile.out.decode_htp_ms  += dt_ms;
+                        break;
+                    case GGML_SCHED_PROFILE_BACKEND_GPU:
+                        g_sched_profile.out.decode_gpu_ops += (uint64_t) graph.n_nodes;
+                        g_sched_profile.out.decode_gpu_ms  += dt_ms;
+                        break;
                 }
             }
         };
@@ -2029,7 +2093,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 return ec;
             }
 
-            prof_add(split->graph.n_nodes, t1_us - t0_us);
+            prof_add(split->graph, t1_us - t0_us);
         } else {
             // similar to ggml_backend_compare_graph_backend
             for (int j0 = 0; j0 < split->graph.n_nodes; j0++) {
@@ -2059,7 +2123,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_synchronize(split_backend);
                 const int64_t t1_us = profile_enabled ? ggml_time_us() : 0;
 
-                prof_add(gv.n_nodes, t1_us - t0_us);
+                prof_add(gv, t1_us - t0_us);
 
                 if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
                     break;

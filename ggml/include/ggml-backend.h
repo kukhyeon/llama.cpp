@@ -368,16 +368,20 @@ extern "C" {
 
     struct ggml_backend_sched_profile_data {
         // Unique layer ids observed for ops executed on each backend bucket.
-        // A layer may be counted in both CPU and HTP if ops for that layer ran on both.
+        // A layer may be counted in multiple buckets if ops for that layer ran on multiple backends.
         uint32_t prefill_cpu_layers;
         uint32_t prefill_htp_layers;
+        uint32_t prefill_gpu_layers;
         double   prefill_cpu_ms;
         double   prefill_htp_ms;
+        double   prefill_gpu_ms;
 
         uint32_t decode_cpu_layers;
         uint32_t decode_htp_layers;
+        uint32_t decode_gpu_layers;
         double   decode_cpu_ms;
         double   decode_htp_ms;
+        double   decode_gpu_ms;
 
         // Operation counts (ggml graph nodes computed).
         uint64_t total_ops;
@@ -385,6 +389,8 @@ extern "C" {
         uint64_t decode_cpu_ops;
         uint64_t prefill_htp_ops;
         uint64_t decode_htp_ops;
+        uint64_t prefill_gpu_ops;
+        uint64_t decode_gpu_ops;
 
         // Operation counts by ggml op type.
         // Indexed by enum ggml_op, see GGML_OP_* / GGML_OP_COUNT.
@@ -392,6 +398,8 @@ extern "C" {
         uint64_t decode_cpu_ops_by_type[GGML_OP_COUNT];
         uint64_t prefill_htp_ops_by_type[GGML_OP_COUNT];
         uint64_t decode_htp_ops_by_type[GGML_OP_COUNT];
+        uint64_t prefill_gpu_ops_by_type[GGML_OP_COUNT];
+        uint64_t decode_gpu_ops_by_type[GGML_OP_COUNT];
 
         // Overhead breakdown (wall-time, ms)
         double   prefill_copy_ms;
