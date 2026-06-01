@@ -21,6 +21,8 @@
 #include <string.h>
 #include <algorithm>
 #include <cctype>
+#include <mutex>
+#include <string>
 #include <vector>
 
 #ifdef __APPLE__
@@ -1130,6 +1132,208 @@ void ggml_backend_sched_profile_add_sampling_ms(double sampling_ms) {
 
 struct ggml_backend_sched_profile_data ggml_backend_sched_profile_get(void) {
     return g_sched_profile.out;
+}
+
+struct ggml_backend_op_load_profile_state {
+    bool enabled = false;
+    ggml_backend_sched_profile_phase phase = GGML_BACKEND_SCHED_PROFILE_PREFILL;
+    ggml_backend_op_load_profile_data out = {};
+    std::mutex mutex;
+};
+
+static ggml_backend_op_load_profile_state g_op_load_profile;
+
+static void ggml_op_load_profile_sync_ops_enabled_locked(void) {
+    bool any = false;
+    for (int op = 0; op < GGML_OP_COUNT; ++op) {
+        if (g_op_load_profile.out.ops_enabled[op]) {
+            any = true;
+            break;
+        }
+    }
+
+    if (!any) {
+        g_op_load_profile.out.ops_enabled[GGML_OP_MUL_MAT]    = 1;
+        g_op_load_profile.out.ops_enabled[GGML_OP_MUL_MAT_ID] = 1;
+        g_op_load_profile.out.ops_enabled[GGML_OP_CONT]       = 1;
+        g_op_load_profile.out.ops_enabled[GGML_OP_SOFT_MAX]   = 1;
+        g_op_load_profile.out.ops_enabled[GGML_OP_SET_ROWS]   = 1;
+    }
+}
+
+static void ggml_op_load_profile_clear_accum_locked(void) {
+    uint8_t ops_enabled[GGML_OP_COUNT];
+    memcpy(ops_enabled, g_op_load_profile.out.ops_enabled, sizeof(ops_enabled));
+    g_op_load_profile.out = {};
+    memcpy(g_op_load_profile.out.ops_enabled, ops_enabled, sizeof(ops_enabled));
+    ggml_op_load_profile_sync_ops_enabled_locked();
+}
+
+static bool ggml_op_load_profile_op_from_name(const std::string & name, enum ggml_op & op_out) {
+    if (name == "MAT_MUL") {
+        op_out = GGML_OP_MUL_MAT;
+        return true;
+    }
+
+    for (int op = 0; op < GGML_OP_COUNT; ++op) {
+        const char * op_name = ggml_op_name((enum ggml_op) op);
+        if (op_name != nullptr && name == op_name) {
+            op_out = (enum ggml_op) op;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static std::string ggml_op_load_profile_trim_token(const char * begin, const char * end) {
+    while (begin < end && std::isspace((unsigned char) *begin)) {
+        ++begin;
+    }
+    while (end > begin && std::isspace((unsigned char) *(end - 1))) {
+        --end;
+    }
+
+    return std::string(begin, end);
+}
+
+void ggml_backend_op_load_profile_set_enabled(bool enabled) {
+    std::lock_guard<std::mutex> lock(g_op_load_profile.mutex);
+    g_op_load_profile.enabled = enabled;
+    ggml_op_load_profile_clear_accum_locked();
+}
+
+bool ggml_backend_op_load_profile_enabled(void) {
+    return g_op_load_profile.enabled;
+}
+
+void ggml_backend_op_load_profile_set_ops_from_env(const char * ops_csv) {
+    std::lock_guard<std::mutex> lock(g_op_load_profile.mutex);
+
+    uint8_t ops_enabled[GGML_OP_COUNT] = {};
+    bool all = false;
+
+    if (ops_csv != nullptr && ops_csv[0] != '\0') {
+        const char * token_begin = ops_csv;
+        const char * p = ops_csv;
+        while (true) {
+            if (*p == ',' || *p == '\0') {
+                std::string token = ggml_op_load_profile_trim_token(token_begin, p);
+                if (!token.empty()) {
+                    if (token == "ALL" || token == "all") {
+                        all = true;
+                    } else {
+                        enum ggml_op op;
+                        if (ggml_op_load_profile_op_from_name(token, op)) {
+                            ops_enabled[op] = 1;
+                        } else {
+                            GGML_LOG_WARN("%s: unknown op '%s' in CSV_OP_LOAD_OPS\n", __func__, token.c_str());
+                        }
+                    }
+                }
+
+                if (*p == '\0') {
+                    break;
+                }
+                token_begin = p + 1;
+            }
+            ++p;
+        }
+    }
+
+    if (all) {
+        for (int op = 0; op < GGML_OP_COUNT; ++op) {
+            ops_enabled[op] = 1;
+        }
+    }
+
+    memcpy(g_op_load_profile.out.ops_enabled, ops_enabled, sizeof(ops_enabled));
+    ggml_op_load_profile_clear_accum_locked();
+}
+
+bool ggml_backend_op_load_profile_is_op_enabled(enum ggml_op op) {
+    if (!g_op_load_profile.enabled || op < 0 || op >= GGML_OP_COUNT) {
+        return false;
+    }
+
+    return g_op_load_profile.out.ops_enabled[op] != 0;
+}
+
+void ggml_backend_op_load_profile_reset(void) {
+    std::lock_guard<std::mutex> lock(g_op_load_profile.mutex);
+    ggml_op_load_profile_clear_accum_locked();
+}
+
+void ggml_backend_op_load_profile_set_phase(enum ggml_backend_sched_profile_phase phase) {
+    if (!g_op_load_profile.enabled) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_op_load_profile.mutex);
+    g_op_load_profile.phase = phase;
+}
+
+void ggml_backend_op_load_profile_add_ms(enum ggml_backend_op_load_profile_backend backend, enum ggml_op op, double ms) {
+    if (!g_op_load_profile.enabled || op < 0 || op >= GGML_OP_COUNT ||
+            backend < 0 || backend >= GGML_BACKEND_OP_LOAD_PROFILE_COUNT ||
+            !g_op_load_profile.out.ops_enabled[op]) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_op_load_profile.mutex);
+
+    double * ms_by_type = nullptr;
+    uint64_t * count_by_type = nullptr;
+
+    if (g_op_load_profile.phase == GGML_BACKEND_SCHED_PROFILE_PREFILL) {
+        switch (backend) {
+            case GGML_BACKEND_OP_LOAD_PROFILE_CPU:
+                ms_by_type    = g_op_load_profile.out.prefill_cpu_ms_by_type;
+                count_by_type = g_op_load_profile.out.prefill_cpu_count_by_type;
+                break;
+            case GGML_BACKEND_OP_LOAD_PROFILE_HTP:
+                ms_by_type    = g_op_load_profile.out.prefill_htp_ms_by_type;
+                count_by_type = g_op_load_profile.out.prefill_htp_count_by_type;
+                break;
+            case GGML_BACKEND_OP_LOAD_PROFILE_GPU:
+                ms_by_type    = g_op_load_profile.out.prefill_gpu_ms_by_type;
+                count_by_type = g_op_load_profile.out.prefill_gpu_count_by_type;
+                break;
+            case GGML_BACKEND_OP_LOAD_PROFILE_COUNT:
+                break;
+        }
+    } else {
+        switch (backend) {
+            case GGML_BACKEND_OP_LOAD_PROFILE_CPU:
+                ms_by_type    = g_op_load_profile.out.decode_cpu_ms_by_type;
+                count_by_type = g_op_load_profile.out.decode_cpu_count_by_type;
+                break;
+            case GGML_BACKEND_OP_LOAD_PROFILE_HTP:
+                ms_by_type    = g_op_load_profile.out.decode_htp_ms_by_type;
+                count_by_type = g_op_load_profile.out.decode_htp_count_by_type;
+                break;
+            case GGML_BACKEND_OP_LOAD_PROFILE_GPU:
+                ms_by_type    = g_op_load_profile.out.decode_gpu_ms_by_type;
+                count_by_type = g_op_load_profile.out.decode_gpu_count_by_type;
+                break;
+            case GGML_BACKEND_OP_LOAD_PROFILE_COUNT:
+                break;
+        }
+    }
+
+    if (ms_by_type != nullptr && count_by_type != nullptr) {
+        ms_by_type[op] += ms;
+        count_by_type[op]++;
+    }
+}
+
+void ggml_backend_op_load_profile_add_us(enum ggml_backend_op_load_profile_backend backend, enum ggml_op op, double usec) {
+    ggml_backend_op_load_profile_add_ms(backend, op, usec / 1000.0);
+}
+
+struct ggml_backend_op_load_profile_data ggml_backend_op_load_profile_get(void) {
+    std::lock_guard<std::mutex> lock(g_op_load_profile.mutex);
+    return g_op_load_profile.out;
 }
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)

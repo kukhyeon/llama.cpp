@@ -67,7 +67,10 @@ static bool env_flag_enabled(const char * name) {
         return false;
     }
 
-    return std::strcmp(env, "1") == 0 || std::strcmp(env, "true") == 0 || std::strcmp(env, "TRUE") == 0;
+    return std::strcmp(env, "1") == 0 ||
+        std::strcmp(env, "on") == 0 || std::strcmp(env, "ON") == 0 ||
+        std::strcmp(env, "yes") == 0 || std::strcmp(env, "YES") == 0 ||
+        std::strcmp(env, "true") == 0 || std::strcmp(env, "TRUE") == 0;
 }
 
 static bool should_write_backend_profile_csv(const llama_igparams * ig) {
@@ -77,6 +80,10 @@ static bool should_write_backend_profile_csv(const llama_igparams * ig) {
 static bool should_write_op_breakdown_csv(const llama_igparams * ig) {
     return should_write_backend_profile_csv(ig) &&
         (ig->backend_op_breakdown || env_flag_enabled("IGNITE_CSV_OP_BREAKDOWN"));
+}
+
+static bool should_write_op_load_csv() {
+    return env_flag_enabled("CSV_OP_LOAD");
 }
 
 // Appends per-op CSV headers for the optional op breakdown section.
@@ -109,6 +116,59 @@ static void append_profile_csv_op_values(std::ostream & os, const ggml_backend_s
            << "," << prof.prefill_gpu_ops_by_type[op]
            << "," << prof.decode_gpu_ops_by_type[op];
     }
+}
+
+static void append_op_load_csv_headers(std::ostream & os, const ggml_backend_op_load_profile_data & prof) {
+    for (int op = 0; op < GGML_OP_COUNT; ++op) {
+        if (!prof.ops_enabled[op]) {
+            continue;
+        }
+
+        const char * op_name = ggml_op_name((ggml_op) op);
+        if (op_name == nullptr || op_name[0] == '\0') {
+            op_name = "unknown";
+        }
+
+        os << ",prefill_cpu_" << op_name << "_ms"
+           << ",prefill_htp_" << op_name << "_ms"
+           << ",prefill_gpu_" << op_name << "_ms"
+           << ",decode_cpu_" << op_name << "_ms"
+           << ",decode_htp_" << op_name << "_ms"
+           << ",decode_gpu_" << op_name << "_ms";
+    }
+}
+
+static void append_op_load_csv_values(std::ostream & os, const ggml_backend_op_load_profile_data & prof) {
+    for (int op = 0; op < GGML_OP_COUNT; ++op) {
+        if (!prof.ops_enabled[op]) {
+            continue;
+        }
+
+        os << "," << prof.prefill_cpu_ms_by_type[op]
+           << "," << prof.prefill_htp_ms_by_type[op]
+           << "," << prof.prefill_gpu_ms_by_type[op]
+           << "," << prof.decode_cpu_ms_by_type[op]
+           << "," << prof.decode_htp_ms_by_type[op]
+           << "," << prof.decode_gpu_ms_by_type[op];
+    }
+}
+
+static void llama_op_load_profile_print_custom(
+        const std::string & output_filename,
+        int query_id,
+        std::chrono::time_point<std::chrono::system_clock> start_sys_time) {
+    auto now_sys_time = std::chrono::system_clock::now();
+    auto sys_time = std::chrono::duration_cast<std::chrono::milliseconds>(now_sys_time - start_sys_time).count();
+
+    std::ofstream file(output_filename, std::ios::app);
+    if (!file.is_open()) {
+        return;
+    }
+
+    const auto prof = ggml_backend_op_load_profile_get();
+    file << std::to_string(sys_time) << "," << query_id;
+    append_op_load_csv_values(file, prof);
+    file << "\n";
 }
 
 void ctx_kv_cache_clear(struct llama_context * ctx) {
@@ -300,6 +360,10 @@ int main(int argc, char ** argv) {
     if (params.rope_freq_scale != 0.0) {
         LOG_WRN("%s: warning: scaling RoPE frequency by %g.\n", __func__, params.rope_freq_scale);
     }
+
+    const bool csv_op_load = should_write_op_load_csv();
+    ggml_backend_op_load_profile_set_enabled(csv_op_load);
+    ggml_backend_op_load_profile_set_ops_from_env(std::getenv("CSV_OP_LOAD_OPS"));
 
     LOG_INF("%s: llama backend init\n", __func__);
 
@@ -624,6 +688,8 @@ int main(int argc, char ** argv) {
     std::cout << std::flush << "json_path: " << json_path << std::endl;
     std::string output_path_infer = params.output_dir + "/inference_stats.csv"; // deprecated in future. see L#982
     std::cout << std::flush << "output_path_infer: " << output_path_infer << std::endl;
+    std::string output_path_load = params.output_dir + "/inference_load.csv";
+    std::cout << std::flush << "output_path_load: " << output_path_load << std::endl;
     auto start_sys_time = std::chrono::system_clock::now();
     std::ofstream file(output_path_infer, std::ios::app);
     if (file.is_open() && output_path_infer!="/inference_stats.csv") {
@@ -642,6 +708,15 @@ int main(int argc, char ** argv) {
         }
         file << "\n";
         file.close();
+    }
+    if (csv_op_load && output_path_load != "/inference_load.csv") {
+        std::ofstream load_file(output_path_load, std::ios::app);
+        if (load_file.is_open()) {
+            load_file << "sys_time,query_id";
+            append_op_load_csv_headers(load_file, ggml_backend_op_load_profile_get());
+            load_file << "\n";
+            load_file.close();
+        }
     }
 
     // dummy dvfs object
@@ -1214,6 +1289,9 @@ int main(int argc, char ** argv) {
                     if(output_path_infer!="/inference_stats.csv"){ // deprecated in future
                         llama_perf_context_print_custom(ctx, output_path_infer, start_sys_time, ig);
                     }
+                    if (csv_op_load && output_path_load != "/inference_load.csv") {
+                        llama_op_load_profile_print_custom(output_path_load, current_question_index, start_sys_time);
+                    }
                     //check_hardware(device_name);
                     // common_sampler_free(smpl);
                     inference_started = false;
@@ -1266,6 +1344,9 @@ int main(int argc, char ** argv) {
                     llama_perf_context_reset(ctx);
                     if (ig->backend_compute_profile) {
                         ggml_backend_sched_profile_reset();
+                    }
+                    if (csv_op_load) {
+                        ggml_backend_op_load_profile_reset();
                     }
                     n_past = 0; n_consumed = 0; waiting_for_first_input = true;
                     common_sampler_reset(smpl);

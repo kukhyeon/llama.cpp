@@ -20,6 +20,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <vector>
 #include <string>
@@ -28,6 +29,7 @@
 #include <memory>
 #include <charconv>
 #include <mutex>
+#include <algorithm>
 
 #undef MIN
 #undef MAX
@@ -320,6 +322,9 @@ struct ProfilingInfo {
     size_t local_size[3];
     // Op output size.
     size_t output_size[4];
+    ggml_op op;
+    bool op_load;
+    bool op_load_recorded;
 };
 
 static void populateProfilingInfo(
@@ -329,6 +334,9 @@ static void populateProfilingInfo(
     info.op_name     = tensor->name;
     info.kernel      = kernel;
     info.evt         = evt;
+    info.op          = tensor->op;
+    info.op_load     = ggml_backend_op_load_profile_is_op_enabled(tensor->op);
+    info.op_load_recorded = false;
 
     // 0 means not specified, e.g., 2D workgroup, or NULL for driver to choose
     info.local_size[0] = 0;
@@ -353,6 +361,18 @@ static void populateProfilingInfo(
     info.output_size[1] = tensor->ne[1];
     info.output_size[2] = tensor->ne[2];
     info.output_size[3] = tensor->ne[3];
+}
+
+static bool ggml_opencl_csv_op_load_env_enabled() {
+    const char * env = std::getenv("CSV_OP_LOAD");
+    if (env == nullptr) {
+        return false;
+    }
+
+    return strcmp(env, "1") == 0 ||
+        strcmp(env, "on") == 0 || strcmp(env, "ON") == 0 ||
+        strcmp(env, "yes") == 0 || strcmp(env, "YES") == 0 ||
+        strcmp(env, "true") == 0 || strcmp(env, "TRUE") == 0;
 }
 
 struct ggml_backend_opencl_context;
@@ -695,6 +715,64 @@ struct ggml_backend_opencl_context {
         fclose(ftrace);
     }
 
+    void accumulate_op_load_profiling_info() {
+        if (!ggml_backend_op_load_profile_enabled()) {
+            return;
+        }
+
+        for (ProfilingInfo & info : profiling_info) {
+            if (!info.op_load || info.op_load_recorded) {
+                continue;
+            }
+
+            cl_ulong cmd_start;
+            cl_ulong cmd_end;
+
+            CL_CHECK(clWaitForEvents(1, &info.evt));
+            const cl_int err_start = clGetEventProfilingInfo(
+                info.evt, CL_PROFILING_COMMAND_START, sizeof(cl_ulong), &cmd_start, NULL);
+            const cl_int err_end = clGetEventProfilingInfo(
+                info.evt, CL_PROFILING_COMMAND_END, sizeof(cl_ulong), &cmd_end, NULL);
+
+            if (err_start == CL_PROFILING_INFO_NOT_AVAILABLE || err_end == CL_PROFILING_INFO_NOT_AVAILABLE) {
+                static bool warned = false;
+                if (!warned) {
+                    GGML_LOG_WARN("ggml_opencl: CSV_OP_LOAD GPU timing unavailable; command queue was created without profiling\n");
+                    warned = true;
+                }
+                info.op_load_recorded = true;
+#ifndef GGML_OPENCL_PROFILING
+                CL_CHECK(clReleaseEvent(info.evt));
+                info.evt = nullptr;
+#endif
+                continue;
+            }
+
+            CL_CHECK(err_start);
+            CL_CHECK(err_end);
+
+            ggml_backend_op_load_profile_add_ms(
+                    GGML_BACKEND_OP_LOAD_PROFILE_GPU,
+                    info.op,
+                    (cmd_end - cmd_start) / 1.e6);
+
+            info.op_load_recorded = true;
+
+#ifndef GGML_OPENCL_PROFILING
+            CL_CHECK(clReleaseEvent(info.evt));
+            info.evt = nullptr;
+#endif
+        }
+
+#ifndef GGML_OPENCL_PROFILING
+        profiling_info.erase(
+                std::remove_if(profiling_info.begin(), profiling_info.end(), [](const ProfilingInfo & info) {
+                    return info.op_load_recorded;
+                }),
+                profiling_info.end());
+#endif
+    }
+
     size_t get_kernel_workgroup_size(cl_kernel kernel) const {
         size_t workgroup_size = 0;
         size_t ret_size = 0;
@@ -706,6 +784,7 @@ struct ggml_backend_opencl_context {
     }
 
     void enqueue_ndrange_kernel(cl_kernel kernel, cl_uint work_dim, size_t *global_work_size, size_t *local_work_size, const ggml_tensor * tensor) {
+        const bool op_load = ggml_backend_op_load_profile_is_op_enabled(tensor->op);
 #ifdef GGML_OPENCL_PROFILING
         cl_event evt;
         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, &evt));
@@ -713,8 +792,16 @@ struct ggml_backend_opencl_context {
         profiling_info.emplace_back();
         populateProfilingInfo(profiling_info.back(), evt, kernel, work_dim, global_work_size, local_work_size, tensor);
 #else
-        GGML_UNUSED(tensor);
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, NULL));
+        if (op_load) {
+            cl_event evt;
+            CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+
+            profiling_info.emplace_back();
+            populateProfilingInfo(profiling_info.back(), evt, kernel, work_dim, global_work_size, local_work_size, tensor);
+        } else {
+            GGML_UNUSED(tensor);
+            CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, NULL));
+        }
 #endif
     }
 
@@ -3454,6 +3541,9 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
 #ifdef GGML_OPENCL_PROFILING
     command_queue_props |= CL_QUEUE_PROFILING_ENABLE;
 #endif
+    if (ggml_backend_op_load_profile_enabled() || ggml_opencl_csv_op_load_env_enabled()) {
+        command_queue_props |= CL_QUEUE_PROFILING_ENABLE;
+    }
     CL_CHECK((backend_ctx->queue = clCreateCommandQueue(context, device, command_queue_props, &err), err));
 
     // Load kernels
@@ -4130,6 +4220,8 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
         }
         GGML_ASSERT(ok);
     }
+
+    backend_ctx->accumulate_op_load_profiling_info();
 
     return GGML_STATUS_SUCCESS;
 }

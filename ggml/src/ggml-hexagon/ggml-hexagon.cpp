@@ -74,6 +74,18 @@ static std::regex* opt_opfilter = NULL; // regex of ops to not claim
 #define HEX_VERBOSE(...) \
     if (opt_verbose) GGML_LOG_DEBUG(__VA_ARGS__)
 
+static bool ggml_hexagon_csv_op_load_env_enabled() {
+    const char * env = getenv("CSV_OP_LOAD");
+    if (env == NULL) {
+        return false;
+    }
+
+    return strcmp(env, "1") == 0 ||
+        strcmp(env, "on") == 0 || strcmp(env, "ON") == 0 ||
+        strcmp(env, "yes") == 0 || strcmp(env, "YES") == 0 ||
+        strcmp(env, "true") == 0 || strcmp(env, "TRUE") == 0;
+}
+
 static inline uint64_t hex_is_aligned(void * addr, uint32_t align) {
     return ((size_t) addr & (align - 1)) == 0;
 }
@@ -1866,6 +1878,7 @@ struct ggml_hexagon_opqueue {
             const htp_prof_desc * pd = (const htp_prof_desc *) p_ptr;
             for (uint32_t i = 0; i < rsp.n_ops; i++) {
                 htp_usec += pd[i].usecs;
+                ggml_backend_op_load_profile_add_us(GGML_BACKEND_OP_LOAD_PROFILE_HTP, ops[i]->op, pd[i].usecs);
                 ggml_hexagon_dump_op_prof(shm_buf->sess->name, ops[i], pd[i].usecs, pd[i].cycles, pd[i].pmu);
             }
 
@@ -3576,6 +3589,12 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
         if (opt_profile == 1) opt_pmu_evt = {};
         GGML_LOG_INFO("ggml-hex: Profiling mode %u : pmu-evt [ %s ]\n", opt_profile,
                 vec_to_str<uint32_t, 16>(opt_pmu_evt).c_str());
+    }
+
+    if ((ggml_backend_op_load_profile_enabled() || ggml_hexagon_csv_op_load_env_enabled()) && opt_profile == 0) {
+        opt_profile = 1;
+        opt_pmu_evt = {};
+        GGML_LOG_INFO("ggml-hex: Profiling mode %u enabled for CSV_OP_LOAD\n", opt_profile);
     }
 
     reg->context = new ggml_hexagon_registry(reg);

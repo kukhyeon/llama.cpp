@@ -3001,6 +3001,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
+        const bool profile_node = ggml_backend_op_load_profile_is_op_enabled(node->op);
+        const int64_t profile_t0_us = profile_node && state->ith == 0 ? ggml_time_us() : 0;
+
         ggml_compute_forward(&params, node);
 
         if (state->ith == 0 && cplan->abort_callback &&
@@ -3011,6 +3014,15 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
+        } else if (profile_node) {
+            ggml_barrier(state->threadpool);
+        }
+
+        if (profile_node && state->ith == 0) {
+            ggml_backend_op_load_profile_add_us(
+                    GGML_BACKEND_OP_LOAD_PROFILE_CPU,
+                    node->op,
+                    ggml_time_us() - profile_t0_us);
         }
     }
 
