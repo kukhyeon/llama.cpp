@@ -3001,7 +3001,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
-        const bool profile_node = ggml_backend_op_load_profile_is_op_enabled(node->op);
+        const bool profile_node = ggml_backend_op_load_profile_should_measure(node->op, node->name);
         const int64_t profile_t0_us = profile_node && state->ith == 0 ? ggml_time_us() : 0;
 
         ggml_compute_forward(&params, node);
@@ -3019,9 +3019,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         }
 
         if (profile_node && state->ith == 0) {
-            ggml_backend_op_load_profile_add_us(
+            ggml_backend_op_load_profile_add_tensor_us(
                     GGML_BACKEND_OP_LOAD_PROFILE_CPU,
                     node->op,
+                    node->name,
                     ggml_time_us() - profile_t0_us);
         }
     }

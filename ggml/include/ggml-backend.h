@@ -373,6 +373,11 @@ extern "C" {
         GGML_BACKEND_OP_LOAD_PROFILE_COUNT = 3,
     };
 
+    enum {
+        GGML_BACKEND_OP_LOAD_PROFILE_MAX_GROUPS = 64,
+        GGML_BACKEND_OP_LOAD_PROFILE_NAME_LEN   = 64,
+    };
+
     struct ggml_backend_sched_profile_data {
         // Unique layer ids observed for ops executed on each backend bucket.
         // A layer may be counted in multiple buckets if ops for that layer ran on multiple backends.
@@ -422,6 +427,8 @@ extern "C" {
 
     struct ggml_backend_op_load_profile_data {
         uint8_t ops_enabled[GGML_OP_COUNT];
+        uint32_t n_name_groups;
+        char name_groups[GGML_BACKEND_OP_LOAD_PROFILE_MAX_GROUPS][GGML_BACKEND_OP_LOAD_PROFILE_NAME_LEN];
 
         double prefill_cpu_ms_by_type[GGML_OP_COUNT];
         double decode_cpu_ms_by_type[GGML_OP_COUNT];
@@ -436,6 +443,20 @@ extern "C" {
         uint64_t decode_htp_count_by_type[GGML_OP_COUNT];
         uint64_t prefill_gpu_count_by_type[GGML_OP_COUNT];
         uint64_t decode_gpu_count_by_type[GGML_OP_COUNT];
+
+        double prefill_cpu_ms_by_name[GGML_BACKEND_OP_LOAD_PROFILE_MAX_GROUPS];
+        double decode_cpu_ms_by_name[GGML_BACKEND_OP_LOAD_PROFILE_MAX_GROUPS];
+        double prefill_htp_ms_by_name[GGML_BACKEND_OP_LOAD_PROFILE_MAX_GROUPS];
+        double decode_htp_ms_by_name[GGML_BACKEND_OP_LOAD_PROFILE_MAX_GROUPS];
+        double prefill_gpu_ms_by_name[GGML_BACKEND_OP_LOAD_PROFILE_MAX_GROUPS];
+        double decode_gpu_ms_by_name[GGML_BACKEND_OP_LOAD_PROFILE_MAX_GROUPS];
+
+        uint64_t prefill_cpu_count_by_name[GGML_BACKEND_OP_LOAD_PROFILE_MAX_GROUPS];
+        uint64_t decode_cpu_count_by_name[GGML_BACKEND_OP_LOAD_PROFILE_MAX_GROUPS];
+        uint64_t prefill_htp_count_by_name[GGML_BACKEND_OP_LOAD_PROFILE_MAX_GROUPS];
+        uint64_t decode_htp_count_by_name[GGML_BACKEND_OP_LOAD_PROFILE_MAX_GROUPS];
+        uint64_t prefill_gpu_count_by_name[GGML_BACKEND_OP_LOAD_PROFILE_MAX_GROUPS];
+        uint64_t decode_gpu_count_by_name[GGML_BACKEND_OP_LOAD_PROFILE_MAX_GROUPS];
     };
 
     // Enables/disables process-global backend scheduler profiling.
@@ -457,12 +478,18 @@ extern "C" {
     // Selects profiled ops from a comma-separated op list. NULL/empty selects the default op list.
     // Use "ALL" to enable all ggml ops.
     GGML_API void ggml_backend_op_load_profile_set_ops_from_env(const char * ops_csv);
+    // Selects profiled node/tensor name groups from comma-separated wildcard patterns.
+    // Example: "Vcur-*,kq-*,attn_score=kq-*".
+    GGML_API void ggml_backend_op_load_profile_set_patterns_from_env(const char * patterns_csv);
     GGML_API bool ggml_backend_op_load_profile_is_op_enabled(enum ggml_op op);
+    GGML_API bool ggml_backend_op_load_profile_should_measure(enum ggml_op op, const char * name);
     // Clears accumulated per-op timings but preserves the selected op list.
     GGML_API void ggml_backend_op_load_profile_reset(void);
     GGML_API void ggml_backend_op_load_profile_set_phase(enum ggml_backend_sched_profile_phase phase);
     GGML_API void ggml_backend_op_load_profile_add_us(enum ggml_backend_op_load_profile_backend backend, enum ggml_op op, double usec);
     GGML_API void ggml_backend_op_load_profile_add_ms(enum ggml_backend_op_load_profile_backend backend, enum ggml_op op, double ms);
+    GGML_API void ggml_backend_op_load_profile_add_tensor_us(enum ggml_backend_op_load_profile_backend backend, enum ggml_op op, const char * name, double usec);
+    GGML_API void ggml_backend_op_load_profile_add_tensor_ms(enum ggml_backend_op_load_profile_backend backend, enum ggml_op op, const char * name, double ms);
     GGML_API struct ggml_backend_op_load_profile_data ggml_backend_op_load_profile_get(void);
 
     //

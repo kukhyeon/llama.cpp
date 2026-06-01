@@ -335,7 +335,7 @@ static void populateProfilingInfo(
     info.kernel      = kernel;
     info.evt         = evt;
     info.op          = tensor->op;
-    info.op_load     = ggml_backend_op_load_profile_is_op_enabled(tensor->op);
+    info.op_load     = ggml_backend_op_load_profile_should_measure(tensor->op, tensor->name);
     info.op_load_recorded = false;
 
     // 0 means not specified, e.g., 2D workgroup, or NULL for driver to choose
@@ -751,9 +751,10 @@ struct ggml_backend_opencl_context {
             CL_CHECK(err_start);
             CL_CHECK(err_end);
 
-            ggml_backend_op_load_profile_add_ms(
+            ggml_backend_op_load_profile_add_tensor_ms(
                     GGML_BACKEND_OP_LOAD_PROFILE_GPU,
                     info.op,
+                    info.op_name.c_str(),
                     (cmd_end - cmd_start) / 1.e6);
 
             info.op_load_recorded = true;
@@ -784,7 +785,7 @@ struct ggml_backend_opencl_context {
     }
 
     void enqueue_ndrange_kernel(cl_kernel kernel, cl_uint work_dim, size_t *global_work_size, size_t *local_work_size, const ggml_tensor * tensor) {
-        const bool op_load = ggml_backend_op_load_profile_is_op_enabled(tensor->op);
+        const bool op_load = ggml_backend_op_load_profile_should_measure(tensor->op, tensor->name);
 #ifdef GGML_OPENCL_PROFILING
         cl_event evt;
         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, &evt));

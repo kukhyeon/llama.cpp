@@ -1878,7 +1878,7 @@ struct ggml_hexagon_opqueue {
             const htp_prof_desc * pd = (const htp_prof_desc *) p_ptr;
             for (uint32_t i = 0; i < rsp.n_ops; i++) {
                 htp_usec += pd[i].usecs;
-                ggml_backend_op_load_profile_add_us(GGML_BACKEND_OP_LOAD_PROFILE_HTP, ops[i]->op, pd[i].usecs);
+                ggml_backend_op_load_profile_add_tensor_us(GGML_BACKEND_OP_LOAD_PROFILE_HTP, ops[i]->op, ops[i]->name, pd[i].usecs);
                 ggml_hexagon_dump_op_prof(shm_buf->sess->name, ops[i], pd[i].usecs, pd[i].cycles, pd[i].pmu);
             }
 
