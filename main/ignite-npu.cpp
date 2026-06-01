@@ -80,8 +80,8 @@ static bool should_write_op_breakdown_csv(const llama_igparams * ig) {
 }
 
 // Appends per-op CSV headers for the optional op breakdown section.
-// Each ggml op contributes four columns:
-// prefill_cpu, decode_cpu, prefill_htp, decode_htp.
+// Each ggml op contributes six columns:
+// prefill_cpu, decode_cpu, prefill_htp, decode_htp, prefill_gpu, decode_gpu.
 // TODO: move to utils if this CSV formatting is reused outside ignite-npu.
 static void append_profile_csv_op_headers(std::ostream & os) {
     for (int op = 0; op < GGML_OP_COUNT; ++op) {
@@ -92,7 +92,9 @@ static void append_profile_csv_op_headers(std::ostream & os) {
         os << ",prefill_cpu_op_" << op_name
            << ",decode_cpu_op_" << op_name
            << ",prefill_htp_op_" << op_name
-           << ",decode_htp_op_" << op_name;
+           << ",decode_htp_op_" << op_name
+           << ",prefill_gpu_op_" << op_name
+           << ",decode_gpu_op_" << op_name;
     }
 }
 
@@ -103,7 +105,9 @@ static void append_profile_csv_op_values(std::ostream & os, const ggml_backend_s
         os << "," << prof.prefill_cpu_ops_by_type[op]
            << "," << prof.decode_cpu_ops_by_type[op]
            << "," << prof.prefill_htp_ops_by_type[op]
-           << "," << prof.decode_htp_ops_by_type[op];
+           << "," << prof.decode_htp_ops_by_type[op]
+           << "," << prof.prefill_gpu_ops_by_type[op]
+           << "," << prof.decode_gpu_ops_by_type[op];
     }
 }
 
@@ -141,17 +145,23 @@ std::tuple<int, double, int, double> llama_perf_context_print_custom(const struc
             const auto prof = ggml_backend_sched_profile_get();
             file << "," << prof.prefill_cpu_layers
                  << "," << prof.prefill_htp_layers
+                 << "," << prof.prefill_gpu_layers
                  << "," << prof.prefill_cpu_ms
                  << "," << prof.prefill_htp_ms
+                 << "," << prof.prefill_gpu_ms
                  << "," << prof.decode_cpu_layers
                  << "," << prof.decode_htp_layers
+                 << "," << prof.decode_gpu_layers
                  << "," << prof.decode_cpu_ms
                  << "," << prof.decode_htp_ms
+                 << "," << prof.decode_gpu_ms
                  << "," << prof.total_ops
                  << "," << prof.prefill_cpu_ops
                  << "," << prof.decode_cpu_ops
                  << "," << prof.prefill_htp_ops
                  << "," << prof.decode_htp_ops
+                 << "," << prof.prefill_gpu_ops
+                 << "," << prof.decode_gpu_ops
                  << "," << prof.prefill_copy_ms
                  << "," << prof.prefill_wait_ms
                  << "," << prof.prefill_build_ms
@@ -619,9 +629,11 @@ int main(int argc, char ** argv) {
     if (file.is_open() && output_path_infer!="/inference_stats.csv") {
         file << "sys_time,prefill_speed,decode_speed,prefill_token,decode_token,ttft";
         if (should_write_backend_profile_csv(ig)) {
-            file << ",prefill_cpu_layers,prefill_htp_layers,prefill_cpu_ms,prefill_htp_ms";
-            file << ",decode_cpu_layers,decode_htp_layers,decode_cpu_ms,decode_htp_ms";
-            file << ",total_ops,prefill_cpu_ops,decode_cpu_ops,prefill_htp_ops,decode_htp_ops";
+            file << ",prefill_cpu_layers,prefill_htp_layers,prefill_gpu_layers";
+            file << ",prefill_cpu_ms,prefill_htp_ms,prefill_gpu_ms";
+            file << ",decode_cpu_layers,decode_htp_layers,decode_gpu_layers";
+            file << ",decode_cpu_ms,decode_htp_ms,decode_gpu_ms";
+            file << ",total_ops,prefill_cpu_ops,decode_cpu_ops,prefill_htp_ops,decode_htp_ops,prefill_gpu_ops,decode_gpu_ops";
             file << ",prefill_copy_ms,prefill_wait_ms,prefill_build_ms,prefill_sampling_ms";
             file << ",decode_copy_ms,decode_wait_ms,decode_build_ms,decode_sampling_ms";
             if (should_write_op_breakdown_csv(ig)) {
