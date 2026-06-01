@@ -366,6 +366,13 @@ extern "C" {
         GGML_BACKEND_SCHED_PROFILE_DECODE  = 1,
     };
 
+    enum ggml_backend_op_load_profile_backend {
+        GGML_BACKEND_OP_LOAD_PROFILE_CPU = 0,
+        GGML_BACKEND_OP_LOAD_PROFILE_HTP = 1,
+        GGML_BACKEND_OP_LOAD_PROFILE_GPU = 2,
+        GGML_BACKEND_OP_LOAD_PROFILE_COUNT = 3,
+    };
+
     struct ggml_backend_sched_profile_data {
         // Unique layer ids observed for ops executed on each backend bucket.
         // A layer may be counted in multiple buckets if ops for that layer ran on multiple backends.
@@ -413,6 +420,24 @@ extern "C" {
         double   decode_sampling_ms;
     };
 
+    struct ggml_backend_op_load_profile_data {
+        uint8_t ops_enabled[GGML_OP_COUNT];
+
+        double prefill_cpu_ms_by_type[GGML_OP_COUNT];
+        double decode_cpu_ms_by_type[GGML_OP_COUNT];
+        double prefill_htp_ms_by_type[GGML_OP_COUNT];
+        double decode_htp_ms_by_type[GGML_OP_COUNT];
+        double prefill_gpu_ms_by_type[GGML_OP_COUNT];
+        double decode_gpu_ms_by_type[GGML_OP_COUNT];
+
+        uint64_t prefill_cpu_count_by_type[GGML_OP_COUNT];
+        uint64_t decode_cpu_count_by_type[GGML_OP_COUNT];
+        uint64_t prefill_htp_count_by_type[GGML_OP_COUNT];
+        uint64_t decode_htp_count_by_type[GGML_OP_COUNT];
+        uint64_t prefill_gpu_count_by_type[GGML_OP_COUNT];
+        uint64_t decode_gpu_count_by_type[GGML_OP_COUNT];
+    };
+
     // Enables/disables process-global backend scheduler profiling.
     GGML_API void ggml_backend_sched_profile_set_enabled(bool enabled);
     // Clears all accumulated profiling state and resets the active phase to prefill.
@@ -425,6 +450,20 @@ extern "C" {
     GGML_API void ggml_backend_sched_profile_add_sampling_ms(double sampling_ms);
     // Returns a snapshot of the accumulated profiling counters.
     GGML_API struct ggml_backend_sched_profile_data ggml_backend_sched_profile_get(void);
+
+    // Enables/disables process-global per-op load profiling.
+    GGML_API void ggml_backend_op_load_profile_set_enabled(bool enabled);
+    GGML_API bool ggml_backend_op_load_profile_enabled(void);
+    // Selects profiled ops from a comma-separated op list. NULL/empty selects the default op list.
+    // Use "ALL" to enable all ggml ops.
+    GGML_API void ggml_backend_op_load_profile_set_ops_from_env(const char * ops_csv);
+    GGML_API bool ggml_backend_op_load_profile_is_op_enabled(enum ggml_op op);
+    // Clears accumulated per-op timings but preserves the selected op list.
+    GGML_API void ggml_backend_op_load_profile_reset(void);
+    GGML_API void ggml_backend_op_load_profile_set_phase(enum ggml_backend_sched_profile_phase phase);
+    GGML_API void ggml_backend_op_load_profile_add_us(enum ggml_backend_op_load_profile_backend backend, enum ggml_op op, double usec);
+    GGML_API void ggml_backend_op_load_profile_add_ms(enum ggml_backend_op_load_profile_backend backend, enum ggml_op op, double ms);
+    GGML_API struct ggml_backend_op_load_profile_data ggml_backend_op_load_profile_get(void);
 
     //
     // Meta backend
