@@ -86,6 +86,10 @@ static bool should_write_op_load_csv() {
     return env_flag_enabled("CSV_OP_LOAD");
 }
 
+static bool should_write_op_load_breakdown_csv() {
+    return env_flag_enabled("CSV_OP_LOAD_BREAKDOWN");
+}
+
 // Appends per-op CSV headers for the optional op breakdown section.
 // Each ggml op contributes six columns:
 // prefill_cpu, decode_cpu, prefill_htp, decode_htp, prefill_gpu, decode_gpu.
@@ -118,88 +122,121 @@ static void append_profile_csv_op_values(std::ostream & os, const ggml_backend_s
     }
 }
 
-static void append_op_load_csv_headers(std::ostream & os, const ggml_backend_op_load_profile_data & prof) {
-    for (int op = 0; op < GGML_OP_COUNT; ++op) {
-        if (!prof.ops_enabled[op]) {
-            continue;
-        }
-
-        const char * op_name = ggml_op_name((ggml_op) op);
-        if (op_name == nullptr || op_name[0] == '\0') {
-            op_name = "unknown";
-        }
-
-        os << ",prefill_cpu_" << op_name << "_ms"
-           << ",prefill_cpu_" << op_name << "_count"
-           << ",prefill_htp_" << op_name << "_ms"
-           << ",prefill_htp_" << op_name << "_count"
-           << ",prefill_gpu_" << op_name << "_ms"
-           << ",prefill_gpu_" << op_name << "_count"
-           << ",decode_cpu_" << op_name << "_ms"
-           << ",decode_cpu_" << op_name << "_count"
-           << ",decode_htp_" << op_name << "_ms"
-           << ",decode_htp_" << op_name << "_count"
-           << ",decode_gpu_" << op_name << "_ms"
-           << ",decode_gpu_" << op_name << "_count";
-    }
-
-    for (uint32_t i = 0; i < prof.n_name_groups; ++i) {
-        const char * group = prof.name_groups[i];
-        os << ",prefill_cpu_node_" << group << "_ms"
-           << ",prefill_cpu_node_" << group << "_count"
-           << ",prefill_htp_node_" << group << "_ms"
-           << ",prefill_htp_node_" << group << "_count"
-           << ",prefill_gpu_node_" << group << "_ms"
-           << ",prefill_gpu_node_" << group << "_count"
-           << ",decode_cpu_node_" << group << "_ms"
-           << ",decode_cpu_node_" << group << "_count"
-           << ",decode_htp_node_" << group << "_ms"
-           << ",decode_htp_node_" << group << "_count"
-           << ",decode_gpu_node_" << group << "_ms"
-           << ",decode_gpu_node_" << group << "_count";
+static void append_op_load_csv_breakdown_headers(std::ostream & os) {
+    for (int timer = 0; timer < GGML_BACKEND_OP_LOAD_PROFILE_TIMER_COUNT; ++timer) {
+        const char * timer_name = ggml_backend_op_load_profile_timer_name((ggml_backend_op_load_profile_timer) timer);
+        os << ",prefill_htp_" << timer_name << "_ms"
+           << ",prefill_gpu_" << timer_name << "_ms"
+           << ",decode_htp_" << timer_name << "_ms"
+           << ",decode_gpu_" << timer_name << "_ms";
     }
 }
 
-static void append_op_load_csv_values(std::ostream & os, const ggml_backend_op_load_profile_data & prof) {
-    for (int op = 0; op < GGML_OP_COUNT; ++op) {
-        if (!prof.ops_enabled[op]) {
-            continue;
+static void append_op_load_csv_breakdown_values(std::ostream & os, const ggml_backend_op_load_profile_data & prof) {
+    for (int timer = 0; timer < GGML_BACKEND_OP_LOAD_PROFILE_TIMER_COUNT; ++timer) {
+        os << "," << prof.prefill_htp_timer_ms[timer]
+           << "," << prof.prefill_gpu_timer_ms[timer]
+           << "," << prof.decode_htp_timer_ms[timer]
+           << "," << prof.decode_gpu_timer_ms[timer];
+    }
+}
+
+static void append_op_load_csv_headers(std::ostream & os, const ggml_backend_op_load_profile_data & prof, bool include_ops, bool include_breakdown) {
+    if (include_ops) {
+        for (int op = 0; op < GGML_OP_COUNT; ++op) {
+            if (!prof.ops_enabled[op]) {
+                continue;
+            }
+
+            const char * op_name = ggml_op_name((ggml_op) op);
+            if (op_name == nullptr || op_name[0] == '\0') {
+                op_name = "unknown";
+            }
+
+            os << ",prefill_cpu_" << op_name << "_ms"
+               << ",prefill_cpu_" << op_name << "_count"
+               << ",prefill_htp_" << op_name << "_ms"
+               << ",prefill_htp_" << op_name << "_count"
+               << ",prefill_gpu_" << op_name << "_ms"
+               << ",prefill_gpu_" << op_name << "_count"
+               << ",decode_cpu_" << op_name << "_ms"
+               << ",decode_cpu_" << op_name << "_count"
+               << ",decode_htp_" << op_name << "_ms"
+               << ",decode_htp_" << op_name << "_count"
+               << ",decode_gpu_" << op_name << "_ms"
+               << ",decode_gpu_" << op_name << "_count";
         }
 
-        os << "," << prof.prefill_cpu_ms_by_type[op]
-           << "," << prof.prefill_cpu_count_by_type[op]
-           << "," << prof.prefill_htp_ms_by_type[op]
-           << "," << prof.prefill_htp_count_by_type[op]
-           << "," << prof.prefill_gpu_ms_by_type[op]
-           << "," << prof.prefill_gpu_count_by_type[op]
-           << "," << prof.decode_cpu_ms_by_type[op]
-           << "," << prof.decode_cpu_count_by_type[op]
-           << "," << prof.decode_htp_ms_by_type[op]
-           << "," << prof.decode_htp_count_by_type[op]
-           << "," << prof.decode_gpu_ms_by_type[op]
-           << "," << prof.decode_gpu_count_by_type[op];
+        for (uint32_t i = 0; i < prof.n_name_groups; ++i) {
+            const char * group = prof.name_groups[i];
+            os << ",prefill_cpu_node_" << group << "_ms"
+               << ",prefill_cpu_node_" << group << "_count"
+               << ",prefill_htp_node_" << group << "_ms"
+               << ",prefill_htp_node_" << group << "_count"
+               << ",prefill_gpu_node_" << group << "_ms"
+               << ",prefill_gpu_node_" << group << "_count"
+               << ",decode_cpu_node_" << group << "_ms"
+               << ",decode_cpu_node_" << group << "_count"
+               << ",decode_htp_node_" << group << "_ms"
+               << ",decode_htp_node_" << group << "_count"
+               << ",decode_gpu_node_" << group << "_ms"
+               << ",decode_gpu_node_" << group << "_count";
+        }
     }
 
-    for (uint32_t i = 0; i < prof.n_name_groups; ++i) {
-        os << "," << prof.prefill_cpu_ms_by_name[i]
-           << "," << prof.prefill_cpu_count_by_name[i]
-           << "," << prof.prefill_htp_ms_by_name[i]
-           << "," << prof.prefill_htp_count_by_name[i]
-           << "," << prof.prefill_gpu_ms_by_name[i]
-           << "," << prof.prefill_gpu_count_by_name[i]
-           << "," << prof.decode_cpu_ms_by_name[i]
-           << "," << prof.decode_cpu_count_by_name[i]
-           << "," << prof.decode_htp_ms_by_name[i]
-           << "," << prof.decode_htp_count_by_name[i]
-           << "," << prof.decode_gpu_ms_by_name[i]
-           << "," << prof.decode_gpu_count_by_name[i];
+    if (include_breakdown) {
+        append_op_load_csv_breakdown_headers(os);
+    }
+}
+
+static void append_op_load_csv_values(std::ostream & os, const ggml_backend_op_load_profile_data & prof, bool include_ops, bool include_breakdown) {
+    if (include_ops) {
+        for (int op = 0; op < GGML_OP_COUNT; ++op) {
+            if (!prof.ops_enabled[op]) {
+                continue;
+            }
+
+            os << "," << prof.prefill_cpu_ms_by_type[op]
+               << "," << prof.prefill_cpu_count_by_type[op]
+               << "," << prof.prefill_htp_ms_by_type[op]
+               << "," << prof.prefill_htp_count_by_type[op]
+               << "," << prof.prefill_gpu_ms_by_type[op]
+               << "," << prof.prefill_gpu_count_by_type[op]
+               << "," << prof.decode_cpu_ms_by_type[op]
+               << "," << prof.decode_cpu_count_by_type[op]
+               << "," << prof.decode_htp_ms_by_type[op]
+               << "," << prof.decode_htp_count_by_type[op]
+               << "," << prof.decode_gpu_ms_by_type[op]
+               << "," << prof.decode_gpu_count_by_type[op];
+        }
+
+        for (uint32_t i = 0; i < prof.n_name_groups; ++i) {
+            os << "," << prof.prefill_cpu_ms_by_name[i]
+               << "," << prof.prefill_cpu_count_by_name[i]
+               << "," << prof.prefill_htp_ms_by_name[i]
+               << "," << prof.prefill_htp_count_by_name[i]
+               << "," << prof.prefill_gpu_ms_by_name[i]
+               << "," << prof.prefill_gpu_count_by_name[i]
+               << "," << prof.decode_cpu_ms_by_name[i]
+               << "," << prof.decode_cpu_count_by_name[i]
+               << "," << prof.decode_htp_ms_by_name[i]
+               << "," << prof.decode_htp_count_by_name[i]
+               << "," << prof.decode_gpu_ms_by_name[i]
+               << "," << prof.decode_gpu_count_by_name[i];
+        }
+    }
+
+    if (include_breakdown) {
+        append_op_load_csv_breakdown_values(os, prof);
     }
 }
 
 static void llama_op_load_profile_print_custom(
         const std::string & output_filename,
         int query_id,
-        std::chrono::time_point<std::chrono::system_clock> start_sys_time) {
+        std::chrono::time_point<std::chrono::system_clock> start_sys_time,
+        bool include_ops,
+        bool include_breakdown) {
     auto now_sys_time = std::chrono::system_clock::now();
     auto sys_time = std::chrono::duration_cast<std::chrono::milliseconds>(now_sys_time - start_sys_time).count();
 
@@ -210,7 +247,7 @@ static void llama_op_load_profile_print_custom(
 
     const auto prof = ggml_backend_op_load_profile_get();
     file << std::to_string(sys_time) << "," << query_id;
-    append_op_load_csv_values(file, prof);
+    append_op_load_csv_values(file, prof, include_ops, include_breakdown);
     file << "\n";
 }
 
@@ -405,7 +442,10 @@ int main(int argc, char ** argv) {
     }
 
     const bool csv_op_load = should_write_op_load_csv();
+    const bool csv_op_load_breakdown = should_write_op_load_breakdown_csv();
+    const bool csv_load = csv_op_load || csv_op_load_breakdown;
     ggml_backend_op_load_profile_set_enabled(csv_op_load);
+    ggml_backend_op_load_profile_set_breakdown_enabled(csv_op_load_breakdown);
     ggml_backend_op_load_profile_set_ops_from_env(std::getenv("CSV_OP_LOAD_OPS"));
     ggml_backend_op_load_profile_set_patterns_from_env(std::getenv("CSV_OP_LOAD_PATTERNS"));
 
@@ -753,11 +793,11 @@ int main(int argc, char ** argv) {
         file << "\n";
         file.close();
     }
-    if (csv_op_load && output_path_load != "/inference_load.csv") {
+    if (csv_load && output_path_load != "/inference_load.csv") {
         std::ofstream load_file(output_path_load, std::ios::app);
         if (load_file.is_open()) {
             load_file << "sys_time,query_id";
-            append_op_load_csv_headers(load_file, ggml_backend_op_load_profile_get());
+            append_op_load_csv_headers(load_file, ggml_backend_op_load_profile_get(), csv_op_load, csv_op_load_breakdown);
             load_file << "\n";
             load_file.close();
         }
@@ -1333,8 +1373,8 @@ int main(int argc, char ** argv) {
                     if(output_path_infer!="/inference_stats.csv"){ // deprecated in future
                         llama_perf_context_print_custom(ctx, output_path_infer, start_sys_time, ig);
                     }
-                    if (csv_op_load && output_path_load != "/inference_load.csv") {
-                        llama_op_load_profile_print_custom(output_path_load, current_question_index, start_sys_time);
+                    if (csv_load && output_path_load != "/inference_load.csv") {
+                        llama_op_load_profile_print_custom(output_path_load, current_question_index, start_sys_time, csv_op_load, csv_op_load_breakdown);
                     }
                     //check_hardware(device_name);
                     // common_sampler_free(smpl);
@@ -1389,7 +1429,7 @@ int main(int argc, char ** argv) {
                     if (ig->backend_compute_profile) {
                         ggml_backend_sched_profile_reset();
                     }
-                    if (csv_op_load) {
+                    if (csv_load) {
                         ggml_backend_op_load_profile_reset();
                     }
                     n_past = 0; n_consumed = 0; waiting_for_first_input = true;

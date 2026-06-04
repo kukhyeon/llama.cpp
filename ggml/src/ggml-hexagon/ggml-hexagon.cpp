@@ -1642,18 +1642,35 @@ struct ggml_hexagon_opbatch {
 
     // add tensor and return its index
     int add_tensor(const ggml_tensor * t) {
+        const bool breakdown = ggml_backend_op_load_profile_breakdown_enabled();
+        const int64_t timer_t0_us = breakdown ? ggml_time_us() : 0;
+        auto record_timer = [&]() {
+            if (breakdown) {
+                ggml_backend_op_load_profile_add_backend_timer_us(
+                        GGML_BACKEND_OP_LOAD_PROFILE_HTP,
+                        GGML_BACKEND_OP_LOAD_PROFILE_TIMER_ADD_TENSOR,
+                        ggml_time_us() - timer_t0_us);
+            }
+        };
+
         auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(t->buffer->context);
 
         // First lookup by tensor data
         auto range = d_map.equal_range(t->data);
         for (auto it = range.first; it != range.second; ++it) {
             htp_tensor * h = &h_tens[it->second];
-            if (same_shape(h, t)) { return it->second; }
+            if (same_shape(h, t)) {
+                record_timer();
+                return it->second;
+            }
         }
 
         // Lookup by tensor ptr
         auto it = t_map.find(t);
-        if (it != t_map.end()) { return it->second; }
+        if (it != t_map.end()) {
+            record_timer();
+            return it->second;
+        }
 
         // Add new tensor to the batch
         int ti = n_tens++;
@@ -1682,6 +1699,7 @@ struct ggml_hexagon_opbatch {
                 ti, t->name, h.bi, (void*) t->data, (size_t) t_offset, t_size, h.flags,
                 (size_t) t->ne[0], (size_t) t->ne[1], (size_t) t->ne[2], (size_t) t->ne[3]);
 
+        record_timer();
         return ti;
     }
 
@@ -1719,6 +1737,9 @@ struct ggml_hexagon_opbatch {
 
     // assumes that fit_op() was called first and returned true
     void add_op(htp_op_code opcode, const struct ggml_tensor * t) {
+        const bool breakdown = ggml_backend_op_load_profile_breakdown_enabled();
+        const int64_t timer_t0_us = breakdown ? ggml_time_us() : 0;
+
         // Add new op
 
         unsigned int n = n_ops++;
@@ -1741,6 +1762,13 @@ struct ggml_hexagon_opbatch {
             o.src[i] = t->src[i] ? add_tensor(t->src[i]) : 0xffff;
         }
         o.dst = add_tensor(t);
+
+        if (breakdown) {
+            ggml_backend_op_load_profile_add_backend_timer_us(
+                    GGML_BACKEND_OP_LOAD_PROFILE_HTP,
+                    GGML_BACKEND_OP_LOAD_PROFILE_TIMER_ADD_OP,
+                    ggml_time_us() - timer_t0_us);
+        }
     }
 };
 
@@ -1890,6 +1918,9 @@ struct ggml_hexagon_opqueue {
 
 // Flush HTP response queue i.e wait for all outstanding requests to complete
 void ggml_hexagon_session::flush_pending(bool all) {
+    const bool breakdown = ggml_backend_op_load_profile_breakdown_enabled();
+    const int64_t pending_t0_us = breakdown ? ggml_time_us() : 0;
+
     while (this->op_pending) {
         struct htp_opbatch_rsp rsp;
         uint32_t               rsp_size;
@@ -1899,7 +1930,14 @@ void ggml_hexagon_session::flush_pending(bool all) {
         uint32_t               n_dbufs;
 
         // Read response packet from queue
+        const int64_t read_t0_us = breakdown ? ggml_time_us() : 0;
         int err = dspqueue_read(this->queue, &flags, 1, &n_dbufs, &dbuf, sizeof(rsp), &rsp_size, (uint8_t *) &rsp, DSPQUEUE_TIMEOUT);
+        if (breakdown) {
+            ggml_backend_op_load_profile_add_backend_timer_us(
+                    GGML_BACKEND_OP_LOAD_PROFILE_HTP,
+                    GGML_BACKEND_OP_LOAD_PROFILE_TIMER_DSPQUEUE_READ,
+                    ggml_time_us() - read_t0_us);
+        }
         if (err == AEE_EEXPIRED) {
             continue;
         }
@@ -1918,23 +1956,54 @@ void ggml_hexagon_session::flush_pending(bool all) {
             // TODO: handle errors
         }
 
+        const int64_t pop_t0_us = breakdown ? ggml_time_us() : 0;
         op_queue->pop(rsp, dbuf);
+        if (breakdown) {
+            ggml_backend_op_load_profile_add_backend_timer_us(
+                    GGML_BACKEND_OP_LOAD_PROFILE_HTP,
+                    GGML_BACKEND_OP_LOAD_PROFILE_TIMER_RESPONSE_POP,
+                    ggml_time_us() - pop_t0_us);
+        }
 
         this->op_pending--;  // atomic dec
 
         if (!all) break;
+    }
+
+    if (breakdown) {
+        ggml_backend_op_load_profile_add_backend_timer_us(
+                GGML_BACKEND_OP_LOAD_PROFILE_HTP,
+                GGML_BACKEND_OP_LOAD_PROFILE_TIMER_FLUSH_PENDING,
+                ggml_time_us() - pending_t0_us);
     }
 }
 
 void ggml_hexagon_session::flush_batch() {
     if (op_batch->empty()) { return; }
 
+    const bool breakdown = ggml_backend_op_load_profile_breakdown_enabled();
+    const int64_t flush_t0_us = breakdown ? ggml_time_us() : 0;
+
     htp_opbatch_req req {};
     dspqueue_buffer dbuf{};
 
+    int64_t push_t0_us = breakdown ? ggml_time_us() : 0;
     if (!op_queue->push(req, dbuf, op_batch)) {
+        if (breakdown) {
+            ggml_backend_op_load_profile_add_backend_timer_us(
+                    GGML_BACKEND_OP_LOAD_PROFILE_HTP,
+                    GGML_BACKEND_OP_LOAD_PROFILE_TIMER_BATCH_PUSH,
+                    ggml_time_us() - push_t0_us);
+        }
         flush_pending(false);
+        push_t0_us = breakdown ? ggml_time_us() : 0;
         op_queue->push(req, dbuf, op_batch);
+    }
+    if (breakdown) {
+        ggml_backend_op_load_profile_add_backend_timer_us(
+                GGML_BACKEND_OP_LOAD_PROFILE_HTP,
+                GGML_BACKEND_OP_LOAD_PROFILE_TIMER_BATCH_PUSH,
+                ggml_time_us() - push_t0_us);
     }
 
     // Bump pending flag (cleared in the session::flush once we get the response)
@@ -1942,17 +2011,41 @@ void ggml_hexagon_session::flush_batch() {
 
     HEX_VERBOSE("ggml-hex: %s queue-opbatch: %p size %u\n", this->c_name(), dbuf.ptr, dbuf.size);
 
+    const int64_t write_t0_us = breakdown ? ggml_time_us() : 0;
     int err = dspqueue_write(this->queue, 0, 1, &dbuf, sizeof(req), (const uint8_t*) &req, DSPQUEUE_TIMEOUT);
+    if (breakdown) {
+        ggml_backend_op_load_profile_add_backend_timer_us(
+                GGML_BACKEND_OP_LOAD_PROFILE_HTP,
+                GGML_BACKEND_OP_LOAD_PROFILE_TIMER_DSPQUEUE_WRITE,
+                ggml_time_us() - write_t0_us);
+    }
     if (err != 0) {
         GGML_ABORT("ggml-hex: %s dspqueue_write failed: 0x%08x\n", this->c_name(), (unsigned) err);
+    }
+
+    if (breakdown) {
+        ggml_backend_op_load_profile_add_backend_timer_us(
+                GGML_BACKEND_OP_LOAD_PROFILE_HTP,
+                GGML_BACKEND_OP_LOAD_PROFILE_TIMER_FLUSH_BATCH,
+                ggml_time_us() - flush_t0_us);
     }
 }
 
 void ggml_hexagon_session::enqueue_op(htp_op_code opcode, const ggml_tensor *op) {
+    const bool breakdown = ggml_backend_op_load_profile_breakdown_enabled();
+    const int64_t timer_t0_us = breakdown ? ggml_time_us() : 0;
+
     if (!op_batch->fit_op(op)) {
         flush_batch();
     }
     op_batch->add_op(opcode, op);
+
+    if (breakdown) {
+        ggml_backend_op_load_profile_add_backend_timer_us(
+                GGML_BACKEND_OP_LOAD_PROFILE_HTP,
+                GGML_BACKEND_OP_LOAD_PROFILE_TIMER_ENQUEUE,
+                ggml_time_us() - timer_t0_us);
+    }
 }
 
 // Flush HTP response queue i.e wait for all outstanding requests to complete
@@ -2851,6 +2944,8 @@ static inline bool op_is_compute(ggml_tensor *node)
 
 static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
     auto sess = static_cast<ggml_hexagon_session *>(backend->context);
+    const bool breakdown = ggml_backend_op_load_profile_breakdown_enabled();
+    const int64_t graph_t0_us = breakdown ? ggml_time_us() : 0;
 
     HEX_VERBOSE("ggml-hex: %s graph-compute n_nodes %d\n", sess->c_name(), graph->n_nodes);
 
@@ -2863,6 +2958,13 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
 
     // Wait until all pending ops complete
     sess->flush();
+
+    if (breakdown) {
+        ggml_backend_op_load_profile_add_backend_timer_us(
+                GGML_BACKEND_OP_LOAD_PROFILE_HTP,
+                GGML_BACKEND_OP_LOAD_PROFILE_TIMER_GRAPH,
+                ggml_time_us() - graph_t0_us);
+    }
 
     return GGML_STATUS_SUCCESS;
 }
