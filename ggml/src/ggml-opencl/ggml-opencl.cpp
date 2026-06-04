@@ -720,6 +720,8 @@ struct ggml_backend_opencl_context {
             return;
         }
 
+        const bool breakdown = ggml_backend_op_load_profile_breakdown_enabled();
+
         for (ProfilingInfo & info : profiling_info) {
             if (!info.op_load || info.op_load_recorded) {
                 continue;
@@ -728,11 +730,26 @@ struct ggml_backend_opencl_context {
             cl_ulong cmd_start;
             cl_ulong cmd_end;
 
+            const int64_t wait_t0_us = breakdown ? ggml_time_us() : 0;
             CL_CHECK(clWaitForEvents(1, &info.evt));
+            if (breakdown) {
+                ggml_backend_op_load_profile_add_backend_timer_us(
+                        GGML_BACKEND_OP_LOAD_PROFILE_GPU,
+                        GGML_BACKEND_OP_LOAD_PROFILE_TIMER_PROFILE_WAIT,
+                        ggml_time_us() - wait_t0_us);
+            }
+
+            const int64_t query_t0_us = breakdown ? ggml_time_us() : 0;
             const cl_int err_start = clGetEventProfilingInfo(
                 info.evt, CL_PROFILING_COMMAND_START, sizeof(cl_ulong), &cmd_start, NULL);
             const cl_int err_end = clGetEventProfilingInfo(
                 info.evt, CL_PROFILING_COMMAND_END, sizeof(cl_ulong), &cmd_end, NULL);
+            if (breakdown) {
+                ggml_backend_op_load_profile_add_backend_timer_us(
+                        GGML_BACKEND_OP_LOAD_PROFILE_GPU,
+                        GGML_BACKEND_OP_LOAD_PROFILE_TIMER_PROFILE_QUERY,
+                        ggml_time_us() - query_t0_us);
+            }
 
             if (err_start == CL_PROFILING_INFO_NOT_AVAILABLE || err_end == CL_PROFILING_INFO_NOT_AVAILABLE) {
                 static bool warned = false;
@@ -786,6 +803,8 @@ struct ggml_backend_opencl_context {
 
     void enqueue_ndrange_kernel(cl_kernel kernel, cl_uint work_dim, size_t *global_work_size, size_t *local_work_size, const ggml_tensor * tensor) {
         const bool op_load = ggml_backend_op_load_profile_should_measure(tensor->op, tensor->name);
+        const bool breakdown = ggml_backend_op_load_profile_breakdown_enabled();
+        const int64_t enqueue_t0_us = breakdown ? ggml_time_us() : 0;
 #ifdef GGML_OPENCL_PROFILING
         cl_event evt;
         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, &evt));
@@ -804,6 +823,12 @@ struct ggml_backend_opencl_context {
             CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, NULL));
         }
 #endif
+        if (breakdown) {
+            ggml_backend_op_load_profile_add_backend_timer_us(
+                    GGML_BACKEND_OP_LOAD_PROFILE_GPU,
+                    GGML_BACKEND_OP_LOAD_PROFILE_TIMER_ENQUEUE,
+                    ggml_time_us() - enqueue_t0_us);
+        }
     }
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
@@ -4182,6 +4207,8 @@ static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor 
 
 static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+    const bool breakdown = ggml_backend_op_load_profile_breakdown_enabled();
+    const int64_t graph_t0_us = breakdown ? ggml_time_us() : 0;
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -4189,7 +4216,14 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
         // NOTE: this may oversynchronize by synchronizing with
         //       backends/devices which don't compute 'cgraph's
         //       dependencies.
+        const int64_t sync_t0_us = breakdown ? ggml_time_us() : 0;
         sync_with_other_backends(backend);
+        if (breakdown) {
+            ggml_backend_op_load_profile_add_backend_timer_us(
+                    GGML_BACKEND_OP_LOAD_PROFILE_GPU,
+                    GGML_BACKEND_OP_LOAD_PROFILE_TIMER_SYNC,
+                    ggml_time_us() - sync_t0_us);
+        }
 
         if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
             continue;
@@ -4200,22 +4234,50 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
         }
 
         if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
+            const int64_t fused_t0_us = breakdown ? ggml_time_us() : 0;
             ggml_opencl_op_norm_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+            if (breakdown) {
+                ggml_backend_op_load_profile_add_backend_timer_us(
+                        GGML_BACKEND_OP_LOAD_PROFILE_GPU,
+                        GGML_BACKEND_OP_LOAD_PROFILE_TIMER_FUSED,
+                        ggml_time_us() - fused_t0_us);
+            }
             i += 2;
             continue;
         }
         if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_GROUP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
+            const int64_t fused_t0_us = breakdown ? ggml_time_us() : 0;
             ggml_opencl_op_group_norm_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+            if (breakdown) {
+                ggml_backend_op_load_profile_add_backend_timer_us(
+                        GGML_BACKEND_OP_LOAD_PROFILE_GPU,
+                        GGML_BACKEND_OP_LOAD_PROFILE_TIMER_FUSED,
+                        ggml_time_us() - fused_t0_us);
+            }
             i += 2;
             continue;
         }
         if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
+            const int64_t fused_t0_us = breakdown ? ggml_time_us() : 0;
             ggml_opencl_op_rms_norm_fused(backend, node, cgraph->nodes[i+1]);
+            if (breakdown) {
+                ggml_backend_op_load_profile_add_backend_timer_us(
+                        GGML_BACKEND_OP_LOAD_PROFILE_GPU,
+                        GGML_BACKEND_OP_LOAD_PROFILE_TIMER_FUSED,
+                        ggml_time_us() - fused_t0_us);
+            }
             i++;
             continue;
         }
 
+        const int64_t dispatch_t0_us = breakdown ? ggml_time_us() : 0;
         bool ok = ggml_cl_compute_forward(backend, node);
+        if (breakdown) {
+            ggml_backend_op_load_profile_add_backend_timer_us(
+                    GGML_BACKEND_OP_LOAD_PROFILE_GPU,
+                    GGML_BACKEND_OP_LOAD_PROFILE_TIMER_DISPATCH,
+                    ggml_time_us() - dispatch_t0_us);
+        }
         if (!ok) {
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
         }
@@ -4223,6 +4285,13 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
     }
 
     backend_ctx->accumulate_op_load_profiling_info();
+
+    if (breakdown) {
+        ggml_backend_op_load_profile_add_backend_timer_us(
+                GGML_BACKEND_OP_LOAD_PROFILE_GPU,
+                GGML_BACKEND_OP_LOAD_PROFILE_TIMER_GRAPH,
+                ggml_time_us() - graph_t0_us);
+    }
 
     return GGML_STATUS_SUCCESS;
 }

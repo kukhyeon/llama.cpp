@@ -2243,7 +2243,7 @@ ggml_status llama_context::graph_compute(
     if (igparams.backend_compute_profile) {
         ggml_backend_sched_profile_set_phase(batched ? GGML_BACKEND_SCHED_PROFILE_PREFILL : GGML_BACKEND_SCHED_PROFILE_DECODE);
     }
-    if (ggml_backend_op_load_profile_enabled()) {
+    if (ggml_backend_op_load_profile_enabled() || ggml_backend_op_load_profile_breakdown_enabled()) {
         ggml_backend_op_load_profile_set_phase(batched ? GGML_BACKEND_SCHED_PROFILE_PREFILL : GGML_BACKEND_SCHED_PROFILE_DECODE);
     }
 

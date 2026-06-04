@@ -373,6 +373,25 @@ extern "C" {
         GGML_BACKEND_OP_LOAD_PROFILE_COUNT = 3,
     };
 
+    enum ggml_backend_op_load_profile_timer {
+        GGML_BACKEND_OP_LOAD_PROFILE_TIMER_GRAPH = 0,
+        GGML_BACKEND_OP_LOAD_PROFILE_TIMER_SYNC,
+        GGML_BACKEND_OP_LOAD_PROFILE_TIMER_DISPATCH,
+        GGML_BACKEND_OP_LOAD_PROFILE_TIMER_FUSED,
+        GGML_BACKEND_OP_LOAD_PROFILE_TIMER_ENQUEUE,
+        GGML_BACKEND_OP_LOAD_PROFILE_TIMER_PROFILE_WAIT,
+        GGML_BACKEND_OP_LOAD_PROFILE_TIMER_PROFILE_QUERY,
+        GGML_BACKEND_OP_LOAD_PROFILE_TIMER_BATCH_PUSH,
+        GGML_BACKEND_OP_LOAD_PROFILE_TIMER_FLUSH_BATCH,
+        GGML_BACKEND_OP_LOAD_PROFILE_TIMER_DSPQUEUE_WRITE,
+        GGML_BACKEND_OP_LOAD_PROFILE_TIMER_FLUSH_PENDING,
+        GGML_BACKEND_OP_LOAD_PROFILE_TIMER_DSPQUEUE_READ,
+        GGML_BACKEND_OP_LOAD_PROFILE_TIMER_RESPONSE_POP,
+        GGML_BACKEND_OP_LOAD_PROFILE_TIMER_ADD_OP,
+        GGML_BACKEND_OP_LOAD_PROFILE_TIMER_ADD_TENSOR,
+        GGML_BACKEND_OP_LOAD_PROFILE_TIMER_COUNT,
+    };
+
     enum {
         GGML_BACKEND_OP_LOAD_PROFILE_MAX_GROUPS = 64,
         GGML_BACKEND_OP_LOAD_PROFILE_NAME_LEN   = 64,
@@ -427,6 +446,7 @@ extern "C" {
 
     struct ggml_backend_op_load_profile_data {
         uint8_t ops_enabled[GGML_OP_COUNT];
+        uint8_t breakdown_enabled;
         uint32_t n_name_groups;
         char name_groups[GGML_BACKEND_OP_LOAD_PROFILE_MAX_GROUPS][GGML_BACKEND_OP_LOAD_PROFILE_NAME_LEN];
 
@@ -457,6 +477,11 @@ extern "C" {
         uint64_t decode_htp_count_by_name[GGML_BACKEND_OP_LOAD_PROFILE_MAX_GROUPS];
         uint64_t prefill_gpu_count_by_name[GGML_BACKEND_OP_LOAD_PROFILE_MAX_GROUPS];
         uint64_t decode_gpu_count_by_name[GGML_BACKEND_OP_LOAD_PROFILE_MAX_GROUPS];
+
+        double prefill_htp_timer_ms[GGML_BACKEND_OP_LOAD_PROFILE_TIMER_COUNT];
+        double decode_htp_timer_ms[GGML_BACKEND_OP_LOAD_PROFILE_TIMER_COUNT];
+        double prefill_gpu_timer_ms[GGML_BACKEND_OP_LOAD_PROFILE_TIMER_COUNT];
+        double decode_gpu_timer_ms[GGML_BACKEND_OP_LOAD_PROFILE_TIMER_COUNT];
     };
 
     // Enables/disables process-global backend scheduler profiling.
@@ -475,6 +500,8 @@ extern "C" {
     // Enables/disables process-global per-op load profiling.
     GGML_API void ggml_backend_op_load_profile_set_enabled(bool enabled);
     GGML_API bool ggml_backend_op_load_profile_enabled(void);
+    GGML_API void ggml_backend_op_load_profile_set_breakdown_enabled(bool enabled);
+    GGML_API bool ggml_backend_op_load_profile_breakdown_enabled(void);
     // Selects profiled ops from a comma-separated op list. NULL/empty selects the default op list.
     // Use "ALL" to enable all ggml ops.
     GGML_API void ggml_backend_op_load_profile_set_ops_from_env(const char * ops_csv);
@@ -490,6 +517,9 @@ extern "C" {
     GGML_API void ggml_backend_op_load_profile_add_ms(enum ggml_backend_op_load_profile_backend backend, enum ggml_op op, double ms);
     GGML_API void ggml_backend_op_load_profile_add_tensor_us(enum ggml_backend_op_load_profile_backend backend, enum ggml_op op, const char * name, double usec);
     GGML_API void ggml_backend_op_load_profile_add_tensor_ms(enum ggml_backend_op_load_profile_backend backend, enum ggml_op op, const char * name, double ms);
+    GGML_API void ggml_backend_op_load_profile_add_backend_timer_us(enum ggml_backend_op_load_profile_backend backend, enum ggml_backend_op_load_profile_timer timer, double usec);
+    GGML_API void ggml_backend_op_load_profile_add_backend_timer_ms(enum ggml_backend_op_load_profile_backend backend, enum ggml_backend_op_load_profile_timer timer, double ms);
+    GGML_API const char * ggml_backend_op_load_profile_timer_name(enum ggml_backend_op_load_profile_timer timer);
     GGML_API struct ggml_backend_op_load_profile_data ggml_backend_op_load_profile_get(void);
 
     //

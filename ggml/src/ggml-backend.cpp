@@ -1136,6 +1136,7 @@ struct ggml_backend_sched_profile_data ggml_backend_sched_profile_get(void) {
 
 struct ggml_backend_op_load_profile_state {
     bool enabled = false;
+    bool breakdown_enabled = false;
     ggml_backend_sched_profile_phase phase = GGML_BACKEND_SCHED_PROFILE_PREFILL;
     ggml_backend_op_load_profile_data out = {};
     std::vector<std::string> name_patterns;
@@ -1179,9 +1180,11 @@ static void ggml_op_load_profile_sync_ops_enabled_locked(void) {
 
 static void ggml_op_load_profile_clear_accum_locked(void) {
     uint8_t ops_enabled[GGML_OP_COUNT];
+    const bool breakdown_enabled = g_op_load_profile.breakdown_enabled;
     memcpy(ops_enabled, g_op_load_profile.out.ops_enabled, sizeof(ops_enabled));
     g_op_load_profile.out = {};
     memcpy(g_op_load_profile.out.ops_enabled, ops_enabled, sizeof(ops_enabled));
+    g_op_load_profile.out.breakdown_enabled = breakdown_enabled ? 1 : 0;
     ggml_op_load_profile_sync_ops_enabled_locked();
     ggml_op_load_profile_sync_name_groups_locked();
 }
@@ -1290,6 +1293,16 @@ void ggml_backend_op_load_profile_set_enabled(bool enabled) {
 
 bool ggml_backend_op_load_profile_enabled(void) {
     return g_op_load_profile.enabled;
+}
+
+void ggml_backend_op_load_profile_set_breakdown_enabled(bool enabled) {
+    std::lock_guard<std::mutex> lock(g_op_load_profile.mutex);
+    g_op_load_profile.breakdown_enabled = enabled;
+    ggml_op_load_profile_clear_accum_locked();
+}
+
+bool ggml_backend_op_load_profile_breakdown_enabled(void) {
+    return g_op_load_profile.breakdown_enabled;
 }
 
 void ggml_backend_op_load_profile_set_ops_from_env(const char * ops_csv) {
@@ -1404,7 +1417,7 @@ void ggml_backend_op_load_profile_reset(void) {
 }
 
 void ggml_backend_op_load_profile_set_phase(enum ggml_backend_sched_profile_phase phase) {
-    if (!g_op_load_profile.enabled) {
+    if (!g_op_load_profile.enabled && !g_op_load_profile.breakdown_enabled) {
         return;
     }
 
@@ -1540,6 +1553,79 @@ void ggml_backend_op_load_profile_add_tensor_us(
         const char * name,
         double usec) {
     ggml_backend_op_load_profile_add_tensor_ms(backend, op, name, usec / 1000.0);
+}
+
+void ggml_backend_op_load_profile_add_backend_timer_ms(
+        enum ggml_backend_op_load_profile_backend backend,
+        enum ggml_backend_op_load_profile_timer timer,
+        double ms) {
+    if (!g_op_load_profile.breakdown_enabled ||
+            backend < 0 || backend >= GGML_BACKEND_OP_LOAD_PROFILE_COUNT ||
+            timer < 0 || timer >= GGML_BACKEND_OP_LOAD_PROFILE_TIMER_COUNT) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_op_load_profile.mutex);
+
+    double * timer_ms = nullptr;
+    if (g_op_load_profile.phase == GGML_BACKEND_SCHED_PROFILE_PREFILL) {
+        switch (backend) {
+            case GGML_BACKEND_OP_LOAD_PROFILE_HTP:
+                timer_ms = g_op_load_profile.out.prefill_htp_timer_ms;
+                break;
+            case GGML_BACKEND_OP_LOAD_PROFILE_GPU:
+                timer_ms = g_op_load_profile.out.prefill_gpu_timer_ms;
+                break;
+            case GGML_BACKEND_OP_LOAD_PROFILE_CPU:
+            case GGML_BACKEND_OP_LOAD_PROFILE_COUNT:
+                break;
+        }
+    } else {
+        switch (backend) {
+            case GGML_BACKEND_OP_LOAD_PROFILE_HTP:
+                timer_ms = g_op_load_profile.out.decode_htp_timer_ms;
+                break;
+            case GGML_BACKEND_OP_LOAD_PROFILE_GPU:
+                timer_ms = g_op_load_profile.out.decode_gpu_timer_ms;
+                break;
+            case GGML_BACKEND_OP_LOAD_PROFILE_CPU:
+            case GGML_BACKEND_OP_LOAD_PROFILE_COUNT:
+                break;
+        }
+    }
+
+    if (timer_ms != nullptr) {
+        timer_ms[timer] += ms;
+    }
+}
+
+void ggml_backend_op_load_profile_add_backend_timer_us(
+        enum ggml_backend_op_load_profile_backend backend,
+        enum ggml_backend_op_load_profile_timer timer,
+        double usec) {
+    ggml_backend_op_load_profile_add_backend_timer_ms(backend, timer, usec / 1000.0);
+}
+
+const char * ggml_backend_op_load_profile_timer_name(enum ggml_backend_op_load_profile_timer timer) {
+    switch (timer) {
+        case GGML_BACKEND_OP_LOAD_PROFILE_TIMER_GRAPH:         return "graph";
+        case GGML_BACKEND_OP_LOAD_PROFILE_TIMER_SYNC:          return "sync";
+        case GGML_BACKEND_OP_LOAD_PROFILE_TIMER_DISPATCH:      return "dispatch";
+        case GGML_BACKEND_OP_LOAD_PROFILE_TIMER_FUSED:         return "fused";
+        case GGML_BACKEND_OP_LOAD_PROFILE_TIMER_ENQUEUE:       return "enqueue";
+        case GGML_BACKEND_OP_LOAD_PROFILE_TIMER_PROFILE_WAIT:  return "profile_wait";
+        case GGML_BACKEND_OP_LOAD_PROFILE_TIMER_PROFILE_QUERY: return "profile_query";
+        case GGML_BACKEND_OP_LOAD_PROFILE_TIMER_BATCH_PUSH:    return "batch_push";
+        case GGML_BACKEND_OP_LOAD_PROFILE_TIMER_FLUSH_BATCH:   return "flush_batch";
+        case GGML_BACKEND_OP_LOAD_PROFILE_TIMER_DSPQUEUE_WRITE:return "dspqueue_write";
+        case GGML_BACKEND_OP_LOAD_PROFILE_TIMER_FLUSH_PENDING: return "flush_pending";
+        case GGML_BACKEND_OP_LOAD_PROFILE_TIMER_DSPQUEUE_READ: return "dspqueue_read";
+        case GGML_BACKEND_OP_LOAD_PROFILE_TIMER_RESPONSE_POP:  return "response_pop";
+        case GGML_BACKEND_OP_LOAD_PROFILE_TIMER_ADD_OP:        return "add_op";
+        case GGML_BACKEND_OP_LOAD_PROFILE_TIMER_ADD_TENSOR:    return "add_tensor";
+        case GGML_BACKEND_OP_LOAD_PROFILE_TIMER_COUNT:         break;
+    }
+    return "unknown";
 }
 
 struct ggml_backend_op_load_profile_data ggml_backend_op_load_profile_get(void) {
