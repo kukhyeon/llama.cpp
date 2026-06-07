@@ -23,18 +23,18 @@ echo "CPU Governor (policy6): $(cat /sys/devices/system/cpu/cpufreq/policy6/scal
 sleep 3
 
 ./build/bin/ignite \
-    -m models/Llama-3.2-1B-Instruct-Q4_K_M.gguf \
+    -m models/Llama-3.2-3B-Instruct-Q8_0.gguf \
     -i -cnv -tb 6 -t 6 -ub 512 -b 512 \
     -c 1024 \
     --temp 0 \
     --top-k 1 \
     --device-name S25 \
     --output-dir output/ \
-    --input-path data/llama32_prefill_64.json \
+    --input-path data/llama32_prefill_256.json \
     -fa off \
     --strict on \
     --strict-limit 128 \
-    --max-query-number 30 \
+    --max-query-number 5 \
     --cpu-p 15 \
     --ram-p 9 \
     --cpu-d 15 \
