@@ -97,6 +97,121 @@ struct thermal_zone_info {
     std::string name;
 };
 
+struct cpu_stat_sample {
+    std::string name;
+    unsigned long long idle = 0;
+    unsigned long long total = 0;
+};
+
+bool is_cpu_stat_name(const std::string & name) {
+    if (name == "cpu") {
+        return true;
+    }
+    if (name.rfind("cpu", 0) != 0 || name.size() == 3) {
+        return false;
+    }
+    return std::all_of(name.begin() + 3, name.end(), [](unsigned char c) {
+        return std::isdigit(c);
+    });
+}
+
+std::vector<cpu_stat_sample> read_cpu_stat_samples() {
+    std::vector<cpu_stat_sample> samples;
+    std::ifstream file("/proc/stat");
+    std::string line;
+
+    while (std::getline(file, line)) {
+        std::istringstream iss(line);
+        std::string name;
+        iss >> name;
+        if (!is_cpu_stat_name(name)) {
+            break;
+        }
+
+        unsigned long long user = 0;
+        unsigned long long nice = 0;
+        unsigned long long system = 0;
+        unsigned long long idle = 0;
+        unsigned long long iowait = 0;
+        unsigned long long irq = 0;
+        unsigned long long softirq = 0;
+        unsigned long long steal = 0;
+
+        iss >> user >> nice >> system >> idle >> iowait >> irq >> softirq >> steal;
+        const unsigned long long idle_all = idle + iowait;
+        const unsigned long long total = user + nice + system + idle + iowait + irq + softirq + steal;
+        samples.push_back({ name, idle_all, total });
+    }
+
+    return samples;
+}
+
+std::vector<std::string> read_cpu_util_names() {
+    std::vector<std::string> names;
+    for (const auto & sample : read_cpu_stat_samples()) {
+        if (sample.name == "cpu") {
+            names.push_back("cpu_util_pct");
+        } else {
+            names.push_back(sample.name + "_util_pct");
+        }
+    }
+    return names;
+}
+
+std::vector<std::string> read_cpu_util_values() {
+    static std::vector<cpu_stat_sample> prev;
+
+    const auto cur = read_cpu_stat_samples();
+    std::vector<std::string> values;
+    values.reserve(cur.size());
+
+    if (prev.empty()) {
+        values.assign(cur.size(), "0");
+        prev = cur;
+        return values;
+    }
+
+    for (const auto & now : cur) {
+        auto it = std::find_if(prev.begin(), prev.end(), [&](const cpu_stat_sample & old) {
+            return old.name == now.name;
+        });
+
+        double util = 0.0;
+        if (it != prev.end() && now.total > it->total) {
+            const unsigned long long total_delta = now.total - it->total;
+            const unsigned long long idle_delta = now.idle >= it->idle ? now.idle - it->idle : 0;
+            util = 100.0 * (1.0 - (double) idle_delta / (double) total_delta);
+            if (util < 0.0) {
+                util = 0.0;
+            } else if (util > 100.0) {
+                util = 100.0;
+            }
+        }
+
+        values.push_back(format_number(util));
+    }
+
+    prev = cur;
+    return values;
+}
+
+std::string read_first_token_file(const std::vector<std::string> & paths, const std::string & fallback = "0") {
+    for (const auto & path : paths) {
+        std::ifstream file(path);
+        if (!file) {
+            continue;
+        }
+
+        std::string value;
+        file >> value;
+        if (!value.empty()) {
+            return value;
+        }
+    }
+
+    return fallback;
+}
+
 std::vector<thermal_zone_info> list_thermal_zones(const DVFS & dvfs) {
     std::vector<thermal_zone_info> zones;
     const std::string thermal_root = "/sys/devices/virtual/thermal";
@@ -300,11 +415,14 @@ const std::string get_records_names(const DVFS& dvfs) {
     }
 
     // gpu info
-    names += "gpu_min_clock,gpu_max_clock,";
+    names += "gpu_min_clock,gpu_max_clock,gpu_busy_pct,gpu_load,";
 
     // cpu info
     for(const auto index : dvfs.get_cluster_indices()){
         names += std::string("cpu") + std::to_string(index) + std::string("_max_freq,cpu") + std::to_string(index) + "_cur_freq,";
+    }
+    for (const auto & name : read_cpu_util_names()) {
+        names += name + ",";
     }
 
     // mem info
@@ -357,6 +475,15 @@ std::vector<std::string> get_hard_records(const DVFS& dvfs) {
         append_value(records, "/sys/kernel/gpu/gpu_min_clock");
         append_value(records, "/sys/kernel/gpu/gpu_max_clock");
     }
+    records.push_back(read_first_token_file({
+        "/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage",
+        "/sys/devices/platform/soc/3d00000.qcom,kgsl-3d0/kgsl/kgsl-3d0/gpu_busy_percentage",
+    }));
+    records.push_back(read_first_token_file({
+        "/sys/class/kgsl/kgsl-3d0/devfreq/gpu_load",
+        "/sys/class/devfreq/3d00000.qcom,kgsl-3d0/gpu_load",
+        "/sys/devices/platform/soc/3d00000.qcom,kgsl-3d0/devfreq/3d00000.qcom,kgsl-3d0/gpu_load",
+    }));
 
     // CPU clock info
     for (std::size_t i=0; i<cluster_indices.size(); ++i){
@@ -365,6 +492,8 @@ std::vector<std::string> get_hard_records(const DVFS& dvfs) {
         append_scaled_value(records, base + "scaling_max_freq", 1000.0);
         append_scaled_value(records, base + "scaling_cur_freq", 1000.0);
     }
+    const auto cpu_util_values = read_cpu_util_values();
+    records.insert(records.end(), cpu_util_values.begin(), cpu_util_values.end());
 
 	// RAM info
     const auto meminfo_values = read_meminfo_values_mib();
@@ -488,7 +617,7 @@ void record_hard(std::atomic<bool>& sigterm, const DVFS& dvfs){
         // File write record
         write_csv_row(file, records);
         // wait
-        //std::this_thread::sleep_for(std::chrono::milliseconds(170));
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     }while(sigterm != true);
 }
