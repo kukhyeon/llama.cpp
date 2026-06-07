@@ -47,7 +47,7 @@ const std::map<std::string, std::vector<std::string>> DVFS::empty_thermal = {
     { "S22_Ultra", { "sdr0-pa0", "sdr1-pa0", "pm8350b_tz", "pm8350b-ibat-lvl0", "pm8350b-ibat-lvl1", "pm8350b-bcl-lvl0", "pm8350b-bcl-lvl1", "pm8350b-bcl-lvl2", "socd", "pmr735b_tz"}},
     { "Fold4", { "sdr0-pa0", "sdr1-pa0", "pm8350b_tz", "pm8350b-ibat-lvl0", "pm8350b-ibat-lvl1", "pm8350b-bcl-lvl0", "pm8350b-bcl-lvl1", "pm8350b-bcl-lvl2", "socd", "pmr735b_tz", "qcom,secure-non"}},
     { "S24", {}},
-    { "S25", {}},
+    { "S25", { "camera*", "video*", "pm8550-bcl-lvl*", "mdmss*", "mmw*", "sdr*" }},
     { "Pixel9", {}}
 };
 

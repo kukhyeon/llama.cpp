@@ -97,6 +97,84 @@ struct thermal_zone_info {
     std::string name;
 };
 
+struct cooling_device_info {
+    std::string dir;
+    std::string name;
+    int index = -1;
+};
+
+int parse_prefixed_index(const std::string & value, const std::string & prefix) {
+    if (value.rfind(prefix, 0) != 0 || value.size() == prefix.size()) {
+        return -1;
+    }
+    const auto first_digit = value.begin() + prefix.size();
+    if (!std::all_of(first_digit, value.end(), [](unsigned char c) {
+        return std::isdigit(c);
+    })) {
+        return -1;
+    }
+    return std::atoi(value.c_str() + prefix.size());
+}
+
+std::string sanitize_column_token(const std::string & value) {
+    std::string out;
+    bool last_was_underscore = false;
+
+    for (unsigned char c : value) {
+        if (std::isalnum(c)) {
+            out.push_back((char) std::tolower(c));
+            last_was_underscore = false;
+        } else if (!last_was_underscore) {
+            out.push_back('_');
+            last_was_underscore = true;
+        }
+    }
+
+    while (!out.empty() && out.back() == '_') {
+        out.pop_back();
+    }
+    while (!out.empty() && out.front() == '_') {
+        out.erase(out.begin());
+    }
+
+    return out.empty() ? "unknown" : out;
+}
+
+bool wildcard_match(const char * pattern, const char * text) {
+    const char * star = nullptr;
+    const char * retry = nullptr;
+
+    while (*text != '\0') {
+        if (*pattern == *text) {
+            pattern++;
+            text++;
+        } else if (*pattern == '*') {
+            star = pattern++;
+            retry = text;
+        } else if (star != nullptr) {
+            pattern = star + 1;
+            text = ++retry;
+        } else {
+            return false;
+        }
+    }
+
+    while (*pattern == '*') {
+        pattern++;
+    }
+
+    return *pattern == '\0';
+}
+
+bool thermal_zone_filtered(const std::string & name, const std::vector<std::string> & filters) {
+    for (const auto & filter : filters) {
+        if (wildcard_match(filter.c_str(), name.c_str())) {
+            return true;
+        }
+    }
+    return false;
+}
+
 struct cpu_stat_sample {
     std::string name;
     unsigned long long idle = 0;
@@ -240,7 +318,7 @@ std::vector<thermal_zone_info> list_thermal_zones(const DVFS & dvfs) {
 
         if (name == "qcom,secure-non") {
             name = "secure-non";
-        } else if (std::find(empty_thermal.begin(), empty_thermal.end(), name) != empty_thermal.end()) {
+        } else if (thermal_zone_filtered(name, empty_thermal)) {
             continue;
         }
 
@@ -252,6 +330,47 @@ std::vector<thermal_zone_info> list_thermal_zones(const DVFS & dvfs) {
     });
 
     return zones;
+}
+
+const std::vector<cooling_device_info> & list_cooling_devices() {
+    static const std::vector<cooling_device_info> devices = []() {
+        std::vector<cooling_device_info> result;
+        const std::string thermal_root = "/sys/class/thermal";
+
+        std::error_code ec;
+        for (const auto & entry : std::filesystem::directory_iterator(thermal_root, ec)) {
+            if (ec) {
+                break;
+            }
+            if (!entry.is_directory()) {
+                continue;
+            }
+
+            const std::string dir = entry.path().string();
+            const std::string base = entry.path().filename().string();
+            if (base.rfind("cooling_device", 0) != 0) {
+                continue;
+            }
+
+            const std::string name = read_token_file(dir + "/type", "");
+            if (name.empty()) {
+                continue;
+            }
+
+            result.push_back({ dir, name, parse_prefixed_index(base, "cooling_device") });
+        }
+
+        std::sort(result.begin(), result.end(), [](const cooling_device_info & a, const cooling_device_info & b) {
+            if (a.index != b.index) {
+                return a.index < b.index;
+            }
+            return a.dir < b.dir;
+        });
+
+        return result;
+    }();
+
+    return devices;
 }
 
 std::vector<std::string> read_meminfo_names() {
@@ -414,6 +533,14 @@ const std::string get_records_names(const DVFS& dvfs) {
         names += zone.name + ",";
     }
 
+    // cooling device mitigation state
+    if (env_flag_enabled("IGNITE_RECORD_COOLING", false)) {
+        for (const auto & device : list_cooling_devices()) {
+            names += "cdev" + std::to_string(device.index) + "_"
+                   + sanitize_column_token(device.name) + "_cur_state,";
+        }
+    }
+
     // gpu info
     names += "gpu_min_clock,gpu_max_clock,gpu_busy_pct,gpu_load,";
 
@@ -426,8 +553,10 @@ const std::string get_records_names(const DVFS& dvfs) {
     }
 
     // mem info
-    for (const auto & name : read_meminfo_names()) {
-        names += name + ",";
+    if (env_flag_enabled("IGNITE_RECORD_MEMINFO", true)) {
+        for (const auto & name : read_meminfo_names()) {
+            names += name + ",";
+        }
     }
 
     // power
@@ -464,6 +593,13 @@ std::vector<std::string> get_hard_records(const DVFS& dvfs) {
         append_scaled_value(records, zone.dir + "/temp", 1000.0);
     }
 
+    // cooling device mitigation state
+    if (env_flag_enabled("IGNITE_RECORD_COOLING", false)) {
+        for (const auto & device : list_cooling_devices()) {
+            append_value(records, device.dir + "/cur_state");
+        }
+    }
+
     // GPU clock info
     if (device_name == "Pixel9"){
         append_value(records, "/sys/devices/platform/1f000000.mali/scaling_min_freq");
@@ -496,8 +632,10 @@ std::vector<std::string> get_hard_records(const DVFS& dvfs) {
     records.insert(records.end(), cpu_util_values.begin(), cpu_util_values.end());
 
 	// RAM info
-    const auto meminfo_values = read_meminfo_values_mib();
-    records.insert(records.end(), meminfo_values.begin(), meminfo_values.end());
+    if (env_flag_enabled("IGNITE_RECORD_MEMINFO", true)) {
+        const auto meminfo_values = read_meminfo_values_mib();
+        records.insert(records.end(), meminfo_values.begin(), meminfo_values.end());
+    }
 
     // Power Consumption info
     if (device_name == "Pixel9"){
