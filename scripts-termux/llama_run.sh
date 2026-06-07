@@ -1,5 +1,12 @@
 # this script should be run on llama.cpp/ dir.
 
+# Hardware stats controls:
+#   IGNITE_RECORD_MEMINFO=1|0
+#   IGNITE_RECORD_COOLING=1|0
+IGNITE_RECORD_MEMINFO="${IGNITE_RECORD_MEMINFO:-0}"
+IGNITE_RECORD_COOLING="${IGNITE_RECORD_COOLING:-1}"
+export IGNITE_RECORD_MEMINFO IGNITE_RECORD_COOLING
+
 # screen brightness control
 echo 0 > /sys/class/backlight/panel0-backlight/brightness
 
@@ -47,4 +54,3 @@ echo "CPU Governor reset (policy6): $(cat /sys/devices/system/cpu/cpufreq/policy
 
 # experiment done -> let screen brightness bright again
 echo 1023 > /sys/class/backlight/panel0-backlight/brightness
-
