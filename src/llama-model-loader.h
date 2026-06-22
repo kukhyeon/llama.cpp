@@ -21,6 +21,14 @@ using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
 // lists of buffer types used for each layer
 using buft_list_t = std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_type_t>>;
 
+struct llama_tensor_shard_info {
+    std::string source_name;
+    std::string backend;
+    int axis = -1;
+    int64_t start = 0;
+    int64_t size = 0;
+};
+
 enum llama_fver {
     GGUF_FILE_VERSION_V1 = 1,
     GGUF_FILE_VERSION_V2 = 2,
@@ -118,6 +126,13 @@ struct llama_model_loader {
     // backend buffers such as CPU or HTP0-REPACK.
     std::unordered_set<ggml_tensor *> residency_tensors;
     std::unordered_map<std::string, std::vector<ggml_tensor *>> residency_tensors_by_name;
+    std::unordered_map<ggml_tensor *, llama_tensor_shard_info> residency_shard_infos;
+
+    // Metadata-only tensors whose data is intentionally provided by residency
+    // shards instead of a full primary weight allocation.
+    std::vector<ggml_context_ptr> virtual_ctxs;
+    std::unordered_set<ggml_tensor *> virtual_tensors;
+    std::unordered_set<std::string> virtual_tensor_names;
 
     // track tensors that had to be moved for debugging:
     size_t n_tensors_moved = 0;
@@ -193,7 +208,13 @@ struct llama_model_loader {
         return residency_tensors.find(const_cast<ggml_tensor *>(tensor)) != residency_tensors.end();
     }
 
+    bool is_virtual_tensor(const ggml_tensor * tensor) const {
+        return virtual_tensors.find(const_cast<ggml_tensor *>(tensor)) != virtual_tensors.end();
+    }
+
     struct ggml_tensor * create_tensor_as_view(struct ggml_context * ctx, struct ggml_tensor * base, const std::string & name, const std::initializer_list<int64_t> & ne, size_t offset, bool required = true);
+
+    bool context_has_loading_shards(const struct ggml_context * ctx) const;
 
     void done_getting_tensors() const;
 

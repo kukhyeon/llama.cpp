@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 #include "llama-model.h"
+#include "llama-backend-policy.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
 
@@ -11,7 +12,9 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include <algorithm>
 #include <cassert>
+#include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <numeric>
@@ -945,6 +948,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     n_ctx_orig       (cparams.n_ctx_orig_yarn),
     pooling_type     (cparams.pooling_type),
     rope_type        (hparams.rope_type),
+    model            (params.model),
     sched            (params.sched),
     backend_cpu      (params.backend_cpu),
     cvec             (params.cvec),
@@ -959,9 +963,9 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
         res->set_params(params);
     }
 
-void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
+void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il, const char * backend_hint) const {
     if (cb_func) {
-        cb_func(ubatch, cur, name, il);
+        cb_func(ubatch, cur, name, il, backend_hint);
     }
 }
 
@@ -1156,8 +1160,135 @@ ggml_tensor * llm_graph_context::build_ffn(
          ggml_tensor * down_s,
          ggml_tensor * act_scales,
      llm_ffn_op_type   type_op,
-   llm_ffn_gate_type   type_gate,
+     llm_ffn_gate_type   type_gate,
                  int   il) const {
+    llama_backend_policy_ffn_parallel ffn_policy;
+    const bool is_prefill = n_tokens > 1;
+    const bool requires_parallel =
+        (up   != nullptr && up->buffer   == nullptr) ||
+        (gate != nullptr && gate->buffer == nullptr) ||
+        (down != nullptr && down->buffer == nullptr);
+    const bool can_try_parallel =
+        model != nullptr &&
+        up != nullptr && gate != nullptr && down != nullptr &&
+        up_b == nullptr && up_s == nullptr &&
+        gate_b == nullptr && gate_s == nullptr &&
+        down_b == nullptr && down_s == nullptr &&
+        act_scales == nullptr &&
+        (loras == nullptr || loras->empty()) &&
+        type_op == LLM_FFN_SILU &&
+        type_gate == LLM_FFN_PAR &&
+        llama_backend_policy_match_ffn_parallel(il, is_prefill, ffn_policy);
+
+    if (can_try_parallel) {
+        const int64_t n_ff = up->ne[1];
+        const int64_t align = std::max<int64_t>(1, ffn_policy.align);
+        bool valid = gate->ne[1] == n_ff && down->ne[0] == n_ff;
+        std::vector<llama_backend_policy_ffn_split> splits = ffn_policy.splits;
+        std::sort(splits.begin(), splits.end(), [](const auto & a, const auto & b) {
+            return a.start < b.start;
+        });
+
+        int64_t covered = 0;
+        for (const auto & split : splits) {
+            valid = valid && split.start == covered && split.size > 0;
+            valid = valid && (split.start % align) == 0 && (split.size % align) == 0;
+            valid = valid && (split.size % ggml_blck_size(up->type)) == 0;
+            covered = split.start + split.size;
+        }
+        valid = valid && covered == n_ff;
+
+        auto tensor_matches_backend = [](const ggml_tensor * t, const std::string & backend) {
+            if (t == nullptr || t->buffer == nullptr || backend.empty()) {
+                return false;
+            }
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t->buffer);
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+            return llama_backend_policy_buft_matches(dev, buft, backend);
+        };
+
+        auto weight_slice = [&](ggml_tensor * w, int axis, const llama_backend_policy_ffn_split & split) -> ggml_tensor * {
+            if (ggml_tensor * shard = model->get_backend_policy_ffn_shard_tensor(w, split.backend, axis, split.start, split.size)) {
+                return shard;
+            }
+
+            if (!tensor_matches_backend(w, split.backend)) {
+                return nullptr;
+            }
+
+            if (axis == 0) {
+                return ggml_view_2d(ctx0, w, split.size, w->ne[1], w->nb[1], ggml_row_size(w->type, split.start));
+            }
+
+            return ggml_view_2d(ctx0, w, w->ne[0], split.size, w->nb[1], split.start * w->nb[1]);
+        };
+
+        if (valid) {
+            std::vector<llama_backend_policy_ffn_split> exec_splits = splits;
+            if (!ffn_policy.reduce_backend.empty()) {
+                std::stable_sort(exec_splits.begin(), exec_splits.end(), [&](const auto & a, const auto & b) {
+                    const bool a_reduce = a.backend == ffn_policy.reduce_backend;
+                    const bool b_reduce = b.backend == ffn_policy.reduce_backend;
+                    if (a_reduce != b_reduce) {
+                        return a_reduce;
+                    }
+                    return a.start < b.start;
+                });
+            }
+
+            std::vector<ggml_tensor *> branch_outs;
+            branch_outs.reserve(exec_splits.size());
+
+            for (const auto & split : exec_splits) {
+                ggml_tensor * up_i   = weight_slice(up,   1, split);
+                ggml_tensor * gate_i = weight_slice(gate, 1, split);
+                ggml_tensor * down_i = weight_slice(down, 0, split);
+
+                if (up_i == nullptr || gate_i == nullptr || down_i == nullptr) {
+                    valid = false;
+                    LLAMA_LOG_DEBUG("backend_policy: ffn_parallel layer %d shard %s missing resident weights for backend %s; falling back\n",
+                            il, split.id.c_str(), split.backend.c_str());
+                    break;
+                }
+
+                const std::string suffix = "." + (split.id.empty() ? split.backend : split.id);
+
+                ggml_tensor * up_cur = ggml_mul_mat(ctx0, up_i, cur);
+                cb(up_cur, ("ffn_up" + suffix).c_str(), il, split.backend.c_str());
+
+                ggml_tensor * gate_cur = ggml_mul_mat(ctx0, gate_i, cur);
+                cb(gate_cur, ("ffn_gate" + suffix).c_str(), il, split.backend.c_str());
+
+                ggml_tensor * act = ggml_swiglu_split(ctx0, gate_cur, up_cur);
+                cb(act, ("ffn_swiglu" + suffix).c_str(), il, split.backend.c_str());
+
+                ggml_tensor * out = ggml_mul_mat(ctx0, down_i, act);
+                cb(out, ("ffn_down" + suffix).c_str(), il, split.backend.c_str());
+
+                branch_outs.push_back(out);
+            }
+
+            if (valid && !branch_outs.empty()) {
+                ggml_tensor * acc = branch_outs[0];
+                for (size_t i = 1; i < branch_outs.size(); ++i) {
+                    acc = ggml_add(ctx0, acc, branch_outs[i]);
+                    cb(acc, "ffn_parallel_sum", il,
+                            ffn_policy.reduce_backend.empty() ? nullptr : ffn_policy.reduce_backend.c_str());
+                }
+                cb(acc, "ffn_parallel_out", il,
+                        ffn_policy.reduce_backend.empty() ? nullptr : ffn_policy.reduce_backend.c_str());
+                return acc;
+            }
+        } else {
+            LLAMA_LOG_DEBUG("backend_policy: ffn_parallel layer %d invalid split coverage/alignment for n_ff=%" PRId64 "; falling back\n",
+                    il, n_ff);
+        }
+    }
+
+    if (requires_parallel) {
+        GGML_ABORT("backend_policy: ffn_parallel shard-only layer %d cannot fall back to full FFN weights", il);
+    }
+
     ggml_tensor * tmp = up ? build_lora_mm(up, cur) : cur;
     cb(tmp, "ffn_up", il);
 

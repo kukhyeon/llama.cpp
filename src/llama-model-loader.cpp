@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cinttypes>
 #include <cstdint>
 #include <cstring>
@@ -1118,6 +1119,48 @@ static ggml_backend_buffer_type_t select_policy_weight_buft(
     return nullptr;
 }
 
+static bool is_ffn_parallel_weight_tensor(const LLM_TN_IMPL & tn, int & axis) {
+    if (tn.suffix == nullptr || std::strcmp(tn.suffix, "weight") != 0 || tn.bid < 0) {
+        return false;
+    }
+
+    switch (tn.tensor) {
+        case LLM_TENSOR_FFN_UP:
+        case LLM_TENSOR_FFN_GATE:
+            axis = 1;
+            return true;
+        case LLM_TENSOR_FFN_DOWN:
+            axis = 0;
+            return true;
+        default:
+            return false;
+    }
+}
+
+static std::string sanitize_shard_name_part(std::string value) {
+    for (char & c : value) {
+        const unsigned char uc = (unsigned char) c;
+        if (!std::isalnum(uc) && c != '_' && c != '-' && c != '.') {
+            c = '_';
+        }
+    }
+    return value;
+}
+
+static void init_tensor_meta_2d(ggml_tensor & meta, ggml_type type, int64_t ne0, int64_t ne1, const char * name) {
+    std::memset(&meta, 0, sizeof(meta));
+    meta.type = type;
+    meta.ne[0] = ne0;
+    meta.ne[1] = ne1;
+    meta.ne[2] = 1;
+    meta.ne[3] = 1;
+    meta.nb[0] = ggml_type_size(type);
+    meta.nb[1] = ggml_row_size(type, ne0);
+    meta.nb[2] = meta.nb[1] * ne1;
+    meta.nb[3] = meta.nb[2];
+    ggml_set_name(&meta, name);
+}
+
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const buft_list_t * buft_list_all, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
@@ -1149,6 +1192,26 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             return ctx;
         }
         return it->second.get();
+    };
+
+    auto ctx_for_virtual_tensor = [&]() -> ggml_context * {
+        if (virtual_ctxs.empty()) {
+            const size_t ctx_size = ggml_tensor_overhead()*(n_tensors + hparams.n_layer*4);
+            ggml_init_params params = {
+                /*.mem_size   =*/ ctx_size,
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+
+            ggml_context * ctx = ggml_init(params);
+            if (!ctx) {
+                throw std::runtime_error(format("failed to create virtual ggml context"));
+            }
+
+            virtual_ctxs.emplace_back(ctx);
+        }
+
+        return virtual_ctxs.back().get();
     };
 
     auto buft_for_tensor = [&](ggml_tensor * t_meta) -> ggml_backend_buffer_type_t {
@@ -1305,6 +1368,80 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return buft;
     };
 
+    auto create_ffn_shards = [&](const ggml_tensor * cur, const char * tensor_name, int ffn_axis, const llama_backend_policy_ffn_parallel & ffn_policy, ggml_op residency_op, ggml_backend_buffer_type_t primary_buft) {
+        if (buft_list_all == nullptr) {
+            return;
+        }
+
+        const int64_t shard_dim = ffn_axis == 0 ? cur->ne[0] : cur->ne[1];
+        const int64_t align = std::max<int64_t>(1, ffn_policy.align);
+
+        for (const auto & split : ffn_policy.splits) {
+            if (split.start < 0 || split.size <= 0 || split.start + split.size > shard_dim) {
+                LLAMA_LOG_WARN("backend_policy: ffn shard %s for %s is out of range [0, %" PRId64 ")\n",
+                        split.id.c_str(), tensor_name, shard_dim);
+                continue;
+            }
+            if ((split.start % align) != 0 || (split.size % align) != 0) {
+                LLAMA_LOG_WARN("backend_policy: ffn shard %s for %s is not aligned to %" PRId64 " channels; skipping shard\n",
+                        split.id.c_str(), tensor_name, align);
+                continue;
+            }
+
+            const int64_t shard_ne0 = ffn_axis == 0 ? split.size : cur->ne[0];
+            const int64_t shard_ne1 = ffn_axis == 0 ? cur->ne[1] : split.size;
+            if (shard_ne0 % ggml_blck_size(cur->type) != 0) {
+                LLAMA_LOG_WARN("backend_policy: ffn shard %s for %s has ne0=%" PRId64 " not divisible by block size %" PRId64 "; skipping shard\n",
+                        split.id.c_str(), tensor_name, shard_ne0, ggml_blck_size(cur->type));
+                continue;
+            }
+
+            const std::string shard_name =
+                std::string(tensor_name) + "#ffn_shard." +
+                sanitize_shard_name_part(split.id.empty() ? split.backend : split.id) + "." +
+                std::to_string(split.start) + "." + std::to_string(split.size);
+
+            ggml_tensor shard_meta;
+            init_tensor_meta_2d(shard_meta, cur->type, shard_ne0, shard_ne1, shard_name.c_str());
+
+            llama_backend_policy_match copy_match;
+            copy_match.matched = true;
+            copy_match.backends = { split.backend };
+            copy_match.source = ffn_policy.source;
+
+            ggml_backend_buffer_type_t shard_buft = select_policy_weight_buft(hparams, &shard_meta, residency_op, copy_match);
+            if (shard_buft == nullptr) {
+                LLAMA_LOG_WARN("backend_policy: ffn shard %s for %s requested %s, but no compatible buffer type was found\n",
+                        split.id.c_str(), tensor_name, split.backend.c_str());
+                continue;
+            }
+
+            if (primary_buft != nullptr && shard_buft == primary_buft) {
+                // The primary full tensor already lives in the requested backend.
+                // The graph can use a view of it without allocating another copy.
+                continue;
+            }
+
+            ggml_context * shard_ctx = ctx_for_buft(shard_buft);
+            if (ggml_get_tensor(shard_ctx, shard_name.c_str()) != nullptr) {
+                continue;
+            }
+
+            ggml_tensor * shard = ggml_new_tensor_2d(shard_ctx, cur->type, shard_ne0, shard_ne1);
+            ggml_set_name(shard, shard_name.c_str());
+            residency_tensors.insert(shard);
+            residency_tensors_by_name[tensor_name].push_back(shard);
+            residency_shard_infos[shard] = { tensor_name, split.backend, ffn_axis, split.start, split.size };
+            size_data += ggml_nbytes(shard);
+
+            LLAMA_LOG_DEBUG("backend_policy: ffn shard tensor %s (%zu MiB %s) from %s axis=%d start=%" PRId64 " size=%" PRId64 " using %s\n",
+                    shard_name.c_str(),
+                    ggml_nbytes(shard) / 1024 / 1024, ggml_type_name(shard->type),
+                    ffn_policy.source.c_str(), ffn_axis, split.start, split.size,
+                    ggml_backend_buft_name(shard_buft));
+        }
+    };
+
     if (files.empty()) {
         if (flags & TENSOR_SKIP_IF_VIRTUAL) {
             return nullptr;
@@ -1344,6 +1481,60 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     }
 
     ggml_tensor * t_meta = get_tensor_meta(tn.str().c_str());
+
+    int ffn_axis = -1;
+    llama_backend_policy_ffn_parallel ffn_policy;
+    const bool ffn_parallel_layer_enabled =
+        t_meta != nullptr &&
+        is_ffn_parallel_weight_tensor(tn, ffn_axis) &&
+        llama_backend_policy_match_ffn_parallel_layer(tn.bid, ffn_policy);
+    std::string ffn_phase = ffn_policy.phase;
+    std::transform(ffn_phase.begin(), ffn_phase.end(), ffn_phase.begin(), [](unsigned char c) {
+        return (char) std::tolower(c);
+    });
+    const bool ffn_parallel_shard_only = ffn_parallel_layer_enabled && ffn_phase == "all";
+
+    llm_tensor residency_tn_tensor = tn.tensor;
+    if (tn.tensor == LLM_TENSOR_TOKEN_EMBD && (flags & TENSOR_DUPLICATED)) {
+        residency_tn_tensor = LLM_TENSOR_OUTPUT;
+    }
+    const llm_tensor_info residency_info = llm_tensor_info_for(residency_tn_tensor);
+    const bool residency_bias = tn.suffix != nullptr && strcmp(tn.suffix, "bias") == 0;
+    const ggml_op residency_op = residency_bias
+        ? (residency_info.op == GGML_OP_MUL_MAT_ID ? GGML_OP_ADD_ID : GGML_OP_ADD)
+        : residency_info.op;
+
+    if (ffn_parallel_shard_only) {
+        const struct ggml_tensor * cur = check_tensor_dims(tn.str(), ne, !(flags & TENSOR_NOT_REQUIRED));
+        if (cur == NULL) {
+            return NULL;
+        }
+
+        ggml_context * ctx = ctx_for_virtual_tensor();
+        if (flags & TENSOR_DUPLICATED) {
+            ggml_tensor * t = ggml_get_tensor(ctx, tn.str().c_str());
+            if (t) {
+                return t;
+            }
+        }
+
+        ggml_tensor * tensor = ggml_dup_tensor(ctx, cur);
+        ggml_set_name(tensor, ggml_get_name(cur));
+        virtual_tensors.insert(tensor);
+        virtual_tensor_names.insert(ggml_get_name(tensor));
+
+        create_ffn_shards(cur, ggml_get_name(tensor), ffn_axis, ffn_policy, residency_op, nullptr);
+
+        if (!(flags & TENSOR_DUPLICATED)) {
+            n_created++;
+        }
+
+        LLAMA_LOG_DEBUG("backend_policy: ffn source tensor %s kept as shard-only metadata placeholder\n",
+                ggml_get_name(tensor));
+
+        return tensor;
+    }
+
     ggml_backend_buffer_type_t buft = buft_for_tensor(t_meta);
     if (buft == nullptr) {
         return nullptr; // return type is ggml_tensor *
@@ -1370,16 +1561,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, cur);
     ggml_set_name(tensor, ggml_get_name(cur));
 
-    if (llama_backend_policy_residency_enabled() && buft_list_all != nullptr) {
-        llm_tensor residency_tn_tensor = tn.tensor;
-        if (tn.tensor == LLM_TENSOR_TOKEN_EMBD && (flags & TENSOR_DUPLICATED)) {
-            residency_tn_tensor = LLM_TENSOR_OUTPUT;
-        }
-        const llm_tensor_info residency_info = llm_tensor_info_for(residency_tn_tensor);
-        const bool residency_bias = tn.suffix != nullptr && strcmp(tn.suffix, "bias") == 0;
-        const ggml_op residency_op = residency_bias
-            ? (residency_info.op == GGML_OP_MUL_MAT_ID ? GGML_OP_ADD_ID : GGML_OP_ADD)
-            : residency_info.op;
+    if (ffn_parallel_layer_enabled) {
+        create_ffn_shards(cur, ggml_get_name(tensor), ffn_axis, ffn_policy, residency_op, buft);
+    }
+
+    if (!ffn_parallel_layer_enabled && llama_backend_policy_residency_enabled() && buft_list_all != nullptr) {
 
         llama_backend_policy_match residency_match;
         const char * tensor_name = ggml_get_name(tensor);
@@ -1451,6 +1637,16 @@ struct ggml_tensor * llama_model_loader::create_tensor_as_view(struct ggml_conte
     return tensor;
 }
 
+bool llama_model_loader::context_has_loading_shards(const ggml_context * ctx) const {
+    for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
+        if (residency_shard_infos.find(tensor) != residency_shard_infos.end()) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 void llama_model_loader::done_getting_tensors() const {
     if (n_created != n_tensors) {
         throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_tensors, n_created));
@@ -1491,6 +1687,9 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
 
     // compute the total size of all tensors for progress reporting
     for (const auto & it : weights_map) {
+        if (virtual_tensor_names.find(it.first) != virtual_tensor_names.end()) {
+            continue;
+        }
         size_data += ggml_nbytes(it.second.tensor);
     }
 }
@@ -1651,7 +1850,13 @@ bool llama_model_loader::load_all_data(
     }
 
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
-        const auto * weight = get_weight(ggml_get_name(cur));
+        const llama_tensor_shard_info * shard = nullptr;
+        auto shard_it = residency_shard_infos.find(cur);
+        if (shard_it != residency_shard_infos.end()) {
+            shard = &shard_it->second;
+        }
+
+        const auto * weight = shard ? get_weight(shard->source_name.c_str()) : get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
             // this can happen with split experts models
             continue;
@@ -1664,6 +1869,52 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+
+        if (shard != nullptr) {
+            const ggml_tensor * src = weight->tensor;
+            if (src->type != cur->type) {
+                throw std::runtime_error(format("ffn shard '%s' has source type %s but shard type %s",
+                            ggml_get_name(cur), ggml_type_name(src->type), ggml_type_name(cur->type)));
+            }
+
+            read_buf.resize(n_size);
+            uint8_t * dst = (uint8_t *) read_buf.data();
+
+            const size_t src_row_size = src->nb[1];
+            const size_t dst_row_size = cur->nb[1];
+            const size_t src_offset_axis0 = ggml_row_size(src->type, shard->start);
+
+            auto read_source = [&](size_t source_offset, void * dst_ptr, size_t size) {
+                if (use_mmap) {
+                    const auto & mapping = mappings.at(weight->idx);
+                    std::memcpy(dst_ptr, (uint8_t *) mapping->addr() + source_offset, size);
+                } else {
+                    const auto & file = files.at(weight->idx);
+                    file->seek(source_offset, SEEK_SET);
+                    file->read_raw(dst_ptr, size);
+                }
+            };
+
+            if (shard->axis == 1) {
+                const size_t source_offset = weight->offs + (size_t) shard->start * src_row_size;
+                read_source(source_offset, dst, n_size);
+            } else if (shard->axis == 0) {
+                for (int64_t row = 0; row < cur->ne[1]; ++row) {
+                    const size_t source_offset = weight->offs + (size_t) row * src_row_size + src_offset_axis0;
+                    read_source(source_offset, dst + (size_t) row * dst_row_size, dst_row_size);
+                }
+            } else {
+                throw std::runtime_error(format("ffn shard '%s' has invalid axis %d", ggml_get_name(cur), shard->axis));
+            }
+
+            ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
+            if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
+                throw std::runtime_error(format("tensor '%s' has invalid shard data", ggml_get_name(cur)));
+            }
+
+            size_done += n_size;
+            continue;
+        }
 
         if (use_mmap) {
             const auto & mapping = mappings.at(weight->idx);
