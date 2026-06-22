@@ -3,6 +3,7 @@
 #include "ggml-backend.h"
 #include "ggml.h"
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -15,9 +16,28 @@ struct llama_backend_policy_match {
     std::string source;
 };
 
+struct llama_backend_policy_ffn_split {
+    std::string id;
+    int64_t start = 0;
+    int64_t size = 0;
+    std::string backend;
+};
+
+struct llama_backend_policy_ffn_parallel {
+    bool enabled = false;
+    std::string phase;
+    int layer_start = -2;
+    int layer_end = -2;
+    int64_t align = 256;
+    std::string reduce_backend;
+    std::vector<llama_backend_policy_ffn_split> splits;
+    std::string source;
+};
+
 bool llama_backend_policy_weights_enabled();
 bool llama_backend_policy_ops_enabled();
 bool llama_backend_policy_residency_enabled();
+bool llama_backend_policy_ffn_parallel_enabled();
 
 // Update the process-global runtime profile from the current execution phase
 // and optional environment/config driven switches. Returns true when the active
@@ -54,6 +74,15 @@ bool llama_backend_policy_match_op(
         int il,
         bool is_prefill,
         llama_backend_policy_match & out);
+
+bool llama_backend_policy_match_ffn_parallel(
+        int il,
+        bool is_prefill,
+        llama_backend_policy_ffn_parallel & out);
+
+bool llama_backend_policy_match_ffn_parallel_layer(
+        int il,
+        llama_backend_policy_ffn_parallel & out);
 
 // Match a requested policy name to a backend buffer type. This is used during
 // model loading, where weights are assigned to buffer types rather than to

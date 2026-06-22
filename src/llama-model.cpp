@@ -943,6 +943,7 @@ struct llama_model::impl {
 
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
+    std::vector<ggml_context_ptr> virtual_ctxs;
 
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
@@ -960,6 +961,7 @@ struct llama_model::impl {
     bool has_tensor_overrides;
 
     std::unordered_map<std::string, std::vector<ggml_tensor *>> backend_policy_residency_tensors;
+    std::unordered_map<ggml_tensor *, llama_tensor_shard_info> backend_policy_residency_shard_infos;
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -1427,6 +1429,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     ml.done_getting_tensors();
     pimpl->backend_policy_residency_tensors = ml.residency_tensors_by_name;
+    pimpl->backend_policy_residency_shard_infos = ml.residency_shard_infos;
 
     // populate tensors_by_name
     for (auto & [_, ctx_ptr] : ml.ctx_map) {
@@ -1437,6 +1440,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             tensors_by_name.emplace_back(ggml_get_name(cur), cur);
         }
     }
+    for (auto * cur : ml.virtual_tensors) {
+        tensors_by_name.emplace_back(ggml_get_name(cur), cur);
+    }
+    pimpl->virtual_ctxs = std::move(ml.virtual_ctxs);
 
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
@@ -1475,7 +1482,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
 
         std::vector<ggml_backend_buffer_ptr> bufs;
-        if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+        if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft && !ml.context_has_loading_shards(ctx)) {
             GGML_ASSERT(!ml.no_alloc);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 // only the mmap region containing the tensors in the model is mapped to the backend buffer
@@ -1954,6 +1961,54 @@ ggml_tensor * llama_model::get_backend_policy_residency_tensor(
             if (tensor_matches(candidate, backend_name)) {
                 return candidate;
             }
+        }
+    }
+
+    return nullptr;
+}
+
+ggml_tensor * llama_model::get_backend_policy_ffn_shard_tensor(
+        const ggml_tensor * tensor,
+        const std::string & backend,
+        int axis,
+        int64_t start,
+        int64_t size) const {
+    if (tensor == nullptr || backend.empty()) {
+        return nullptr;
+    }
+
+    const char * name_c = ggml_get_name(tensor);
+    if (name_c == nullptr || name_c[0] == '\0') {
+        return nullptr;
+    }
+
+    auto tensor_matches_backend = [](const ggml_tensor * cur, const std::string & backend_name) {
+        if (cur == nullptr || cur->buffer == nullptr) {
+            return false;
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(cur->buffer);
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        return llama_backend_policy_buft_matches(dev, buft, backend_name);
+    };
+
+    auto it = pimpl->backend_policy_residency_tensors.find(name_c);
+    if (it == pimpl->backend_policy_residency_tensors.end()) {
+        return nullptr;
+    }
+
+    for (ggml_tensor * candidate : it->second) {
+        auto info_it = pimpl->backend_policy_residency_shard_infos.find(candidate);
+        if (info_it == pimpl->backend_policy_residency_shard_infos.end()) {
+            continue;
+        }
+
+        const llama_tensor_shard_info & info = info_it->second;
+        if (info.source_name != name_c || info.axis != axis || info.start != start || info.size != size) {
+            continue;
+        }
+
+        if (tensor_matches_backend(candidate, backend)) {
+            return candidate;
         }
     }
 

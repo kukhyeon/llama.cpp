@@ -14,6 +14,7 @@
 #include <map>
 #include <mutex>
 #include <regex>
+#include <sstream>
 #include <stdexcept>
 #include <unordered_set>
 
@@ -47,6 +48,18 @@ struct profile_policy {
     std::vector<policy_rule> op_rules;
 };
 
+struct ffn_parallel_policy {
+    bool configured = false;
+    bool enabled = false;
+    std::string phase;
+    int layer_start = -2;
+    int layer_end = -2;
+    int64_t align = 256;
+    std::string reduce_backend;
+    std::vector<llama_backend_policy_ffn_split> splits;
+    std::string source;
+};
+
 // Process-global policy state. The policy is loaded once before model loading
 // and then queried from the model loader and graph callback paths.
 struct policy_state {
@@ -62,6 +75,8 @@ struct policy_state {
 
     bool residency_enabled = false;
     std::vector<policy_rule> residency_rules;
+
+    ffn_parallel_policy ffn_parallel;
 
     bool stage_switch_enabled = false;
     bool thermal_switch_enabled = false;
@@ -383,6 +398,164 @@ void parse_rules(const json & section, const char * section_name, std::vector<po
     }
 }
 
+void parse_layer_range(const json & obj, const std::string & source, int & layer_start, int & layer_end) {
+    if (!obj.contains("layer_range")) {
+        return;
+    }
+    if (!obj["layer_range"].is_array() || obj["layer_range"].size() != 2) {
+        throw std::runtime_error(source + ".layer_range must be [start, end]");
+    }
+    layer_start = obj["layer_range"][0].get<int>();
+    layer_end = obj["layer_range"][1].get<int>();
+}
+
+ffn_parallel_policy parse_ffn_parallel(const json & root, const std::string & source) {
+    ffn_parallel_policy out;
+    if (!root.is_object()) {
+        throw std::runtime_error(source + " must be an object");
+    }
+
+    out.configured = true;
+    out.enabled = root.value("enabled", false);
+    out.phase = root.value("phase", std::string("prefill"));
+    out.align = root.value("align", (int64_t) 256);
+    out.reduce_backend = root.value("reduce_backend", std::string());
+    out.source = source;
+    parse_layer_range(root, source, out.layer_start, out.layer_end);
+
+    if (!root.contains("splits") || !root["splits"].is_array()) {
+        throw std::runtime_error(source + ".splits must be an array");
+    }
+
+    int i = 0;
+    for (const auto & item : root["splits"]) {
+        if (!item.is_object()) {
+            throw std::runtime_error(source + ".splits entries must be objects");
+        }
+        llama_backend_policy_ffn_split split;
+        split.id = item.value("id", std::string("s") + std::to_string(i));
+        split.start = item.value("start", (int64_t) -1);
+        split.size = item.value("size", (int64_t) -1);
+        split.backend = item.value("backend", std::string());
+        if (split.start < 0 || split.size <= 0 || split.backend.empty()) {
+            throw std::runtime_error(source + ".splits[" + std::to_string(i) + "] requires backend, start, and positive size");
+        }
+        out.splits.push_back(std::move(split));
+        ++i;
+    }
+
+    return out;
+}
+
+bool parse_env_ffn_splits(std::vector<llama_backend_policy_ffn_split> & splits) {
+    const std::string spec = trim(env_string("LLAMA_FFN_PARALLEL_SPLITS"));
+    if (spec.empty()) {
+        return false;
+    }
+
+    splits.clear();
+    int64_t start = 0;
+    std::stringstream ss(spec);
+    std::string item;
+    int idx = 0;
+    while (std::getline(ss, item, ',')) {
+        item = trim(item);
+        if (item.empty()) {
+            continue;
+        }
+
+        const size_t colon = item.find(':');
+        if (colon == std::string::npos) {
+            LLAMA_LOG_WARN("backend_policy: invalid LLAMA_FFN_PARALLEL_SPLITS item '%s'; expected backend:size\n", item.c_str());
+            splits.clear();
+            return false;
+        }
+
+        llama_backend_policy_ffn_split split;
+        split.id = std::string("env") + std::to_string(idx);
+        split.backend = trim(item.substr(0, colon));
+        const std::string size_str = trim(item.substr(colon + 1));
+        char * end = nullptr;
+        const long long size = std::strtoll(size_str.c_str(), &end, 10);
+        if (split.backend.empty() || end == size_str.c_str() || *end != '\0' || size <= 0) {
+            LLAMA_LOG_WARN("backend_policy: invalid LLAMA_FFN_PARALLEL_SPLITS item '%s'; expected backend:positive_size\n", item.c_str());
+            splits.clear();
+            return false;
+        }
+
+        split.start = start;
+        split.size = size;
+        start += split.size;
+        splits.push_back(std::move(split));
+        ++idx;
+    }
+
+    return !splits.empty();
+}
+
+llama_backend_policy_ffn_parallel materialize_ffn_policy(const ffn_parallel_policy & policy) {
+    llama_backend_policy_ffn_parallel out;
+    out.enabled = policy.enabled;
+    out.phase = policy.phase;
+    out.layer_start = policy.layer_start;
+    out.layer_end = policy.layer_end;
+    out.align = policy.align;
+    out.reduce_backend = policy.reduce_backend;
+    out.splits = policy.splits;
+    out.source = policy.source;
+
+    if (const std::string align_env = trim(env_string("LLAMA_FFN_PARALLEL_ALIGN")); !align_env.empty()) {
+        char * end = nullptr;
+        const long long align = std::strtoll(align_env.c_str(), &end, 10);
+        if (end != align_env.c_str() && *end == '\0' && align > 0) {
+            out.align = align;
+        }
+    }
+
+    if (const std::string reduce_env = trim(env_string("LLAMA_FFN_PARALLEL_REDUCE_BACKEND")); !reduce_env.empty()) {
+        out.reduce_backend = reduce_env;
+    }
+
+    std::vector<llama_backend_policy_ffn_split> env_splits;
+    if (parse_env_ffn_splits(env_splits)) {
+        out.splits = std::move(env_splits);
+        out.source = "LLAMA_FFN_PARALLEL_SPLITS";
+    }
+
+    return out;
+}
+
+bool effective_ffn_policy(llama_backend_policy_ffn_parallel & out) {
+    ffn_parallel_policy policy = g_policy.ffn_parallel;
+
+    std::vector<llama_backend_policy_ffn_split> env_splits;
+    const bool has_env_splits = parse_env_ffn_splits(env_splits);
+    if (!policy.configured && has_env_splits) {
+        policy.configured = true;
+        policy.enabled = true;
+        policy.phase = "prefill";
+        policy.align = 256;
+        policy.source = "LLAMA_FFN_PARALLEL_SPLITS";
+        policy.splits = env_splits;
+    }
+
+    if (!policy.configured) {
+        out = {};
+        return false;
+    }
+
+    policy.enabled = env_enabled("LLAMA_FFN_PARALLEL", policy.enabled);
+    out = materialize_ffn_policy(policy);
+    out.enabled = policy.enabled;
+
+    if (!out.enabled || out.splits.empty()) {
+        out = {};
+        return false;
+    }
+
+    return true;
+}
+
 void parse_profile_section(
         const json & root,
         const std::string & profile_name,
@@ -590,6 +763,11 @@ bool llama_backend_policy_load(const char * path, bool enable_weights, bool enab
             parse_rules(residency, "residency", next.residency_rules);
         }
 
+        if (root.contains("ffn_parallel")) {
+            next.ffn_parallel = parse_ffn_parallel(root["ffn_parallel"], "ffn_parallel");
+            next.ffn_parallel.enabled = next.enabled && next.ffn_parallel.enabled;
+        }
+
         if (root.contains("runtime") && root["runtime"].is_object()) {
             const auto & runtime = root["runtime"];
             next.default_profile = runtime.value("default_profile", std::string());
@@ -631,11 +809,12 @@ bool llama_backend_policy_load(const char * path, bool enable_weights, bool enab
 
         g_policy = std::move(next);
 
-        LLAMA_LOG_INFO("backend_policy: loaded '%s' (weights=%s, weight_rules=%zu, ops=%s, op_rules=%zu, residency=%s, residency_rules=%zu, profiles=%zu)\n",
+        LLAMA_LOG_INFO("backend_policy: loaded '%s' (weights=%s, weight_rules=%zu, ops=%s, op_rules=%zu, residency=%s, residency_rules=%zu, ffn_parallel=%s, profiles=%zu)\n",
                 g_policy.path.c_str(),
                 g_policy.weights_enabled ? "on" : "off", g_policy.weight_rules.size(),
                 g_policy.ops_enabled ? "on" : "off", g_policy.op_rules.size(),
                 g_policy.residency_enabled ? "on" : "off", g_policy.residency_rules.size(),
+                g_policy.ffn_parallel.enabled ? "on" : "off",
                 g_policy.profiles.size());
         return true;
     } catch (const std::exception & e) {
@@ -673,6 +852,12 @@ bool llama_backend_policy_ops_enabled() {
 bool llama_backend_policy_residency_enabled() {
     std::lock_guard<std::mutex> lock(g_policy_mutex);
     return g_policy.loaded && env_enabled("LLAMA_BACKEND_POLICY_RESIDENCY", g_policy.residency_enabled);
+}
+
+bool llama_backend_policy_ffn_parallel_enabled() {
+    std::lock_guard<std::mutex> lock(g_policy_mutex);
+    llama_backend_policy_ffn_parallel policy;
+    return g_policy.loaded && effective_ffn_policy(policy);
 }
 
 bool llama_backend_policy_update_runtime_profile(bool is_prefill) {
@@ -833,6 +1018,50 @@ bool llama_backend_policy_match_op(
     }
 
     return match_op_rules(g_policy.op_rules, g_policy.fallback_priority, base, name, op, il, is_prefill, out);
+}
+
+bool llama_backend_policy_match_ffn_parallel(
+        int il,
+        bool is_prefill,
+        llama_backend_policy_ffn_parallel & out) {
+    std::lock_guard<std::mutex> lock(g_policy_mutex);
+    out = {};
+
+    if (!g_policy.loaded || !effective_ffn_policy(out)) {
+        return false;
+    }
+
+    if (!phase_matches(out.phase, is_prefill)) {
+        out = {};
+        return false;
+    }
+    if (out.layer_start != -2) {
+        if (il < out.layer_start || (out.layer_end != -2 && il > out.layer_end)) {
+            out = {};
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool llama_backend_policy_match_ffn_parallel_layer(
+        int il,
+        llama_backend_policy_ffn_parallel & out) {
+    std::lock_guard<std::mutex> lock(g_policy_mutex);
+    out = {};
+
+    if (!g_policy.loaded || !effective_ffn_policy(out)) {
+        return false;
+    }
+    if (out.layer_start != -2) {
+        if (il < out.layer_start || (out.layer_end != -2 && il > out.layer_end)) {
+            out = {};
+            return false;
+        }
+    }
+
+    return true;
 }
 
 bool llama_backend_policy_buft_matches(

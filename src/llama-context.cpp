@@ -2201,6 +2201,7 @@ llm_graph_params llama_context::graph_params(
         /*.cparams     =*/ cparams,
         /*.ubatch      =*/ ubatch,
         /*.gtype       =*/ gtype,
+        /*.model       =*/ &model,
         /*.sched       =*/ sched.get(),
         /*.backend_cpu =*/ backend_cpu,
         /*.cvec        =*/ cvec.get(),
@@ -2306,7 +2307,7 @@ bool llama_context::lp_eval_callback(struct ggml_tensor * t, bool ask, void * us
 }
 
 llm_graph_cb llama_context::graph_get_cb() const {
-    return [&](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
+    return [&](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il, const char * backend_hint) {
         if (il >= 0) {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
@@ -2336,6 +2337,28 @@ llm_graph_cb llama_context::graph_get_cb() const {
                     cur->src[i] = replacement;
                 }
             }
+        }
+
+        if (backend_hint != nullptr && backend_hint[0] != '\0') {
+            for (const auto & backend : backends) {
+                ggml_backend_t backend_ptr = backend.get();
+                if (!llama_backend_policy_backend_matches(backend_ptr, backend_hint)) {
+                    continue;
+                }
+                if (ggml_backend_supports_op(backend_ptr, cur)) {
+                    ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend_ptr);
+                    LLAMA_LOG_DEBUG("backend_policy: op %s (%s, il=%d, phase=%s) using backend hint %s -> %s\n",
+                            ggml_get_name(cur), ggml_op_name(cur->op), il,
+                            lp_is_prefill ? "prefill" : "decode",
+                            backend_hint,
+                            ggml_backend_dev_name(ggml_backend_get_device(backend_ptr)));
+                    return;
+                }
+            }
+            LLAMA_LOG_DEBUG("backend_policy: op %s (%s, il=%d, phase=%s) backend hint %s was not supported\n",
+                    ggml_get_name(cur), ggml_op_name(cur->op), il,
+                    lp_is_prefill ? "prefill" : "decode",
+                    backend_hint);
         }
 
         if (llama_backend_policy_ops_enabled()) {

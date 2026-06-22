@@ -18,6 +18,7 @@ struct ggml_tensor;
 
 struct llama_cparams;
 struct llama_layer;
+struct llama_model;
 
 struct llama_memory_context_i;
 
@@ -523,7 +524,7 @@ public:
 //   these are used by the llama_context to extact the relevant data, based on the compute parameters
 
 // callback that allows us to apply custom logic to each tensor (e.g. ggml-alloc, offloading, etc.)
-using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il)>;
+using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il, const char * backend_hint)>;
 
 class llm_graph_result;
 
@@ -536,6 +537,8 @@ struct llm_graph_params {
     llama_ubatch ubatch; // note: intentionally make a copy
 
     llm_graph_type gtype;
+
+    const llama_model * model;
 
     ggml_backend_sched_t sched;
     ggml_backend_t backend_cpu;
@@ -628,6 +631,7 @@ struct llm_graph_params {
             cparams.causal_attn == other.cparams.causal_attn &&
             arch  == other.arch  &&
             gtype == other.gtype &&
+            model == other.model &&
             cvec  == other.cvec  &&
             loras == other.loras &&
             cross == other.cross;
@@ -750,6 +754,8 @@ struct llm_graph_context {
     const enum llama_pooling_type pooling_type;
     const enum llama_rope_type    rope_type;
 
+    const llama_model * model;
+
     ggml_backend_sched_t sched;
 
     ggml_backend_t backend_cpu; // TODO: needed by build_attn_mha, figure out a way to remove?
@@ -771,7 +777,7 @@ struct llm_graph_context {
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
 
-    void cb(ggml_tensor * cur, const char * name, int il) const;
+    void cb(ggml_tensor * cur, const char * name, int il, const char * backend_hint = nullptr) const;
 
     //
     // common
