@@ -2345,58 +2345,112 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
-static bool ggml_backend_sched_split_ffn_branch_layer(
-        const struct ggml_backend_sched_split * split,
-        const char * branch_marker,
-        int * layer_out) {
-    bool found = false;
+struct ggml_backend_sched_ffn_branch_info {
+    std::string branch;
     int layer = -1;
-    const size_t marker_len = strlen(branch_marker);
+};
+
+static bool ggml_backend_sched_parse_ffn_branch_node(
+        const char * name,
+        ggml_backend_sched_ffn_branch_info * info) {
+    static const char * prefixes[] = {
+        "ffn_up.",
+        "ffn_gate.",
+        "ffn_swiglu.",
+        "ffn_down.",
+    };
+
+    const char * branch_start = nullptr;
+    for (const char * prefix : prefixes) {
+        const size_t prefix_len = strlen(prefix);
+        if (strncmp(name, prefix, prefix_len) == 0) {
+            branch_start = name + prefix_len;
+            break;
+        }
+    }
+
+    if (branch_start == nullptr || branch_start[0] == '\0') {
+        return false;
+    }
+
+    const char * layer_start = strrchr(branch_start, '-');
+    if (layer_start == nullptr || layer_start == branch_start || layer_start[1] == '\0') {
+        return false;
+    }
+
+    char * end = nullptr;
+    const long parsed = strtol(layer_start + 1, &end, 10);
+    if (end == layer_start + 1 || *end != '\0') {
+        return false;
+    }
+
+    info->branch.assign(branch_start, layer_start - branch_start);
+    info->layer = (int) parsed;
+    return true;
+}
+
+static bool ggml_backend_sched_split_ffn_branch_info(
+        const struct ggml_backend_sched_split * split,
+        ggml_backend_sched_ffn_branch_info * info) {
+    bool found = false;
+    ggml_backend_sched_ffn_branch_info split_info;
 
     for (int i = 0; i < split->graph.n_nodes; ++i) {
         const char * name = split->graph.nodes[i]->name;
-        const char * marker = strstr(name, branch_marker);
-        if (marker == nullptr) {
-            continue;
+        ggml_backend_sched_ffn_branch_info node_info;
+        if (!ggml_backend_sched_parse_ffn_branch_node(name, &node_info)) {
+            return false;
         }
 
-        char * end = nullptr;
-        const long parsed = strtol(marker + marker_len, &end, 10);
-        if (end == marker + marker_len) {
-            continue;
-        }
-
-        if (found && layer != (int) parsed) {
+        if (found && (split_info.layer != node_info.layer || split_info.branch != node_info.branch)) {
             return false;
         }
 
         found = true;
-        layer = (int) parsed;
+        split_info = std::move(node_info);
     }
 
     if (!found) {
         return false;
     }
 
-    *layer_out = layer;
+    *info = std::move(split_info);
     return true;
 }
 
-static bool ggml_backend_sched_can_parallel_ffn_pair(
-        const struct ggml_backend_sched_split * a,
-        const struct ggml_backend_sched_split * b) {
-    int a_gpu = -1;
-    int a_npu = -1;
-    int b_gpu = -1;
-    int b_npu = -1;
+static int ggml_backend_sched_collect_parallel_ffn_group(
+        const struct ggml_backend_sched_split * splits,
+        int n_splits,
+        int split_id,
+        std::vector<ggml_backend_sched_ffn_branch_info> * infos) {
+    GGML_ASSERT(infos != nullptr);
+    infos->clear();
 
-    const bool a_is_gpu = ggml_backend_sched_split_ffn_branch_layer(a, ".gpu-", &a_gpu);
-    const bool a_is_npu = ggml_backend_sched_split_ffn_branch_layer(a, ".npu-", &a_npu);
-    const bool b_is_gpu = ggml_backend_sched_split_ffn_branch_layer(b, ".gpu-", &b_gpu);
-    const bool b_is_npu = ggml_backend_sched_split_ffn_branch_layer(b, ".npu-", &b_npu);
+    ggml_backend_sched_ffn_branch_info first;
+    if (!ggml_backend_sched_split_ffn_branch_info(&splits[split_id], &first)) {
+        return 0;
+    }
 
-    return (a_is_gpu && b_is_npu && a_gpu == b_npu) ||
-           (a_is_npu && b_is_gpu && a_npu == b_gpu);
+    infos->push_back(first);
+
+    for (int i = split_id + 1; i < n_splits; ++i) {
+        ggml_backend_sched_ffn_branch_info cur;
+        if (!ggml_backend_sched_split_ffn_branch_info(&splits[i], &cur)) {
+            break;
+        }
+        if (cur.layer != first.layer) {
+            break;
+        }
+        const auto duplicate = std::find_if(infos->begin(), infos->end(), [&](const ggml_backend_sched_ffn_branch_info & prev) {
+            return prev.branch == cur.branch;
+        });
+        if (duplicate != infos->end()) {
+            break;
+        }
+        infos->push_back(std::move(cur));
+    }
+
+    return infos->size() >= 2 ? (int) infos->size() : 0;
 }
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
@@ -2708,72 +2762,109 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         ggml_sched_profile_note_layers(split->graph, split_bucket);
 
-        if (!sched->callback_eval &&
-                split_id + 1 < sched->n_splits &&
-                ggml_backend_sched_can_parallel_ffn_pair(split, &splits[split_id + 1])) {
-            struct ggml_backend_sched_split * next = &splits[split_id + 1];
-            ggml_backend_t next_backend = sched->backends[next->backend_id];
-            const ggml_sched_profile_backend_kind next_bucket = ggml_sched_profile_backend_bucket(next_backend);
+        std::vector<ggml_backend_sched_ffn_branch_info> ffn_group_infos;
+        const int ffn_group_size = !sched->callback_eval
+            ? ggml_backend_sched_collect_parallel_ffn_group(splits, sched->n_splits, split_id, &ffn_group_infos)
+            : 0;
+        if (ffn_group_size > 0) {
+            std::vector<ggml_sched_profile_backend_kind> group_buckets(ffn_group_size);
+            for (int i = 0; i < ffn_group_size; ++i) {
+                struct ggml_backend_sched_split * group_split = &splits[split_id + i];
+                ggml_backend_t group_backend = sched->backends[group_split->backend_id];
+                group_buckets[i] = ggml_sched_profile_backend_bucket(group_backend);
+                if (i > 0) {
+                    ggml_sched_profile_note_layers(group_split->graph, group_buckets[i]);
+                }
+            }
 
-            ggml_sched_profile_note_layers(next->graph, next_bucket);
-
-            const int64_t pair_t0_us = ggml_time_us();
-            const int64_t copy_t0_us = pair_t0_us;
-            copy_split_inputs(split);
-            copy_split_inputs(next);
+            const int64_t group_t0_us = ggml_time_us();
+            const int64_t copy_t0_us = group_t0_us;
+            for (int i = 0; i < ffn_group_size; ++i) {
+                copy_split_inputs(&splits[split_id + i]);
+            }
             const int64_t copy_t1_us = ggml_time_us();
 
-            int64_t dt_us = 0;
-            int64_t next_dt_us = 0;
-            enum ggml_status ec = GGML_STATUS_SUCCESS;
-            enum ggml_status next_ec = GGML_STATUS_SUCCESS;
+            std::vector<int64_t> dt_us(ffn_group_size, 0);
+            std::vector<enum ggml_status> status(ffn_group_size, GGML_STATUS_SUCCESS);
+            std::vector<std::thread> workers;
+            workers.reserve(ffn_group_size > 0 ? ffn_group_size - 1 : 0);
 
             const int64_t compute_t0_us = ggml_time_us();
-            std::thread worker([&]() {
-                ec = compute_split_no_callback(split, &dt_us, true);
-            });
-            next_ec = compute_split_no_callback(next, &next_dt_us, true);
-            worker.join();
+            for (int i = 0; i + 1 < ffn_group_size; ++i) {
+                workers.emplace_back([&, i]() {
+                    status[i] = compute_split_no_callback(&splits[split_id + i], &dt_us[i], true);
+                });
+            }
+            const int main_i = ffn_group_size - 1;
+            status[main_i] = compute_split_no_callback(&splits[split_id + main_i], &dt_us[main_i], true);
+            for (std::thread & worker : workers) {
+                worker.join();
+            }
             const int64_t compute_t1_us = ggml_time_us();
-            const int64_t pair_t1_us = compute_t1_us;
+            const int64_t group_t1_us = compute_t1_us;
 
-            if (ec != GGML_STATUS_SUCCESS) {
-                return ec;
-            }
-            if (next_ec != GGML_STATUS_SUCCESS) {
-                return next_ec;
+            for (int i = 0; i < ffn_group_size; ++i) {
+                if (status[i] != GGML_STATUS_SUCCESS) {
+                    return status[i];
+                }
             }
 
-            prof_add(split->graph, split_bucket, dt_us);
-            prof_add(next->graph, next_bucket, next_dt_us);
-            record_split_event(split);
-            record_split_event(next);
+            for (int i = 0; i < ffn_group_size; ++i) {
+                struct ggml_backend_sched_split * group_split = &splits[split_id + i];
+                prof_add(group_split->graph, group_buckets[i], dt_us[i]);
+                record_split_event(group_split);
+            }
 
             const int64_t copy_us = copy_t1_us - copy_t0_us;
             const int64_t compute_wall_us = compute_t1_us - compute_t0_us;
-            const int64_t pair_wall_us = pair_t1_us - pair_t0_us;
-            const int64_t serial_compute_us = dt_us + next_dt_us;
-            const int64_t min_branch_us = std::min(dt_us, next_dt_us);
-            const int64_t max_branch_us = std::max(dt_us, next_dt_us);
+            const int64_t group_wall_us = group_t1_us - group_t0_us;
+            int64_t serial_compute_us = 0;
+            int64_t min_branch_us = LLONG_MAX;
+            int64_t max_branch_us = 0;
+            std::string split_list;
+            std::string branch_list;
+            for (int i = 0; i < ffn_group_size; ++i) {
+                ggml_backend_t group_backend = sched->backends[splits[split_id + i].backend_id];
+                serial_compute_us += dt_us[i];
+                min_branch_us = std::min(min_branch_us, dt_us[i]);
+                max_branch_us = std::max(max_branch_us, dt_us[i]);
+
+                if (!split_list.empty()) {
+                    split_list += "/";
+                }
+                split_list += std::to_string(split_id + i);
+
+                if (!branch_list.empty()) {
+                    branch_list += " + ";
+                }
+                branch_list += ggml_backend_name(group_backend);
+                branch_list += "[";
+                branch_list += ffn_group_infos[i].branch;
+                branch_list += "] ";
+                char branch_ms[32];
+                snprintf(branch_ms, sizeof(branch_ms), "%.3f", (double) dt_us[i] / 1000.0);
+                branch_list += branch_ms;
+                branch_list += " ms";
+            }
             const int64_t overlap_us = std::max<int64_t>(0, serial_compute_us - compute_wall_us);
             const double speedup = compute_wall_us > 0 ? (double) serial_compute_us / (double) compute_wall_us : 0.0;
             const double balance = max_branch_us > 0 ? 100.0 * (double) min_branch_us / (double) max_branch_us : 0.0;
-            double overlap = min_branch_us > 0 ? 100.0 * (double) overlap_us / (double) min_branch_us : 0.0;
+            double overlap = min_branch_us > 0 && min_branch_us != LLONG_MAX ? 100.0 * (double) overlap_us / (double) min_branch_us : 0.0;
             overlap = std::min(100.0, std::max(0.0, overlap));
 
             GGML_LOG_DEBUG(
-                    "sched: parallel ffn splits %d/%d: %s %.3f ms + %s %.3f ms, compute_wall %.3f ms, pair_wall %.3f ms, copy %.3f ms, speedup %.2fx, overlap %.1f%%, balance %.1f%%\n",
-                    split_id, split_id + 1,
-                    ggml_backend_name(split_backend), (double) dt_us / 1000.0,
-                    ggml_backend_name(next_backend), (double) next_dt_us / 1000.0,
+                    "sched: parallel ffn group layer %d splits %s: %s, compute_wall %.3f ms, group_wall %.3f ms, copy %.3f ms, speedup %.2fx, overlap %.1f%%, balance %.1f%%\n",
+                    ffn_group_infos[0].layer,
+                    split_list.c_str(),
+                    branch_list.c_str(),
                     (double) compute_wall_us / 1000.0,
-                    (double) pair_wall_us / 1000.0,
+                    (double) group_wall_us / 1000.0,
                     (double) copy_us / 1000.0,
                     speedup,
                     overlap,
                     balance);
 
-            split_id++;
+            split_id += ffn_group_size - 1;
             continue;
         }
 
