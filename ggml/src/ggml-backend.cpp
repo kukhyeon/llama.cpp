@@ -2483,6 +2483,7 @@ static int ggml_backend_sched_collect_parallel_ffn_group(
         const struct ggml_backend_sched_split * splits,
         int n_splits,
         int split_id,
+        bool allow_single,
         std::vector<ggml_backend_sched_ffn_branch_info> * infos) {
     GGML_ASSERT(infos != nullptr);
     infos->clear();
@@ -2511,7 +2512,7 @@ static int ggml_backend_sched_collect_parallel_ffn_group(
         infos->push_back(std::move(cur));
     }
 
-    return infos->size() >= 2 ? (int) infos->size() : 0;
+    return infos->size() >= 2 || allow_single ? (int) infos->size() : 0;
 }
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
@@ -2824,8 +2825,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         ggml_sched_profile_note_layers(split->graph, split_bucket);
 
         std::vector<ggml_backend_sched_ffn_branch_info> ffn_group_infos;
+        const bool allow_single_ffn_group = sched->debug >= 2;
         const int ffn_group_size = !sched->callback_eval
-            ? ggml_backend_sched_collect_parallel_ffn_group(splits, sched->n_splits, split_id, &ffn_group_infos)
+            ? ggml_backend_sched_collect_parallel_ffn_group(
+                    splits, sched->n_splits, split_id, allow_single_ffn_group, &ffn_group_infos)
             : 0;
         if (ffn_group_size > 0) {
             std::vector<ggml_sched_profile_backend_kind> group_buckets(ffn_group_size);
