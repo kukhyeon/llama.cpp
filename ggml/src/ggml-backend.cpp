@@ -1818,7 +1818,10 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
 }
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
-static bool ggml_backend_sched_is_ffn_parallel_branch_node_name(const char * name) {
+static bool ggml_backend_sched_parse_ffn_branch_name(
+        const char * name,
+        std::string * branch,
+        int * layer) {
     static const char * prefixes[] = {
         "ffn_up.",
         "ffn_gate.",
@@ -1838,7 +1841,47 @@ static bool ggml_backend_sched_is_ffn_parallel_branch_node_name(const char * nam
 
         const char * branch_start = name + prefix_len;
         const char * layer_start = strrchr(branch_start, '-');
-        return layer_start != nullptr && layer_start != branch_start && layer_start[1] != '\0';
+        if (layer_start == nullptr || layer_start == branch_start || layer_start[1] == '\0') {
+            return false;
+        }
+
+        char * end = nullptr;
+        const long parsed = strtol(layer_start + 1, &end, 10);
+        if (end == layer_start + 1 || *end != '\0') {
+            return false;
+        }
+
+        if (branch != nullptr) {
+            branch->assign(branch_start, layer_start - branch_start);
+        }
+        if (layer != nullptr) {
+            *layer = (int) parsed;
+        }
+        return true;
+    }
+
+    return false;
+}
+
+static bool ggml_backend_sched_is_ffn_parallel_branch_node(const struct ggml_tensor * node) {
+    if (node == nullptr) {
+        return false;
+    }
+
+    if (ggml_backend_sched_parse_ffn_branch_name(node->name, nullptr, nullptr)) {
+        return true;
+    }
+
+    // In a single-shard FFN, the down projection can become the final ffn_out-<layer>
+    // tensor after the graph builder names the returned FFN result. Recover the branch
+    // identity from its swiglu input so debug-only split isolation can still see it.
+    if (node->op == GGML_OP_MUL_MAT && node->name != nullptr && strncmp(node->name, "ffn_out-", 8) == 0) {
+        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+            if (node->src[i] != nullptr &&
+                    ggml_backend_sched_parse_ffn_branch_name(node->src[i]->name, nullptr, nullptr)) {
+                return true;
+            }
+        }
     }
 
     return false;
@@ -2120,11 +2163,21 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             }
 
             const int node_backend_id = tensor_backend_id(node);
+            const bool node_is_ffn_parallel_branch = ggml_backend_sched_is_ffn_parallel_branch_node(node);
 
             GGML_ASSERT(node_backend_id != -1); // all nodes should be assigned by now, this can happen if there is no CPU fallback
 
             // check if we should start a new split based on the sources of the current node
             bool need_new_split = false;
+            if (sched->debug >= 2 &&
+                    node_backend_id == cur_backend_id &&
+                    cur_split_has_ffn_parallel_branch != node_is_ffn_parallel_branch &&
+                    (cur_split_has_ffn_parallel_branch || split->i_start < i)) {
+                // In single-backend debug runs, the default scheduler can fuse the
+                // whole layer into one split, so there is no pure FFN branch split
+                // to time. Isolate branch regions only in debug mode.
+                need_new_split = true;
+            }
             if (node_backend_id == cur_backend_id &&
                     cur_split_has_ffn_parallel_branch &&
                     ggml_backend_sched_is_ffn_parallel_reduce_node_name(node->name)) {
@@ -2180,7 +2233,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 cur_split_has_ffn_parallel_branch = false;
             }
 
-            if (ggml_backend_sched_is_ffn_parallel_branch_node_name(node->name)) {
+            if (node_is_ffn_parallel_branch) {
                 cur_split_has_ffn_parallel_branch = true;
             }
 
@@ -2412,42 +2465,26 @@ struct ggml_backend_sched_ffn_branch_info {
 };
 
 static bool ggml_backend_sched_parse_ffn_branch_node(
-        const char * name,
+        const struct ggml_tensor * node,
         ggml_backend_sched_ffn_branch_info * info) {
-    static const char * prefixes[] = {
-        "ffn_up.",
-        "ffn_gate.",
-        "ffn_swiglu.",
-        "ffn_down.",
-    };
+    if (node == nullptr) {
+        return false;
+    }
 
-    const char * branch_start = nullptr;
-    for (const char * prefix : prefixes) {
-        const size_t prefix_len = strlen(prefix);
-        if (strncmp(name, prefix, prefix_len) == 0) {
-            branch_start = name + prefix_len;
-            break;
+    if (ggml_backend_sched_parse_ffn_branch_name(node->name, &info->branch, &info->layer)) {
+        return true;
+    }
+
+    if (node->op == GGML_OP_MUL_MAT && node->name != nullptr && strncmp(node->name, "ffn_out-", 8) == 0) {
+        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+            if (node->src[i] != nullptr &&
+                    ggml_backend_sched_parse_ffn_branch_name(node->src[i]->name, &info->branch, &info->layer)) {
+                return true;
+            }
         }
     }
 
-    if (branch_start == nullptr || branch_start[0] == '\0') {
-        return false;
-    }
-
-    const char * layer_start = strrchr(branch_start, '-');
-    if (layer_start == nullptr || layer_start == branch_start || layer_start[1] == '\0') {
-        return false;
-    }
-
-    char * end = nullptr;
-    const long parsed = strtol(layer_start + 1, &end, 10);
-    if (end == layer_start + 1 || *end != '\0') {
-        return false;
-    }
-
-    info->branch.assign(branch_start, layer_start - branch_start);
-    info->layer = (int) parsed;
-    return true;
+    return false;
 }
 
 static bool ggml_backend_sched_split_ffn_branch_info(
@@ -2457,9 +2494,8 @@ static bool ggml_backend_sched_split_ffn_branch_info(
     ggml_backend_sched_ffn_branch_info split_info;
 
     for (int i = 0; i < split->graph.n_nodes; ++i) {
-        const char * name = split->graph.nodes[i]->name;
         ggml_backend_sched_ffn_branch_info node_info;
-        if (!ggml_backend_sched_parse_ffn_branch_node(name, &node_info)) {
+        if (!ggml_backend_sched_parse_ffn_branch_node(split->graph.nodes[i], &node_info)) {
             return false;
         }
 
