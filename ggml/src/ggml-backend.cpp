@@ -1818,6 +1818,52 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
 }
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
+static bool ggml_backend_sched_is_ffn_parallel_branch_node_name(const char * name) {
+    static const char * prefixes[] = {
+        "ffn_up.",
+        "ffn_gate.",
+        "ffn_swiglu.",
+        "ffn_down.",
+    };
+
+    if (name == nullptr) {
+        return false;
+    }
+
+    for (const char * prefix : prefixes) {
+        const size_t prefix_len = strlen(prefix);
+        if (strncmp(name, prefix, prefix_len) != 0) {
+            continue;
+        }
+
+        const char * branch_start = name + prefix_len;
+        const char * layer_start = strrchr(branch_start, '-');
+        return layer_start != nullptr && layer_start != branch_start && layer_start[1] != '\0';
+    }
+
+    return false;
+}
+
+static bool ggml_backend_sched_is_ffn_parallel_reduce_node_name(const char * name) {
+    static const char * prefixes[] = {
+        "ffn_parallel_sum-",
+        "ffn_parallel_out-",
+    };
+
+    if (name == nullptr) {
+        return false;
+    }
+
+    for (const char * prefix : prefixes) {
+        const size_t prefix_len = strlen(prefix);
+        if (strncmp(name, prefix, prefix_len) == 0 && name[prefix_len] != '\0') {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     // reset splits
     sched->n_splits = 0;
@@ -2065,6 +2111,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         split->i_start = 0;
         split->n_inputs = 0;
         int cur_backend_id = split->backend_id;
+        bool cur_split_has_ffn_parallel_branch = false;
         for (; i < graph->n_nodes; i++) {
             struct ggml_tensor * node = graph->nodes[i];
 
@@ -2078,6 +2125,15 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
             // check if we should start a new split based on the sources of the current node
             bool need_new_split = false;
+            if (node_backend_id == cur_backend_id &&
+                    cur_split_has_ffn_parallel_branch &&
+                    ggml_backend_sched_is_ffn_parallel_reduce_node_name(node->name)) {
+                // Keep each FFN shard branch split pure. When the reduce backend
+                // equals the backend of the last branch, the default scheduler
+                // would fuse that branch and the reduce ADDs into one split. That
+                // prevents the branch from joining the parallel FFN group.
+                need_new_split = true;
+            }
             if (node_backend_id == cur_backend_id && split->n_inputs > 0) {
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     struct ggml_tensor * src = node->src[j];
@@ -2121,6 +2177,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 split->i_start = i;
                 split->n_inputs = 0;
                 cur_backend_id = node_backend_id;
+                cur_split_has_ffn_parallel_branch = false;
+            }
+
+            if (ggml_backend_sched_is_ffn_parallel_branch_node_name(node->name)) {
+                cur_split_has_ffn_parallel_branch = true;
             }
 
             // find inputs that are not on the same backend
@@ -2695,7 +2756,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         const int64_t t0_us = ggml_time_us();
         enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
         if (ec == GGML_STATUS_SUCCESS && sync_after) {
-            // FFN parallel pairs need backend completion inside the parallel section.
+            // FFN parallel groups need backend completion inside the parallel section.
             // Otherwise async backends can defer the real wait to the following split.
             ggml_backend_synchronize(split_backend);
         }

@@ -1225,16 +1225,42 @@ ggml_tensor * llm_graph_context::build_ffn(
 
         if (valid) {
             std::vector<llama_backend_policy_ffn_split> exec_splits = splits;
-            if (!ffn_policy.reduce_backend.empty()) {
-                std::stable_sort(exec_splits.begin(), exec_splits.end(), [&](const auto & a, const auto & b) {
-                    const bool a_reduce = a.backend == ffn_policy.reduce_backend;
-                    const bool b_reduce = b.backend == ffn_policy.reduce_backend;
-                    if (a_reduce != b_reduce) {
-                        return a_reduce;
-                    }
-                    return a.start < b.start;
-                });
-            }
+            // Keep the HTP/NPU branch after non-HTP branches so that ffn_norm is
+            // emitted as a completed prefix split before all parallel branches.
+            std::stable_sort(exec_splits.begin(), exec_splits.end(), [](const auto & a, const auto & b) {
+                auto is_hybrid_prefix_backend = [](std::string backend) {
+                    std::transform(backend.begin(), backend.end(), backend.begin(), [](unsigned char c) {
+                        return (char) std::tolower(c);
+                    });
+                    return backend.find("htp") != std::string::npos ||
+                           backend.find("hexagon") != std::string::npos;
+                };
+
+                const bool a_prefix = is_hybrid_prefix_backend(a.backend);
+                const bool b_prefix = is_hybrid_prefix_backend(b.backend);
+                if (a_prefix != b_prefix) {
+                    return !a_prefix;
+                }
+                return a.start < b.start;
+            });
+
+            auto reduce_add = [&](ggml_tensor * lhs, ggml_tensor * rhs) {
+                ggml_tensor * acc = ggml_add(ctx0, lhs, rhs);
+                cb(acc, "ffn_parallel_sum", il,
+                        ffn_policy.reduce_backend.empty() ? nullptr : ffn_policy.reduce_backend.c_str());
+                return acc;
+            };
+
+            auto reduce_branches = [&](const std::vector<ggml_tensor *> & outs) -> ggml_tensor * {
+                if (outs.empty()) {
+                    return nullptr;
+                }
+                ggml_tensor * acc = outs.back();
+                for (size_t ri = outs.size() - 1; ri > 0; --ri) {
+                    acc = reduce_add(outs[ri - 1], acc);
+                }
+                return acc;
+            };
 
             std::vector<ggml_tensor *> branch_outs;
             branch_outs.reserve(exec_splits.size());
@@ -1269,12 +1295,7 @@ ggml_tensor * llm_graph_context::build_ffn(
             }
 
             if (valid && !branch_outs.empty()) {
-                ggml_tensor * acc = branch_outs[0];
-                for (size_t i = 1; i < branch_outs.size(); ++i) {
-                    acc = ggml_add(ctx0, acc, branch_outs[i]);
-                    cb(acc, "ffn_parallel_sum", il,
-                            ffn_policy.reduce_backend.empty() ? nullptr : ffn_policy.reduce_backend.c_str());
-                }
+                ggml_tensor * acc = reduce_branches(branch_outs);
                 cb(acc, "ffn_parallel_out", il,
                         ffn_policy.reduce_backend.empty() ? nullptr : ffn_policy.reduce_backend.c_str());
                 return acc;
