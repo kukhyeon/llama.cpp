@@ -24,6 +24,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #ifdef __APPLE__
@@ -2155,6 +2156,39 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         split->n_inputs = 0;
         int cur_backend_id = split->backend_id;
         bool cur_split_has_ffn_parallel_branch = false;
+        bool cur_split_needs_ffn_branch_isolation = false;
+        std::vector<std::pair<int, std::string>> ffn_parallel_branch_keys;
+        for (int j = 0; j < graph->n_nodes; ++j) {
+            const struct ggml_tensor * node = graph->nodes[j];
+            std::string branch;
+            int layer = -1;
+            if (!ggml_backend_sched_parse_ffn_branch_name(node->name, &branch, &layer)) {
+                continue;
+            }
+
+            const auto duplicate = std::find_if(ffn_parallel_branch_keys.begin(), ffn_parallel_branch_keys.end(),
+                    [&](const std::pair<int, std::string> & prev) {
+                        return prev.first == layer && prev.second == branch;
+                    });
+            if (duplicate == ffn_parallel_branch_keys.end()) {
+                ffn_parallel_branch_keys.emplace_back(layer, std::move(branch));
+            }
+        }
+        auto ffn_layer_has_multiple_branches = [&](const struct ggml_tensor * node) {
+            std::string branch;
+            int layer = -1;
+            if (!ggml_backend_sched_parse_ffn_branch_name(node->name, &branch, &layer)) {
+                return false;
+            }
+
+            int n_layer_branches = 0;
+            for (const auto & key : ffn_parallel_branch_keys) {
+                if (key.first == layer && ++n_layer_branches >= 2) {
+                    return true;
+                }
+            }
+            return false;
+        };
         for (; i < graph->n_nodes; i++) {
             struct ggml_tensor * node = graph->nodes[i];
 
@@ -2164,18 +2198,22 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
             const int node_backend_id = tensor_backend_id(node);
             const bool node_is_ffn_parallel_branch = ggml_backend_sched_is_ffn_parallel_branch_node(node);
+            const bool node_needs_ffn_branch_isolation =
+                node_is_ffn_parallel_branch &&
+                (sched->debug >= 2 || ffn_layer_has_multiple_branches(node));
 
             GGML_ASSERT(node_backend_id != -1); // all nodes should be assigned by now, this can happen if there is no CPU fallback
 
             // check if we should start a new split based on the sources of the current node
             bool need_new_split = false;
-            if (sched->debug >= 2 &&
-                    node_backend_id == cur_backend_id &&
+            if (node_backend_id == cur_backend_id &&
                     cur_split_has_ffn_parallel_branch != node_is_ffn_parallel_branch &&
-                    (cur_split_has_ffn_parallel_branch || split->i_start < i)) {
-                // In single-backend debug runs, the default scheduler can fuse the
-                // whole layer into one split, so there is no pure FFN branch split
-                // to time. Isolate branch regions only in debug mode.
+                    (cur_split_needs_ffn_branch_isolation ||
+                     (node_needs_ffn_branch_isolation && split->i_start < i))) {
+                // Keep FFN shard branch splits pure. If a branch is fused with
+                // the surrounding layer prefix/suffix on the same backend, the
+                // scheduler cannot collect consecutive branch splits into one
+                // parallel FFN group in normal (non-debug) multi-shard runs.
                 need_new_split = true;
             }
             if (node_backend_id == cur_backend_id &&
@@ -2231,10 +2269,13 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 split->n_inputs = 0;
                 cur_backend_id = node_backend_id;
                 cur_split_has_ffn_parallel_branch = false;
+                cur_split_needs_ffn_branch_isolation = false;
             }
 
             if (node_is_ffn_parallel_branch) {
                 cur_split_has_ffn_parallel_branch = true;
+                cur_split_needs_ffn_branch_isolation =
+                    cur_split_needs_ffn_branch_isolation || node_needs_ffn_branch_isolation;
             }
 
             // find inputs that are not on the same backend
