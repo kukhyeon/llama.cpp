@@ -21,6 +21,7 @@
 #include <string.h>
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -872,8 +873,173 @@ static bool ggml_sched_profile_enabled(void) {
     return g_sched_profile.enabled;
 }
 
+struct ggml_backend_sched_trace_state {
+    bool initialized = false;
+    bool enabled = false;
+    bool warned_open = false;
+    FILE * file = nullptr;
+    std::string path = "output/scheduler_trace.csv";
+
+    int64_t graph_id = 0;
+    int query_id = -1;
+    int token_index = -1;
+    int n_past = -1;
+    int n_tokens = -1;
+
+    std::mutex mutex;
+};
+
+static ggml_backend_sched_trace_state g_sched_trace;
+
+static bool ggml_sched_trace_env_enabled(const char * name) {
+    const char * env = getenv(name);
+    if (env == nullptr) {
+        return false;
+    }
+
+    return strcmp(env, "1") == 0 || strcmp(env, "on") == 0 || strcmp(env, "ON") == 0 ||
+        strcmp(env, "yes") == 0 || strcmp(env, "YES") == 0 ||
+        strcmp(env, "true") == 0 || strcmp(env, "TRUE") == 0;
+}
+
+static void ggml_sched_trace_init_locked(void) {
+    if (g_sched_trace.initialized) {
+        return;
+    }
+
+    g_sched_trace.initialized = true;
+    g_sched_trace.enabled = ggml_sched_trace_env_enabled("SCHED_TRACE") ||
+        ggml_sched_trace_env_enabled("GGML_SCHED_TRACE");
+
+    if (const char * path = getenv("SCHED_TRACE_PATH")) {
+        if (path[0] != '\0') {
+            g_sched_trace.path = path;
+        }
+    } else if (const char * path = getenv("GGML_SCHED_TRACE_PATH")) {
+        if (path[0] != '\0') {
+            g_sched_trace.path = path;
+        }
+    }
+}
+
+static bool ggml_sched_trace_enabled(void) {
+    std::lock_guard<std::mutex> lock(g_sched_trace.mutex);
+    ggml_sched_trace_init_locked();
+    return g_sched_trace.enabled;
+}
+
+static FILE * ggml_sched_trace_file_locked(void) {
+    ggml_sched_trace_init_locked();
+    if (!g_sched_trace.enabled) {
+        return nullptr;
+    }
+
+    if (g_sched_trace.file != nullptr) {
+        return g_sched_trace.file;
+    }
+
+    g_sched_trace.file = fopen(g_sched_trace.path.c_str(), "a");
+    if (g_sched_trace.file == nullptr) {
+        if (!g_sched_trace.warned_open) {
+            GGML_LOG_WARN("%s: failed to open scheduler trace CSV '%s'\n", __func__, g_sched_trace.path.c_str());
+            g_sched_trace.warned_open = true;
+        }
+        return nullptr;
+    }
+
+    fseek(g_sched_trace.file, 0, SEEK_END);
+    const long pos = ftell(g_sched_trace.file);
+    if (pos == 0) {
+        fprintf(g_sched_trace.file,
+                "query_id,phase,graph_id,token_index,n_past,n_tokens,"
+                "split_id,backend,layer,"
+                "node_start,node_end,node_count,"
+                "first_node,last_node,op_first,op_last,"
+                "copy_in_us,wait_before_copy_us,"
+                "compute_submit_us,compute_wall_us,"
+                "is_ffn_group,ffn_branch,group_id,group_wall_us,group_copy_us,"
+                "timing_mode\n");
+    }
+
+    return g_sched_trace.file;
+}
+
+static void ggml_sched_trace_csv_cell(FILE * f, const char * value) {
+    fputc('"', f);
+    if (value != nullptr) {
+        for (const char * p = value; *p != '\0'; ++p) {
+            if (*p == '"') {
+                fputc('"', f);
+            }
+            fputc(*p, f);
+        }
+    }
+    fputc('"', f);
+}
+
+static const char * ggml_sched_profile_phase_name(void) {
+    return g_sched_profile_phase == GGML_BACKEND_SCHED_PROFILE_PREFILL ? "prefill" : "decode";
+}
+
+void ggml_backend_sched_trace_set_enabled(bool enabled) {
+    std::lock_guard<std::mutex> lock(g_sched_trace.mutex);
+    ggml_sched_trace_init_locked();
+    g_sched_trace.enabled = enabled;
+    if (!enabled && g_sched_trace.file != nullptr) {
+        fclose(g_sched_trace.file);
+        g_sched_trace.file = nullptr;
+    }
+}
+
+void ggml_backend_sched_trace_set_path(const char * path) {
+    if (path == nullptr || path[0] == '\0') {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_sched_trace.mutex);
+    ggml_sched_trace_init_locked();
+    if (g_sched_trace.path == path) {
+        return;
+    }
+
+    if (g_sched_trace.file != nullptr) {
+        fclose(g_sched_trace.file);
+        g_sched_trace.file = nullptr;
+    }
+    g_sched_trace.path = path;
+    g_sched_trace.warned_open = false;
+}
+
+void ggml_backend_sched_trace_reset(void) {
+    std::lock_guard<std::mutex> lock(g_sched_trace.mutex);
+    ggml_sched_trace_init_locked();
+    g_sched_trace.graph_id = 0;
+    g_sched_trace.token_index = -1;
+    g_sched_trace.n_past = -1;
+    g_sched_trace.n_tokens = -1;
+}
+
+void ggml_backend_sched_trace_set_query_id(int query_id) {
+    std::lock_guard<std::mutex> lock(g_sched_trace.mutex);
+    ggml_sched_trace_init_locked();
+    g_sched_trace.query_id = query_id;
+}
+
+void ggml_backend_sched_trace_set_ubatch(int token_index, int n_past, int n_tokens) {
+    std::lock_guard<std::mutex> lock(g_sched_trace.mutex);
+    ggml_sched_trace_init_locked();
+    g_sched_trace.token_index = token_index;
+    g_sched_trace.n_past = n_past;
+    g_sched_trace.n_tokens = n_tokens;
+}
+
 static inline int64_t ggml_sched_profile_time_us(void) {
-    return ggml_sched_profile_enabled() ? ggml_time_us() : 0;
+    if (ggml_sched_profile_enabled()) {
+        return ggml_time_us();
+    }
+    // compute_splits initializes trace state once per graph, so the fast path
+    // can avoid taking the trace mutex for every copy/wait timestamp.
+    return g_sched_trace.initialized && g_sched_trace.enabled ? ggml_time_us() : 0;
 }
 
 static ggml_sched_profile_backend_kind ggml_sched_profile_backend_bucket(ggml_backend_t backend) {
@@ -1075,7 +1241,7 @@ void ggml_backend_sched_profile_reset(void) {
 }
 
 void ggml_backend_sched_profile_set_phase(enum ggml_backend_sched_profile_phase phase) {
-    if (!ggml_sched_profile_enabled()) {
+    if (!ggml_sched_profile_enabled() && !ggml_sched_trace_enabled()) {
         return;
     }
 
@@ -2592,9 +2758,103 @@ static int ggml_backend_sched_collect_parallel_ffn_group(
     return infos->size() >= 2 || allow_single ? (int) infos->size() : 0;
 }
 
+struct ggml_backend_sched_trace_io_times {
+    int64_t copy_us = 0;
+    int64_t wait_us = 0;
+};
+
+static int ggml_backend_sched_trace_graph_layer(const ggml_cgraph & graph) {
+    for (int i = 0; i < graph.n_nodes; ++i) {
+        const ggml_tensor * node = graph.nodes[i];
+        const int layer = ggml_sched_profile_extract_layer_id(node ? node->name : nullptr);
+        if (layer >= 0) {
+            return layer;
+        }
+    }
+    return -1;
+}
+
+static void ggml_backend_sched_trace_write_split(
+        ggml_backend_sched_t sched,
+        int64_t graph_id,
+        int split_id,
+        const struct ggml_backend_sched_split * split,
+        const ggml_backend_sched_trace_io_times & io_times,
+        int64_t compute_submit_us,
+        int64_t compute_wall_us,
+        bool is_ffn_group,
+        const char * ffn_branch,
+        int group_id,
+        int64_t group_wall_us,
+        int64_t group_copy_us,
+        const char * timing_mode) {
+    if (!ggml_sched_trace_enabled()) {
+        return;
+    }
+
+    GGML_ASSERT(sched != nullptr);
+    GGML_ASSERT(split != nullptr);
+
+    const ggml_cgraph & graph = split->graph;
+    const ggml_tensor * first = graph.n_nodes > 0 ? graph.nodes[0] : nullptr;
+    const ggml_tensor * last  = graph.n_nodes > 0 ? graph.nodes[graph.n_nodes - 1] : nullptr;
+    const int node_start = split->i_start;
+    const int node_end = split->i_end > split->i_start ? split->i_end - 1 : split->i_start;
+    const int layer = ggml_backend_sched_trace_graph_layer(graph);
+
+    std::lock_guard<std::mutex> lock(g_sched_trace.mutex);
+    FILE * f = ggml_sched_trace_file_locked();
+    if (f == nullptr) {
+        return;
+    }
+
+    fprintf(f, "%d,%s,%lld,%d,%d,%d,",
+            g_sched_trace.query_id,
+            ggml_sched_profile_phase_name(),
+            (long long) graph_id,
+            g_sched_trace.token_index,
+            g_sched_trace.n_past,
+            g_sched_trace.n_tokens);
+
+    fprintf(f, "%d,", split_id);
+    ggml_sched_trace_csv_cell(f, ggml_backend_name(sched->backends[split->backend_id]));
+    fprintf(f, ",%d,", layer);
+
+    fprintf(f, "%d,%d,%d,", node_start, node_end, graph.n_nodes);
+    ggml_sched_trace_csv_cell(f, first ? first->name : "");
+    fputc(',', f);
+    ggml_sched_trace_csv_cell(f, last ? last->name : "");
+    fputc(',', f);
+    ggml_sched_trace_csv_cell(f, first ? ggml_op_name(first->op) : "");
+    fputc(',', f);
+    ggml_sched_trace_csv_cell(f, last ? ggml_op_name(last->op) : "");
+    fputc(',', f);
+
+    fprintf(f, "%lld,%lld,%lld,%lld,%d,",
+            (long long) io_times.copy_us,
+            (long long) io_times.wait_us,
+            (long long) compute_submit_us,
+            (long long) compute_wall_us,
+            is_ffn_group ? 1 : 0);
+    ggml_sched_trace_csv_cell(f, ffn_branch ? ffn_branch : "");
+    fprintf(f, ",%d,%lld,%lld,",
+            group_id,
+            (long long) group_wall_us,
+            (long long) group_copy_us);
+    ggml_sched_trace_csv_cell(f, timing_mode ? timing_mode : "");
+    fputc('\n', f);
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
+
+    int64_t trace_graph_id = -1;
+    if (ggml_sched_trace_enabled()) {
+        std::lock_guard<std::mutex> lock(g_sched_trace.mutex);
+        ggml_sched_trace_init_locked();
+        trace_graph_id = g_sched_trace.graph_id++;
+    }
 
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
@@ -2644,6 +2904,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     };
 
     auto copy_split_inputs = [&](struct ggml_backend_sched_split * split) {
+        ggml_backend_sched_trace_io_times io_times;
+        auto add_copy_us = [&](int64_t dt_us) {
+            io_times.copy_us += dt_us;
+            ggml_sched_profile_add_copy_us(dt_us);
+        };
+        auto add_wait_us = [&](int64_t dt_us) {
+            io_times.wait_us += dt_us;
+            ggml_sched_profile_add_wait_us(dt_us);
+        };
+
         const int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
 
@@ -2658,18 +2928,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     const int64_t t0_us = ggml_sched_profile_time_us();
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                     const int64_t t1_us = ggml_sched_profile_time_us();
-                    ggml_sched_profile_add_wait_us(t1_us - t0_us);
+                    add_wait_us(t1_us - t0_us);
                 } else {
                     const int64_t t0_us = ggml_sched_profile_time_us();
                     ggml_backend_synchronize(split_backend);
                     const int64_t t1_us = ggml_sched_profile_time_us();
-                    ggml_sched_profile_add_wait_us(t1_us - t0_us);
+                    add_wait_us(t1_us - t0_us);
                 }
                 {
                     const int64_t t0_us = ggml_sched_profile_time_us();
                     ggml_backend_tensor_copy(input, input_cpy);
                     const int64_t t1_us = ggml_sched_profile_time_us();
-                    ggml_sched_profile_add_copy_us(t1_us - t0_us);
+                    add_copy_us(t1_us - t0_us);
                 }
             } else {
                 // wait for the split backend to finish using the input before overwriting it
@@ -2677,12 +2947,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     const int64_t t0_us = ggml_sched_profile_time_us();
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
                     const int64_t t1_us = ggml_sched_profile_time_us();
-                    ggml_sched_profile_add_wait_us(t1_us - t0_us);
+                    add_wait_us(t1_us - t0_us);
                 } else {
                     const int64_t t0_us = ggml_sched_profile_time_us();
                     ggml_backend_synchronize(split_backend);
                     const int64_t t1_us = ggml_sched_profile_time_us();
-                    ggml_sched_profile_add_wait_us(t1_us - t0_us);
+                    add_wait_us(t1_us - t0_us);
                 }
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
@@ -2701,7 +2971,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         const int64_t t0_us = ggml_sched_profile_time_us();
                         ggml_backend_synchronize(input_backend);
                         const int64_t t1_us = ggml_sched_profile_time_us();
-                        ggml_sched_profile_add_wait_us(t1_us - t0_us);
+                        add_wait_us(t1_us - t0_us);
                     }
 
                     // get the ids
@@ -2724,13 +2994,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             const int64_t t0_us = ggml_sched_profile_time_us();
                             ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
                             const int64_t t1_us = ggml_sched_profile_time_us();
-                            ggml_sched_profile_add_copy_us(t1_us - t0_us);
+                            add_copy_us(t1_us - t0_us);
                         }
                         {
                             const int64_t t0_us = ggml_sched_profile_time_us();
                             ggml_backend_synchronize(ids_backend);
                             const int64_t t1_us = ggml_sched_profile_time_us();
-                            ggml_sched_profile_add_wait_us(t1_us - t0_us);
+                            add_wait_us(t1_us - t0_us);
                         }
 
                         // find the used experts
@@ -2762,7 +3032,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 // this is necessary for MMQ in the CUDA backend
                                 expert_size_copy + padding_end);
                         const int64_t t1_us = ggml_sched_profile_time_us();
-                        ggml_sched_profile_add_copy_us(t1_us - t0_us);
+                        add_copy_us(t1_us - t0_us);
                     };
 
                     int id = 0;
@@ -2796,7 +3066,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         const int64_t t0_us = ggml_sched_profile_time_us();
                         async_ok = split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy);
                         const int64_t t1_us = ggml_sched_profile_time_us();
-                        ggml_sched_profile_add_copy_us(t1_us - t0_us);
+                        add_copy_us(t1_us - t0_us);
                     }
 
                     if (!async_ok) {
@@ -2804,29 +3074,31 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             const int64_t t0_us = ggml_sched_profile_time_us();
                             ggml_backend_synchronize(input_backend);
                             const int64_t t1_us = ggml_sched_profile_time_us();
-                            ggml_sched_profile_add_wait_us(t1_us - t0_us);
+                            add_wait_us(t1_us - t0_us);
                         }
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             const int64_t t0_us = ggml_sched_profile_time_us();
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                             const int64_t t1_us = ggml_sched_profile_time_us();
-                            ggml_sched_profile_add_wait_us(t1_us - t0_us);
+                            add_wait_us(t1_us - t0_us);
                         } else {
                             const int64_t t0_us = ggml_sched_profile_time_us();
                             ggml_backend_synchronize(split_backend);
                             const int64_t t1_us = ggml_sched_profile_time_us();
-                            ggml_sched_profile_add_wait_us(t1_us - t0_us);
+                            add_wait_us(t1_us - t0_us);
                         }
                         {
                             const int64_t t0_us = ggml_sched_profile_time_us();
                             ggml_backend_tensor_copy(input, input_cpy);
                             const int64_t t1_us = ggml_sched_profile_time_us();
-                            ggml_sched_profile_add_copy_us(t1_us - t0_us);
+                            add_copy_us(t1_us - t0_us);
                         }
                     }
                 }
             }
         }
+
+        return io_times;
     };
 
     auto compute_split_no_callback = [&](struct ggml_backend_sched_split * split, int64_t * dt_us, bool sync_after) {
@@ -2920,8 +3192,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
             const int64_t group_t0_us = ggml_time_us();
             const int64_t copy_t0_us = group_t0_us;
+            std::vector<ggml_backend_sched_trace_io_times> io_times(ffn_group_size);
             for (int i = 0; i < ffn_group_size; ++i) {
-                copy_split_inputs(&splits[split_id + i]);
+                io_times[i] = copy_split_inputs(&splits[split_id + i]);
             }
             const int64_t copy_t1_us = ggml_time_us();
 
@@ -3005,11 +3278,30 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     overlap,
                     balance);
 
+            if (trace_graph_id >= 0) {
+                for (int i = 0; i < ffn_group_size; ++i) {
+                    ggml_backend_sched_trace_write_split(
+                            sched,
+                            trace_graph_id,
+                            split_id + i,
+                            &splits[split_id + i],
+                            io_times[i],
+                            dt_us[i],
+                            dt_us[i],
+                            true,
+                            ffn_group_infos[i].branch.c_str(),
+                            split_id,
+                            group_wall_us,
+                            copy_us,
+                            "synced_wall");
+                }
+            }
+
             split_id += ffn_group_size - 1;
             continue;
         }
 
-        copy_split_inputs(split);
+        const ggml_backend_sched_trace_io_times io_times = copy_split_inputs(split);
 
         if (!sched->callback_eval) {
             int64_t dt_us = 0;
@@ -3018,10 +3310,44 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 return ec;
             }
             prof_add(split->graph, split_bucket, dt_us);
+
+            if (trace_graph_id >= 0) {
+                const bool split_is_cpu = split_bucket == GGML_SCHED_PROFILE_BACKEND_CPU;
+                ggml_backend_sched_trace_write_split(
+                        sched,
+                        trace_graph_id,
+                        split_id,
+                        split,
+                        io_times,
+                        dt_us,
+                        split_is_cpu ? dt_us : -1,
+                        false,
+                        "",
+                        -1,
+                        -1,
+                        io_times.copy_us,
+                        split_is_cpu ? "sync_wall" : "async_submit");
+            }
         } else {
             enum ggml_status ec = compute_split_with_callback(split);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
+            }
+            if (trace_graph_id >= 0) {
+                ggml_backend_sched_trace_write_split(
+                        sched,
+                        trace_graph_id,
+                        split_id,
+                        split,
+                        io_times,
+                        -1,
+                        -1,
+                        false,
+                        "",
+                        -1,
+                        -1,
+                        io_times.copy_us,
+                        "callback");
             }
         }
 

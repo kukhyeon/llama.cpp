@@ -90,6 +90,10 @@ static bool should_write_op_load_breakdown_csv() {
     return env_flag_enabled("CSV_OP_LOAD_BREAKDOWN");
 }
 
+static bool should_write_sched_trace_csv() {
+    return env_flag_enabled("SCHED_TRACE") || env_flag_enabled("GGML_SCHED_TRACE");
+}
+
 // Appends per-op CSV headers for the optional op breakdown section.
 // Each ggml op contributes six columns:
 // prefill_cpu, decode_cpu, prefill_htp, decode_htp, prefill_gpu, decode_gpu.
@@ -444,10 +448,17 @@ int main(int argc, char ** argv) {
     const bool csv_op_load = should_write_op_load_csv();
     const bool csv_op_load_breakdown = should_write_op_load_breakdown_csv();
     const bool csv_load = csv_op_load || csv_op_load_breakdown;
+    const bool sched_trace = should_write_sched_trace_csv();
     ggml_backend_op_load_profile_set_enabled(csv_op_load);
     ggml_backend_op_load_profile_set_breakdown_enabled(csv_op_load_breakdown);
     ggml_backend_op_load_profile_set_ops_from_env(std::getenv("CSV_OP_LOAD_OPS"));
     ggml_backend_op_load_profile_set_patterns_from_env(std::getenv("CSV_OP_LOAD_PATTERNS"));
+    if (const char * path = std::getenv("SCHED_TRACE_PATH")) {
+        ggml_backend_sched_trace_set_path(path);
+    } else if (const char * path = std::getenv("GGML_SCHED_TRACE_PATH")) {
+        ggml_backend_sched_trace_set_path(path);
+    }
+    ggml_backend_sched_trace_set_enabled(sched_trace);
 
     LOG_INF("%s: llama backend init\n", __func__);
 
@@ -1428,6 +1439,10 @@ int main(int argc, char ** argv) {
                     llama_perf_context_reset(ctx);
                     if (ig->backend_compute_profile) {
                         ggml_backend_sched_profile_reset();
+                    }
+                    if (sched_trace) {
+                        ggml_backend_sched_trace_reset();
+                        ggml_backend_sched_trace_set_query_id((int) current_question_index);
                     }
                     if (csv_load) {
                         ggml_backend_op_load_profile_reset();

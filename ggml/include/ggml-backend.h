@@ -497,6 +497,19 @@ extern "C" {
     // Returns a snapshot of the accumulated profiling counters.
     GGML_API struct ggml_backend_sched_profile_data ggml_backend_sched_profile_get(void);
 
+    // Enables/disables lightweight scheduler split tracing.
+    // Unlike op-load profiling, this does not enable backend/kernel profilers.
+    GGML_API void ggml_backend_sched_trace_set_enabled(bool enabled);
+    // Selects the scheduler trace CSV path. If unset, SCHED_TRACE_PATH or
+    // "output/scheduler_trace.csv" is used.
+    GGML_API void ggml_backend_sched_trace_set_path(const char * path);
+    // Resets per-query graph numbering for scheduler trace rows.
+    GGML_API void ggml_backend_sched_trace_reset(void);
+    // Attaches the current application query id to subsequent trace rows.
+    GGML_API void ggml_backend_sched_trace_set_query_id(int query_id);
+    // Attaches the current ubatch context to subsequent trace rows.
+    GGML_API void ggml_backend_sched_trace_set_ubatch(int token_index, int n_past, int n_tokens);
+
     // Enables/disables process-global per-op load profiling.
     GGML_API void ggml_backend_op_load_profile_set_enabled(bool enabled);
     GGML_API bool ggml_backend_op_load_profile_enabled(void);
