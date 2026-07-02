@@ -1199,8 +1199,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (llama_backend_policy_update_runtime_profile(lp_is_prefill)) {
         gf_res_prev->reset();
     }
-    if (igparams.backend_compute_profile) {
-        ggml_backend_sched_profile_set_phase(lp_is_prefill ? GGML_BACKEND_SCHED_PROFILE_PREFILL : GGML_BACKEND_SCHED_PROFILE_DECODE);
+    ggml_backend_sched_profile_set_phase(lp_is_prefill ? GGML_BACKEND_SCHED_PROFILE_PREFILL : GGML_BACKEND_SCHED_PROFILE_DECODE);
+    {
+        const int trace_n_past = ubatch.pos && ubatch.n_tokens > 0 ? (int) ubatch.pos[0] : -1;
+        const int trace_token_index = lp_is_prefill ? -1 : trace_n_past;
+        ggml_backend_sched_trace_set_ubatch(trace_token_index, trace_n_past, (int) ubatch.n_tokens);
     }
 
     auto * res = gf_res_prev.get();
