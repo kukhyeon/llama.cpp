@@ -998,6 +998,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
 
     // get general kv
     ml.get_key(LLM_KV_GENERAL_NAME, name, false);
+    ftype = ml.ftype;
 
     // everything past this point is not vocab-related
     // for CLIP models, we only need to load tensors, no hparams
@@ -2186,6 +2187,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
 ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     std::unique_ptr<llm_graph_context> llm = build_arch_graph(params);
+
+    if (params.module_bench_active) {
+        llm->res->set_outputs();
+        return llm->res->get_gf();
+    }
 
     // add on pooling layer
     llm->build_pooling(cls, cls_b, cls_out, cls_out_b, cls_norm);

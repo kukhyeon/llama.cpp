@@ -24,6 +24,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cinttypes>
 #include <climits>
 #include <cstdarg>
@@ -70,6 +71,73 @@ static std::string read_file(const std::string & fname) {
     std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
     file.close();
     return content;
+}
+
+static std::string common_arg_lower(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return (char) std::tolower(c);
+    });
+    return value;
+}
+
+static llama_module_bench_type common_arg_parse_module_bench_type(const std::string & value) {
+    const std::string v = common_arg_lower(value);
+    if (v == "off" || v == "0" || v == "false") {
+        return LLAMA_MODULE_BENCH_OFF;
+    }
+    if (v == "attn_norm") {
+        return LLAMA_MODULE_BENCH_ATTN_NORM;
+    }
+    if (v == "attn_projection" || v == "attention_projection") {
+        return LLAMA_MODULE_BENCH_ATTN_PROJECTION;
+    }
+    if (v == "attn_score" || v == "attention_score") {
+        return LLAMA_MODULE_BENCH_ATTN_SCORE;
+    }
+    if (v == "attn_out_proj" || v == "attention_out_proj" || v == "attn_out") {
+        return LLAMA_MODULE_BENCH_ATTN_OUT_PROJ;
+    }
+    if (v == "ffn_inp") {
+        return LLAMA_MODULE_BENCH_FFN_INP;
+    }
+    if (v == "ffn_norm") {
+        return LLAMA_MODULE_BENCH_FFN_NORM;
+    }
+    if (v == "ffn_core") {
+        return LLAMA_MODULE_BENCH_FFN_CORE;
+    }
+    if (v == "l_out") {
+        return LLAMA_MODULE_BENCH_L_OUT;
+    }
+    throw std::runtime_error(string_format("unknown --module-bench value '%s'", value.c_str()));
+}
+
+static llama_module_bench_phase common_arg_parse_module_bench_phase(const std::string & value) {
+    const std::string v = common_arg_lower(value);
+    if (v == "both" || v == "all") {
+        return LLAMA_MODULE_BENCH_PHASE_BOTH;
+    }
+    if (v == "prefill") {
+        return LLAMA_MODULE_BENCH_PHASE_PREFILL;
+    }
+    if (v == "decode") {
+        return LLAMA_MODULE_BENCH_PHASE_DECODE;
+    }
+    throw std::runtime_error(string_format("unknown --module-bench-phase value '%s'", value.c_str()));
+}
+
+static void common_arg_parse_module_layer_range(common_params & params, const std::string & value) {
+    size_t sep = value.find(':');
+    if (sep == std::string::npos) {
+        sep = value.find('-', 1);
+    }
+    if (sep == std::string::npos) {
+        params.module_bench_layer_start = std::stoi(value);
+        params.module_bench_layer_end   = params.module_bench_layer_start;
+        return;
+    }
+    params.module_bench_layer_start = std::stoi(value.substr(0, sep));
+    params.module_bench_layer_end   = std::stoi(value.substr(sep + 1));
 }
 
 static const std::vector<common_arg> & get_common_arg_defs() {
@@ -1183,6 +1251,48 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.backend_policy_ops = is_truthy(value);
         }
     ).set_env("LLAMA_ARG_BACKEND_POLICY_OPS"));
+    add_opt(common_arg(
+        {"--module-bench"}, "off|attn_norm|attn_projection|attn_score|attn_out_proj|ffn_inp|ffn_norm|ffn_core|l_out",
+        "enable experimental module-only micro-benchmark graph (default: off)",
+        [](common_params & params, const std::string & value) {
+            params.module_bench_type = common_arg_parse_module_bench_type(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_MODULE_BENCH"));
+    add_opt(common_arg(
+        {"--module-bench-profile"}, "NAME",
+        "module-bench model profile (currently: llama3.2_3b_q8_0)",
+        [](common_params & params, const std::string & value) {
+            params.module_bench_profile = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_MODULE_BENCH_PROFILE"));
+    add_opt(common_arg(
+        {"--module-bench-repeat"}, "N",
+        "repeat the selected module graph N times per ubatch",
+        [](common_params & params, int value) {
+            params.module_bench_repeat = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_MODULE_BENCH_REPEAT"));
+    add_opt(common_arg(
+        {"--module-bench-phase"}, "prefill|decode|both",
+        "phase in which module-bench graph replaces the normal graph",
+        [](common_params & params, const std::string & value) {
+            params.module_bench_phase = common_arg_parse_module_bench_phase(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_MODULE_BENCH_PHASE"));
+    add_opt(common_arg(
+        {"--module-bench-layer-range"}, "START:END",
+        "inclusive transformer layer range for module-bench",
+        [](common_params & params, const std::string & value) {
+            common_arg_parse_module_layer_range(params, value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_MODULE_BENCH_LAYER_RANGE"));
+    add_opt(common_arg(
+        {"--module-bench-trace"}, "FNAME",
+        "CSV path for module-bench synchronized wall-time measurements",
+        [](common_params & params, const std::string & value) {
+            params.module_bench_trace_path = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_MODULE_BENCH_TRACE"));
     add_opt(common_arg(
         {"--strict"}, "on|off",
         "enable ignite strict generation limit",

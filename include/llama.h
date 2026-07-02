@@ -191,6 +191,24 @@ extern "C" {
 
     LLAMA_API const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_type);
 
+    enum llama_module_bench_type {
+        LLAMA_MODULE_BENCH_OFF = 0,
+        LLAMA_MODULE_BENCH_ATTN_NORM,
+        LLAMA_MODULE_BENCH_ATTN_PROJECTION,
+        LLAMA_MODULE_BENCH_ATTN_SCORE,
+        LLAMA_MODULE_BENCH_ATTN_OUT_PROJ,
+        LLAMA_MODULE_BENCH_FFN_INP,
+        LLAMA_MODULE_BENCH_FFN_NORM,
+        LLAMA_MODULE_BENCH_FFN_CORE,
+        LLAMA_MODULE_BENCH_L_OUT,
+    };
+
+    enum llama_module_bench_phase {
+        LLAMA_MODULE_BENCH_PHASE_BOTH    = 0,
+        LLAMA_MODULE_BENCH_PHASE_PREFILL = 1,
+        LLAMA_MODULE_BENCH_PHASE_DECODE  = 2,
+    };
+
     enum llama_split_mode {
         LLAMA_SPLIT_MODE_NONE   = 0, // single GPU
         LLAMA_SPLIT_MODE_LAYER  = 1, // split layers and KV across GPUs
@@ -356,6 +374,15 @@ extern "C" {
 
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
+
+        // Experimental module-only micro-benchmarking. Default is OFF.
+        enum llama_module_bench_type  module_bench_type;
+        enum llama_module_bench_phase module_bench_phase;
+        int32_t module_bench_repeat;
+        int32_t module_bench_layer_start;
+        int32_t module_bench_layer_end;
+        const char * module_bench_profile;
+        const char * module_bench_trace_path;
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted

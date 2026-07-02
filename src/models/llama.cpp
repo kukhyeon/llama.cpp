@@ -1,4 +1,7 @@
 #include "models.h"
+#include "llama-kv-cache.h"
+
+#include <algorithm>
 
 void llama_model_llama::load_arch_hparams(llama_model_loader & ml) {
     const auto n_vocab = vocab.n_tokens();
@@ -101,6 +104,171 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
     GGML_ASSERT(n_embd_head == n_rot);
 
+    const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f/sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
+
+    if (params.module_bench_active) {
+        const int il_start = std::max<int>(0, cparams.module_bench_layer_start);
+        const int il_end = std::min<int>((int) n_layer - 1,
+                cparams.module_bench_layer_end < 0 ? (int) n_layer - 1 : cparams.module_bench_layer_end);
+        if (il_start > il_end) {
+            GGML_ABORT("module-bench invalid layer range");
+        }
+
+        ggml_tensor * last = nullptr;
+        auto finish = [&](ggml_tensor * out) {
+            ggml_build_forward_expand(gf, out);
+            res->t_embd = out;
+            last = out;
+        };
+
+        auto build_module_inp = [&](const char * name, int64_t ne0, int64_t ne1 = 1, int64_t ne2 = 1, int64_t ne3 = 1) {
+            return build_inp_f32_zeros(name, ne0, ne1, ne2, ne3);
+        };
+
+        auto build_named_rms_norm = [&](ggml_tensor * inp, ggml_tensor * weight, const char * rms_name, const char * out_name, int il) {
+            ggml_tensor * out = ggml_rms_norm(ctx0, inp, hparams.f_norm_rms_eps);
+            cb(out, rms_name, il);
+            out = ggml_mul(ctx0, out, weight);
+            cb(out, out_name, il);
+            return out;
+        };
+
+        switch (cparams.module_bench_type) {
+            case LLAMA_MODULE_BENCH_ATTN_NORM:
+                for (int il = il_start; il <= il_end; ++il) {
+                    ggml_tensor * inp = build_module_inp("module_attn_norm_inp", n_embd, n_tokens);
+                    cb(inp, "module_attn_norm_inp", il);
+                    finish(build_named_rms_norm(inp, model.layers[il].attn_norm, "attn_rms_norm", "attn_norm", il));
+                }
+                break;
+
+            case LLAMA_MODULE_BENCH_ATTN_PROJECTION:
+                {
+                    ggml_tensor * inp_pos = build_inp_pos();
+                    auto * inp_attn = build_attn_inp_kv();
+                    const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
+                    for (int il = il_start; il <= il_end; ++il) {
+                        ggml_tensor * inp = build_module_inp("module_attn_projection_inp", n_embd, n_tokens);
+                        cb(inp, "module_attn_projection_inp", il);
+
+                        ggml_tensor * rope_factors = model.get_rope_factors(cparams, il);
+                        auto [Qcur, Kcur, Vcur] = build_qkv(model.layers[il], inp,
+                                n_embd_head, n_head, n_head_kv, il);
+
+                        Qcur = ggml_rope_ext(
+                                ctx0, Qcur, inp_pos, rope_factors,
+                                n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                                ext_factor, attn_factor, beta_fast, beta_slow);
+
+                        Kcur = ggml_rope_ext(
+                                ctx0, Kcur, inp_pos, rope_factors,
+                                n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                                ext_factor, attn_factor, beta_fast, beta_slow);
+
+                        cb(Qcur, "Qcur", il);
+                        cb(Kcur, "Kcur", il);
+                        cb(Vcur, "Vcur", il);
+
+                        ggml_build_forward_expand(gf, Qcur);
+                        ggml_build_forward_expand(gf, Vcur);
+                        ggml_build_forward_expand(gf, Kcur);
+
+                        const auto & k_idxs = inp_attn->get_k_idxs();
+                        const auto & v_idxs = inp_attn->get_v_idxs();
+                        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, Kcur, k_idxs, il));
+                        ggml_tensor * out = mctx_cur->cpy_v(ctx0, Vcur, v_idxs, il);
+                        finish(out);
+                    }
+                }
+                break;
+
+            case LLAMA_MODULE_BENCH_ATTN_SCORE:
+                {
+                    auto * inp_attn = build_attn_inp_kv();
+                    const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
+                    for (int il = il_start; il <= il_end; ++il) {
+                        ggml_tensor * Qcur = build_module_inp("module_attn_score_q", n_embd_head, n_head, n_tokens);
+                        cb(Qcur, "module_attn_score_q", il);
+                        ggml_tensor * Kcur = mctx_cur->get_k(ctx0, il);
+                        ggml_tensor * Vcur = mctx_cur->get_v(ctx0, il);
+                        ggml_tensor * out = build_attn_mha(Qcur, Kcur, Vcur, nullptr, inp_attn->get_kq_mask(), nullptr, nullptr, kq_scale, il);
+                        cb(out, "kqv_out", il);
+                        finish(out);
+                    }
+                }
+                break;
+
+            case LLAMA_MODULE_BENCH_ATTN_OUT_PROJ:
+                for (int il = il_start; il <= il_end; ++il) {
+                    ggml_tensor * inp = build_module_inp("module_attn_out_proj_inp", n_embd, n_tokens);
+                    cb(inp, "module_attn_out_proj_inp", il);
+                    ggml_tensor * out = build_lora_mm(model.layers[il].wo, inp, model.layers[il].wo_s);
+                    cb(out, "attn_out", il);
+                    if (model.layers[il].wo_b) {
+                        out = ggml_add(ctx0, out, model.layers[il].wo_b);
+                    }
+                    finish(out);
+                }
+                break;
+
+            case LLAMA_MODULE_BENCH_FFN_INP:
+                for (int il = il_start; il <= il_end; ++il) {
+                    ggml_tensor * lhs = build_module_inp("module_ffn_inp_lhs", n_embd, n_tokens);
+                    ggml_tensor * rhs = build_module_inp("module_ffn_inp_rhs", n_embd, n_tokens);
+                    cb(lhs, "module_ffn_inp_lhs", il);
+                    cb(rhs, "module_ffn_inp_rhs", il);
+                    ggml_tensor * out = ggml_add(ctx0, lhs, rhs);
+                    cb(out, "ffn_inp", il);
+                    finish(out);
+                }
+                break;
+
+            case LLAMA_MODULE_BENCH_FFN_NORM:
+                for (int il = il_start; il <= il_end; ++il) {
+                    ggml_tensor * inp = build_module_inp("module_ffn_norm_inp", n_embd, n_tokens);
+                    cb(inp, "module_ffn_norm_inp", il);
+                    finish(build_named_rms_norm(inp, model.layers[il].ffn_norm, "ffn_rms_norm", "ffn_norm", il));
+                }
+                break;
+
+            case LLAMA_MODULE_BENCH_FFN_CORE:
+                for (int il = il_start; il <= il_end; ++il) {
+                    if (model.layers[il].ffn_gate_inp != nullptr) {
+                        GGML_ABORT("module-bench ffn_core only supports dense FFN layers");
+                    }
+                    ggml_tensor * inp = build_module_inp("module_ffn_core_inp", n_embd, n_tokens);
+                    cb(inp, "ffn_norm", il);
+                    ggml_tensor * out = build_ffn(inp,
+                            model.layers[il].ffn_up,   model.layers[il].ffn_up_b,   model.layers[il].ffn_up_s,
+                            model.layers[il].ffn_gate, model.layers[il].ffn_gate_b, model.layers[il].ffn_gate_s,
+                            model.layers[il].ffn_down, model.layers[il].ffn_down_b, model.layers[il].ffn_down_s,
+                            NULL,
+                            LLM_FFN_SILU, LLM_FFN_PAR, il);
+                    cb(out, "ffn_out", il);
+                    finish(out);
+                }
+                break;
+
+            case LLAMA_MODULE_BENCH_L_OUT:
+                for (int il = il_start; il <= il_end; ++il) {
+                    ggml_tensor * lhs = build_module_inp("module_l_out_lhs", n_embd, n_tokens);
+                    ggml_tensor * rhs = build_module_inp("module_l_out_rhs", n_embd, n_tokens);
+                    cb(lhs, "module_l_out_lhs", il);
+                    cb(rhs, "module_l_out_rhs", il);
+                    ggml_tensor * out = ggml_add(ctx0, lhs, rhs);
+                    cb(out, "l_out", il);
+                    finish(out);
+                }
+                break;
+
+            case LLAMA_MODULE_BENCH_OFF:
+                GGML_ABORT("module-bench active with off module");
+        }
+
+        GGML_ASSERT(last != nullptr);
+        return;
+    }
+
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
@@ -117,8 +285,6 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
     } else {
         inp_attn = build_attn_inp_kv();
     }
-
-    const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f/sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
