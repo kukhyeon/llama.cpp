@@ -58,6 +58,10 @@ static bool can_reuse_kq_mask(
     return res;
 }
 
+static bool tensor_is_allocated(const ggml_tensor * t) {
+    return t != nullptr && t->buffer != nullptr;
+}
+
 // impl
 
 static ggml_tensor * ggml_mul_mat_aux(
@@ -133,6 +137,18 @@ bool llm_graph_input_pos::can_reuse(const llm_graph_params & params) {
     res &= pos->ne[0] == params.ubatch.n_tokens*n_pos_per_embd;
 
     return res;
+}
+
+void llm_graph_input_f32_zeros::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+    if (tensor != nullptr && !data.empty()) {
+        ggml_backend_tensor_set(tensor, data.data(), 0, data.size()*sizeof(float));
+    }
+}
+
+bool llm_graph_input_f32_zeros::can_reuse(const llm_graph_params & params) {
+    GGML_UNUSED(params);
+    return tensor != nullptr && ggml_nbytes(tensor) == data.size()*sizeof(float);
 }
 
 void llm_graph_input_attn_temp::set_input(const llama_ubatch * ubatch) {
@@ -453,16 +469,22 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
-    mctx->set_input_k_idxs(self_k_idxs, ubatch);
-    mctx->set_input_v_idxs(self_v_idxs, ubatch);
+    if (tensor_is_allocated(self_k_idxs)) {
+        mctx->set_input_k_idxs(self_k_idxs, ubatch);
+    }
+    if (tensor_is_allocated(self_v_idxs)) {
+        mctx->set_input_v_idxs(self_v_idxs, ubatch);
+    }
 
-    mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+    if (tensor_is_allocated(self_kq_mask)) {
+        mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+    }
 
-    if (self_k_rot) {
+    if (tensor_is_allocated(self_k_rot)) {
         mctx->set_input_k_rot(self_k_rot);
     }
 
-    if (self_v_rot) {
+    if (tensor_is_allocated(self_v_rot)) {
         mctx->set_input_v_rot(self_v_rot);
     }
 }
@@ -483,9 +505,13 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
 }
 
 void llm_graph_input_attn_k::set_input(const llama_ubatch * ubatch) {
-    mctx->set_input_k_idxs(self_k_idxs, ubatch);
+    if (tensor_is_allocated(self_k_idxs)) {
+        mctx->set_input_k_idxs(self_k_idxs, ubatch);
+    }
 
-    mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+    if (tensor_is_allocated(self_kq_mask)) {
+        mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+    }
 }
 
 bool llm_graph_input_attn_k::can_reuse(const llm_graph_params & params) {
@@ -1949,6 +1975,25 @@ ggml_tensor * llm_graph_context::build_inp_pos() const {
 
     cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t)n_tokens*hparams.n_pos_per_embd());
     ggml_set_input(cur);
+
+    res->add_input(std::move(inp));
+
+    return cur;
+}
+
+ggml_tensor * llm_graph_context::build_inp_f32_zeros(
+        const char * name,
+            int64_t ne0,
+            int64_t ne1,
+            int64_t ne2,
+            int64_t ne3) const {
+    const size_t n_values = (size_t) ne0 * (size_t) ne1 * (size_t) ne2 * (size_t) ne3;
+    auto inp = std::make_unique<llm_graph_input_f32_zeros>(n_values);
+
+    auto & cur = inp->tensor;
+    cur = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, ne0, ne1, ne2, ne3);
+    ggml_set_input(cur);
+    cb(cur, name, -1);
 
     res->add_input(std::move(inp));
 

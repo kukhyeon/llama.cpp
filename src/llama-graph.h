@@ -135,6 +135,21 @@ public:
     const uint32_t n_pos_per_embd = 1;
 };
 
+class llm_graph_input_f32_zeros : public llm_graph_input_i {
+public:
+    explicit llm_graph_input_f32_zeros(size_t n_values) : data(n_values, 0.0f) {}
+    virtual ~llm_graph_input_f32_zeros() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * tensor = nullptr;
+
+private:
+    std::vector<float> data;
+};
+
 // temperature tuning, used by llama4
 class llm_graph_input_attn_temp : public llm_graph_input_i {
 public:
@@ -566,6 +581,7 @@ struct llm_graph_params {
     }
 
     uint32_t n_outputs;
+    bool module_bench_active = false;
 
     llm_graph_cb cb;
 
@@ -608,6 +624,10 @@ struct llm_graph_params {
             return false;
         }
 
+        if (module_bench_active != other.module_bench_active) {
+            return false;
+        }
+
         if (!samplers_equal(samplers, other.samplers)) {
             return false;
         }
@@ -629,6 +649,9 @@ struct llm_graph_params {
         return
             cparams.embeddings  == other.cparams.embeddings  &&
             cparams.causal_attn == other.cparams.causal_attn &&
+            cparams.module_bench_type        == other.cparams.module_bench_type &&
+            cparams.module_bench_layer_start == other.cparams.module_bench_layer_start &&
+            cparams.module_bench_layer_end   == other.cparams.module_bench_layer_end &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             model == other.model &&
@@ -889,6 +912,13 @@ struct llm_graph_context {
     ggml_tensor * build_inp_out_ids() const;
     ggml_tensor * build_inp_mean() const;
     ggml_tensor * build_inp_cls() const;
+
+    ggml_tensor * build_inp_f32_zeros(
+            const char * name,
+                int64_t ne0,
+                int64_t ne1 = 1,
+                int64_t ne2 = 1,
+                int64_t ne3 = 1) const;
 
     ggml_tensor * build_inp_cross_embd() const;
     ggml_tensor * build_inp_pos_bucket_enc() const;

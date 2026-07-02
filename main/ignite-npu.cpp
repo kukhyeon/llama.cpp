@@ -73,6 +73,27 @@ static bool env_flag_enabled(const char * name) {
         std::strcmp(env, "true") == 0 || std::strcmp(env, "TRUE") == 0;
 }
 
+static bool module_bench_done(
+        const common_params & params,
+        const std::vector<llama_token> & embd,
+        int n_consumed,
+        const std::vector<llama_token> & embd_inp) {
+    if (params.module_bench_type == LLAMA_MODULE_BENCH_OFF) {
+        return false;
+    }
+
+    const bool module_both_done =
+        params.module_bench_phase == LLAMA_MODULE_BENCH_PHASE_BOTH;
+    const bool module_prefill_done =
+        params.module_bench_phase == LLAMA_MODULE_BENCH_PHASE_PREFILL && embd.size() > 1;
+    const bool module_decode_done =
+        params.module_bench_phase == LLAMA_MODULE_BENCH_PHASE_DECODE &&
+        embd.size() == 1 &&
+        n_consumed >= (int) embd_inp.size();
+
+    return module_both_done || module_prefill_done || module_decode_done;
+}
+
 static bool should_write_backend_profile_csv(const llama_igparams * ig) {
     return ig != nullptr && ig->backend_compute_profile;
 }
@@ -279,11 +300,13 @@ std::tuple<int, double, int, double> llama_perf_context_print_custom(const struc
     // Convert time_point to time_t (seconds since epoch)
     auto now_sys_time = std::chrono::system_clock::now();
     auto sys_time = std::chrono::duration_cast<std::chrono::milliseconds>(now_sys_time-start_sys_time).count();
+    const double prefill_speed = data.t_p_eval_ms > 0.0 && data.n_p_eval > 0 ? 1e3 / data.t_p_eval_ms * data.n_p_eval : 0.0;
+    const double decode_speed  = data.t_eval_ms   > 0.0 && data.n_eval   > 0 ? 1e3 / data.t_eval_ms   * data.n_eval   : 0.0;
 
     // system time, prefill speed, decode speed, prefill tokens, decode tokens, ttft
     std::ofstream file(output_filename, std::ios::app);
     if (file.is_open()) {
-        file << std::to_string(sys_time) << "," << ( 1e3 / data.t_p_eval_ms *data.n_p_eval ) << "," << (1e3 / data.t_eval_ms * data.n_eval ) << "," 
+        file << std::to_string(sys_time) << "," << prefill_speed << "," << decode_speed << ","
               << data.n_p_eval << ","<< data.n_eval << "," << (data.t_p_eval_ms);
         if (should_write_backend_profile_csv(ig)) {
             const auto prof = ggml_backend_sched_profile_get();
@@ -324,7 +347,7 @@ std::tuple<int, double, int, double> llama_perf_context_print_custom(const struc
         // LLAMA_LOG_INFO("Failed to open file: %s\n", output_filename.c_str());
     }
 
-    return std::make_tuple(data.n_p_eval, 1e3 / data.t_p_eval_ms * data.n_p_eval, data.n_eval, 1e3 / data.t_eval_ms * data.n_eval);
+    return std::make_tuple(data.n_p_eval, prefill_speed, data.n_eval, decode_speed);
 }
 
 std::vector<std::string> loadQuestions(const std::string &filename) {
@@ -1195,6 +1218,17 @@ int main(int argc, char ** argv) {
                 // Display total tokens alongside total time
                 if (params.n_print > 0 && n_past % params.n_print == 0) {
                     LOG_DBG("\n\033[31mTokens consumed so far = %d / %d \033[0m\n", n_past, n_ctx);
+                }
+                if (module_bench_done(params, embd, n_consumed, embd_inp)) {
+                    if (output_path_infer != "/inference_stats.csv") {
+                        llama_perf_context_print_custom(ctx, output_path_infer, start_sys_time, ig);
+                    }
+                    if (csv_load && output_path_load != "/inference_load.csv") {
+                        llama_op_load_profile_print_custom(output_path_load, current_question_index, start_sys_time, csv_op_load, csv_op_load_breakdown);
+                    }
+                    inference_started = false;
+                    LOG_INF("module-bench complete; exiting after isolated module graph\n");
+                    break;
                 }
             }
 

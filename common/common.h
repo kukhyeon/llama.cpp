@@ -499,6 +499,15 @@ struct common_params {
     bool backend_policy_weights = true;
     bool backend_policy_ops = true;
 
+    // Experimental module-only micro-benchmarking. Default is off.
+    llama_module_bench_type  module_bench_type = LLAMA_MODULE_BENCH_OFF;
+    llama_module_bench_phase module_bench_phase = LLAMA_MODULE_BENCH_PHASE_BOTH;
+    int32_t module_bench_repeat = 1;
+    int32_t module_bench_layer_start = 0;
+    int32_t module_bench_layer_end = -1;
+    std::string module_bench_profile = "llama3.2_3b_q8_0";
+    std::string module_bench_trace_path = "output/module_trace.csv";
+
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale
 

@@ -12,18 +12,124 @@
 #include "llama-ext.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 
 //
 // llama_context
 //
+
+static const char * llama_module_bench_type_name(llama_module_bench_type type) {
+    switch (type) {
+        case LLAMA_MODULE_BENCH_OFF:             return "off";
+        case LLAMA_MODULE_BENCH_ATTN_NORM:       return "attn_norm";
+        case LLAMA_MODULE_BENCH_ATTN_PROJECTION: return "attn_projection";
+        case LLAMA_MODULE_BENCH_ATTN_SCORE:      return "attn_score";
+        case LLAMA_MODULE_BENCH_ATTN_OUT_PROJ:   return "attn_out_proj";
+        case LLAMA_MODULE_BENCH_FFN_INP:         return "ffn_inp";
+        case LLAMA_MODULE_BENCH_FFN_NORM:        return "ffn_norm";
+        case LLAMA_MODULE_BENCH_FFN_CORE:        return "ffn_core";
+        case LLAMA_MODULE_BENCH_L_OUT:           return "l_out";
+    }
+    return "unknown";
+}
+
+static bool llama_module_bench_phase_matches(const llama_cparams & cparams, bool is_prefill) {
+    if (cparams.module_bench_type == LLAMA_MODULE_BENCH_OFF) {
+        return false;
+    }
+    switch (cparams.module_bench_phase) {
+        case LLAMA_MODULE_BENCH_PHASE_BOTH:    return true;
+        case LLAMA_MODULE_BENCH_PHASE_PREFILL: return is_prefill;
+        case LLAMA_MODULE_BENCH_PHASE_DECODE:  return !is_prefill;
+    }
+    return false;
+}
+
+static bool llama_module_bench_profile_matches(const llama_model & model, const llama_cparams & cparams) {
+    if (cparams.module_bench_type == LLAMA_MODULE_BENCH_OFF) {
+        return true;
+    }
+    if (cparams.module_bench_profile != "llama3.2_3b_q8_0") {
+        LLAMA_LOG_ERROR("%s: unsupported module-bench profile '%s'\n", __func__, cparams.module_bench_profile.c_str());
+        return false;
+    }
+    const auto & hparams = model.hparams;
+    const bool ok =
+        model.arch == LLM_ARCH_LLAMA &&
+        model.name == "Llama 3.2 3B Instruct" &&
+        model.ftype == LLAMA_FTYPE_MOSTLY_Q8_0 &&
+        hparams.n_layer == 28 &&
+        hparams.n_embd == 3072 &&
+        hparams.n_ff() == 8192 &&
+        hparams.n_head() == 24 &&
+        hparams.n_head_kv() == 8;
+    if (!ok) {
+        LLAMA_LOG_ERROR("%s: module-bench profile '%s' only supports Llama 3.2 3B Instruct Q8_0 (got name='%s', arch=%d, ftype=%d, layers=%u, embd=%u, ff=%u, heads=%u/%u)\n",
+                __func__, cparams.module_bench_profile.c_str(), model.name.c_str(), (int) model.arch, (int) model.ftype,
+                hparams.n_layer, hparams.n_embd, hparams.n_ff(), hparams.n_head(), hparams.n_head_kv());
+    }
+    return ok;
+}
+
+static void llama_module_bench_trace_write(
+        const llama_cparams & cparams,
+        const char * phase,
+        int token_index,
+        int n_past,
+        int n_tokens,
+        int repeat_idx,
+        int64_t wall_us) {
+    if (cparams.module_bench_trace_path.empty()) {
+        return;
+    }
+
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    bool need_header = false;
+    {
+        FILE * fr = std::fopen(cparams.module_bench_trace_path.c_str(), "r");
+        if (fr == nullptr) {
+            need_header = true;
+        } else {
+            std::fseek(fr, 0, SEEK_END);
+            need_header = std::ftell(fr) == 0;
+            std::fclose(fr);
+        }
+    }
+
+    FILE * f = std::fopen(cparams.module_bench_trace_path.c_str(), "a");
+    if (f == nullptr) {
+        LLAMA_LOG_ERROR("%s: failed to open module-bench trace '%s'\n", __func__, cparams.module_bench_trace_path.c_str());
+        return;
+    }
+
+    if (need_header) {
+        std::fprintf(f, "profile,module,phase,token_index,n_past,n_tokens,repeat_idx,layer_start,layer_end,wall_us,timing_mode\n");
+    }
+    std::fprintf(f, "%s,%s,%s,%d,%d,%d,%d,%d,%d,%lld,sync_wall\n",
+            cparams.module_bench_profile.c_str(),
+            llama_module_bench_type_name(cparams.module_bench_type),
+            phase,
+            token_index,
+            n_past,
+            n_tokens,
+            repeat_idx,
+            cparams.module_bench_layer_start,
+            cparams.module_bench_layer_end,
+            (long long) wall_us);
+    std::fclose(f);
+}
 
 llama_context::llama_context(
         const llama_model & model,
@@ -57,6 +163,13 @@ llama_context::llama_context(
     cparams.no_perf          = params.no_perf;
     cparams.pooling_type     = params.pooling_type;
     cparams.warmup           = false;
+    cparams.module_bench_type        = params.module_bench_type;
+    cparams.module_bench_phase       = params.module_bench_phase;
+    cparams.module_bench_repeat      = std::max(1, params.module_bench_repeat);
+    cparams.module_bench_layer_start = params.module_bench_layer_start;
+    cparams.module_bench_layer_end   = params.module_bench_layer_end;
+    cparams.module_bench_profile     = params.module_bench_profile ? params.module_bench_profile : "";
+    cparams.module_bench_trace_path  = params.module_bench_trace_path ? params.module_bench_trace_path : "";
 
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
     cparams.rope_freq_base   = params.rope_freq_base  == 0.0f ? hparams.rope_freq_base_train  : params.rope_freq_base;
@@ -1196,6 +1309,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     lp_is_prefill = (ubatch.n_tokens > 1);
+    if (!llama_module_bench_profile_matches(model, cparams)) {
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
     if (llama_backend_policy_update_runtime_profile(lp_is_prefill)) {
         gf_res_prev->reset();
     }
@@ -1274,11 +1391,30 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
 
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
-    if (status != GGML_STATUS_SUCCESS) {
-        LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
-        ret = status;
-        return nullptr;
+    const bool module_bench_active = llama_module_bench_phase_matches(cparams, lp_is_prefill);
+    const int module_bench_repeat = module_bench_active ? std::max(1, cparams.module_bench_repeat) : 1;
+    for (int ir = 0; ir < module_bench_repeat; ++ir) {
+        const int64_t t_module_us = module_bench_active ? ggml_time_us() : 0;
+        const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+        if (status != GGML_STATUS_SUCCESS) {
+            LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+            ret = status;
+            return nullptr;
+        }
+        if (module_bench_active) {
+            ggml_backend_sched_synchronize(sched.get());
+            const int64_t wall_us = ggml_time_us() - t_module_us;
+            const int trace_n_past = ubatch.pos && ubatch.n_tokens > 0 ? (int) ubatch.pos[0] : -1;
+            const int trace_token_index = lp_is_prefill ? -1 : trace_n_past;
+            llama_module_bench_trace_write(
+                    cparams,
+                    lp_is_prefill ? "prefill" : "decode",
+                    trace_token_index,
+                    trace_n_past,
+                    (int) ubatch.n_tokens,
+                    ir,
+                    wall_us);
+        }
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -2213,6 +2349,7 @@ llm_graph_params llama_context::graph_params(
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
+        /*.module_bench_active =*/ llama_module_bench_phase_matches(cparams, lp_is_prefill),
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
@@ -3345,6 +3482,13 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
+        /*.module_bench_type           =*/ LLAMA_MODULE_BENCH_OFF,
+        /*.module_bench_phase          =*/ LLAMA_MODULE_BENCH_PHASE_BOTH,
+        /*.module_bench_repeat         =*/ 1,
+        /*.module_bench_layer_start    =*/ 0,
+        /*.module_bench_layer_end      =*/ -1,
+        /*.module_bench_profile        =*/ nullptr,
+        /*.module_bench_trace_path     =*/ nullptr,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

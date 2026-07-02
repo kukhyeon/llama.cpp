@@ -705,6 +705,20 @@ int main(int argc, char ** argv) {
                 if (params.n_print > 0 && n_past % params.n_print == 0) {
                     LOG_DBG("\n\033[31mTokens consumed so far = %d / %d \033[0m\n", n_past, n_ctx);
                 }
+
+                if (params.module_bench_type != LLAMA_MODULE_BENCH_OFF) {
+                    const bool module_both_done =
+                        params.module_bench_phase == LLAMA_MODULE_BENCH_PHASE_BOTH;
+                    const bool module_prefill_done =
+                        params.module_bench_phase == LLAMA_MODULE_BENCH_PHASE_PREFILL && embd.size() > 1;
+                    const bool module_decode_done =
+                        params.module_bench_phase == LLAMA_MODULE_BENCH_PHASE_DECODE &&
+                        embd.size() == 1 &&
+                        n_consumed >= (int) embd_inp.size();
+                    if (module_both_done || module_prefill_done || module_decode_done) {
+                        break;
+                    }
+                }
             }
         }
 

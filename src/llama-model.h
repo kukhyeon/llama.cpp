@@ -512,6 +512,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
+    llama_ftype ftype = LLAMA_FTYPE_GUESSED;
 
     std::string name = "n/a";
 

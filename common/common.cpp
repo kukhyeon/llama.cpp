@@ -1584,6 +1584,13 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
+    cparams.module_bench_type        = params.module_bench_type;
+    cparams.module_bench_phase       = params.module_bench_phase;
+    cparams.module_bench_repeat      = params.module_bench_repeat;
+    cparams.module_bench_layer_start = params.module_bench_layer_start;
+    cparams.module_bench_layer_end   = params.module_bench_layer_end;
+    cparams.module_bench_profile     = params.module_bench_profile.c_str();
+    cparams.module_bench_trace_path  = params.module_bench_trace_path.c_str();
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

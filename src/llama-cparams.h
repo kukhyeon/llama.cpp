@@ -3,6 +3,7 @@
 #include "llama.h"
 
 #include <cstdint>
+#include <string>
 
 #define LLAMA_MAX_SEQ 256
 
@@ -39,6 +40,14 @@ struct llama_cparams {
     bool op_offload;
     bool kv_unified;
     bool pipeline_parallel;
+
+    enum llama_module_bench_type  module_bench_type = LLAMA_MODULE_BENCH_OFF;
+    enum llama_module_bench_phase module_bench_phase = LLAMA_MODULE_BENCH_PHASE_BOTH;
+    int32_t module_bench_repeat = 1;
+    int32_t module_bench_layer_start = 0;
+    int32_t module_bench_layer_end = -1;
+    std::string module_bench_profile;
+    std::string module_bench_trace_path;
 
     enum llama_pooling_type pooling_type;
 
