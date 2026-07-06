@@ -125,6 +125,15 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
             return build_inp_f32_zeros(name, ne0, ne1, ne2, ne3);
         };
 
+        auto module_ffn_tokens = [&](int il) {
+            return il == (int) n_layer - 1 ? n_outputs : n_tokens;
+        };
+
+        const char * module_backend_hint = cparams.module_bench_backend.empty() ? nullptr : cparams.module_bench_backend.c_str();
+        auto cb_module = [&](ggml_tensor * cur, const char * name, int il) {
+            cb(cur, name, il, module_backend_hint);
+        };
+
         auto build_named_rms_norm = [&](ggml_tensor * inp, ggml_tensor * weight, const char * rms_name, const char * out_name, int il) {
             ggml_tensor * out = ggml_rms_norm(ctx0, inp, hparams.f_norm_rms_eps);
             cb(out, rms_name, il);
@@ -211,21 +220,41 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                 }
                 break;
 
+            case LLAMA_MODULE_BENCH_INPUT_GET_ROWS:
+                {
+                    if (!ubatch.token) {
+                        GGML_ABORT("module-bench input_get_rows requires token input");
+                    }
+
+                    auto inp = std::make_unique<llm_graph_input_embd>(hparams.n_embd_inp());
+                    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
+                    cb(inp->tokens, "inp_tokens", -1);
+                    ggml_set_input(inp->tokens);
+                    res->t_inp_tokens = inp->tokens;
+
+                    ggml_tensor * out = ggml_get_rows(ctx0, model.tok_embd, inp->tokens);
+                    cb_module(out, "input_get_rows", 0);
+                    res->add_input(std::move(inp));
+                    finish(out);
+                }
+                break;
+
             case LLAMA_MODULE_BENCH_FFN_INP:
                 for (int il = il_start; il <= il_end; ++il) {
-                    ggml_tensor * lhs = build_module_inp("module_ffn_inp_lhs", n_embd, n_tokens);
-                    ggml_tensor * rhs = build_module_inp("module_ffn_inp_rhs", n_embd, n_tokens);
-                    cb(lhs, "module_ffn_inp_lhs", il);
-                    cb(rhs, "module_ffn_inp_rhs", il);
+                    const int64_t n_ffn_tokens = module_ffn_tokens(il);
+                    ggml_tensor * lhs = build_module_inp("module_ffn_inp_lhs", n_embd, n_ffn_tokens);
+                    ggml_tensor * rhs = build_module_inp("module_ffn_inp_rhs", n_embd, n_ffn_tokens);
+                    cb_module(lhs, "module_ffn_inp_lhs", il);
+                    cb_module(rhs, "module_ffn_inp_rhs", il);
                     ggml_tensor * out = ggml_add(ctx0, lhs, rhs);
-                    cb(out, "ffn_inp", il);
+                    cb_module(out, "ffn_inp", il);
                     finish(out);
                 }
                 break;
 
             case LLAMA_MODULE_BENCH_FFN_NORM:
                 for (int il = il_start; il <= il_end; ++il) {
-                    ggml_tensor * inp = build_module_inp("module_ffn_norm_inp", n_embd, n_tokens);
+                    ggml_tensor * inp = build_module_inp("module_ffn_norm_inp", n_embd, module_ffn_tokens(il));
                     cb(inp, "module_ffn_norm_inp", il);
                     finish(build_named_rms_norm(inp, model.layers[il].ffn_norm, "ffn_rms_norm", "ffn_norm", il));
                 }
@@ -236,7 +265,7 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                     if (model.layers[il].ffn_gate_inp != nullptr) {
                         GGML_ABORT("module-bench ffn_core only supports dense FFN layers");
                     }
-                    ggml_tensor * inp = build_module_inp("module_ffn_core_inp", n_embd, n_tokens);
+                    ggml_tensor * inp = build_module_inp("module_ffn_core_inp", n_embd, module_ffn_tokens(il));
                     cb(inp, "ffn_norm", il);
                     ggml_tensor * out = build_ffn(inp,
                             model.layers[il].ffn_up,   model.layers[il].ffn_up_b,   model.layers[il].ffn_up_s,
@@ -251,13 +280,32 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
 
             case LLAMA_MODULE_BENCH_L_OUT:
                 for (int il = il_start; il <= il_end; ++il) {
-                    ggml_tensor * lhs = build_module_inp("module_l_out_lhs", n_embd, n_tokens);
-                    ggml_tensor * rhs = build_module_inp("module_l_out_rhs", n_embd, n_tokens);
-                    cb(lhs, "module_l_out_lhs", il);
-                    cb(rhs, "module_l_out_rhs", il);
+                    const int64_t n_ffn_tokens = module_ffn_tokens(il);
+                    ggml_tensor * lhs = build_module_inp("module_l_out_lhs", n_embd, n_ffn_tokens);
+                    ggml_tensor * rhs = build_module_inp("module_l_out_rhs", n_embd, n_ffn_tokens);
+                    cb_module(lhs, "module_l_out_lhs", il);
+                    cb_module(rhs, "module_l_out_rhs", il);
                     ggml_tensor * out = ggml_add(ctx0, lhs, rhs);
-                    cb(out, "l_out", il);
-                    finish(out);
+                    cb_module(out, "l_out", il);
+
+                    if (il == (int) n_layer - 1) {
+                        ggml_tensor * tail = ggml_rms_norm(ctx0, out, hparams.f_norm_rms_eps);
+                        cb(tail, "norm", -1, module_backend_hint);
+                        tail = ggml_mul(ctx0, tail, model.output_norm);
+                        cb(tail, "result_norm", -1, module_backend_hint);
+                        res->t_embd = tail;
+
+                        if constexpr (!embed) {
+                            tail = build_lora_mm(model.output, tail);
+                            cb(tail, "result_output", -1, module_backend_hint);
+                            res->t_logits = tail;
+                        }
+
+                        ggml_build_forward_expand(gf, tail);
+                        last = tail;
+                    } else {
+                        finish(out);
+                    }
                 }
                 break;
 

@@ -1591,6 +1591,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.module_bench_layer_end   = params.module_bench_layer_end;
     cparams.module_bench_profile     = params.module_bench_profile.c_str();
     cparams.module_bench_trace_path  = params.module_bench_trace_path.c_str();
+    cparams.module_bench_backend     = params.module_bench_backend.c_str();
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

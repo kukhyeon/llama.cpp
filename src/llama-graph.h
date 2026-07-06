@@ -652,6 +652,7 @@ struct llm_graph_params {
             cparams.module_bench_type        == other.cparams.module_bench_type &&
             cparams.module_bench_layer_start == other.cparams.module_bench_layer_start &&
             cparams.module_bench_layer_end   == other.cparams.module_bench_layer_end &&
+            cparams.module_bench_backend     == other.cparams.module_bench_backend &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             model == other.model &&

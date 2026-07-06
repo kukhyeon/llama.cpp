@@ -97,6 +97,9 @@ static llama_module_bench_type common_arg_parse_module_bench_type(const std::str
     if (v == "attn_out_proj" || v == "attention_out_proj" || v == "attn_out") {
         return LLAMA_MODULE_BENCH_ATTN_OUT_PROJ;
     }
+    if (v == "input_get_rows" || v == "get_rows" || v == "token_embd" || v == "tok_embd") {
+        return LLAMA_MODULE_BENCH_INPUT_GET_ROWS;
+    }
     if (v == "ffn_inp") {
         return LLAMA_MODULE_BENCH_FFN_INP;
     }
@@ -1252,7 +1255,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_BACKEND_POLICY_OPS"));
     add_opt(common_arg(
-        {"--module-bench"}, "off|attn_norm|attn_projection|attn_score|attn_out_proj|ffn_inp|ffn_norm|ffn_core|l_out",
+        {"--module-bench"}, "off|attn_norm|attn_projection|attn_score|attn_out_proj|input_get_rows|ffn_inp|ffn_norm|ffn_core|l_out",
         "enable experimental module-only micro-benchmark graph (default: off)",
         [](common_params & params, const std::string & value) {
             params.module_bench_type = common_arg_parse_module_bench_type(value);
@@ -1293,6 +1296,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.module_bench_trace_path = value;
         }
     ).set_examples({LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_MODULE_BENCH_TRACE"));
+    add_opt(common_arg(
+        {"--module-bench-backend"}, "BACKEND",
+        "backend hint for synthetic module-bench inputs/weightless ops (examples: CPU, OpenCL, HTP0; default: scheduler)",
+        [](common_params & params, const std::string & value) {
+            params.module_bench_backend = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_MODULE_BENCH_BACKEND"));
     add_opt(common_arg(
         {"--strict"}, "on|off",
         "enable ignite strict generation limit",

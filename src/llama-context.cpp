@@ -35,6 +35,7 @@ static const char * llama_module_bench_type_name(llama_module_bench_type type) {
         case LLAMA_MODULE_BENCH_ATTN_PROJECTION: return "attn_projection";
         case LLAMA_MODULE_BENCH_ATTN_SCORE:      return "attn_score";
         case LLAMA_MODULE_BENCH_ATTN_OUT_PROJ:   return "attn_out_proj";
+        case LLAMA_MODULE_BENCH_INPUT_GET_ROWS:  return "input_get_rows";
         case LLAMA_MODULE_BENCH_FFN_INP:         return "ffn_inp";
         case LLAMA_MODULE_BENCH_FFN_NORM:        return "ffn_norm";
         case LLAMA_MODULE_BENCH_FFN_CORE:        return "ffn_core";
@@ -117,6 +118,12 @@ static void llama_module_bench_trace_write(
     if (need_header) {
         std::fprintf(f, "profile,module,phase,token_index,n_past,n_tokens,repeat_idx,layer_start,layer_end,wall_us,timing_mode\n");
     }
+    int layer_start = cparams.module_bench_layer_start;
+    int layer_end   = cparams.module_bench_layer_end;
+    if (cparams.module_bench_type == LLAMA_MODULE_BENCH_INPUT_GET_ROWS) {
+        layer_start = 0;
+        layer_end   = 0;
+    }
     std::fprintf(f, "%s,%s,%s,%d,%d,%d,%d,%d,%d,%lld,sync_wall\n",
             cparams.module_bench_profile.c_str(),
             llama_module_bench_type_name(cparams.module_bench_type),
@@ -125,8 +132,8 @@ static void llama_module_bench_trace_write(
             n_past,
             n_tokens,
             repeat_idx,
-            cparams.module_bench_layer_start,
-            cparams.module_bench_layer_end,
+            layer_start,
+            layer_end,
             (long long) wall_us);
     std::fclose(f);
 }
@@ -170,6 +177,7 @@ llama_context::llama_context(
     cparams.module_bench_layer_end   = params.module_bench_layer_end;
     cparams.module_bench_profile     = params.module_bench_profile ? params.module_bench_profile : "";
     cparams.module_bench_trace_path  = params.module_bench_trace_path ? params.module_bench_trace_path : "";
+    cparams.module_bench_backend     = params.module_bench_backend ? params.module_bench_backend : "";
 
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
     cparams.rope_freq_base   = params.rope_freq_base  == 0.0f ? hparams.rope_freq_base_train  : params.rope_freq_base;
@@ -3489,6 +3497,7 @@ llama_context_params llama_context_default_params() {
         /*.module_bench_layer_end      =*/ -1,
         /*.module_bench_profile        =*/ nullptr,
         /*.module_bench_trace_path     =*/ nullptr,
+        /*.module_bench_backend        =*/ nullptr,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
