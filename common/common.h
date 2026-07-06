@@ -507,6 +507,7 @@ struct common_params {
     int32_t module_bench_layer_end = -1;
     std::string module_bench_profile = "llama3.2_3b_q8_0";
     std::string module_bench_trace_path = "output/module_trace.csv";
+    std::string module_bench_backend = "";
 
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale

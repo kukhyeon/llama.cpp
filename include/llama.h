@@ -197,6 +197,7 @@ extern "C" {
         LLAMA_MODULE_BENCH_ATTN_PROJECTION,
         LLAMA_MODULE_BENCH_ATTN_SCORE,
         LLAMA_MODULE_BENCH_ATTN_OUT_PROJ,
+        LLAMA_MODULE_BENCH_INPUT_GET_ROWS,
         LLAMA_MODULE_BENCH_FFN_INP,
         LLAMA_MODULE_BENCH_FFN_NORM,
         LLAMA_MODULE_BENCH_FFN_CORE,
@@ -383,6 +384,7 @@ extern "C" {
         int32_t module_bench_layer_end;
         const char * module_bench_profile;
         const char * module_bench_trace_path;
+        const char * module_bench_backend;
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted

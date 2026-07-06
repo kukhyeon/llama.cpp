@@ -48,6 +48,7 @@ struct llama_cparams {
     int32_t module_bench_layer_end = -1;
     std::string module_bench_profile;
     std::string module_bench_trace_path;
+    std::string module_bench_backend;
 
     enum llama_pooling_type pooling_type;
 
