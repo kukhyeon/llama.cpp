@@ -509,6 +509,8 @@ extern "C" {
     GGML_API void ggml_backend_sched_trace_set_query_id(int query_id);
     // Attaches the current ubatch context to subsequent trace rows.
     GGML_API void ggml_backend_sched_trace_set_ubatch(int token_index, int n_past, int n_tokens);
+    // Writes buffered scheduler trace rows to the configured CSV file.
+    GGML_API void ggml_backend_sched_trace_flush(void);
 
     // Enables/disables process-global per-op load profiling.
     GGML_API void ggml_backend_op_load_profile_set_enabled(bool enabled);

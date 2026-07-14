@@ -1226,6 +1226,9 @@ int main(int argc, char ** argv) {
                     if (csv_load && output_path_load != "/inference_load.csv") {
                         llama_op_load_profile_print_custom(output_path_load, current_question_index, start_sys_time, csv_op_load, csv_op_load_breakdown);
                     }
+                    if (sched_trace) {
+                        ggml_backend_sched_trace_flush();
+                    }
                     inference_started = false;
                     LOG_INF("module-bench complete; exiting after isolated module graph\n");
                     break;
@@ -1420,6 +1423,9 @@ int main(int argc, char ** argv) {
                     }
                     if (csv_load && output_path_load != "/inference_load.csv") {
                         llama_op_load_profile_print_custom(output_path_load, current_question_index, start_sys_time, csv_op_load, csv_op_load_breakdown);
+                    }
+                    if (sched_trace) {
+                        ggml_backend_sched_trace_flush();
                     }
                     //check_hardware(device_name);
                     // common_sampler_free(smpl);
@@ -1633,6 +1639,9 @@ int main(int argc, char ** argv) {
 
     LOG("\n\n");
     common_perf_print(ctx, smpl);
+    if (sched_trace) {
+        ggml_backend_sched_trace_flush();
+    }
 
     llama_backend_free();
 
