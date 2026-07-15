@@ -2140,7 +2140,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * sinks,
          ggml_tensor * v_mla,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+        const char *   backend_hint) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2173,7 +2174,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
-        cb(cur, LLAMA_TENSOR_NAME_FATTN, il);
+        cb(cur, LLAMA_TENSOR_NAME_FATTN, il, backend_hint);
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
@@ -2189,7 +2190,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             // The permutations are noops and only change how the tensor data is interpreted.
             cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
             cur = ggml_mul_mat(ctx0, v_mla, cur);
-            cb(cur, "fattn_mla", il);
+            cb(cur, "fattn_mla", il, backend_hint);
             cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
             cur = ggml_cont(ctx0, cur); // Needed because ggml_reshape_2d expects contiguous inputs.
 #endif
@@ -2198,7 +2199,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
     } else {
         ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
-        cb(kq, "kq", il);
+        cb(kq, "kq", il, backend_hint);
 
         // note: this op tends to require high floating point range
         //       while for some models F16 is enough, for others it is not, so we default to F32 here
@@ -2212,42 +2213,42 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             // before the softmax below
 
             kq = ggml_tanh(ctx0, ggml_scale(ctx0, kq, hparams.f_attn_out_scale / hparams.f_attn_logit_softcapping));
-            cb(kq, "kq_tanh", il);
+            cb(kq, "kq_tanh", il, backend_hint);
             kq = ggml_scale(ctx0, kq, hparams.f_attn_logit_softcapping);
-            cb(kq, "kq_scaled", il);
+            cb(kq, "kq_scaled", il, backend_hint);
         }
 
         if (hparams.attn_soft_cap) {
             kq = ggml_scale(ctx0, kq, 1.0f / hparams.f_attn_logit_softcapping);
-            cb(kq, "kq_scaled_1", il);
+            cb(kq, "kq_scaled_1", il, backend_hint);
             kq = ggml_tanh (ctx0, kq);
-            cb(kq, "kq_tanh", il);
+            cb(kq, "kq_tanh", il, backend_hint);
             kq = ggml_scale(ctx0, kq, hparams.f_attn_logit_softcapping);
-            cb(kq, "kq_scaled_2", il);
+            cb(kq, "kq_scaled_2", il, backend_hint);
         }
 
         if (kq_b) {
             kq = ggml_add(ctx0, kq, kq_b);
-            cb(kq, "kq_plus_kq_b", il);
+            cb(kq, "kq_plus_kq_b", il, backend_hint);
         }
 
         kq = ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias);
         ggml_soft_max_add_sinks(kq, sinks);
-        cb(kq, "kq_soft_max", il);
+        cb(kq, "kq_soft_max", il, backend_hint);
 
         if (!v_trans) {
             // note: avoid this branch
             v = ggml_cont(ctx0, ggml_transpose(ctx0, v));
-            cb(v, "v_cont", il);
+            cb(v, "v_cont", il, backend_hint);
         }
 
         ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
-        cb(kqv, "kqv", il);
+        cb(kqv, "kqv", il, backend_hint);
 
         // for MLA with the absorption optimization, we need to "decompress" from MQA back to MHA
         if (v_mla) {
             kqv = ggml_mul_mat(ctx0, v_mla, kqv);
-            cb(kqv, "kqv_mla", il);
+            cb(kqv, "kqv_mla", il, backend_hint);
         }
 
         cur = ggml_permute(ctx0, kqv, 0, 2, 1, 3);

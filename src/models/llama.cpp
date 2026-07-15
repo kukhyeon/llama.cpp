@@ -197,11 +197,12 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
                     for (int il = il_start; il <= il_end; ++il) {
                         ggml_tensor * Qcur = build_module_inp("module_attn_score_q", n_embd_head, n_head, n_tokens);
-                        cb(Qcur, "module_attn_score_q", il);
+                        cb_module(Qcur, "module_attn_score_q", il);
                         ggml_tensor * Kcur = mctx_cur->get_k(ctx0, il);
                         ggml_tensor * Vcur = mctx_cur->get_v(ctx0, il);
-                        ggml_tensor * out = build_attn_mha(Qcur, Kcur, Vcur, nullptr, inp_attn->get_kq_mask(), nullptr, nullptr, kq_scale, il);
-                        cb(out, "kqv_out", il);
+                        ggml_tensor * out = build_attn_mha(Qcur, Kcur, Vcur, nullptr, inp_attn->get_kq_mask(), nullptr, nullptr,
+                                kq_scale, il, module_backend_hint);
+                        cb_module(out, "kqv_out", il);
                         finish(out);
                     }
                 }
