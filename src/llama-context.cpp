@@ -535,6 +535,8 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    ggml_backend_sched_set_ffn_parallel_reduce_threads(
+            sched.get(), cparams.n_threads_batch, llama_backend_policy_ffn_parallel_reduce_threads());
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -689,6 +691,8 @@ void llama_context::sched_reserve() {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                ggml_backend_sched_set_ffn_parallel_reduce_threads(
+                        sched.get(), cparams.n_threads_batch, llama_backend_policy_ffn_parallel_reduce_threads());
                 gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get());
             }
             if (!gf) {
@@ -2381,6 +2385,8 @@ ggml_status llama_context::graph_compute(
     for (const auto & set_n_threads_fn : set_n_threads_fns) {
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
+    ggml_backend_sched_set_ffn_parallel_reduce_threads(
+            sched.get(), n_threads, llama_backend_policy_ffn_parallel_reduce_threads());
 
     if (igparams.is_ignite_active && lp_enable && batched) {
         ggml_backend_sched_set_eval_callback(sched.get(), lp_eval_callback, this);

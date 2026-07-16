@@ -34,6 +34,6 @@ std::vector<std::string> get_hard_records_wo_systime(const DVFS& dvfs);
 // write function
 void write_file(const std::vector<std::string>& data, std::string output);
 void write_file(const std::string& data, std::string output);
-void record_hard(std::atomic<bool>& sigterm, const DVFS& dvfs); 
+void record_hard(std::atomic<bool>& sigterm, const DVFS& dvfs, int core = -1);
 
 #endif

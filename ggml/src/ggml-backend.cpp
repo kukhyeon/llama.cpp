@@ -771,6 +771,7 @@ struct ggml_backend_sched_split {
     int backend_id;
     int i_start;
     int i_end;
+    bool is_ffn_parallel_reduce;
     struct ggml_tensor * inputs[GGML_SCHED_MAX_SPLIT_INPUTS];
     int n_inputs;
     // graph view of this split
@@ -818,6 +819,9 @@ struct ggml_backend_sched {
 
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
+
+    int cpu_threads;
+    int ffn_parallel_reduce_threads;
 
     char * context_buffer;
     size_t context_buffer_size;
@@ -2137,12 +2141,13 @@ static bool ggml_backend_sched_parse_ffn_branch_name(
     return false;
 }
 
-static bool ggml_backend_sched_is_ffn_parallel_branch_node(const struct ggml_tensor * node) {
+static bool ggml_backend_sched_parse_ffn_parallel_branch_node(
+        const struct ggml_tensor * node, std::string * branch, int * layer) {
     if (node == nullptr) {
         return false;
     }
 
-    if (ggml_backend_sched_parse_ffn_branch_name(node->name, nullptr, nullptr)) {
+    if (ggml_backend_sched_parse_ffn_branch_name(node->name, branch, layer)) {
         return true;
     }
 
@@ -2152,7 +2157,7 @@ static bool ggml_backend_sched_is_ffn_parallel_branch_node(const struct ggml_ten
     if (node->op == GGML_OP_MUL_MAT && node->name != nullptr && strncmp(node->name, "ffn_out-", 8) == 0) {
         for (int i = 0; i < GGML_MAX_SRC; ++i) {
             if (node->src[i] != nullptr &&
-                    ggml_backend_sched_parse_ffn_branch_name(node->src[i]->name, nullptr, nullptr)) {
+                    ggml_backend_sched_parse_ffn_branch_name(node->src[i]->name, branch, layer)) {
                 return true;
             }
         }
@@ -2161,24 +2166,51 @@ static bool ggml_backend_sched_is_ffn_parallel_branch_node(const struct ggml_ten
     return false;
 }
 
-static bool ggml_backend_sched_is_ffn_parallel_reduce_node_name(const char * name) {
-    static const char * prefixes[] = {
-        "ffn_parallel_sum-",
-        "ffn_parallel_out-",
-    };
+static bool ggml_backend_sched_is_ffn_parallel_branch_node(const struct ggml_tensor * node) {
+    return ggml_backend_sched_parse_ffn_parallel_branch_node(node, nullptr, nullptr);
+}
 
-    if (name == nullptr) {
+struct ggml_backend_sched_ffn_reduce_info {
+    int layer = -1;
+    std::vector<std::string> branches;
+};
+
+static bool ggml_backend_sched_collect_ffn_parallel_reduce_info(
+        const struct ggml_tensor * node, ggml_backend_sched_ffn_reduce_info * info) {
+    std::string branch;
+    int layer = -1;
+    if (ggml_backend_sched_parse_ffn_parallel_branch_node(node, &branch, &layer)) {
+        info->layer = layer;
+        info->branches = { std::move(branch) };
+        return true;
+    }
+    if (node == nullptr || node->op != GGML_OP_ADD || node->src[0] == nullptr || node->src[1] == nullptr) {
         return false;
     }
 
-    for (const char * prefix : prefixes) {
-        const size_t prefix_len = strlen(prefix);
-        if (strncmp(name, prefix, prefix_len) == 0 && name[prefix_len] != '\0') {
-            return true;
-        }
+    ggml_backend_sched_ffn_reduce_info lhs;
+    ggml_backend_sched_ffn_reduce_info rhs;
+    if (!ggml_backend_sched_collect_ffn_parallel_reduce_info(node->src[0], &lhs) ||
+            !ggml_backend_sched_collect_ffn_parallel_reduce_info(node->src[1], &rhs) ||
+            lhs.layer != rhs.layer) {
+        return false;
     }
 
-    return false;
+    info->layer = lhs.layer;
+    info->branches = std::move(lhs.branches);
+    for (std::string & rhs_branch : rhs.branches) {
+        if (std::find(info->branches.begin(), info->branches.end(), rhs_branch) != info->branches.end()) {
+            return false;
+        }
+        info->branches.push_back(std::move(rhs_branch));
+    }
+    return true;
+}
+
+static bool ggml_backend_sched_is_ffn_parallel_reduce_node(const struct ggml_tensor * node) {
+    ggml_backend_sched_ffn_reduce_info info;
+    return node != nullptr && node->op == GGML_OP_ADD &&
+        ggml_backend_sched_collect_ffn_parallel_reduce_info(node, &info) && info.branches.size() >= 2;
 }
 
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
@@ -2427,12 +2459,16 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         }
         split->i_start = 0;
         split->n_inputs = 0;
+        split->is_ffn_parallel_reduce = false;
         int cur_backend_id = split->backend_id;
         bool cur_split_has_ffn_parallel_branch = false;
         bool cur_split_needs_ffn_branch_isolation = false;
+        bool cur_split_has_ffn_parallel_reduce = false;
         std::vector<std::pair<int, std::string>> ffn_parallel_branch_keys;
+        std::vector<bool> ffn_parallel_reduce_nodes(graph->n_nodes, false);
         for (int j = 0; j < graph->n_nodes; ++j) {
             const struct ggml_tensor * node = graph->nodes[j];
+            ffn_parallel_reduce_nodes[j] = ggml_backend_sched_is_ffn_parallel_reduce_node(node);
             std::string branch;
             int layer = -1;
             if (!ggml_backend_sched_parse_ffn_branch_name(node->name, &branch, &layer)) {
@@ -2471,6 +2507,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
             const int node_backend_id = tensor_backend_id(node);
             const bool node_is_ffn_parallel_branch = ggml_backend_sched_is_ffn_parallel_branch_node(node);
+            const bool node_is_ffn_parallel_reduce = ffn_parallel_reduce_nodes[i];
             const bool node_needs_ffn_branch_isolation =
                 node_is_ffn_parallel_branch &&
                 (sched->debug >= 2 || ffn_layer_has_multiple_branches(node));
@@ -2491,11 +2528,21 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             }
             if (node_backend_id == cur_backend_id &&
                     cur_split_has_ffn_parallel_branch &&
-                    ggml_backend_sched_is_ffn_parallel_reduce_node_name(node->name)) {
+                    node_is_ffn_parallel_reduce) {
                 // Keep each FFN shard branch split pure. When the reduce backend
                 // equals the backend of the last branch, the default scheduler
                 // would fuse that branch and the reduce ADDs into one split. That
                 // prevents the branch from joining the parallel FFN group.
+                need_new_split = true;
+            }
+            if (node_backend_id == cur_backend_id &&
+                    sched->ffn_parallel_reduce_threads > 0 &&
+                    cur_split_has_ffn_parallel_reduce &&
+                    !node_is_ffn_parallel_reduce &&
+                    ggml_backend_dev_type(ggml_backend_get_device(sched->backends[cur_backend_id])) ==
+                        GGML_BACKEND_DEVICE_TYPE_CPU) {
+                // Keep the reduce split pure so its CPU thread override does not
+                // leak into the following residual/norm nodes on the same backend.
                 need_new_split = true;
             }
             if (node_backend_id == cur_backend_id && split->n_inputs > 0) {
@@ -2540,15 +2587,21 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 split->backend_id = node_backend_id;
                 split->i_start = i;
                 split->n_inputs = 0;
+                split->is_ffn_parallel_reduce = false;
                 cur_backend_id = node_backend_id;
                 cur_split_has_ffn_parallel_branch = false;
                 cur_split_needs_ffn_branch_isolation = false;
+                cur_split_has_ffn_parallel_reduce = false;
             }
 
             if (node_is_ffn_parallel_branch) {
                 cur_split_has_ffn_parallel_branch = true;
                 cur_split_needs_ffn_branch_isolation =
                     cur_split_needs_ffn_branch_isolation || node_needs_ffn_branch_isolation;
+            }
+            if (node_is_ffn_parallel_reduce) {
+                cur_split_has_ffn_parallel_reduce = true;
+                split->is_ffn_parallel_reduce = true;
             }
 
             // find inputs that are not on the same backend
@@ -2781,24 +2834,7 @@ struct ggml_backend_sched_ffn_branch_info {
 static bool ggml_backend_sched_parse_ffn_branch_node(
         const struct ggml_tensor * node,
         ggml_backend_sched_ffn_branch_info * info) {
-    if (node == nullptr) {
-        return false;
-    }
-
-    if (ggml_backend_sched_parse_ffn_branch_name(node->name, &info->branch, &info->layer)) {
-        return true;
-    }
-
-    if (node->op == GGML_OP_MUL_MAT && node->name != nullptr && strncmp(node->name, "ffn_out-", 8) == 0) {
-        for (int i = 0; i < GGML_MAX_SRC; ++i) {
-            if (node->src[i] != nullptr &&
-                    ggml_backend_sched_parse_ffn_branch_name(node->src[i]->name, &info->branch, &info->layer)) {
-                return true;
-            }
-        }
-    }
-
-    return false;
+    return ggml_backend_sched_parse_ffn_parallel_branch_node(node, &info->branch, &info->layer);
 }
 
 static bool ggml_backend_sched_split_ffn_branch_info(
@@ -3193,10 +3229,63 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     };
 
+    auto ffn_reduce_set_n_threads = [&](struct ggml_backend_sched_split * split) -> ggml_backend_set_n_threads_t {
+        if (sched->ffn_parallel_reduce_threads <= 0 ||
+                sched->cpu_threads <= 0 ||
+                sched->ffn_parallel_reduce_threads >= sched->cpu_threads ||
+                !split->is_ffn_parallel_reduce) {
+            return nullptr;
+        }
+
+        ggml_backend_t backend = sched->backends[split->backend_id];
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            return nullptr;
+        }
+
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        return reg != nullptr
+            ? (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads")
+            : nullptr;
+    };
+
+    struct ffn_reduce_thread_guard {
+        ggml_backend_t backend;
+        ggml_backend_set_n_threads_t set_n_threads;
+        int restore_threads;
+
+        ffn_reduce_thread_guard(
+                ggml_backend_t backend,
+                ggml_backend_set_n_threads_t set_n_threads,
+                int reduce_threads,
+                int restore_threads) :
+            backend(backend), set_n_threads(set_n_threads), restore_threads(restore_threads) {
+            if (set_n_threads != nullptr) {
+                set_n_threads(backend, reduce_threads);
+            }
+        }
+
+        ~ffn_reduce_thread_guard() {
+            if (set_n_threads != nullptr) {
+                ggml_backend_synchronize(backend);
+                set_n_threads(backend, restore_threads);
+            }
+        }
+    };
+
     auto compute_split_no_callback = [&](struct ggml_backend_sched_split * split, int64_t * dt_us, bool sync_after) {
         ggml_backend_t split_backend = sched->backends[split->backend_id];
+        ggml_backend_set_n_threads_t set_n_threads = ffn_reduce_set_n_threads(split);
         const int64_t t0_us = ggml_time_us();
-        enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+        enum ggml_status ec;
+        {
+            ffn_reduce_thread_guard guard(
+                    split_backend,
+                    set_n_threads,
+                    sched->ffn_parallel_reduce_threads,
+                    sched->cpu_threads);
+            ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+        }
         if (ec == GGML_STATUS_SUCCESS && sync_after) {
             // FFN parallel groups need backend completion inside the parallel section.
             // Otherwise async backends can defer the real wait to the following split.
@@ -3210,6 +3299,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     auto compute_split_with_callback = [&](struct ggml_backend_sched_split * split) {
         ggml_backend_t split_backend = sched->backends[split->backend_id];
         const ggml_sched_profile_backend_kind split_bucket = ggml_sched_profile_backend_bucket(split_backend);
+        ggml_backend_set_n_threads_t set_n_threads = ffn_reduce_set_n_threads(split);
+        ffn_reduce_thread_guard guard(
+                split_backend,
+                set_n_threads,
+                sched->ffn_parallel_reduce_threads,
+                sched->cpu_threads);
 
         // similar to ggml_backend_compare_graph_backend
         for (int j0 = 0; j0 < split->graph.n_nodes; j0++) {
@@ -3653,6 +3748,13 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+void ggml_backend_sched_set_ffn_parallel_reduce_threads(
+        ggml_backend_sched_t sched, int cpu_threads, int reduce_threads) {
+    GGML_ASSERT(sched);
+    sched->cpu_threads = cpu_threads;
+    sched->ffn_parallel_reduce_threads = reduce_threads;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

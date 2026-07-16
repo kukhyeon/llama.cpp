@@ -845,11 +845,21 @@ int main(int argc, char ** argv) {
     dvfs.control_start_point = start_sys_time;
     dvfs.output_filename = params.output_dir + "/hardware_stats.csv";
 
-    const bool want_cpu_dvfs = ig->cpu_clk_idx_p >= 0 || ig->cpu_clk_idx_d >= 0;
+    const bool want_prefill_cpu_cluster_dvfs =
+        params.cpu_gold_clk_idx_p >= 0 || params.cpu_prime_clk_idx_p >= 0;
+    const bool want_decode_cpu_cluster_dvfs =
+        params.cpu_gold_clk_idx_d >= 0 || params.cpu_prime_clk_idx_d >= 0;
+    const bool want_cpu_dvfs =
+        ig->cpu_clk_idx_p >= 0 || ig->cpu_clk_idx_d >= 0 ||
+        want_prefill_cpu_cluster_dvfs || want_decode_cpu_cluster_dvfs;
     const bool want_ram_dvfs = ig->ram_clk_idx_p >= 0 || ig->ram_clk_idx_d >= 0;
     const bool want_gpu_dvfs = ig->gpu_clk_idx_p >= 0 || ig->gpu_clk_idx_d >= 0;
-    const bool want_prefill_dvfs = ig->cpu_clk_idx_p >= 0 || ig->ram_clk_idx_p >= 0 || ig->gpu_clk_idx_p >= 0;
-    const bool want_decode_dvfs  = ig->cpu_clk_idx_d >= 0 || ig->ram_clk_idx_d >= 0 || ig->gpu_clk_idx_d >= 0;
+    const bool want_prefill_dvfs =
+        ig->cpu_clk_idx_p >= 0 || want_prefill_cpu_cluster_dvfs ||
+        ig->ram_clk_idx_p >= 0 || ig->gpu_clk_idx_p >= 0;
+    const bool want_decode_dvfs =
+        ig->cpu_clk_idx_d >= 0 || want_decode_cpu_cluster_dvfs ||
+        ig->ram_clk_idx_d >= 0 || ig->gpu_clk_idx_d >= 0;
     bool runtime_dvfs_ready = false;
 
     if (want_prefill_dvfs || want_decode_dvfs) {
@@ -860,12 +870,21 @@ int main(int argc, char ** argv) {
         }
     }
 
-    auto apply_dvfs = [&](int cpu_idx, int ram_idx, int gpu_idx) {
+    auto apply_dvfs = [&](int cpu_idx, int cpu_gold_idx, int cpu_prime_idx, int ram_idx, int gpu_idx) {
         if (!runtime_dvfs_ready) {
             return;
         }
 
-        if (cpu_idx >= 0) {
+        if (cpu_gold_idx >= 0 || cpu_prime_idx >= 0) {
+            if (device_name != "S25") {
+                LOG_WRN("%s: separate Gold/Prime CPU DVFS indices are only supported for S25\n", __func__);
+            } else if (cpu_gold_idx < 0 || cpu_prime_idx < 0) {
+                LOG_WRN("%s: Gold and Prime CPU DVFS indices must both be set\n", __func__);
+            } else if (dvfs.set_cpu_freq({cpu_gold_idx, cpu_prime_idx}) != 0) {
+                LOG_WRN("%s: failed to set Gold/Prime CPU DVFS indices %d/%d\n",
+                        __func__, cpu_gold_idx, cpu_prime_idx);
+            }
+        } else if (cpu_idx >= 0) {
             auto conf = dvfs.get_cpu_freqs_conf(cpu_idx);
             if (dvfs.set_cpu_freq(conf) != 0) {
                 LOG_WRN("%s: failed to set CPU DVFS index %d\n", __func__, cpu_idx);
@@ -901,11 +920,24 @@ int main(int argc, char ** argv) {
     };
 
     if (ig->is_ignite_active && want_prefill_dvfs) {
-        apply_dvfs(ig->cpu_clk_idx_p, ig->ram_clk_idx_p, ig->gpu_clk_idx_p);
+        apply_dvfs(
+            ig->cpu_clk_idx_p,
+            params.cpu_gold_clk_idx_p,
+            params.cpu_prime_clk_idx_p,
+            ig->ram_clk_idx_p,
+            ig->gpu_clk_idx_p);
     }
 
     #if IGNITE_USE_SYSTEM_DVFS
-    std::thread record_thread = std::thread(record_hard, std::ref(sigterm), std::ref(dvfs));
+    std::thread record_thread;
+    if (params.hardware_stats) {
+        sigterm = false;
+        record_thread = std::thread(
+            record_hard,
+            std::ref(sigterm),
+            std::cref(dvfs),
+            params.hardware_stats_core);
+    }
     #endif
 
     // Input json file instead of cli input
@@ -1185,7 +1217,12 @@ int main(int argc, char ** argv) {
                 if (!generation_started) {
                     // prefill phase
                     if (!prefill_active && ig->is_ignite_active) {
-                        apply_dvfs(ig->cpu_clk_idx_p, ig->ram_clk_idx_p, ig->gpu_clk_idx_p);
+                        apply_dvfs(
+                            ig->cpu_clk_idx_p,
+                            params.cpu_gold_clk_idx_p,
+                            params.cpu_prime_clk_idx_p,
+                            ig->ram_clk_idx_p,
+                            ig->gpu_clk_idx_p);
                     }
                     if (!prefill_active) {
                         prefill_active = true;
@@ -1194,7 +1231,12 @@ int main(int argc, char ** argv) {
                 } else {
                     // decode phase
                     if (!decode_active && ig->is_ignite_active) {
-                        apply_dvfs(ig->cpu_clk_idx_d, ig->ram_clk_idx_d, ig->gpu_clk_idx_d);
+                        apply_dvfs(
+                            ig->cpu_clk_idx_d,
+                            params.cpu_gold_clk_idx_d,
+                            params.cpu_prime_clk_idx_d,
+                            ig->ram_clk_idx_d,
+                            ig->gpu_clk_idx_d);
                     }
                     if (!decode_active) {
                         prefill_active = false;
@@ -1626,8 +1668,10 @@ int main(int argc, char ** argv) {
     }
     
     #if IGNITE_USE_SYSTEM_DVFS
-    sigterm = true;
-    record_thread.join();
+    if (record_thread.joinable()) {
+        sigterm = true;
+        record_thread.join();
+    }
     #endif
 
     reset_dvfs();

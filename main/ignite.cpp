@@ -355,7 +355,15 @@ int main(int argc, char ** argv) {
     //std::future<void> result = task.get_future();
     //std::thread(std::move(task)).detach();
     
-    std::thread record_thread = std::thread(record_hard, std::ref(sigterm), std::ref(dvfs));
+    std::thread record_thread;
+    if (params.hardware_stats) {
+        sigterm = false;
+        record_thread = std::thread(
+            record_hard,
+            std::ref(sigterm),
+            std::cref(dvfs),
+            params.hardware_stats_core);
+    }
     auto start_sys_time = std::chrono::system_clock::now();
     // pin_current({4,5,6,7}); // generally gold/prime cores on mobile
 // ----------------------------------------------------------------
@@ -1282,7 +1290,9 @@ int main(int argc, char ** argv) {
     if (want_gpu_dvfs) {
         dvfs.unset_gpu_freq();
     }
-    record_thread.join();
+    if (record_thread.joinable()) {
+        record_thread.join();
+    }
 // ------------------------------------------------
 #endif
 

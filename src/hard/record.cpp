@@ -722,9 +722,11 @@ void write_file(const std::string& data, std::string output){
  * ### sigterm should be true after experiment completion
  * 
  * */
-void record_hard(std::atomic<bool>& sigterm, const DVFS& dvfs){
-    // pin_current({2}); // generally silver core on mobile
-    sigterm = false;
+void record_hard(std::atomic<bool>& sigterm, const DVFS& dvfs, int core){
+    if (core >= 0 && !pin_current({core})) {
+        std::cerr << "hardware stats: failed to pin logger thread to CPU " << core
+                  << "; continuing without explicit pinning" << std::endl;
+    }
     std::string filename = dvfs.output_filename;
     thermal_signal_detector thermal_signal(dvfs);
 

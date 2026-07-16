@@ -30,6 +30,7 @@ struct llama_backend_policy_ffn_parallel {
     int layer_end = -2;
     int64_t align = 256;
     std::string reduce_backend;
+    int reduce_threads = 0;
     std::vector<llama_backend_policy_ffn_split> splits;
     std::string source;
 };
@@ -38,6 +39,7 @@ bool llama_backend_policy_weights_enabled();
 bool llama_backend_policy_ops_enabled();
 bool llama_backend_policy_residency_enabled();
 bool llama_backend_policy_ffn_parallel_enabled();
+int  llama_backend_policy_ffn_parallel_reduce_threads();
 
 // Update the process-global runtime profile from the current execution phase
 // and optional environment/config driven switches. Returns true when the active
