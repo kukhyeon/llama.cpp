@@ -351,6 +351,11 @@ extern "C" {
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
+    // Override the active CPU threads only for FFN parallel reduce splits.
+    // A non-positive reduce thread count disables the override.
+    GGML_API void                 ggml_backend_sched_set_ffn_parallel_reduce_threads(
+            ggml_backend_sched_t sched, int cpu_threads, int reduce_threads);
+
     //
     // Backend scheduler profiling (lightweight)
     //

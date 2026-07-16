@@ -1156,6 +1156,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
     add_opt(common_arg(
+        {"--cpu-gold-p"}, "IDX",
+        "prefill Gold CPU DVFS index (requires --cpu-prime-p)",
+        [](common_params & params, int value) {
+            params.cpu_gold_clk_idx_p = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
+        {"--cpu-prime-p"}, "IDX",
+        "prefill Prime CPU DVFS index (requires --cpu-gold-p)",
+        [](common_params & params, int value) {
+            params.cpu_prime_clk_idx_p = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
         {"--ram-p"}, "IDX",
         "prefill RAM DVFS index",
         [](common_params & params, int value) {
@@ -1174,6 +1188,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "decode CPU DVFS index",
         [](common_params & params, int value) {
             params.cpu_clk_idx_d = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
+        {"--cpu-gold-d"}, "IDX",
+        "decode Gold CPU DVFS index (requires --cpu-prime-d)",
+        [](common_params & params, int value) {
+            params.cpu_gold_clk_idx_d = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
+        {"--cpu-prime-d"}, "IDX",
+        "decode Prime CPU DVFS index (requires --cpu-gold-d)",
+        [](common_params & params, int value) {
+            params.cpu_prime_clk_idx_d = value;
         }
     ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
     add_opt(common_arg(
@@ -1322,6 +1350,31 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "result output directory for ignite hardware and inference logs",
         [](common_params & params, const std::string & value) {
             params.output_dir = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
+        {"--hardware-stats"}, "on|off",
+        "enable hardware_stats.csv logging (default: on)",
+        [](common_params & params, const std::string & value) {
+            const std::string normalized = common_arg_lower(value);
+            if (is_truthy(normalized)) {
+                params.hardware_stats = true;
+            } else if (is_falsey(normalized)) {
+                params.hardware_stats = false;
+            } else {
+                throw std::invalid_argument(
+                    string_format("error: unknown value for --hardware-stats: '%s'\n", value.c_str()));
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
+        {"--hardware-stats-core"}, "N",
+        "pin the hardware stats logger to CPU N (-1 = no pinning, default: -1)",
+        [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument("error: --hardware-stats-core must be -1 or a non-negative CPU index");
+            }
+            params.hardware_stats_core = value;
         }
     ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
 

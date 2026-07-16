@@ -711,9 +711,13 @@ struct common_params {
 
     std::string device_name = "S25";
     int cpu_clk_idx_p = -1;
+    int cpu_gold_clk_idx_p = -1;
+    int cpu_prime_clk_idx_p = -1;
     int ram_clk_idx_p = -1;
     int gpu_clk_idx_p = -1;
     int cpu_clk_idx_d = -1;
+    int cpu_gold_clk_idx_d = -1;
+    int cpu_prime_clk_idx_d = -1;
     int ram_clk_idx_d = -1;
     int gpu_clk_idx_d = -1;
 
@@ -738,6 +742,8 @@ struct common_params {
     std::string json_path = "questions.json"; // deprecated, use input_path
     std::string input_path = "";
     std::string output_dir = "";
+    bool hardware_stats = true;
+    int hardware_stats_core = -1;
     std::string output_path_hard = "";
     std::string output_path_infer = "";
 

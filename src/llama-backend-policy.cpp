@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <regex>
@@ -56,6 +57,7 @@ struct ffn_parallel_policy {
     int layer_end = -2;
     int64_t align = 256;
     std::string reduce_backend;
+    int reduce_threads = 0;
     std::vector<llama_backend_policy_ffn_split> splits;
     std::string source;
 };
@@ -420,6 +422,16 @@ ffn_parallel_policy parse_ffn_parallel(const json & root, const std::string & so
     out.phase = root.value("phase", std::string("prefill"));
     out.align = root.value("align", (int64_t) 256);
     out.reduce_backend = root.value("reduce_backend", std::string());
+    if (root.contains("reduce_threads")) {
+        if (!root["reduce_threads"].is_number_integer()) {
+            throw std::runtime_error(source + ".reduce_threads must be a non-negative integer");
+        }
+        const int64_t reduce_threads = root["reduce_threads"].get<int64_t>();
+        if (reduce_threads < 0 || reduce_threads > std::numeric_limits<int>::max()) {
+            throw std::runtime_error(source + ".reduce_threads must be a non-negative integer");
+        }
+        out.reduce_threads = (int) reduce_threads;
+    }
     out.source = source;
     parse_layer_range(root, source, out.layer_start, out.layer_end);
 
@@ -501,6 +513,7 @@ llama_backend_policy_ffn_parallel materialize_ffn_policy(const ffn_parallel_poli
     out.layer_end = policy.layer_end;
     out.align = policy.align;
     out.reduce_backend = policy.reduce_backend;
+    out.reduce_threads = policy.reduce_threads;
     out.splits = policy.splits;
     out.source = policy.source;
 
@@ -858,6 +871,14 @@ bool llama_backend_policy_ffn_parallel_enabled() {
     std::lock_guard<std::mutex> lock(g_policy_mutex);
     llama_backend_policy_ffn_parallel policy;
     return g_policy.loaded && effective_ffn_policy(policy);
+}
+
+int llama_backend_policy_ffn_parallel_reduce_threads() {
+    std::lock_guard<std::mutex> lock(g_policy_mutex);
+    llama_backend_policy_ffn_parallel policy;
+    return g_policy.loaded && effective_ffn_policy(policy) && policy.splits.size() >= 2
+        ? policy.reduce_threads
+        : 0;
 }
 
 bool llama_backend_policy_update_runtime_profile(bool is_prefill) {
