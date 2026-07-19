@@ -2264,14 +2264,28 @@ void llama_context::output_reorder() {
 //
 
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+    uint64_t res;
     if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) {
-        return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
+        res = std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
+    } else {
+        res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
     }
-    uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
+
+    // Atomic FFN residency expands one logical processor branch into several
+    // tile-local up/gate/swiglu/down ops plus same-backend ADDs. Reserve enough
+    // graph metadata for the union plan; this is deliberately conservative
+    // because any active profile uses only a subset of the resident tiles.
+    for (uint32_t il = 0; il < model.hparams.n_layer; ++il) {
+        llama_backend_policy_ffn_residency_plan plan;
+        if (llama_backend_policy_build_ffn_residency_plan((int) il, plan)) {
+            res += 5u * plan.tiles.size();
+        }
+    }
+
     for (const auto & lora : model.loras) {
         res += lora->get_n_nodes();
     }
-    return res;
+    return (uint32_t) std::min<uint64_t>(res, std::numeric_limits<uint32_t>::max());
 }
 
 llm_graph_result * llama_context::get_gf_res_reserve() const {

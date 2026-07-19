@@ -18,6 +18,12 @@ struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
 
+struct llama_backend_policy_ffn_resident_tile {
+    struct ggml_tensor * tensor = nullptr;
+    int64_t start = 0;
+    int64_t size = 0;
+};
+
 // available models
 enum llm_type {
     LLM_TYPE_UNKNOWN,
@@ -612,7 +618,7 @@ struct llama_model {
     struct ggml_tensor * get_backend_policy_residency_tensor(
             const struct ggml_tensor * tensor,
             const std::vector<std::string> & backends) const;
-    struct ggml_tensor * get_backend_policy_ffn_shard_tensor(
+    std::vector<llama_backend_policy_ffn_resident_tile> get_backend_policy_ffn_shard_tiles(
             const struct ggml_tensor * tensor,
             const std::string & backend,
             int axis,

@@ -35,6 +35,18 @@ struct llama_backend_policy_ffn_parallel {
     std::string source;
 };
 
+// Model-load residency for every FFN policy that can become active at runtime.
+// Each entry is an exact, non-overlapping atomic tile. Policy endpoints are
+// intentionally preserved instead of merging adjacent tiles: a runtime split
+// can then be reconstructed without taking an unsafe axis-0 view of a REPACK
+// tensor.
+struct llama_backend_policy_ffn_residency_plan {
+    bool enabled = false;
+    bool keep_full_source = true;
+    std::vector<llama_backend_policy_ffn_split> tiles;
+    std::string source;
+};
+
 bool llama_backend_policy_weights_enabled();
 bool llama_backend_policy_ops_enabled();
 bool llama_backend_policy_residency_enabled();
@@ -85,6 +97,21 @@ bool llama_backend_policy_match_ffn_parallel(
 bool llama_backend_policy_match_ffn_parallel_layer(
         int il,
         llama_backend_policy_ffn_parallel & out);
+
+// Return every enabled base/profile FFN policy that may need exact resident
+// weight shards for this layer. Policies with identical split ranges/backends
+// are deduplicated because their model-load residency requirements are equal.
+bool llama_backend_policy_list_ffn_parallel_load_policies(
+        int il,
+        std::vector<llama_backend_policy_ffn_parallel> & out);
+
+// Build the union residency plan for one layer. Intervals are grouped by
+// backend and split at every policy boundary, while uncovered gaps are not
+// allocated. keep_full_source is false only when every applicable policy has
+// phase="all".
+bool llama_backend_policy_build_ffn_residency_plan(
+        int il,
+        llama_backend_policy_ffn_residency_plan & out);
 
 // Match a requested policy name to a backend buffer type. This is used during
 // model loading, where weights are assigned to buffer types rather than to

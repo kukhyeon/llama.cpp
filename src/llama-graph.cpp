@@ -1224,31 +1224,6 @@ ggml_tensor * llm_graph_context::build_ffn(
         }
         valid = valid && covered == n_ff;
 
-        auto tensor_matches_backend = [](const ggml_tensor * t, const std::string & backend) {
-            if (t == nullptr || t->buffer == nullptr || backend.empty()) {
-                return false;
-            }
-            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t->buffer);
-            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-            return llama_backend_policy_buft_matches(dev, buft, backend);
-        };
-
-        auto weight_slice = [&](ggml_tensor * w, int axis, const llama_backend_policy_ffn_split & split) -> ggml_tensor * {
-            if (ggml_tensor * shard = model->get_backend_policy_ffn_shard_tensor(w, split.backend, axis, split.start, split.size)) {
-                return shard;
-            }
-
-            if (!tensor_matches_backend(w, split.backend)) {
-                return nullptr;
-            }
-
-            if (axis == 0) {
-                return ggml_view_2d(ctx0, w, split.size, w->ne[1], w->nb[1], ggml_row_size(w->type, split.start));
-            }
-
-            return ggml_view_2d(ctx0, w, w->ne[0], split.size, w->nb[1], split.start * w->nb[1]);
-        };
-
         if (valid) {
             std::vector<llama_backend_policy_ffn_split> exec_splits = splits;
             // Keep the HTP/NPU branch after non-HTP branches so that ffn_norm is
@@ -1292,32 +1267,70 @@ ggml_tensor * llm_graph_context::build_ffn(
             branch_outs.reserve(exec_splits.size());
 
             for (const auto & split : exec_splits) {
-                ggml_tensor * up_i   = weight_slice(up,   1, split);
-                ggml_tensor * gate_i = weight_slice(gate, 1, split);
-                ggml_tensor * down_i = weight_slice(down, 0, split);
+                const auto up_tiles =
+                    model->get_backend_policy_ffn_shard_tiles(up, split.backend, 1, split.start, split.size);
+                const auto gate_tiles =
+                    model->get_backend_policy_ffn_shard_tiles(gate, split.backend, 1, split.start, split.size);
+                const auto down_tiles =
+                    model->get_backend_policy_ffn_shard_tiles(down, split.backend, 0, split.start, split.size);
 
-                if (up_i == nullptr || gate_i == nullptr || down_i == nullptr) {
+                if (up_tiles.empty() || up_tiles.size() != gate_tiles.size() || up_tiles.size() != down_tiles.size()) {
                     valid = false;
-                    LLAMA_LOG_DEBUG("backend_policy: ffn_parallel layer %d shard %s missing resident weights for backend %s; falling back\n",
+                    LLAMA_LOG_DEBUG("backend_policy: ffn_parallel layer %d shard %s missing atomic resident weights for backend %s; falling back\n",
                             il, split.id.c_str(), split.backend.c_str());
                     break;
                 }
 
                 const std::string suffix = "." + (split.id.empty() ? split.backend : split.id);
+                ggml_tensor * branch = nullptr;
 
-                ggml_tensor * up_cur = ggml_mul_mat(ctx0, up_i, cur);
-                cb(up_cur, ("ffn_up" + suffix).c_str(), il, split.backend.c_str());
+                for (size_t ti = 0; ti < up_tiles.size(); ++ti) {
+                    const auto & up_tile = up_tiles[ti];
+                    const auto & gate_tile = gate_tiles[ti];
+                    const auto & down_tile = down_tiles[ti];
+                    if (up_tile.start != gate_tile.start || up_tile.start != down_tile.start ||
+                            up_tile.size != gate_tile.size || up_tile.size != down_tile.size ||
+                            up_tile.tensor == nullptr || gate_tile.tensor == nullptr || down_tile.tensor == nullptr ||
+                            up_tile.tensor->ne[1] != up_tile.size ||
+                            gate_tile.tensor->ne[1] != up_tile.size ||
+                            down_tile.tensor->ne[0] != up_tile.size) {
+                        valid = false;
+                        LLAMA_LOG_DEBUG("backend_policy: ffn_parallel layer %d shard %s has inconsistent atomic tile metadata for backend %s; falling back\n",
+                                il, split.id.c_str(), split.backend.c_str());
+                        break;
+                    }
 
-                ggml_tensor * gate_cur = ggml_mul_mat(ctx0, gate_i, cur);
-                cb(gate_cur, ("ffn_gate" + suffix).c_str(), il, split.backend.c_str());
+                    // Every tile node intentionally carries the same logical
+                    // branch suffix. The scheduler can then keep all tiles for
+                    // one processor in a single branch split and run the three
+                    // processor branches concurrently.
+                    ggml_tensor * up_cur = ggml_mul_mat(ctx0, up_tile.tensor, cur);
+                    cb(up_cur, ("ffn_up" + suffix).c_str(), il, split.backend.c_str());
 
-                ggml_tensor * act = ggml_swiglu_split(ctx0, gate_cur, up_cur);
-                cb(act, ("ffn_swiglu" + suffix).c_str(), il, split.backend.c_str());
+                    ggml_tensor * gate_cur = ggml_mul_mat(ctx0, gate_tile.tensor, cur);
+                    cb(gate_cur, ("ffn_gate" + suffix).c_str(), il, split.backend.c_str());
 
-                ggml_tensor * out = ggml_mul_mat(ctx0, down_i, act);
-                cb(out, ("ffn_down" + suffix).c_str(), il, split.backend.c_str());
+                    ggml_tensor * act = ggml_swiglu_split(ctx0, gate_cur, up_cur);
+                    cb(act, ("ffn_swiglu" + suffix).c_str(), il, split.backend.c_str());
 
-                branch_outs.push_back(out);
+                    ggml_tensor * out = ggml_mul_mat(ctx0, down_tile.tensor, act);
+                    cb(out, ("ffn_down" + suffix).c_str(), il, split.backend.c_str());
+
+                    // Interleave each tile with a left-fold ADD. This keeps at
+                    // most the accumulated output and the next tile output live
+                    // instead of materializing every down projection at once.
+                    if (branch == nullptr) {
+                        branch = out;
+                    } else {
+                        branch = ggml_add(ctx0, branch, out);
+                        cb(branch, ("ffn_down" + suffix).c_str(), il, split.backend.c_str());
+                    }
+                }
+
+                if (!valid || branch == nullptr) {
+                    break;
+                }
+                branch_outs.push_back(branch);
             }
 
             if (valid && !branch_outs.empty()) {

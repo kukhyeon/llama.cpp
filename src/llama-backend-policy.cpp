@@ -7,10 +7,12 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -41,12 +43,22 @@ struct policy_rule {
     std::string source;
 };
 
-struct profile_policy {
-    bool weights_enabled = false;
-    bool ops_enabled = false;
-    std::vector<std::string> default_weight_backends;
-    std::vector<policy_rule> weight_rules;
-    std::vector<policy_rule> op_rules;
+struct token_range {
+    bool configured = false;
+    int32_t min = 0;
+    int32_t max = 0;
+};
+
+struct ffn_clock_axis {
+    int index = -1;
+    int64_t frequency = 0;
+};
+
+struct ffn_clock_point {
+    bool configured = false;
+    ffn_clock_axis prime;
+    ffn_clock_axis gold;
+    ffn_clock_axis gpu;
 };
 
 struct ffn_parallel_policy {
@@ -60,6 +72,18 @@ struct ffn_parallel_policy {
     int reduce_threads = 0;
     std::vector<llama_backend_policy_ffn_split> splits;
     std::string source;
+};
+
+struct profile_policy {
+    bool weights_enabled = false;
+    bool ops_enabled = false;
+    std::vector<std::string> default_weight_backends;
+    std::vector<policy_rule> weight_rules;
+    std::vector<policy_rule> op_rules;
+    ffn_parallel_policy ffn_parallel;
+    ffn_clock_point clock_point;
+    token_range input_tokens;
+    token_range ubatch_tokens;
 };
 
 // Process-global policy state. The policy is loaded once before model loading
@@ -79,6 +103,9 @@ struct policy_state {
     std::vector<policy_rule> residency_rules;
 
     ffn_parallel_policy ffn_parallel;
+
+    bool ffn_clock_switch_enabled = false;
+    std::string pending_clock_profile;
 
     bool stage_switch_enabled = false;
     bool thermal_switch_enabled = false;
@@ -409,6 +436,81 @@ void parse_layer_range(const json & obj, const std::string & source, int & layer
     }
     layer_start = obj["layer_range"][0].get<int>();
     layer_end = obj["layer_range"][1].get<int>();
+    if (layer_start < 0 || layer_end < layer_start) {
+        throw std::runtime_error(source + ".layer_range must contain non-negative [start, end] with start <= end");
+    }
+}
+
+token_range parse_token_range(const json & root, const char * key, const std::string & source, bool required) {
+    token_range out;
+    if (!root.contains(key)) {
+        if (required) {
+            throw std::runtime_error(source + "." + key + " is required");
+        }
+        return out;
+    }
+
+    const auto & value = root[key];
+    if (!value.is_array() || value.size() != 2 ||
+        !value[0].is_number_integer() || !value[1].is_number_integer()) {
+        throw std::runtime_error(source + "." + key + " must be [min, max]");
+    }
+
+    const int64_t min = value[0].get<int64_t>();
+    const int64_t max = value[1].get<int64_t>();
+    if (min <= 0 || max < min || max > std::numeric_limits<int32_t>::max()) {
+        throw std::runtime_error(source + "." + key + " must contain positive token counts with min <= max");
+    }
+
+    out.configured = true;
+    out.min = (int32_t) min;
+    out.max = (int32_t) max;
+    return out;
+}
+
+ffn_clock_axis parse_clock_axis(
+        const json & root,
+        const char * name,
+        const char * frequency_key,
+        const std::string & source) {
+    if (!root.contains(name) || !root[name].is_object()) {
+        throw std::runtime_error(source + "." + name + " must be an object");
+    }
+
+    const auto & axis = root[name];
+    if (!axis.contains("index") || !axis["index"].is_number_integer()) {
+        throw std::runtime_error(source + "." + name + ".index must be a non-negative integer");
+    }
+    if (!axis.contains(frequency_key) || !axis[frequency_key].is_number_integer()) {
+        throw std::runtime_error(source + "." + name + "." + frequency_key + " must be a positive integer");
+    }
+
+    const int64_t index = axis["index"].get<int64_t>();
+    const int64_t frequency = axis[frequency_key].get<int64_t>();
+    if (index < 0 || index > std::numeric_limits<int>::max()) {
+        throw std::runtime_error(source + "." + name + ".index must be a non-negative integer");
+    }
+    if (frequency <= 0) {
+        throw std::runtime_error(source + "." + name + "." + frequency_key + " must be a positive integer");
+    }
+
+    ffn_clock_axis out;
+    out.index = (int) index;
+    out.frequency = frequency;
+    return out;
+}
+
+ffn_clock_point parse_clock_point(const json & root, const std::string & source) {
+    if (!root.is_object()) {
+        throw std::runtime_error(source + " must be an object");
+    }
+
+    ffn_clock_point out;
+    out.configured = true;
+    out.prime = parse_clock_axis(root, "prime", "khz", source);
+    out.gold = parse_clock_axis(root, "gold", "khz", source);
+    out.gpu = parse_clock_axis(root, "gpu", "hz", source);
+    return out;
 }
 
 ffn_parallel_policy parse_ffn_parallel(const json & root, const std::string & source) {
@@ -421,6 +523,12 @@ ffn_parallel_policy parse_ffn_parallel(const json & root, const std::string & so
     out.enabled = root.value("enabled", false);
     out.phase = root.value("phase", std::string("prefill"));
     out.align = root.value("align", (int64_t) 256);
+    if (!str_eq_ci(out.phase, "all") && !str_eq_ci(out.phase, "prefill") && !str_eq_ci(out.phase, "decode")) {
+        throw std::runtime_error(source + ".phase must be all, prefill, or decode");
+    }
+    if (out.align <= 0) {
+        throw std::runtime_error(source + ".align must be a positive integer");
+    }
     out.reduce_backend = root.value("reduce_backend", std::string());
     if (root.contains("reduce_threads")) {
         if (!root["reduce_threads"].is_number_integer()) {
@@ -440,6 +548,7 @@ ffn_parallel_policy parse_ffn_parallel(const json & root, const std::string & so
     }
 
     int i = 0;
+    std::unordered_set<std::string> split_ids;
     for (const auto & item : root["splits"]) {
         if (!item.is_object()) {
             throw std::runtime_error(source + ".splits entries must be objects");
@@ -452,8 +561,38 @@ ffn_parallel_policy parse_ffn_parallel(const json & root, const std::string & so
         if (split.start < 0 || split.size <= 0 || split.backend.empty()) {
             throw std::runtime_error(source + ".splits[" + std::to_string(i) + "] requires backend, start, and positive size");
         }
+        if (split.start > std::numeric_limits<int64_t>::max() - split.size) {
+            throw std::runtime_error(source + ".splits[" + std::to_string(i) + "] range overflows int64");
+        }
+        if (split.id.empty() || !split_ids.insert(split.id).second) {
+            throw std::runtime_error(source + ".splits ids must be non-empty and unique");
+        }
         out.splits.push_back(std::move(split));
         ++i;
+    }
+
+    if (out.splits.empty()) {
+        throw std::runtime_error(source + ".splits must not be empty");
+    }
+
+    // The graph requires one contiguous, aligned partition starting at zero.
+    // Reject gaps/overlaps during policy loading so an invalid shard-only
+    // policy cannot allocate weights successfully and abort much later.
+    auto sorted_splits = out.splits;
+    std::sort(sorted_splits.begin(), sorted_splits.end(), [](const auto & lhs, const auto & rhs) {
+        return lhs.start < rhs.start;
+    });
+    int64_t covered = 0;
+    for (const auto & split : sorted_splits) {
+        if (split.start != covered) {
+            throw std::runtime_error(source + ".splits must form a contiguous partition starting at 0");
+        }
+        if ((split.start % out.align) != 0 || (split.size % out.align) != 0) {
+            throw std::runtime_error(
+                    source + ".splits start and size must be multiples of align=" +
+                    std::to_string(out.align));
+        }
+        covered += split.size;
     }
 
     return out;
@@ -489,7 +628,8 @@ bool parse_env_ffn_splits(std::vector<llama_backend_policy_ffn_split> & splits) 
         const std::string size_str = trim(item.substr(colon + 1));
         char * end = nullptr;
         const long long size = std::strtoll(size_str.c_str(), &end, 10);
-        if (split.backend.empty() || end == size_str.c_str() || *end != '\0' || size <= 0) {
+        if (split.backend.empty() || end == size_str.c_str() || *end != '\0' || size <= 0 ||
+                start > std::numeric_limits<int64_t>::max() - size) {
             LLAMA_LOG_WARN("backend_policy: invalid LLAMA_FFN_PARALLEL_SPLITS item '%s'; expected backend:positive_size\n", item.c_str());
             splits.clear();
             return false;
@@ -540,6 +680,12 @@ llama_backend_policy_ffn_parallel materialize_ffn_policy(const ffn_parallel_poli
 
 bool effective_ffn_policy(llama_backend_policy_ffn_parallel & out) {
     ffn_parallel_policy policy = g_policy.ffn_parallel;
+    if (!g_policy.active_profile.empty()) {
+        const auto it = g_policy.profiles.find(g_policy.active_profile);
+        if (it != g_policy.profiles.end() && it->second.ffn_parallel.configured) {
+            policy = it->second.ffn_parallel;
+        }
+    }
 
     std::vector<llama_backend_policy_ffn_split> env_splits;
     const bool has_env_splits = parse_env_ffn_splits(env_splits);
@@ -597,6 +743,33 @@ void parse_profile_section(
         const auto & ops = root["ops"];
         out.ops_enabled = policy_enabled && enable_ops && ops.value("enabled", true);
         parse_rules(ops, ("profiles." + profile_name + ".ops").c_str(), out.op_rules);
+    }
+
+    const std::string profile_source = "profiles." + profile_name;
+    if (root.contains("ffn_parallel")) {
+        out.ffn_parallel = parse_ffn_parallel(root["ffn_parallel"], profile_source + ".ffn_parallel");
+        out.ffn_parallel.enabled = policy_enabled && out.ffn_parallel.enabled;
+    }
+
+    if (root.contains("applicability")) {
+        if (!root["applicability"].is_object()) {
+            throw std::runtime_error(profile_source + ".applicability must be an object");
+        }
+        const auto & applicability = root["applicability"];
+        out.input_tokens = parse_token_range(
+                applicability, "input_tokens", profile_source + ".applicability", true);
+        out.ubatch_tokens = parse_token_range(
+                applicability, "ubatch_tokens", profile_source + ".applicability", false);
+    }
+
+    if (root.contains("clock_point")) {
+        out.clock_point = parse_clock_point(root["clock_point"], profile_source + ".clock_point");
+        if (!out.input_tokens.configured) {
+            throw std::runtime_error(profile_source + ".clock_point requires applicability.input_tokens");
+        }
+        if (!out.ffn_parallel.configured) {
+            throw std::runtime_error(profile_source + ".clock_point requires ffn_parallel");
+        }
     }
 }
 
@@ -714,6 +887,76 @@ bool extra_buft_matches(ggml_backend_dev_t dev, const std::string & backend_name
     return false;
 }
 
+bool token_range_contains(const token_range & range, int32_t value) {
+    return !range.configured || (value >= range.min && value <= range.max);
+}
+
+bool token_ranges_overlap(const token_range & lhs, const token_range & rhs) {
+    if (!lhs.configured || !rhs.configured) {
+        return true;
+    }
+    return lhs.min <= rhs.max && rhs.min <= lhs.max;
+}
+
+bool same_clock_frequencies(const ffn_clock_point & lhs, const ffn_clock_point & rhs) {
+    return lhs.prime.frequency == rhs.prime.frequency &&
+           lhs.gold.frequency == rhs.gold.frequency &&
+           lhs.gpu.frequency == rhs.gpu.frequency;
+}
+
+bool ffn_policy_matches_layer(const llama_backend_policy_ffn_parallel & policy, int il) {
+    if (policy.layer_start == -2) {
+        return true;
+    }
+    return il >= policy.layer_start && (policy.layer_end == -2 || il <= policy.layer_end);
+}
+
+bool same_ffn_residency_requirements(
+        const llama_backend_policy_ffn_parallel & lhs,
+        const llama_backend_policy_ffn_parallel & rhs) {
+    // Phase also carries whether the full source tensor must be retained for
+    // fallback. Keeping an "all" representative for a duplicate "prefill"
+    // policy could otherwise make the loader discard weights needed by decode.
+    if (!str_eq_ci(lhs.phase, rhs.phase)) {
+        return false;
+    }
+    if (lhs.splits.size() != rhs.splits.size()) {
+        return false;
+    }
+
+    auto lhs_splits = lhs.splits;
+    auto rhs_splits = rhs.splits;
+    const auto by_range = [](const llama_backend_policy_ffn_split & a, const llama_backend_policy_ffn_split & b) {
+        if (a.start != b.start) {
+            return a.start < b.start;
+        }
+        if (a.size != b.size) {
+            return a.size < b.size;
+        }
+        return lower(a.backend) < lower(b.backend);
+    };
+    std::sort(lhs_splits.begin(), lhs_splits.end(), by_range);
+    std::sort(rhs_splits.begin(), rhs_splits.end(), by_range);
+
+    for (size_t i = 0; i < lhs_splits.size(); ++i) {
+        if (lhs_splits[i].start != rhs_splits[i].start ||
+            lhs_splits[i].size != rhs_splits[i].size ||
+            !str_eq_ci(lhs_splits[i].backend, rhs_splits[i].backend)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void validate_profile_reference(
+        const policy_state & state,
+        const std::string & profile,
+        const std::string & source) {
+    if (!profile.empty() && state.profiles.find(profile) == state.profiles.end()) {
+        throw std::runtime_error(source + " references unknown profile '" + profile + "'");
+    }
+}
+
 } // namespace
 
 bool llama_backend_policy_load(const char * path, bool enable_weights, bool enable_ops) {
@@ -781,6 +1024,14 @@ bool llama_backend_policy_load(const char * path, bool enable_weights, bool enab
             next.ffn_parallel.enabled = next.enabled && next.ffn_parallel.enabled;
         }
 
+        if (root.contains("ffn_clock_switch")) {
+            if (!root["ffn_clock_switch"].is_object()) {
+                throw std::runtime_error("ffn_clock_switch must be an object");
+            }
+            next.ffn_clock_switch_enabled =
+                next.enabled && root["ffn_clock_switch"].value("enabled", false);
+        }
+
         if (root.contains("runtime") && root["runtime"].is_object()) {
             const auto & runtime = root["runtime"];
             next.default_profile = runtime.value("default_profile", std::string());
@@ -807,9 +1058,60 @@ bool llama_backend_policy_load(const char * path, bool enable_weights, bool enab
                 if (!it.value().is_object()) {
                     throw std::runtime_error("profiles entries must be objects");
                 }
+                if (it.key().empty() || it.key().size() >= LLAMA_BACKEND_POLICY_PROFILE_NAME_MAX) {
+                    throw std::runtime_error(
+                            "profile names must be non-empty and shorter than " +
+                            std::to_string(LLAMA_BACKEND_POLICY_PROFILE_NAME_MAX) + " bytes");
+                }
                 profile_policy profile;
                 parse_profile_section(it.value(), it.key(), next.enabled, enable_weights, enable_ops, profile);
                 next.profiles.emplace(it.key(), std::move(profile));
+            }
+        }
+
+        validate_profile_reference(next, next.default_profile, "runtime.default_profile");
+        validate_profile_reference(next, next.prefill_profile, "stage_switch.prefill_profile");
+        validate_profile_reference(next, next.decode_profile, "stage_switch.decode_profile");
+        validate_profile_reference(next, next.cool_profile, "thermal_switch.cool_profile");
+        validate_profile_reference(next, next.hot_profile, "thermal_switch.hot_profile");
+        validate_profile_reference(next, next.critical_profile, "thermal_switch.critical_profile");
+
+        if (next.ffn_clock_switch_enabled) {
+            size_t selectable_profiles = 0;
+            for (const auto & kv : next.profiles) {
+                if (kv.second.clock_point.configured &&
+                    kv.second.input_tokens.configured &&
+                    kv.second.ffn_parallel.configured &&
+                    kv.second.ffn_parallel.enabled) {
+                    ++selectable_profiles;
+                }
+            }
+            if (selectable_profiles == 0) {
+                throw std::runtime_error(
+                        "ffn_clock_switch.enabled requires at least one enabled profile with "
+                        "clock_point, applicability.input_tokens, and ffn_parallel");
+            }
+
+            // Two profiles with the same measured clock point and overlapping
+            // token applicability would be indistinguishable to the selector.
+            // Treat that as a configuration error instead of silently choosing
+            // whichever profile name happens to sort first.
+            for (auto lhs = next.profiles.begin(); lhs != next.profiles.end(); ++lhs) {
+                if (!lhs->second.clock_point.configured) {
+                    continue;
+                }
+                for (auto rhs = std::next(lhs); rhs != next.profiles.end(); ++rhs) {
+                    if (!rhs->second.clock_point.configured) {
+                        continue;
+                    }
+                    if (same_clock_frequencies(lhs->second.clock_point, rhs->second.clock_point) &&
+                        token_ranges_overlap(lhs->second.input_tokens, rhs->second.input_tokens) &&
+                        token_ranges_overlap(lhs->second.ubatch_tokens, rhs->second.ubatch_tokens)) {
+                        throw std::runtime_error(
+                                "ffn clock profiles '" + lhs->first + "' and '" + rhs->first +
+                                "' have an indistinguishable clock/token selector");
+                    }
+                }
             }
         }
 
@@ -822,12 +1124,13 @@ bool llama_backend_policy_load(const char * path, bool enable_weights, bool enab
 
         g_policy = std::move(next);
 
-        LLAMA_LOG_INFO("backend_policy: loaded '%s' (weights=%s, weight_rules=%zu, ops=%s, op_rules=%zu, residency=%s, residency_rules=%zu, ffn_parallel=%s, profiles=%zu)\n",
+        LLAMA_LOG_INFO("backend_policy: loaded '%s' (weights=%s, weight_rules=%zu, ops=%s, op_rules=%zu, residency=%s, residency_rules=%zu, ffn_parallel=%s, ffn_clock_switch=%s, profiles=%zu)\n",
                 g_policy.path.c_str(),
                 g_policy.weights_enabled ? "on" : "off", g_policy.weight_rules.size(),
                 g_policy.ops_enabled ? "on" : "off", g_policy.op_rules.size(),
                 g_policy.residency_enabled ? "on" : "off", g_policy.residency_rules.size(),
                 g_policy.ffn_parallel.enabled ? "on" : "off",
+                g_policy.ffn_clock_switch_enabled ? "on" : "off",
                 g_policy.profiles.size());
         return true;
     } catch (const std::exception & e) {
@@ -881,6 +1184,102 @@ int llama_backend_policy_ffn_parallel_reduce_threads() {
         : 0;
 }
 
+bool llama_backend_policy_ffn_clock_switch_enabled(void) {
+    std::lock_guard<std::mutex> lock(g_policy_mutex);
+    return g_policy.loaded && g_policy.enabled &&
+        env_enabled("LLAMA_BACKEND_POLICY_FFN_CLOCK_SWITCH", g_policy.ffn_clock_switch_enabled);
+}
+
+bool llama_backend_policy_reset_ffn_clock_profile(void) {
+    std::lock_guard<std::mutex> lock(g_policy_mutex);
+    const bool changed = !g_policy.pending_clock_profile.empty();
+    g_policy.pending_clock_profile.clear();
+    return changed;
+}
+
+struct llama_backend_policy_ffn_clock_result llama_backend_policy_select_ffn_clock_profile(
+        int32_t input_tokens,
+        int32_t ubatch_tokens,
+        int64_t gold_khz,
+        int64_t prime_khz,
+        int64_t gpu_hz) {
+    llama_backend_policy_ffn_clock_result result = {};
+    result.distance = -1.0;
+
+    std::lock_guard<std::mutex> lock(g_policy_mutex);
+    result.enabled = g_policy.loaded && g_policy.enabled &&
+        env_enabled("LLAMA_BACKEND_POLICY_FFN_CLOCK_SWITCH", g_policy.ffn_clock_switch_enabled);
+    if (!result.enabled) {
+        return result;
+    }
+
+    // A failed sysfs read must not evict a previously valid pending profile.
+    // The caller can retry at the next query boundary.
+    if (input_tokens <= 0 || ubatch_tokens <= 0 ||
+        gold_khz <= 0 || prime_khz <= 0 || gpu_hz <= 0) {
+        return result;
+    }
+
+    const profile_policy * best = nullptr;
+    std::string best_name;
+    long double best_distance = std::numeric_limits<long double>::infinity();
+    long double best_total_khz = std::numeric_limits<long double>::infinity();
+    constexpr long double tie_epsilon = 1.0e-15L;
+
+    for (const auto & kv : g_policy.profiles) {
+        const auto & profile = kv.second;
+        if (!profile.clock_point.configured ||
+            !profile.ffn_parallel.configured ||
+            !env_enabled("LLAMA_FFN_PARALLEL", profile.ffn_parallel.enabled) ||
+            !token_range_contains(profile.input_tokens, input_tokens) ||
+            !token_range_contains(profile.ubatch_tokens, ubatch_tokens)) {
+            continue;
+        }
+
+        const auto relative_error = [](int64_t actual, int64_t target) {
+            return std::fabs((long double) actual - (long double) target) /
+                (long double) target;
+        };
+        const long double distance =
+            relative_error(prime_khz, profile.clock_point.prime.frequency) +
+            relative_error(gold_khz, profile.clock_point.gold.frequency) +
+            relative_error(gpu_hz, profile.clock_point.gpu.frequency);
+        const long double total_khz =
+            (long double) profile.clock_point.prime.frequency +
+            (long double) profile.clock_point.gold.frequency +
+            (long double) profile.clock_point.gpu.frequency / 1000.0L;
+
+        const bool distance_better = distance + tie_epsilon < best_distance;
+        const bool distance_tied = std::fabs(distance - best_distance) <= tie_epsilon;
+        const bool lower_frequency = total_khz + tie_epsilon < best_total_khz;
+        const bool fully_tied = distance_tied &&
+            std::fabs(total_khz - best_total_khz) <= tie_epsilon;
+        if (best == nullptr || distance_better ||
+            (distance_tied && lower_frequency) ||
+            (fully_tied && kv.first < best_name)) {
+            best = &profile;
+            best_name = kv.first;
+            best_distance = distance;
+            best_total_khz = total_khz;
+        }
+    }
+
+    if (best == nullptr) {
+        if (!g_policy.pending_clock_profile.empty()) {
+            g_policy.pending_clock_profile.clear();
+            result.pending_changed = true;
+        }
+        return result;
+    }
+
+    result.matched = true;
+    result.distance = (double) best_distance;
+    std::snprintf(result.profile, sizeof(result.profile), "%s", best_name.c_str());
+    result.pending_changed = best_name != g_policy.pending_clock_profile;
+    g_policy.pending_clock_profile = std::move(best_name);
+    return result;
+}
+
 bool llama_backend_policy_update_runtime_profile(bool is_prefill) {
     std::lock_guard<std::mutex> lock(g_policy_mutex);
 
@@ -889,6 +1288,12 @@ bool llama_backend_policy_update_runtime_profile(bool is_prefill) {
     }
 
     std::string next_profile = env_string("LLAMA_BACKEND_POLICY_ACTIVE_PROFILE");
+
+    const bool clock_switch_enabled =
+        env_enabled("LLAMA_BACKEND_POLICY_FFN_CLOCK_SWITCH", g_policy.ffn_clock_switch_enabled);
+    if (next_profile.empty() && clock_switch_enabled && !g_policy.pending_clock_profile.empty()) {
+        next_profile = g_policy.pending_clock_profile;
+    }
 
     const bool thermal_enabled = env_enabled("LLAMA_BACKEND_POLICY_THERMAL_SWITCH", g_policy.thermal_switch_enabled);
     if (next_profile.empty() && thermal_enabled) {
@@ -1083,6 +1488,164 @@ bool llama_backend_policy_match_ffn_parallel_layer(
     }
 
     return true;
+}
+
+bool llama_backend_policy_list_ffn_parallel_load_policies(
+        int il,
+        std::vector<llama_backend_policy_ffn_parallel> & out) {
+    std::lock_guard<std::mutex> lock(g_policy_mutex);
+    out.clear();
+
+    if (!g_policy.loaded || !g_policy.enabled) {
+        return false;
+    }
+
+    const auto append_policy = [&](ffn_parallel_policy policy) {
+        if (!policy.configured) {
+            return;
+        }
+        policy.enabled = env_enabled("LLAMA_FFN_PARALLEL", policy.enabled);
+        if (!policy.enabled) {
+            return;
+        }
+
+        llama_backend_policy_ffn_parallel candidate = materialize_ffn_policy(policy);
+        candidate.enabled = true;
+        if (candidate.splits.empty() || !ffn_policy_matches_layer(candidate, il)) {
+            return;
+        }
+        for (const auto & existing : out) {
+            if (same_ffn_residency_requirements(existing, candidate)) {
+                return;
+            }
+        }
+        out.push_back(std::move(candidate));
+    };
+
+    ffn_parallel_policy base = g_policy.ffn_parallel;
+    if (!base.configured) {
+        std::vector<llama_backend_policy_ffn_split> env_splits;
+        if (parse_env_ffn_splits(env_splits)) {
+            base.configured = true;
+            base.enabled = true;
+            base.phase = "prefill";
+            base.align = 256;
+            base.source = "LLAMA_FFN_PARALLEL_SPLITS";
+            base.splits = std::move(env_splits);
+        }
+    }
+    append_policy(std::move(base));
+
+    for (const auto & kv : g_policy.profiles) {
+        append_policy(kv.second.ffn_parallel);
+    }
+
+    return !out.empty();
+}
+
+bool llama_backend_policy_build_ffn_residency_plan(
+        int il,
+        llama_backend_policy_ffn_residency_plan & out) {
+    out = {};
+
+    std::vector<llama_backend_policy_ffn_parallel> policies;
+    if (!llama_backend_policy_list_ffn_parallel_load_policies(il, policies)) {
+        return false;
+    }
+
+    struct backend_intervals {
+        std::string backend;
+        std::vector<std::pair<int64_t, int64_t>> ranges;
+    };
+
+    std::map<std::string, backend_intervals> grouped;
+    out.enabled = true;
+    out.keep_full_source = false;
+    out.source = "ffn_parallel atomic union";
+    bool has_all_phase_root = false;
+
+    for (const auto & policy : policies) {
+        if (policy.source == "ffn_parallel" && str_eq_ci(policy.phase, "all")) {
+            has_all_phase_root = true;
+        }
+        if (!str_eq_ci(policy.phase, "all")) {
+            out.keep_full_source = true;
+        }
+
+        for (const auto & split : policy.splits) {
+            const std::string key = lower(split.backend);
+            auto & entry = grouped[key];
+            if (entry.backend.empty()) {
+                entry.backend = split.backend;
+            }
+            entry.ranges.emplace_back(split.start, split.start + split.size);
+        }
+    }
+
+    // Before the first clock selection, and whenever no profile is selected,
+    // graph construction uses the root policy. A profile-only residency union
+    // therefore cannot safely discard the full source tensor.
+    if (!has_all_phase_root) {
+        out.keep_full_source = true;
+    }
+
+    // A manually/default-selected profile whose layer range excludes this
+    // layer falls back to the ordinary FFN path. Preserve the full source for
+    // that case even if every residency policy that did match was phase=all.
+    {
+        std::lock_guard<std::mutex> lock(g_policy_mutex);
+        for (const auto & kv : g_policy.profiles) {
+            ffn_parallel_policy profile = kv.second.ffn_parallel;
+            if (!profile.configured) {
+                continue;
+            }
+            profile.enabled = env_enabled("LLAMA_FFN_PARALLEL", profile.enabled);
+            if (!profile.enabled) {
+                continue;
+            }
+            const auto candidate = materialize_ffn_policy(profile);
+            if (!ffn_policy_matches_layer(candidate, il)) {
+                out.keep_full_source = true;
+                break;
+            }
+        }
+    }
+
+    for (const auto & kv : grouped) {
+        const backend_intervals & entry = kv.second;
+        std::vector<int64_t> boundaries;
+        boundaries.reserve(entry.ranges.size() * 2);
+        for (const auto & range : entry.ranges) {
+            boundaries.push_back(range.first);
+            boundaries.push_back(range.second);
+        }
+        std::sort(boundaries.begin(), boundaries.end());
+        boundaries.erase(std::unique(boundaries.begin(), boundaries.end()), boundaries.end());
+
+        for (size_t i = 1; i < boundaries.size(); ++i) {
+            const int64_t start = boundaries[i - 1];
+            const int64_t end = boundaries[i];
+            if (start == end) {
+                continue;
+            }
+
+            const bool covered = std::any_of(entry.ranges.begin(), entry.ranges.end(), [&](const auto & range) {
+                return range.first <= start && end <= range.second;
+            });
+            if (!covered) {
+                continue;
+            }
+
+            llama_backend_policy_ffn_split tile;
+            tile.id = "tile." + kv.first + "." + std::to_string(start) + "." + std::to_string(end - start);
+            tile.start = start;
+            tile.size = end - start;
+            tile.backend = entry.backend;
+            out.tiles.push_back(std::move(tile));
+        }
+    }
+
+    return !out.tiles.empty();
 }
 
 bool llama_backend_policy_buft_matches(

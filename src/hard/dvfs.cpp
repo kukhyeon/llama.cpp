@@ -1,5 +1,20 @@
 #include "dvfs.h"
 
+namespace {
+
+long long read_first_positive_integer(const std::vector<std::string> & candidates) {
+    for (const auto & path : candidates) {
+        std::ifstream file(path);
+        long long value = -1;
+        if (file && (file >> value) && value > 0) {
+            return value;
+        }
+    }
+    return -1;
+}
+
+} // namespace
+
 // DVFS --------------------------------------
 const std::map<std::string, std::map<int, std::vector<int>>> DVFS::cpufreq = {
     { "S22_Ultra", {
@@ -94,6 +109,66 @@ std::vector<int> DVFS::get_cpu_freqs_conf(int prime_cpu_index){
     }
 
     return freq_conf;
+}
+
+bool DVFS::read_s25_clock_snapshot(S25ClockSnapshot & snapshot) const {
+    // Always clear the output first so a failed read cannot leave stale clocks
+    // that could accidentally select a runtime FFN profile.
+    snapshot = {};
+
+    if (get_device_name() != "S25") {
+        return false;
+    }
+
+    snapshot.cpu_gold_khz = read_first_positive_integer({
+        "/sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq",
+        "/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq",
+        "/sys/devices/system/cpu/cpufreq/policy0/cpuinfo_cur_freq",
+        "/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_cur_freq",
+    });
+    snapshot.cpu_prime_khz = read_first_positive_integer({
+        "/sys/devices/system/cpu/cpufreq/policy6/scaling_cur_freq",
+        "/sys/devices/system/cpu/cpu6/cpufreq/scaling_cur_freq",
+        "/sys/devices/system/cpu/cpufreq/policy6/cpuinfo_cur_freq",
+        "/sys/devices/system/cpu/cpu6/cpufreq/cpuinfo_cur_freq",
+    });
+    snapshot.gpu_hz = read_first_positive_integer({
+        "/sys/class/devfreq/3d00000.qcom,kgsl-3d0/cur_freq",
+        "/sys/class/kgsl/kgsl-3d0/devfreq/cur_freq",
+        "/sys/devices/platform/soc/3d00000.qcom,kgsl-3d0/devfreq/3d00000.qcom,kgsl-3d0/cur_freq",
+    });
+
+    return snapshot.cpu_gold_khz > 0 &&
+           snapshot.cpu_prime_khz > 0 &&
+           snapshot.gpu_hz > 0;
+}
+
+bool DVFS::get_s25_clock_targets(
+        int cpu_gold_idx,
+        int cpu_prime_idx,
+        int gpu_idx,
+        S25ClockSnapshot & targets) const {
+    targets = {};
+    if (get_device_name() != "S25" ||
+            cpu_gold_idx < 0 || cpu_prime_idx < 0 || gpu_idx < 0) {
+        return false;
+    }
+
+    const auto & cpu = get_cpu_freq();
+    const auto gold_it = cpu.find(0);
+    const auto prime_it = cpu.find(6);
+    const auto & gpu = get_gpu_freq();
+    if (gold_it == cpu.end() || prime_it == cpu.end() ||
+            cpu_gold_idx >= (int) gold_it->second.size() ||
+            cpu_prime_idx >= (int) prime_it->second.size() ||
+            gpu_idx >= (int) gpu.size()) {
+        return false;
+    }
+
+    targets.cpu_gold_khz = gold_it->second[cpu_gold_idx];
+    targets.cpu_prime_khz = prime_it->second[cpu_prime_idx];
+    targets.gpu_hz = gpu[gpu_idx];
+    return true;
 }
 // -------------------------------------------
 
