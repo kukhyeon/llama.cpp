@@ -1168,9 +1168,21 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             // one ggml context per buffer type
-            int max_n_tensors = n_tensors;
+            size_t max_n_tensors = n_tensors;
             max_n_tensors += 1;                 // duplicated output tensor
             max_n_tensors += hparams.n_layer*2; // duplicated rope freq tensors
+
+            // Each atomic FFN interval is materialized for up, gate, and down.
+            // Contexts are per buffer type, but reserving the complete union in
+            // each one keeps this sizing independent of backend aliases and
+            // avoids exhausting metadata before all shards are declared.
+            for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                llama_backend_policy_ffn_residency_plan plan;
+                if (llama_backend_policy_build_ffn_residency_plan((int) il, plan)) {
+                    max_n_tensors += 3 * plan.tiles.size();
+                }
+            }
+
             if (files.empty()) {
                 max_n_tensors += hparams.n_layer*256; // this should be well above what any model actually uses
             }
@@ -1368,23 +1380,19 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return buft;
     };
 
-    auto create_ffn_shards = [&](const ggml_tensor * cur, const char * tensor_name, int ffn_axis, const llama_backend_policy_ffn_parallel & ffn_policy, ggml_op residency_op, ggml_backend_buffer_type_t primary_buft) {
+    auto create_ffn_shards = [&](const ggml_tensor * cur, const char * tensor_name, int ffn_axis, const llama_backend_policy_ffn_residency_plan & residency_plan, ggml_op residency_op) {
         if (buft_list_all == nullptr) {
-            return;
+            return false;
         }
 
+        bool complete = true;
         const int64_t shard_dim = ffn_axis == 0 ? cur->ne[0] : cur->ne[1];
-        const int64_t align = std::max<int64_t>(1, ffn_policy.align);
 
-        for (const auto & split : ffn_policy.splits) {
+        for (const auto & split : residency_plan.tiles) {
             if (split.start < 0 || split.size <= 0 || split.start + split.size > shard_dim) {
                 LLAMA_LOG_WARN("backend_policy: ffn shard %s for %s is out of range [0, %" PRId64 ")\n",
                         split.id.c_str(), tensor_name, shard_dim);
-                continue;
-            }
-            if ((split.start % align) != 0 || (split.size % align) != 0) {
-                LLAMA_LOG_WARN("backend_policy: ffn shard %s for %s is not aligned to %" PRId64 " channels; skipping shard\n",
-                        split.id.c_str(), tensor_name, align);
+                complete = false;
                 continue;
             }
 
@@ -1393,12 +1401,18 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             if (shard_ne0 % ggml_blck_size(cur->type) != 0) {
                 LLAMA_LOG_WARN("backend_policy: ffn shard %s for %s has ne0=%" PRId64 " not divisible by block size %" PRId64 "; skipping shard\n",
                         split.id.c_str(), tensor_name, shard_ne0, ggml_blck_size(cur->type));
+                complete = false;
                 continue;
             }
 
+            // Use the physical shard identity rather than the profile-local id
+            // in the tensor name. Multiple clock profiles often share the same
+            // backend/start/size tuple; giving those tuples the same name lets
+            // the loader allocate and upload one exact resident shard only.
             const std::string shard_name =
                 std::string(tensor_name) + "#ffn_shard." +
-                sanitize_shard_name_part(split.id.empty() ? split.backend : split.id) + "." +
+                sanitize_shard_name_part(split.backend) + "." +
+                std::to_string(ffn_axis) + "." +
                 std::to_string(split.start) + "." + std::to_string(split.size);
 
             ggml_tensor shard_meta;
@@ -1407,18 +1421,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             llama_backend_policy_match copy_match;
             copy_match.matched = true;
             copy_match.backends = { split.backend };
-            copy_match.source = ffn_policy.source;
+            copy_match.source = residency_plan.source;
 
             ggml_backend_buffer_type_t shard_buft = select_policy_weight_buft(hparams, &shard_meta, residency_op, copy_match);
             if (shard_buft == nullptr) {
                 LLAMA_LOG_WARN("backend_policy: ffn shard %s for %s requested %s, but no compatible buffer type was found\n",
                         split.id.c_str(), tensor_name, split.backend.c_str());
-                continue;
-            }
-
-            if (primary_buft != nullptr && shard_buft == primary_buft) {
-                // The primary full tensor already lives in the requested backend.
-                // The graph can use a view of it without allocating another copy.
+                complete = false;
                 continue;
             }
 
@@ -1437,9 +1446,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             LLAMA_LOG_DEBUG("backend_policy: ffn shard tensor %s (%zu MiB %s) from %s axis=%d start=%" PRId64 " size=%" PRId64 " using %s\n",
                     shard_name.c_str(),
                     ggml_nbytes(shard) / 1024 / 1024, ggml_type_name(shard->type),
-                    ffn_policy.source.c_str(), ffn_axis, split.start, split.size,
+                    residency_plan.source.c_str(), ffn_axis, split.start, split.size,
                     ggml_backend_buft_name(shard_buft));
         }
+
+        return complete;
     };
 
     if (files.empty()) {
@@ -1483,16 +1494,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     ggml_tensor * t_meta = get_tensor_meta(tn.str().c_str());
 
     int ffn_axis = -1;
-    llama_backend_policy_ffn_parallel ffn_policy;
+    llama_backend_policy_ffn_residency_plan ffn_residency_plan;
     const bool ffn_parallel_layer_enabled =
         t_meta != nullptr &&
         is_ffn_parallel_weight_tensor(tn, ffn_axis) &&
-        llama_backend_policy_match_ffn_parallel_layer(tn.bid, ffn_policy);
-    std::string ffn_phase = ffn_policy.phase;
-    std::transform(ffn_phase.begin(), ffn_phase.end(), ffn_phase.begin(), [](unsigned char c) {
-        return (char) std::tolower(c);
-    });
-    const bool ffn_parallel_shard_only = ffn_parallel_layer_enabled && ffn_phase == "all";
+        llama_backend_policy_build_ffn_residency_plan(tn.bid, ffn_residency_plan);
+    const bool ffn_parallel_shard_only =
+        ffn_parallel_layer_enabled &&
+        !ffn_residency_plan.keep_full_source;
 
     llm_tensor residency_tn_tensor = tn.tensor;
     if (tn.tensor == LLM_TENSOR_TOKEN_EMBD && (flags & TENSOR_DUPLICATED)) {
@@ -1523,7 +1532,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         virtual_tensors.insert(tensor);
         virtual_tensor_names.insert(ggml_get_name(tensor));
 
-        create_ffn_shards(cur, ggml_get_name(tensor), ffn_axis, ffn_policy, residency_op, nullptr);
+        if (!create_ffn_shards(cur, ggml_get_name(tensor), ffn_axis, ffn_residency_plan, residency_op)) {
+            throw std::runtime_error(format(
+                    "backend_policy: failed to create complete shard-only FFN residency for tensor %s",
+                    ggml_get_name(tensor)));
+        }
 
         if (!(flags & TENSOR_DUPLICATED)) {
             n_created++;
@@ -1562,7 +1575,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     ggml_set_name(tensor, ggml_get_name(cur));
 
     if (ffn_parallel_layer_enabled) {
-        create_ffn_shards(cur, ggml_get_name(tensor), ffn_axis, ffn_policy, residency_op, buft);
+        // Always create compact atomic shards, even when the full source happens
+        // to use the same buffer type. Axis-0 views of HTP/CPU REPACK tensors do
+        // not preserve the packed scale/interleave layout.
+        (void) create_ffn_shards(cur, ggml_get_name(tensor), ffn_axis, ffn_residency_plan, residency_op);
     }
 
     if (!ffn_parallel_layer_enabled && llama_backend_policy_residency_enabled() && buft_list_all != nullptr) {

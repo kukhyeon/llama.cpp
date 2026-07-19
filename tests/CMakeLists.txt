@@ -200,6 +200,9 @@ llama_build_and_test(test-chat-auto-parser.cpp WORKING_DIRECTORY ${PROJECT_SOURC
 llama_build_and_test(test-chat-template.cpp)
 llama_build_and_test(test-json-partial.cpp)
 llama_build_and_test(test-log.cpp)
+llama_build(test-backend-policy-clock.cpp)
+target_include_directories(test-backend-policy-clock PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_test(test-backend-policy-clock)
 llama_build_and_test(
     test-peg-parser.cpp
     peg-parser/simple-tokenize.cpp

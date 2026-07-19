@@ -27,6 +27,7 @@
 #include <cstring>
 #include <cmath>
 #include <functional>
+#include <limits>
 #include <map>
 #include <numeric>
 #include <regex>
@@ -1968,19 +1969,21 @@ ggml_tensor * llama_model::get_backend_policy_residency_tensor(
     return nullptr;
 }
 
-ggml_tensor * llama_model::get_backend_policy_ffn_shard_tensor(
+std::vector<llama_backend_policy_ffn_resident_tile> llama_model::get_backend_policy_ffn_shard_tiles(
         const ggml_tensor * tensor,
         const std::string & backend,
         int axis,
         int64_t start,
         int64_t size) const {
-    if (tensor == nullptr || backend.empty()) {
-        return nullptr;
+    std::vector<llama_backend_policy_ffn_resident_tile> result;
+    if (tensor == nullptr || backend.empty() || start < 0 || size <= 0 ||
+            start > std::numeric_limits<int64_t>::max() - size) {
+        return result;
     }
 
     const char * name_c = ggml_get_name(tensor);
     if (name_c == nullptr || name_c[0] == '\0') {
-        return nullptr;
+        return result;
     }
 
     auto tensor_matches_backend = [](const ggml_tensor * cur, const std::string & backend_name) {
@@ -1992,9 +1995,10 @@ ggml_tensor * llama_model::get_backend_policy_ffn_shard_tensor(
         return llama_backend_policy_buft_matches(dev, buft, backend_name);
     };
 
+    const int64_t end = start + size;
     auto it = pimpl->backend_policy_residency_tensors.find(name_c);
     if (it == pimpl->backend_policy_residency_tensors.end()) {
-        return nullptr;
+        return result;
     }
 
     for (ggml_tensor * candidate : it->second) {
@@ -2004,16 +2008,42 @@ ggml_tensor * llama_model::get_backend_policy_ffn_shard_tensor(
         }
 
         const llama_tensor_shard_info & info = info_it->second;
-        if (info.source_name != name_c || info.axis != axis || info.start != start || info.size != size) {
+        if (info.source_name != name_c || info.axis != axis ||
+                info.start < start || info.start > end ||
+                info.size <= 0 || info.start > std::numeric_limits<int64_t>::max() - info.size ||
+                info.start + info.size > end ||
+                !tensor_matches_backend(candidate, backend)) {
             continue;
         }
 
-        if (tensor_matches_backend(candidate, backend)) {
-            return candidate;
+        result.push_back({ candidate, info.start, info.size });
+    }
+
+    std::sort(result.begin(), result.end(), [](const auto & lhs, const auto & rhs) {
+        if (lhs.start != rhs.start) {
+            return lhs.start < rhs.start;
+        }
+        return lhs.size < rhs.size;
+    });
+
+    int64_t covered = start;
+    std::vector<llama_backend_policy_ffn_resident_tile> contiguous;
+    contiguous.reserve(result.size());
+    for (const auto & tile : result) {
+        if (tile.start < covered) {
+            continue;
+        }
+        if (tile.start != covered) {
+            break;
+        }
+        contiguous.push_back(tile);
+        covered += tile.size;
+        if (covered == end) {
+            return contiguous;
         }
     }
 
-    return nullptr;
+    return {};
 }
 
 float llama_model::get_rope_freq_base (const llama_cparams & cparams, int il) const {

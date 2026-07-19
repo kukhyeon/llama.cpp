@@ -22,6 +22,14 @@
 
 class Collector;
 
+// Actual S25 clocks sampled at a query boundary.
+// CPU cpufreq values are exposed in kHz, while KGSL devfreq uses Hz.
+struct S25ClockSnapshot {
+    long long cpu_gold_khz  = -1;
+    long long cpu_prime_khz = -1;
+    long long gpu_hz        = -1;
+};
+
 class Collector : public Device {
 private:
     // pixel9
@@ -127,6 +135,17 @@ public:
     std::vector<int> get_cpu_freqs_conf(int prime_cpu_index);
 
     Collector get_collector() { return Collector(this->get_device_name()); }
+
+    // Read-only actual-clock sampling for query-boundary policy selection.
+    // Returns false for non-S25 devices or when any clock cannot be read.
+    bool read_s25_clock_snapshot(S25ClockSnapshot & snapshot) const;
+
+    // Resolve requested S25 indices to the exact clocks written by the setters.
+    bool get_s25_clock_targets(
+            int cpu_gold_idx,
+            int cpu_prime_idx,
+            int gpu_idx,
+            S25ClockSnapshot & targets) const;
 
     // FD cache
     int init_fd_cache();    // sysfs open

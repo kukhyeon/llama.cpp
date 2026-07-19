@@ -48,6 +48,8 @@
 #define LLAMA_STATE_SEQ_MAGIC   LLAMA_FILE_MAGIC_GGSQ
 #define LLAMA_STATE_SEQ_VERSION 2
 
+#define LLAMA_BACKEND_POLICY_PROFILE_NAME_MAX 128
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -523,6 +525,29 @@ extern "C" {
     // The policy is process-global and is consulted during model loading and graph construction.
     LLAMA_API bool llama_backend_policy_load(const char * path, bool enable_weights, bool enable_ops);
     LLAMA_API void llama_backend_policy_clear(void);
+
+    // Result of selecting a query-boundary FFN profile from the clock points
+    // declared in the backend policy. "pending_changed" reports whether the
+    // pending selection changed; the active graph profile is switched later at
+    // a safe graph-build boundary.
+    struct llama_backend_policy_ffn_clock_result {
+        bool enabled;
+        bool matched;
+        bool pending_changed;
+        char profile[LLAMA_BACKEND_POLICY_PROFILE_NAME_MAX];
+        double distance;
+    };
+
+    LLAMA_API bool llama_backend_policy_ffn_clock_switch_enabled(void);
+    // Clear the pending clock-selected profile so the root FFN policy is used
+    // at the next safe graph boundary. Returns true when pending state changed.
+    LLAMA_API bool llama_backend_policy_reset_ffn_clock_profile(void);
+    LLAMA_API struct llama_backend_policy_ffn_clock_result llama_backend_policy_select_ffn_clock_profile(
+            int32_t input_tokens,
+            int32_t ubatch_tokens,
+            int64_t gold_khz,
+            int64_t prime_khz,
+            int64_t gpu_hz);
 
     //optional:
     LLAMA_API void llama_numa_init(enum ggml_numa_strategy numa);

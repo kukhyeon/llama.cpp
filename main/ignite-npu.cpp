@@ -808,6 +808,7 @@ int main(int argc, char ** argv) {
     std::cout << std::flush << "output_path_infer: " << output_path_infer << std::endl;
     std::string output_path_load = params.output_dir + "/inference_load.csv";
     std::cout << std::flush << "output_path_load: " << output_path_load << std::endl;
+    std::string output_path_ffn_profile = params.output_dir + "/ffn_profile_trace.csv";
     auto start_sys_time = std::chrono::system_clock::now();
     std::ofstream file(output_path_infer, std::ios::app);
     if (file.is_open() && output_path_infer!="/inference_stats.csv") {
@@ -844,6 +845,39 @@ int main(int argc, char ** argv) {
     DVFS dvfs(device_name);
     dvfs.control_start_point = start_sys_time;
     dvfs.output_filename = params.output_dir + "/hardware_stats.csv";
+
+    const bool ffn_clock_switch_enabled = llama_backend_policy_ffn_clock_switch_enabled();
+    S25ClockSnapshot requested_prefill_clocks;
+    const bool requested_prefill_clocks_valid = dvfs.get_s25_clock_targets(
+            params.cpu_gold_clk_idx_p,
+            params.cpu_prime_clk_idx_p,
+            ig->gpu_clk_idx_p,
+            requested_prefill_clocks);
+    if (ffn_clock_switch_enabled && !requested_prefill_clocks_valid) {
+        LOG_WRN(
+                "%s: FFN clock switching requires valid S25 prefill Gold/Prime/GPU "
+                "indices; keeping the base policy until targets are available\n",
+                __func__);
+    }
+
+    std::ofstream ffn_profile_trace;
+    if (ffn_clock_switch_enabled && output_path_ffn_profile != "/ffn_profile_trace.csv") {
+        ffn_profile_trace.open(output_path_ffn_profile, std::ios::app);
+        if (ffn_profile_trace.is_open()) {
+            if (ffn_profile_trace.tellp() == std::streampos(0)) {
+                ffn_profile_trace
+                    << "sys_time_ms,query_id,input_tokens,ubatch_tokens,"
+                    << "requested_gold_idx,requested_prime_idx,requested_gpu_idx,"
+                    << "requested_gold_khz,requested_prime_khz,requested_gpu_hz,"
+                    << "actual_gold_khz,actual_prime_khz,actual_gpu_hz,"
+                    << "thermal_throttled,matched,pending_changed,profile,distance\n";
+                ffn_profile_trace.flush();
+            }
+        } else {
+            LOG_WRN("%s: failed to open FFN profile trace '%s'\n",
+                    __func__, output_path_ffn_profile.c_str());
+        }
+    }
 
     const bool want_prefill_cpu_cluster_dvfs =
         params.cpu_gold_clk_idx_p >= 0 || params.cpu_prime_clk_idx_p >= 0;
@@ -1214,6 +1248,7 @@ int main(int argc, char ** argv) {
 
             if (!embd.empty()) {
                 // prefill/decode detector
+                const bool entering_prefill = !generation_started && !prefill_active;
                 if (!generation_started) {
                     // prefill phase
                     if (!prefill_active && ig->is_ignite_active) {
@@ -1244,6 +1279,105 @@ int main(int argc, char ** argv) {
                     }
                 }
                 int n_eval = (int) embd.size();
+
+                if (entering_prefill && ffn_clock_switch_enabled) {
+                    S25ClockSnapshot clocks;
+                    llama_backend_policy_ffn_clock_result selection = {};
+                    selection.distance = -1.0;
+                    const bool clocks_valid = dvfs.read_s25_clock_snapshot(clocks);
+                    bool thermal_throttled = false;
+
+                    if (clocks_valid && requested_prefill_clocks_valid) {
+                        thermal_throttled =
+                            clocks.cpu_gold_khz < requested_prefill_clocks.cpu_gold_khz ||
+                            clocks.cpu_prime_khz < requested_prefill_clocks.cpu_prime_khz ||
+                            clocks.gpu_hz < requested_prefill_clocks.gpu_hz;
+
+                        if (thermal_throttled) {
+                            selection = llama_backend_policy_select_ffn_clock_profile(
+                                    (int32_t) embd_inp.size(),
+                                    (int32_t) n_eval,
+                                    clocks.cpu_gold_khz,
+                                    clocks.cpu_prime_khz,
+                                    clocks.gpu_hz);
+                        } else {
+                            selection.enabled = true;
+                            selection.pending_changed =
+                                llama_backend_policy_reset_ffn_clock_profile();
+                        }
+
+                        if (thermal_throttled && selection.matched) {
+                            LOG_INF(
+                                    "ffn_clock_switch: query=%zu tokens=%zu/%d "
+                                    "clock(gold=%lldkHz prime=%lldkHz gpu=%lldHz) "
+                                    "profile=%s distance=%.6f pending_changed=%s\n",
+                                    current_question_index,
+                                    embd_inp.size(), n_eval,
+                                    clocks.cpu_gold_khz,
+                                    clocks.cpu_prime_khz,
+                                    clocks.gpu_hz,
+                                    selection.profile,
+                                    selection.distance,
+                                    selection.pending_changed ? "yes" : "no");
+                        } else if (thermal_throttled) {
+                            LOG_WRN(
+                                    "ffn_clock_switch: no profile matches query=%zu "
+                                    "tokens=%zu/%d; keeping the base FFN policy\n",
+                                    current_question_index, embd_inp.size(), n_eval);
+                        } else {
+                            LOG_INF(
+                                    "ffn_clock_switch: query=%zu has no clock drop "
+                                    "(actual gold=%lld prime=%lld gpu=%lld, "
+                                    "requested gold=%lld prime=%lld gpu=%lld); "
+                                    "using the base FFN policy%s\n",
+                                    current_question_index,
+                                    clocks.cpu_gold_khz,
+                                    clocks.cpu_prime_khz,
+                                    clocks.gpu_hz,
+                                    requested_prefill_clocks.cpu_gold_khz,
+                                    requested_prefill_clocks.cpu_prime_khz,
+                                    requested_prefill_clocks.gpu_hz,
+                                    selection.pending_changed ? " (profile reset)" : "");
+                        }
+                    } else if (!clocks_valid) {
+                        LOG_WRN(
+                                "ffn_clock_switch: failed to read the S25 Gold/Prime/GPU "
+                                "clock snapshot for query=%zu; keeping the current FFN profile\n",
+                                current_question_index);
+                    } else {
+                        LOG_WRN(
+                                "ffn_clock_switch: requested S25 prefill clocks are unavailable "
+                                "for query=%zu; keeping the current FFN profile\n",
+                                current_question_index);
+                    }
+
+                    if (ffn_profile_trace.is_open()) {
+                        const auto now = std::chrono::system_clock::now();
+                        const auto sys_time_ms =
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    now - start_sys_time).count();
+                        ffn_profile_trace
+                            << sys_time_ms << ","
+                            << current_question_index << ","
+                            << embd_inp.size() << ","
+                            << n_eval << ","
+                            << params.cpu_gold_clk_idx_p << ","
+                            << params.cpu_prime_clk_idx_p << ","
+                            << ig->gpu_clk_idx_p << ","
+                            << requested_prefill_clocks.cpu_gold_khz << ","
+                            << requested_prefill_clocks.cpu_prime_khz << ","
+                            << requested_prefill_clocks.gpu_hz << ","
+                            << clocks.cpu_gold_khz << ","
+                            << clocks.cpu_prime_khz << ","
+                            << clocks.gpu_hz << ","
+                            << (thermal_throttled ? 1 : 0) << ","
+                            << (selection.matched ? 1 : 0) << ","
+                            << (selection.pending_changed ? 1 : 0) << ","
+                            << selection.profile << ","
+                            << selection.distance << "\n";
+                        ffn_profile_trace.flush();
+                    }
+                }
 
                 LOG_DBG("eval: %s\n", string_from(ctx, embd).c_str());
 
