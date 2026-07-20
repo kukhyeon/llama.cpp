@@ -1449,11 +1449,12 @@ static void ggml_op_load_profile_sync_ops_enabled_locked(void) {
     }
 
     if (!any) {
-        g_op_load_profile.out.ops_enabled[GGML_OP_MUL_MAT]    = 1;
-        g_op_load_profile.out.ops_enabled[GGML_OP_MUL_MAT_ID] = 1;
-        g_op_load_profile.out.ops_enabled[GGML_OP_CONT]       = 1;
-        g_op_load_profile.out.ops_enabled[GGML_OP_SOFT_MAX]   = 1;
-        g_op_load_profile.out.ops_enabled[GGML_OP_SET_ROWS]   = 1;
+        g_op_load_profile.out.ops_enabled[GGML_OP_MUL_MAT]             = 1;
+        g_op_load_profile.out.ops_enabled[GGML_OP_MUL_MAT_ID]          = 1;
+        g_op_load_profile.out.ops_enabled[GGML_OP_MUL_MAT_SRC0_REGION] = 1;
+        g_op_load_profile.out.ops_enabled[GGML_OP_CONT]                = 1;
+        g_op_load_profile.out.ops_enabled[GGML_OP_SOFT_MAX]            = 1;
+        g_op_load_profile.out.ops_enabled[GGML_OP_SET_ROWS]            = 1;
     }
 }
 
@@ -2154,7 +2155,9 @@ static bool ggml_backend_sched_parse_ffn_parallel_branch_node(
     // In a single-shard FFN, the down projection can become the final ffn_out-<layer>
     // tensor after the graph builder names the returned FFN result. Recover the branch
     // identity from its swiglu input so debug-only split isolation can still see it.
-    if (node->op == GGML_OP_MUL_MAT && node->name != nullptr && strncmp(node->name, "ffn_out-", 8) == 0) {
+    if ((node->op == GGML_OP_MUL_MAT ||
+         node->op == GGML_OP_MUL_MAT_SRC0_REGION) &&
+            node->name != nullptr && strncmp(node->name, "ffn_out-", 8) == 0) {
         for (int i = 0; i < GGML_MAX_SRC; ++i) {
             if (node->src[i] != nullptr &&
                     ggml_backend_sched_parse_ffn_branch_name(node->src[i]->name, branch, layer)) {

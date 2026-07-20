@@ -48,6 +48,14 @@ struct htp_matmul_context {
     struct fastdiv_values mm_div_ne1;
     struct fastdiv_values mm_div_r2;
     struct fastdiv_values mm_div_r3;
+
+    // MUL_MAT_SRC0_REGION metadata.  Region weights remain in their parent
+    // repacked row layout in DDR and are gathered into compact VTCM rows.
+    uint32_t region_k_start;
+    uint32_t region_k_size;
+    uint32_t region_out_start;
+    uint32_t region_out_size;
+    atomic_int region_worker_error;
 };
 
 // vdelta control to expand first 32 e8m0 values into 32 uint32 elements
@@ -2801,6 +2809,400 @@ static void htp_mminit_spad(struct htp_ops_context * octx,
     octx->dst_spad.size  = octx->dst_spad.size_per_thread * octx->n_threads;
 }
 
+static int op_matmul_hvx(struct htp_ops_context * octx);
+
+static bool htp_matmul_region_get_params(
+        const struct htp_ops_context * octx,
+        struct htp_mul_mat_src0_region_params * params) {
+    memcpy(params, octx->op_params, sizeof(*params));
+
+    return params->version == HTP_MUL_MAT_SRC0_REGION_PARAMS_VERSION &&
+           params->reserved == 0;
+}
+
+static int htp_matmul_region_validate(
+        const struct htp_ops_context * octx,
+        struct htp_mul_mat_src0_region_params * params) {
+    const struct htp_tensor * src0 = octx->src[0];
+    const struct htp_tensor * src1 = octx->src[1];
+    const struct htp_tensor * dst  = octx->dst;
+
+    if (!src0 || !src1 || !dst || !htp_matmul_region_get_params(octx, params)) {
+        return HTP_STATUS_INVAL_PARAMS;
+    }
+
+    // The first implementation intentionally supports the Q8_0 FFN cover
+    // tensors only.  Other layouts must be rejected rather than interpreted
+    // as the ordinary compact matmul format.
+    if (src0->type != HTP_TYPE_Q8_0 ||
+        src1->type != HTP_TYPE_F32 ||
+        dst->type  != HTP_TYPE_F32) {
+        return HTP_STATUS_NO_SUPPORT;
+    }
+
+    if (params->k_start < 0 || params->k_size <= 0 ||
+        params->out_start < 0 || params->out_size <= 0 ||
+        params->k_start > UINT32_MAX || params->k_size > UINT32_MAX ||
+        params->out_start > UINT32_MAX || params->out_size > UINT32_MAX) {
+        return HTP_STATUS_INVAL_PARAMS;
+    }
+
+    const uint32_t k_start  = (uint32_t) params->k_start;
+    const uint32_t k_size   = (uint32_t) params->k_size;
+    const uint32_t out_start = (uint32_t) params->out_start;
+    const uint32_t out_size  = (uint32_t) params->out_size;
+
+    if (k_start > src0->ne[0] || k_size > src0->ne[0] - k_start ||
+        out_start > src0->ne[1] || out_size > src0->ne[1] - out_start) {
+        return HTP_STATUS_INVAL_PARAMS;
+    }
+
+    // Q8_0 is repacked as x4x2 super-blocks.  Requiring the active K range
+    // to start/end on a super-block keeps the gathered quant and scale rows
+    // wire-compatible with the existing HVX dot kernels.
+    if ((src0->ne[0] % QK_Q8_0x4x2) != 0 ||
+        (k_start % QK_Q8_0x4x2) != 0 ||
+        (k_size % QK_Q8_0x4x2) != 0) {
+        return HTP_STATUS_INVAL_PARAMS;
+    }
+
+    if (src0->ne[2] != 1 || src0->ne[3] != 1 ||
+        src1->ne[0] != k_size || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+        dst->ne[0] != out_size || dst->ne[1] != src1->ne[1] ||
+        dst->ne[2] != 1 || dst->ne[3] != 1) {
+        return HTP_STATUS_INVAL_PARAMS;
+    }
+
+    // A repacked Q8_0 row is [parent-K quants][parent-K/16 scale bytes].
+    const uint64_t parent_row_size = (uint64_t) src0->ne[0] + src0->ne[0] / 16;
+    const uint64_t last_row_end =
+        ((uint64_t) out_start + out_size - 1) * src0->nb[1] + parent_row_size;
+    if (src0->nb[1] != parent_row_size || last_row_end > src0->size) {
+        return HTP_STATUS_INVAL_PARAMS;
+    }
+
+    return HTP_STATUS_OK;
+}
+
+static bool htp_matmul_region_gather_q8_row(
+        dma_queue * dma,
+        uint8_t * compact,
+        const uint8_t * parent_row,
+        uint32_t parent_k,
+        uint32_t k_start,
+        uint32_t k_size) {
+    const size_t scale_start = k_start / 16;
+    const size_t scale_size  = k_size  / 16;
+
+    // Keep the two transfers separate: in the parent row the scales begin
+    // after parent_k, while the compact row consumed by vec_dot begins its
+    // scale area immediately after the active k_size quants.
+    if (!dma_queue_push_ddr_to_vtcm(
+            dma,
+            dma_make_ptr(compact, parent_row + k_start),
+            k_size, k_size, 1)) {
+        return false;
+    }
+    if (!dma_queue_push_ddr_to_vtcm(
+            dma,
+            dma_make_ptr(compact + k_size, parent_row + parent_k + scale_start),
+            scale_size, scale_size, 1)) {
+        (void) dma_queue_pop(dma);
+        return false;
+    }
+
+    (void) dma_queue_pop(dma);
+    (void) dma_queue_pop(dma);
+    return true;
+}
+
+// Correctness-first HVX implementation of MUL_MAT_SRC0_REGION.  The graph
+// still contains one matmul op per processor, while each worker streams one
+// selected parent row at a time and reuses it across all activation rows.
+static void matmul_src0_region_q8(unsigned int nth, unsigned int ith, void * data) {
+    struct htp_matmul_context * mmctx = data;
+    struct htp_ops_context * octx = mmctx->octx;
+    const struct htp_tensor * src0 = octx->src[0];
+    const struct htp_tensor * src1 = octx->src[1];
+    const struct htp_tensor * dst  = octx->dst;
+    dma_queue * dma = octx->ctx->dma[ith];
+
+    const uint32_t first =
+        mmctx->src0_nrows_per_thread * ith;
+    const uint32_t end = MIN(
+        first + mmctx->src0_nrows_per_thread,
+        mmctx->region_out_size);
+
+    if (first >= end) {
+        return;
+    }
+
+    uint8_t * compact0 = octx->src0_spad.data +
+        octx->src0_spad.size_per_thread * ith;
+    uint8_t * compact1 = compact0 + octx->src0_spad.stride;
+    const uint8_t * quantized_src1 = octx->src1_spad.data;
+
+    uint32_t local_row = first;
+    for (; local_row + 1 < end; local_row += 2) {
+        const uint32_t parent_row_index0 =
+            mmctx->region_out_start + local_row;
+        const uint32_t parent_row_index1 = parent_row_index0 + 1;
+        const uint8_t * parent_row0 =
+            (const uint8_t *) src0->data +
+            (uint64_t) parent_row_index0 * src0->nb[1];
+        const uint8_t * parent_row1 =
+            (const uint8_t *) src0->data +
+            (uint64_t) parent_row_index1 * src0->nb[1];
+
+        if (!htp_matmul_region_gather_q8_row(
+                dma,
+                compact0,
+                parent_row0,
+                src0->ne[0],
+                mmctx->region_k_start,
+                mmctx->region_k_size) ||
+            !htp_matmul_region_gather_q8_row(
+                dma,
+                compact1,
+                parent_row1,
+                src0->ne[0],
+                mmctx->region_k_start,
+                mmctx->region_k_size)) {
+            FARF(ERROR, "matmul-src0-region: DMA gather failed on worker %u", ith);
+            atomic_store(&mmctx->region_worker_error, 1);
+            return;
+        }
+
+        uint32_t input_row = 0;
+        for (; input_row + 1 < src1->ne[1]; input_row += 2) {
+            const uint8_t * src1_row0 =
+                quantized_src1 +
+                (uint64_t) input_row * octx->src1_spad.stride;
+            const uint8_t * src1_row1 =
+                src1_row0 + octx->src1_spad.stride;
+            float * dst_row0 =
+                (float *) ((uint8_t *) dst->data +
+                           (uint64_t) input_row * dst->nb[1]);
+            float * dst_row1 =
+                (float *) ((uint8_t *) dst->data +
+                           (uint64_t) (input_row + 1) * dst->nb[1]);
+
+            mmctx->vec_dot_2x2(
+                mmctx->region_k_size,
+                &dst_row0[local_row],
+                &dst_row1[local_row],
+                compact0,
+                compact1,
+                src1_row0,
+                src1_row1);
+        }
+
+        if (input_row < src1->ne[1]) {
+            const uint8_t * src1_row =
+                quantized_src1 +
+                (uint64_t) input_row * octx->src1_spad.stride;
+            float * dst_row =
+                (float *) ((uint8_t *) dst->data +
+                           (uint64_t) input_row * dst->nb[1]);
+
+            mmctx->vec_dot_2x1(
+                mmctx->region_k_size,
+                &dst_row[local_row],
+                compact0,
+                compact1,
+                src1_row);
+        }
+    }
+
+    if (local_row < end) {
+        const uint32_t parent_row_index =
+            mmctx->region_out_start + local_row;
+        const uint8_t * parent_row =
+            (const uint8_t *) src0->data +
+            (uint64_t) parent_row_index * src0->nb[1];
+
+        if (!htp_matmul_region_gather_q8_row(
+                dma,
+                compact0,
+                parent_row,
+                src0->ne[0],
+                mmctx->region_k_start,
+                mmctx->region_k_size)) {
+            FARF(ERROR, "matmul-src0-region: DMA gather failed on worker %u", ith);
+            atomic_store(&mmctx->region_worker_error, 1);
+            return;
+        }
+
+        for (uint32_t input_row = 0; input_row < src1->ne[1]; ++input_row) {
+            const uint8_t * src1_row =
+                quantized_src1 +
+                (uint64_t) input_row * octx->src1_spad.stride;
+            float * dst_row =
+                (float *) ((uint8_t *) dst->data +
+                           (uint64_t) input_row * dst->nb[1]);
+
+            mmctx->vec_dot_1x1(
+                mmctx->region_k_size,
+                &dst_row[local_row],
+                compact0,
+                src1_row);
+        }
+    }
+
+    (void) nth;
+}
+
+int op_matmul_src0_region(struct htp_ops_context * octx) {
+    struct htp_mul_mat_src0_region_params params = {0};
+    const int validation = htp_matmul_region_validate(octx, &params);
+    if (validation != HTP_STATUS_OK) {
+        FARF(ERROR,
+             "matmul-src0-region: invalid/unsupported request status=%d "
+             "version=%d k=%lld+%lld out=%lld+%lld",
+             validation,
+             params.version,
+             (long long) params.k_start,
+             (long long) params.k_size,
+             (long long) params.out_start,
+             (long long) params.out_size);
+        return validation;
+    }
+
+    const struct htp_tensor * src0 = octx->src[0];
+    const struct htp_tensor * src1 = octx->src[1];
+    const struct htp_tensor * dst  = octx->dst;
+
+    // Up/gate regions keep the complete K row and only select output rows.
+    // A whole repacked row is independently addressable, so this case can
+    // use the existing HMX/HVX implementation with a temporary logical
+    // tensor descriptor.  K-sliced down projections take the gather path
+    // below because their parent quant/scale sections are non-contiguous.
+    if (params.k_start == 0 && params.k_size == src0->ne[0]) {
+        struct htp_tensor selected_src0 = *src0;
+        selected_src0.data +=
+            (uint32_t) params.out_start * src0->nb[1];
+        selected_src0.size =
+            (uint32_t) params.out_size * src0->nb[1];
+        selected_src0.ne[1] = (uint32_t) params.out_size;
+        selected_src0.ne[2] = 1;
+        selected_src0.ne[3] = 1;
+        selected_src0.nb[2] =
+            selected_src0.nb[1] * selected_src0.ne[1];
+        selected_src0.nb[3] = selected_src0.nb[2];
+
+        octx->src[0] = &selected_src0;
+        const int status =
+            (((uintptr_t) selected_src0.data & (VLEN - 1)) == 0)
+                ? op_matmul(octx)
+                : op_matmul_hvx(octx);
+        octx->src[0] = src0;
+        octx->src[1] = src1;
+        octx->dst    = dst;
+
+        // Some legacy HMX paths return zero on success whereas the HTP ABI
+        // uses HTP_STATUS_OK (1).  Normalize at this new opcode boundary.
+        return status == 0 ? HTP_STATUS_OK : status;
+    }
+
+    struct htp_matmul_context mmctx_struct = {0};
+    struct htp_matmul_context * mmctx = &mmctx_struct;
+    mmctx->octx             = octx;
+    mmctx->region_k_start   = (uint32_t) params.k_start;
+    mmctx->region_k_size    = (uint32_t) params.k_size;
+    mmctx->region_out_start = (uint32_t) params.out_start;
+    mmctx->region_out_size  = (uint32_t) params.out_size;
+    atomic_init(&mmctx->region_worker_error, 0);
+
+    if (htp_mminit_vec_dot(mmctx, src0->type) != 0) {
+        return HTP_STATUS_NO_SUPPORT;
+    }
+    mmctx->type = "q8x4x2-region-f32";
+
+    mmctx->src0_nrows_per_thread =
+        (mmctx->region_out_size + octx->n_threads - 1) / octx->n_threads;
+    mmctx->src0_nrows_per_thread +=
+        mmctx->src0_nrows_per_thread & 1U;
+
+    const uint32_t src1_nrows = src1->ne[1];
+    const size_t active_weight_row_size =
+        mmctx->region_k_size + mmctx->region_k_size / 16;
+    const size_t active_weight_row_size_padded =
+        hex_round_up(active_weight_row_size, 128);
+    const size_t src1_row_size =
+        q8x4x2_row_size(mmctx->region_k_size);
+
+    htp_mminit_spad(
+        octx,
+        dst->nb[1],
+        active_weight_row_size_padded,
+        src1_row_size,
+        src1_nrows,
+        0);
+
+    const size_t spad_size =
+        octx->src1_spad.size +
+        octx->src0_spad.size +
+        octx->dst_spad.size;
+    if (octx->ctx->vtcm_size < spad_size) {
+        FARF(ERROR,
+             "matmul-src0-region: current VTCM reservation %zu is too small, needed %zu",
+             octx->ctx->vtcm_size,
+             spad_size);
+        return HTP_STATUS_VTCM_TOO_SMALL;
+    }
+
+    octx->src1_spad.data = octx->ctx->vtcm_base;
+    octx->src0_spad.data = octx->src1_spad.data + octx->src1_spad.size;
+    octx->dst_spad.data  = octx->src0_spad.data + octx->src0_spad.size;
+
+    // HMX currently has no parent-row region ABI.  Never reinterpret this
+    // op as ordinary compact HMX matmul; use the explicit HVX gather path.
+    octx->src1_spad.src =
+        (src1 == octx->src1_spad.src) ? src1 : NULL;
+    octx->src0_spad.src = NULL;
+    octx->dst_spad.src  = NULL;
+    octx->src0_spad.stride = active_weight_row_size_padded;
+    octx->src1_spad.stride = src1_row_size;
+
+    if (octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) {
+        return HTP_STATUS_OK;
+    }
+
+    if (!octx->src1_spad.src) {
+        const uint32_t n_quant_jobs = MIN(src1_nrows, octx->n_threads);
+        mmctx->src1_nrows_per_thread =
+            (src1_nrows + n_quant_jobs - 1) / n_quant_jobs;
+        worker_pool_run_func(
+            octx->ctx->worker_pool,
+            quantize_f32_q8x4x2,
+            mmctx,
+            n_quant_jobs);
+        octx->src1_spad.src = src1;
+    }
+
+    worker_pool_run_func(
+        octx->ctx->worker_pool,
+        matmul_src0_region_q8,
+        mmctx,
+        octx->n_threads);
+
+    if (atomic_load(&mmctx->region_worker_error)) {
+        return HTP_STATUS_INTERNAL_ERR;
+    }
+
+    FARF(HIGH,
+         "matmul-src0-region: parent=%ux%u k=%u+%u out=%u+%u input-rows=%u",
+         src0->ne[0],
+         src0->ne[1],
+         mmctx->region_k_start,
+         mmctx->region_k_size,
+         mmctx->region_out_start,
+         mmctx->region_out_size,
+         src1_nrows);
+
+    return HTP_STATUS_OK;
+}
+
 static int op_matmul_hvx(struct htp_ops_context * octx) {
     htp_matmul_tensors_preamble;
 
@@ -3058,7 +3460,7 @@ int op_matmul(struct htp_ops_context * octx) {
 
     if (ret != 0) {
         FARF(HIGH, "HMX matmul failed (ret=%d), falling back to HVX", ret);
-        return op_matmul(octx);
+        return op_matmul_hvx(octx);
     }
 
     // --- Phase 2: HVX on the remaining m_tail rows ---

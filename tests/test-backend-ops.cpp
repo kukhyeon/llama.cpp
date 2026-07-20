@@ -3952,6 +3952,63 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// GGML_OP_MUL_MAT_SRC0_REGION
+struct test_mul_mat_src0_region : public test_case {
+    const ggml_type type;
+    const int64_t parent_k;
+    const int64_t parent_out;
+    const int64_t n;
+    const int64_t k_start;
+    const int64_t k_size;
+    const int64_t out_start;
+    const int64_t out_size;
+
+    test_mul_mat_src0_region(
+            ggml_type type,
+            int64_t parent_k,
+            int64_t parent_out,
+            int64_t n,
+            int64_t k_start,
+            int64_t k_size,
+            int64_t out_start,
+            int64_t out_size)
+        : type(type),
+          parent_k(parent_k),
+          parent_out(parent_out),
+          n(n),
+          k_start(k_start),
+          k_size(k_size),
+          out_start(out_start),
+          out_size(out_size) {}
+
+    std::string vars() override {
+        return VARS_TO_STR8(type, parent_k, parent_out, n,
+                            k_start, k_size, out_start, out_size);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * out_size * n * k_size;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * weight = ggml_new_tensor_2d(ctx, type, parent_k, parent_out);
+        ggml_set_name(weight, "cover");
+
+        ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k_size, n);
+        ggml_set_name(input, "input");
+
+        ggml_tensor * output = ggml_mul_mat_src0_region(
+            ctx, weight, input, k_start, k_size, out_start, out_size);
+        ggml_set_name(output, "output");
+        return output;
+    }
+};
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -8121,6 +8178,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 64, 1, 64));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 256, 1, 256));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 32, 128));
+
+    // Cover-tensor region matmul: output-only, K-only, and combined middle slices.
+    test_cases.emplace_back(new test_mul_mat_src0_region(
+        GGML_TYPE_F32, 16, 12, 5, 3, 8, 2, 7));
+    test_cases.emplace_back(new test_mul_mat_src0_region(
+        GGML_TYPE_Q8_0, 256, 32, 1, 0, 256, 8, 16));
+    test_cases.emplace_back(new test_mul_mat_src0_region(
+        GGML_TYPE_Q8_0, 256, 32, 1, 64, 128, 0, 32));
+    test_cases.emplace_back(new test_mul_mat_src0_region(
+        GGML_TYPE_Q8_0, 256, 32, 8, 64, 128, 8, 16));
 
 #if 0
     // > 4GB A matrix. Too slow to be enabled by default.

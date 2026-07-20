@@ -36,14 +36,15 @@ struct llama_backend_policy_ffn_parallel {
 };
 
 // Model-load residency for every FFN policy that can become active at runtime.
-// Each entry is an exact, non-overlapping atomic tile. Policy endpoints are
-// intentionally preserved instead of merging adjacent tiles: a runtime split
-// can then be reconstructed without taking an unsafe axis-0 view of a REPACK
-// tensor.
+// Each entry is one connected union cover for a backend. Overlapping or
+// touching profile intervals are merged, while genuinely disjoint intervals
+// remain separate covers. The cover tensor is independently packed by its
+// backend and runtime profiles select a logical sub-region with
+// GGML_OP_MUL_MAT_SRC0_REGION.
 struct llama_backend_policy_ffn_residency_plan {
     bool enabled = false;
     bool keep_full_source = true;
-    std::vector<llama_backend_policy_ffn_split> tiles;
+    std::vector<llama_backend_policy_ffn_split> covers;
     std::string source;
 };
 
@@ -98,15 +99,15 @@ bool llama_backend_policy_match_ffn_parallel_layer(
         int il,
         llama_backend_policy_ffn_parallel & out);
 
-// Return every enabled base/profile FFN policy that may need exact resident
-// weight shards for this layer. Policies with identical split ranges/backends
+// Return every enabled base/profile FFN policy whose split ranges contribute
+// to resident covers for this layer. Policies with identical ranges/backends
 // are deduplicated because their model-load residency requirements are equal.
 bool llama_backend_policy_list_ffn_parallel_load_policies(
         int il,
         std::vector<llama_backend_policy_ffn_parallel> & out);
 
 // Build the union residency plan for one layer. Intervals are grouped by
-// backend and split at every policy boundary, while uncovered gaps are not
+// backend and merged into connected covers, while uncovered gaps are not
 // allocated. keep_full_source is false only when every applicable policy has
 // phase="all".
 bool llama_backend_policy_build_ffn_residency_plan(

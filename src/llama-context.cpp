@@ -2271,14 +2271,13 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
     }
 
-    // Atomic FFN residency expands one logical processor branch into several
-    // tile-local up/gate/swiglu/down ops plus same-backend ADDs. Reserve enough
-    // graph metadata for the union plan; this is deliberately conservative
-    // because any active profile uses only a subset of the resident tiles.
+    // A cover-backed FFN processor branch has one up, gate, activation, and
+    // down node. Reserve against the connected cover union; this is slightly
+    // conservative when an active profile uses only part of that union.
     for (uint32_t il = 0; il < model.hparams.n_layer; ++il) {
         llama_backend_policy_ffn_residency_plan plan;
         if (llama_backend_policy_build_ffn_residency_plan((int) il, plan)) {
-            res += 5u * plan.tiles.size();
+            res += 4u * plan.covers.size();
         }
     }
 

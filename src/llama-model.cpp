@@ -962,7 +962,7 @@ struct llama_model::impl {
     bool has_tensor_overrides;
 
     std::unordered_map<std::string, std::vector<ggml_tensor *>> backend_policy_residency_tensors;
-    std::unordered_map<ggml_tensor *, llama_tensor_shard_info> backend_policy_residency_shard_infos;
+    std::unordered_map<ggml_tensor *, llama_tensor_cover_info> backend_policy_residency_cover_infos;
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -1431,7 +1431,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     ml.done_getting_tensors();
     pimpl->backend_policy_residency_tensors = ml.residency_tensors_by_name;
-    pimpl->backend_policy_residency_shard_infos = ml.residency_shard_infos;
+    pimpl->backend_policy_residency_cover_infos = ml.residency_cover_infos;
 
     // populate tensors_by_name
     for (auto & [_, ctx_ptr] : ml.ctx_map) {
@@ -1484,7 +1484,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
 
         std::vector<ggml_backend_buffer_ptr> bufs;
-        if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft && !ml.context_has_loading_shards(ctx)) {
+        if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft && !ml.context_has_loading_covers(ctx)) {
             GGML_ASSERT(!ml.no_alloc);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 // only the mmap region containing the tensors in the model is mapped to the backend buffer
@@ -1969,13 +1969,13 @@ ggml_tensor * llama_model::get_backend_policy_residency_tensor(
     return nullptr;
 }
 
-std::vector<llama_backend_policy_ffn_resident_tile> llama_model::get_backend_policy_ffn_shard_tiles(
+llama_backend_policy_ffn_resident_cover llama_model::get_backend_policy_ffn_cover(
         const ggml_tensor * tensor,
         const std::string & backend,
         int axis,
         int64_t start,
         int64_t size) const {
-    std::vector<llama_backend_policy_ffn_resident_tile> result;
+    llama_backend_policy_ffn_resident_cover result;
     if (tensor == nullptr || backend.empty() || start < 0 || size <= 0 ||
             start > std::numeric_limits<int64_t>::max() - size) {
         return result;
@@ -2002,48 +2002,31 @@ std::vector<llama_backend_policy_ffn_resident_tile> llama_model::get_backend_pol
     }
 
     for (ggml_tensor * candidate : it->second) {
-        auto info_it = pimpl->backend_policy_residency_shard_infos.find(candidate);
-        if (info_it == pimpl->backend_policy_residency_shard_infos.end()) {
+        auto info_it = pimpl->backend_policy_residency_cover_infos.find(candidate);
+        if (info_it == pimpl->backend_policy_residency_cover_infos.end()) {
             continue;
         }
 
-        const llama_tensor_shard_info & info = info_it->second;
+        const llama_tensor_cover_info & info = info_it->second;
         if (info.source_name != name_c || info.axis != axis ||
-                info.start < start || info.start > end ||
                 info.size <= 0 || info.start > std::numeric_limits<int64_t>::max() - info.size ||
-                info.start + info.size > end ||
+                info.start > start || info.start + info.size < end ||
                 !tensor_matches_backend(candidate, backend)) {
             continue;
         }
 
-        result.push_back({ candidate, info.start, info.size });
-    }
-
-    std::sort(result.begin(), result.end(), [](const auto & lhs, const auto & rhs) {
-        if (lhs.start != rhs.start) {
-            return lhs.start < rhs.start;
-        }
-        return lhs.size < rhs.size;
-    });
-
-    int64_t covered = start;
-    std::vector<llama_backend_policy_ffn_resident_tile> contiguous;
-    contiguous.reserve(result.size());
-    for (const auto & tile : result) {
-        if (tile.start < covered) {
-            continue;
-        }
-        if (tile.start != covered) {
-            break;
-        }
-        contiguous.push_back(tile);
-        covered += tile.size;
-        if (covered == end) {
-            return contiguous;
+        // Connected covers for one backend do not overlap. Prefer the smallest
+        // containing cover defensively in case aliases or duplicated policy
+        // declarations materialize equivalent candidates.
+        if (result.tensor == nullptr || info.size < result.cover_size) {
+            result.tensor = candidate;
+            result.cover_start = info.start;
+            result.cover_size = info.size;
+            result.local_start = start - info.start;
         }
     }
 
-    return {};
+    return result;
 }
 
 float llama_model::get_rope_freq_base (const llama_cparams & cparams, int il) const {

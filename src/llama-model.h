@@ -18,10 +18,11 @@ struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
 
-struct llama_backend_policy_ffn_resident_tile {
+struct llama_backend_policy_ffn_resident_cover {
     struct ggml_tensor * tensor = nullptr;
-    int64_t start = 0;
-    int64_t size = 0;
+    int64_t cover_start = 0;
+    int64_t cover_size = 0;
+    int64_t local_start = 0;
 };
 
 // available models
@@ -618,7 +619,7 @@ struct llama_model {
     struct ggml_tensor * get_backend_policy_residency_tensor(
             const struct ggml_tensor * tensor,
             const std::vector<std::string> & backends) const;
-    std::vector<llama_backend_policy_ffn_resident_tile> get_backend_policy_ffn_shard_tiles(
+    llama_backend_policy_ffn_resident_cover get_backend_policy_ffn_cover(
             const struct ggml_tensor * tensor,
             const std::string & backend,
             int axis,

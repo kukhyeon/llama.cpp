@@ -193,3 +193,88 @@ __kernel void kernel_gemv_noshuffle_q8_0_f32(
         dst[gid] = totalSum;
     }
 }
+
+// Multiply a compact activation by a logical rectangle of a larger Q8_0
+// weight.  The weight has already been converted to the Adreno K-major SOA
+// layout:
+//
+//   q[(k / 4)  * parent_m + row]
+//   d[(k / 32) * parent_m + row]
+//
+// src1 is compact and starts at logical K=0.  k_start and out_start select the
+// corresponding physical rectangle from the immutable parent/cover weight.
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
+__kernel void kernel_gemv_noshuffle_q8_0_f32_region(
+        __read_only  image1d_buffer_t src0_q,
+        global half  * src0_d,
+        __read_only  image1d_buffer_t src1,
+        global float * dst,
+        ulong offsetd,
+        int parent_k,
+        int parent_m,
+        int k_start,
+        int k_size,
+        int out_start,
+        int out_size)
+{
+    uint groupId = get_local_id(1);
+    uint gid = get_global_id(0);
+    ushort slid = get_sub_group_local_id();
+
+    // Padded work-items must still participate in the workgroup barrier.
+    const bool valid_row = gid < (uint) out_size;
+    const uint local_row = valid_row ? gid : (uint) out_size - 1;
+    const uint physical_row = (uint) out_start + local_row;
+    const uint first_k_block = (uint) k_start / QK8_0;
+    const uint n_k_blocks = (uint) k_size / QK8_0;
+    const uint line_stride_a = (uint) parent_m;
+    const uint block_stride_a = 8 * line_stride_a;
+
+    __private uint8 regA;
+    __private half regS;
+    __private float8 regB;
+    __private float totalSum = (float) 0.0f;
+
+    #pragma unroll 1
+    for (uint local_k_block = groupId;
+            local_k_block < n_k_blocks;
+            local_k_block += N_SIMDGROUP) {
+        const uint physical_k_block = first_k_block + local_k_block;
+        regS = src0_d[physical_row + physical_k_block * line_stride_a];
+
+        if (slid < 4) {
+            regB.s0123 = read_imagef(src1, (slid * 2 + local_k_block * 8));
+            regB.s4567 = read_imagef(src1, (1 + slid * 2 + local_k_block * 8));
+        }
+
+        const uint q_base = physical_row + physical_k_block * block_stride_a;
+        regA.s0 = read_imageui(src0_q, q_base + line_stride_a * 0).x;
+        regA.s1 = read_imageui(src0_q, q_base + line_stride_a * 1).x;
+        regA.s2 = read_imageui(src0_q, q_base + line_stride_a * 2).x;
+        regA.s3 = read_imageui(src0_q, q_base + line_stride_a * 3).x;
+        regA.s4 = read_imageui(src0_q, q_base + line_stride_a * 4).x;
+        regA.s5 = read_imageui(src0_q, q_base + line_stride_a * 5).x;
+        regA.s6 = read_imageui(src0_q, q_base + line_stride_a * 6).x;
+        regA.s7 = read_imageui(src0_q, q_base + line_stride_a * 7).x;
+
+        dequantizeBlockAccum_ns_sgbroadcast_1(totalSum, regA, regS, regB);
+    }
+
+    __local float reduceLM[SIMDGROUP_WIDTH * 3];
+    if (groupId == 1) reduceLM[SIMDGROUP_WIDTH * 0 + slid] = totalSum;
+    if (groupId == 2) reduceLM[SIMDGROUP_WIDTH * 1 + slid] = totalSum;
+    if (groupId == 3) reduceLM[SIMDGROUP_WIDTH * 2 + slid] = totalSum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (groupId == 0) totalSum += reduceLM[SIMDGROUP_WIDTH * 0 + slid];
+    if (groupId == 0) totalSum += reduceLM[SIMDGROUP_WIDTH * 1 + slid];
+    if (groupId == 0) totalSum += reduceLM[SIMDGROUP_WIDTH * 2 + slid];
+
+    if (groupId == 0 && valid_row) {
+        dst = (global float *) ((global char *) dst + offsetd);
+        dst[gid] = totalSum;
+    }
+
+    (void) parent_k;
+}
