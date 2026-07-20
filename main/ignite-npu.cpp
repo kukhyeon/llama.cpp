@@ -8,6 +8,7 @@
 
 #include "ggml-backend.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <atomic>
@@ -1247,9 +1248,18 @@ int main(int argc, char ** argv) {
             }
 
             if (!embd.empty()) {
+                const int n_eval = (int) embd.size();
+                const int profile_ubatch_tokens =
+                    std::min(n_eval, (int) llama_n_ubatch(ctx));
+
                 // prefill/decode detector
-                const bool entering_prefill = !generation_started && !prefill_active;
-                if (!generation_started) {
+                // Match llama_context::process_ubatch(): a physical ubatch with more
+                // than one token is prefill. The one-token graph emitted before the
+                // queued prompt must not consume the query's clock-profile sample.
+                const bool is_prefill_eval =
+                    !generation_started && profile_ubatch_tokens > 1;
+                const bool entering_prefill = is_prefill_eval && !prefill_active;
+                if (is_prefill_eval) {
                     // prefill phase
                     if (!prefill_active && ig->is_ignite_active) {
                         apply_dvfs(
@@ -1263,7 +1273,7 @@ int main(int argc, char ** argv) {
                         prefill_active = true;
                         decode_active = false;
                     }
-                } else {
+                } else if (generation_started) {
                     // decode phase
                     if (!decode_active && ig->is_ignite_active) {
                         apply_dvfs(
@@ -1278,7 +1288,6 @@ int main(int argc, char ** argv) {
                         decode_active = true;
                     }
                 }
-                int n_eval = (int) embd.size();
 
                 if (entering_prefill && ffn_clock_switch_enabled) {
                     S25ClockSnapshot clocks;
@@ -1296,7 +1305,7 @@ int main(int argc, char ** argv) {
                         if (thermal_throttled) {
                             selection = llama_backend_policy_select_ffn_clock_profile(
                                     (int32_t) embd_inp.size(),
-                                    (int32_t) n_eval,
+                                    (int32_t) profile_ubatch_tokens,
                                     clocks.cpu_gold_khz,
                                     clocks.cpu_prime_khz,
                                     clocks.gpu_hz);
@@ -1312,7 +1321,7 @@ int main(int argc, char ** argv) {
                                     "clock(gold=%lldkHz prime=%lldkHz gpu=%lldHz) "
                                     "profile=%s distance=%.6f pending_changed=%s\n",
                                     current_question_index,
-                                    embd_inp.size(), n_eval,
+                                    embd_inp.size(), profile_ubatch_tokens,
                                     clocks.cpu_gold_khz,
                                     clocks.cpu_prime_khz,
                                     clocks.gpu_hz,
@@ -1323,7 +1332,8 @@ int main(int argc, char ** argv) {
                             LOG_WRN(
                                     "ffn_clock_switch: no profile matches query=%zu "
                                     "tokens=%zu/%d; keeping the base FFN policy\n",
-                                    current_question_index, embd_inp.size(), n_eval);
+                                    current_question_index,
+                                    embd_inp.size(), profile_ubatch_tokens);
                         } else {
                             LOG_INF(
                                     "ffn_clock_switch: query=%zu has no clock drop "
@@ -1360,7 +1370,7 @@ int main(int argc, char ** argv) {
                             << sys_time_ms << ","
                             << current_question_index << ","
                             << embd_inp.size() << ","
-                            << n_eval << ","
+                            << profile_ubatch_tokens << ","
                             << params.cpu_gold_clk_idx_p << ","
                             << params.cpu_prime_clk_idx_p << ","
                             << ig->gpu_clk_idx_p << ","
