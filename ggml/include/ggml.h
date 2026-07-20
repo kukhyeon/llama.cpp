@@ -583,6 +583,10 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        // Inference-only matrix multiplication over a rectangular region of src0.
+        // Appended to preserve the numeric values of all existing operations.
+        GGML_OP_MUL_MAT_SRC0_REGION,
+
         GGML_OP_COUNT,
     };
 
@@ -1418,6 +1422,44 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
+
+    // Parameters stored in op_params by ggml_mul_mat_src0_region().
+    //
+    // src0 keeps the shape and physical layout of the full cover tensor.  The
+    // selected rectangle is [k_start, k_start + k_size) along src0.ne[0] and
+    // [out_start, out_start + out_size) along src0.ne[1].
+    //
+    // Backends must use the versioned parameters rather than treating src0 as
+    // an ordinary view: repacked layouts can have parent-dependent strides.
+#define GGML_MUL_MAT_SRC0_REGION_PARAMS_VERSION 1
+    struct ggml_mul_mat_src0_region_params {
+        int32_t version;
+        int32_t reserved;
+        int64_t k_start;
+        int64_t k_size;
+        int64_t out_start;
+        int64_t out_size;
+    };
+
+    // Inference-only matrix multiplication over a rectangular region of src0.
+    //
+    // src0: [parent_k, parent_out, ...]
+    // src1: [k_size, rows, ...]
+    // dst:  [out_size, rows, ...]
+    GGML_API struct ggml_tensor * ggml_mul_mat_src0_region(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * src0,
+            struct ggml_tensor  * src1,
+            int64_t               k_start,
+            int64_t               k_size,
+            int64_t               out_start,
+            int64_t               out_size);
+
+    // Copies and validates the versioned region parameters. Returns false when
+    // tensor is not a region matmul or its parameters are unsupported.
+    GGML_API bool ggml_mul_mat_src0_region_get_params(
+            const struct ggml_tensor                  * tensor,
+            struct ggml_mul_mat_src0_region_params    * params);
 
     // change the precision of a matrix multiplication
     // set to GGML_PREC_F32 for higher precision (useful for phi-2)

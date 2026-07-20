@@ -1267,69 +1267,69 @@ ggml_tensor * llm_graph_context::build_ffn(
             branch_outs.reserve(exec_splits.size());
 
             for (const auto & split : exec_splits) {
-                const auto up_tiles =
-                    model->get_backend_policy_ffn_shard_tiles(up, split.backend, 1, split.start, split.size);
-                const auto gate_tiles =
-                    model->get_backend_policy_ffn_shard_tiles(gate, split.backend, 1, split.start, split.size);
-                const auto down_tiles =
-                    model->get_backend_policy_ffn_shard_tiles(down, split.backend, 0, split.start, split.size);
+                const auto up_cover =
+                    model->get_backend_policy_ffn_cover(up, split.backend, 1, split.start, split.size);
+                const auto gate_cover =
+                    model->get_backend_policy_ffn_cover(gate, split.backend, 1, split.start, split.size);
+                const auto down_cover =
+                    model->get_backend_policy_ffn_cover(down, split.backend, 0, split.start, split.size);
 
-                if (up_tiles.empty() || up_tiles.size() != gate_tiles.size() || up_tiles.size() != down_tiles.size()) {
+                if (up_cover.tensor == nullptr || gate_cover.tensor == nullptr || down_cover.tensor == nullptr) {
                     valid = false;
-                    LLAMA_LOG_DEBUG("backend_policy: ffn_parallel layer %d shard %s missing atomic resident weights for backend %s; falling back\n",
+                    LLAMA_LOG_DEBUG("backend_policy: ffn_parallel layer %d shard %s missing a containing resident cover for backend %s; falling back\n",
                             il, split.id.c_str(), split.backend.c_str());
                     break;
                 }
 
                 const std::string suffix = "." + (split.id.empty() ? split.backend : split.id);
-                ggml_tensor * branch = nullptr;
 
-                for (size_t ti = 0; ti < up_tiles.size(); ++ti) {
-                    const auto & up_tile = up_tiles[ti];
-                    const auto & gate_tile = gate_tiles[ti];
-                    const auto & down_tile = down_tiles[ti];
-                    if (up_tile.start != gate_tile.start || up_tile.start != down_tile.start ||
-                            up_tile.size != gate_tile.size || up_tile.size != down_tile.size ||
-                            up_tile.tensor == nullptr || gate_tile.tensor == nullptr || down_tile.tensor == nullptr ||
-                            up_tile.tensor->ne[1] != up_tile.size ||
-                            gate_tile.tensor->ne[1] != up_tile.size ||
-                            down_tile.tensor->ne[0] != up_tile.size) {
-                        valid = false;
-                        LLAMA_LOG_DEBUG("backend_policy: ffn_parallel layer %d shard %s has inconsistent atomic tile metadata for backend %s; falling back\n",
-                                il, split.id.c_str(), split.backend.c_str());
-                        break;
-                    }
-
-                    // Every tile node intentionally carries the same logical
-                    // branch suffix. The scheduler can then keep all tiles for
-                    // one processor in a single branch split and run the three
-                    // processor branches concurrently.
-                    ggml_tensor * up_cur = ggml_mul_mat(ctx0, up_tile.tensor, cur);
-                    cb(up_cur, ("ffn_up" + suffix).c_str(), il, split.backend.c_str());
-
-                    ggml_tensor * gate_cur = ggml_mul_mat(ctx0, gate_tile.tensor, cur);
-                    cb(gate_cur, ("ffn_gate" + suffix).c_str(), il, split.backend.c_str());
-
-                    ggml_tensor * act = ggml_swiglu_split(ctx0, gate_cur, up_cur);
-                    cb(act, ("ffn_swiglu" + suffix).c_str(), il, split.backend.c_str());
-
-                    ggml_tensor * out = ggml_mul_mat(ctx0, down_tile.tensor, act);
-                    cb(out, ("ffn_down" + suffix).c_str(), il, split.backend.c_str());
-
-                    // Interleave each tile with a left-fold ADD. This keeps at
-                    // most the accumulated output and the next tile output live
-                    // instead of materializing every down projection at once.
-                    if (branch == nullptr) {
-                        branch = out;
-                    } else {
-                        branch = ggml_add(ctx0, branch, out);
-                        cb(branch, ("ffn_down" + suffix).c_str(), il, split.backend.c_str());
-                    }
-                }
-
-                if (!valid || branch == nullptr) {
+                const bool covers_consistent =
+                    up_cover.cover_start == gate_cover.cover_start &&
+                    up_cover.cover_start == down_cover.cover_start &&
+                    up_cover.cover_size == gate_cover.cover_size &&
+                    up_cover.cover_size == down_cover.cover_size &&
+                    up_cover.local_start == gate_cover.local_start &&
+                    up_cover.local_start == down_cover.local_start &&
+                    up_cover.local_start >= 0 &&
+                    up_cover.local_start <= up_cover.cover_size - split.size &&
+                    up_cover.tensor->ne[0] == up->ne[0] &&
+                    gate_cover.tensor->ne[0] == gate->ne[0] &&
+                    up_cover.tensor->ne[1] == up_cover.cover_size &&
+                    gate_cover.tensor->ne[1] == gate_cover.cover_size &&
+                    down_cover.tensor->ne[0] == down_cover.cover_size &&
+                    down_cover.tensor->ne[1] == down->ne[1];
+                if (!covers_consistent) {
+                    valid = false;
+                    LLAMA_LOG_DEBUG("backend_policy: ffn_parallel layer %d shard %s has inconsistent resident cover metadata for backend %s; falling back\n",
+                            il, split.id.c_str(), split.backend.c_str());
                     break;
                 }
+
+                // The cover tensors stay resident and independently packed for
+                // their processor. Only these immutable node-local regions
+                // change when a query-boundary clock profile selects a new
+                // shard proportion.
+                ggml_tensor * up_cur = ggml_mul_mat_src0_region(
+                        ctx0, up_cover.tensor, cur,
+                        0, up_cover.tensor->ne[0],
+                        up_cover.local_start, split.size);
+                cb(up_cur, ("ffn_up" + suffix).c_str(), il, split.backend.c_str());
+
+                ggml_tensor * gate_cur = ggml_mul_mat_src0_region(
+                        ctx0, gate_cover.tensor, cur,
+                        0, gate_cover.tensor->ne[0],
+                        gate_cover.local_start, split.size);
+                cb(gate_cur, ("ffn_gate" + suffix).c_str(), il, split.backend.c_str());
+
+                ggml_tensor * act = ggml_swiglu_split(ctx0, gate_cur, up_cur);
+                cb(act, ("ffn_swiglu" + suffix).c_str(), il, split.backend.c_str());
+
+                ggml_tensor * branch = ggml_mul_mat_src0_region(
+                        ctx0, down_cover.tensor, act,
+                        down_cover.local_start, split.size,
+                        0, down_cover.tensor->ne[1]);
+                cb(branch, ("ffn_down" + suffix).c_str(), il, split.backend.c_str());
+
                 branch_outs.push_back(branch);
             }
 
@@ -1346,7 +1346,7 @@ ggml_tensor * llm_graph_context::build_ffn(
     }
 
     if (requires_parallel) {
-        GGML_ABORT("backend_policy: ffn_parallel shard-only layer %d cannot fall back to full FFN weights", il);
+        GGML_ABORT("backend_policy: ffn_parallel cover-only layer %d cannot fall back to full FFN weights", il);
     }
 
     ggml_tensor * tmp = up ? build_lora_mm(up, cur) : cur;

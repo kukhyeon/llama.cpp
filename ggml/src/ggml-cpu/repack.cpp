@@ -4153,6 +4153,7 @@ template <> void gemm<block_q2_K, 1, 16, GGML_TYPE_Q8_K>(int n, float * s, size_
 class tensor_traits_base : public ggml::cpu::tensor_traits {
   public:
     virtual int repack(struct ggml_tensor * t, const void * data, size_t data_size) = 0;
+    virtual bool supports_src0_region(const struct ggml_tensor * op) const = 0;
 };
 
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PARAM_TYPE> class tensor_traits : public tensor_traits_base {
@@ -4162,6 +4163,14 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         switch (op->op) {
             case GGML_OP_MUL_MAT:
                 {
+                    size = ggml_row_size(PARAM_TYPE, ggml_nelements(op->src[1]));
+                    return true;
+                }
+            case GGML_OP_MUL_MAT_SRC0_REGION:
+                {
+                    if (!supports_src0_region(op)) {
+                        return false;
+                    }
                     size = ggml_row_size(PARAM_TYPE, ggml_nelements(op->src[1]));
                     return true;
                 }
@@ -4191,6 +4200,14 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             case GGML_OP_MUL_MAT:
                 forward_mul_mat(params, op);
                 return true;
+            case GGML_OP_MUL_MAT_SRC0_REGION:
+                // A packed tensor cannot safely fall through to the canonical
+                // CPU implementation. The scheduler should have rejected an
+                // unsupported region before execution; fail closed if it did
+                // not.
+                GGML_ASSERT(supports_src0_region(op));
+                this->forward_mul_mat_src0_region(params, op);
+                return true;
             case GGML_OP_MUL_MAT_ID:
                 forward_mul_mat_id(params, op);
                 return true;
@@ -4199,6 +4216,22 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 break;
         }
         return false;
+    }
+
+    bool supports_src0_region(const struct ggml_tensor * op) const override {
+        if (op == nullptr || op->op != GGML_OP_MUL_MAT_SRC0_REGION ||
+            op->src[0] == nullptr || op->src[1] == nullptr ||
+            op->src[0]->type != GGML_TYPE_Q8_0 ||
+            ggml_n_dims(op->src[0]) != 2 ||
+            op->src[1]->type != GGML_TYPE_F32 ||
+            op->src[1]->nb[0] != sizeof(float)) {
+            return false;
+        }
+
+        struct ggml_mul_mat_src0_region_params region;
+        return ggml_mul_mat_src0_region_get_params(op, &region) &&
+               region.out_start % NB_COLS == 0 &&
+               region.out_size  % NB_COLS == 0;
     }
 
     void forward_mul_mat_one_chunk(ggml_compute_params * params,
@@ -4378,6 +4411,216 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             }
 
             forward_mul_mat_one_chunk(params, dst, src0_start, src0_end, src1_start, src1_end);
+
+            current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
+        }
+    }
+
+    void forward_mul_mat_src0_region_one_chunk(
+            ggml_compute_params                            * params,
+            ggml_tensor                                    * op,
+            const struct ggml_mul_mat_src0_region_params   & region,
+            int64_t                                          local_out_start,
+            int64_t                                          local_out_end,
+            int64_t                                          src1_start,
+            int64_t                                          src1_end) {
+        const ggml_tensor * src0 = op->src[0];
+        const ggml_tensor * src1 = op->src[1];
+        ggml_tensor *       dst  = op;
+
+        GGML_TENSOR_BINARY_OP_LOCALS
+
+        GGML_ASSERT(local_out_start % NB_COLS == 0);
+        GGML_ASSERT(local_out_end   % NB_COLS == 0);
+        GGML_ASSERT(region.out_start % NB_COLS == 0);
+
+        const int64_t src0_block_size = ggml_blck_size(src0->type);
+        const int64_t parent_nblocks  = ne00 / src0_block_size;
+        const int64_t k_block_start   = region.k_start / src0_block_size;
+        const size_t  packed_block_sz = ggml_type_size(src0->type) * NB_COLS;
+        const size_t  parent_group_stride = parent_nblocks * packed_block_sz;
+        const size_t  k_byte_offset = k_block_start * packed_block_sz;
+        const size_t  src1_col_stride = ggml_row_size(PARAM_TYPE, region.k_size);
+
+        GGML_ASSERT(ne03 == 1 && ne13 == 1);
+        GGML_ASSERT(ne02 == 1);
+
+        const int64_t i12 = src1_start / ne1;
+        const int64_t i11 = src1_start - i12 * ne1;
+        const int64_t i1  = i11;
+        const int64_t i2  = i12;
+
+        const char * src1_ptr = (const char *) params->wdata +
+            (i11 + i12 * ne11) * src1_col_stride;
+        char * dst_ptr = (char *) dst->data + i1 * nb1 + i2 * nb2;
+
+        const int64_t nrows = src1_end - src1_start;
+        GGML_ASSERT(src1_ptr + src1_col_stride * nrows <=
+                    (const char *) params->wdata + params->wsize);
+
+        const auto compute_output_groups =
+                [&](int64_t out_offset, int64_t ncols, const char * weights) {
+            if (nrows > 3) {
+                gemm<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
+                    region.k_size,
+                    (float *) dst_ptr + out_offset,
+                    nb1 / nb0,
+                    weights,
+                    src1_ptr,
+                    nrows - (nrows % 4),
+                    ncols);
+            }
+
+            for (int64_t iter = nrows - (nrows % 4); iter < nrows; ++iter) {
+                gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
+                    region.k_size,
+                    (float *) (dst_ptr + iter * nb1) + out_offset,
+                    ncols,
+                    weights,
+                    src1_ptr + src1_col_stride * iter,
+                    1,
+                    ncols);
+            }
+        };
+
+        const int64_t physical_out_start = region.out_start + local_out_start;
+        const char * first_group = (const char *) src0->data +
+            (physical_out_start / NB_COLS) * parent_group_stride + k_byte_offset;
+
+        if (region.k_start == 0 && region.k_size == ne00) {
+            // Consecutive complete parent row groups remain contiguous after
+            // repacking, so up/gate can use one large optimized kernel call.
+            compute_output_groups(
+                local_out_start,
+                local_out_end - local_out_start,
+                first_group);
+            return;
+        }
+
+        // A K slice has a parent-K-sized gap between packed row groups.  Keep
+        // the graph as one operation, but invoke the existing microkernel once
+        // per packed output-row group with the correct parent group stride.
+        for (int64_t local_out = local_out_start;
+             local_out < local_out_end;
+             local_out += NB_COLS) {
+            const int64_t physical_out = region.out_start + local_out;
+            const char * weights = (const char *) src0->data +
+                (physical_out / NB_COLS) * parent_group_stride + k_byte_offset;
+            compute_output_groups(local_out, NB_COLS, weights);
+        }
+    }
+
+    void forward_mul_mat_src0_region(ggml_compute_params * params, ggml_tensor * op) {
+        const ggml_tensor * src0 = op->src[0];
+        const ggml_tensor * src1 = op->src[1];
+        ggml_tensor *       dst  = op;
+
+        GGML_TENSOR_BINARY_OP_LOCALS
+
+        struct ggml_mul_mat_src0_region_params region;
+        GGML_ASSERT(ggml_mul_mat_src0_region_get_params(op, &region));
+        GGML_ASSERT(supports_src0_region(op));
+
+        const int ith = params->ith;
+        const int nth = params->nth;
+
+        GGML_ASSERT(ne0 == region.out_size);
+        GGML_ASSERT(ne10 == region.k_size);
+        GGML_ASSERT(ne1 == ne11);
+        GGML_ASSERT(ne2 == ne12);
+        GGML_ASSERT(ne3 == ne13);
+
+        GGML_ASSERT(nb0 == sizeof(float));
+        GGML_ASSERT(nb0 <= nb1);
+        GGML_ASSERT(nb1 <= nb2);
+        GGML_ASSERT(nb2 <= nb3);
+
+        // CPU_REPACK cover tensors are currently 2-D, while src1/dst may be
+        // 3-D (token planes). This matches the existing optimized matmul path.
+        GGML_ASSERT(ne02 == 1 && ne03 == 1);
+        GGML_ASSERT(ne13 == 1 && ne3 == 1);
+        GGML_ASSERT(src1->type == GGML_TYPE_F32);
+
+        char *       wdata = static_cast<char *>(params->wdata);
+        const size_t nbw1  = ggml_row_size(PARAM_TYPE, ne10);
+        const size_t nbw2  = nbw1 * ne11;
+
+        GGML_ASSERT(params->wsize >= nbw2 * ne12);
+
+        const ggml_from_float_t from_float = ggml_get_type_traits_cpu(PARAM_TYPE)->from_float;
+
+        for (int64_t i12 = 0; i12 < ne12; ++i12) {
+            char * data_ptr  = (char *) src1->data + i12 * nb12;
+            char * wdata_ptr = wdata + i12 * nbw2;
+
+            for (int64_t i11 = ith * 4; i11 < ne11 - ne11 % 4; i11 += nth * 4) {
+                ggml_quantize_mat_t<INTER_SIZE, PARAM_TYPE>(
+                    (float *) (data_ptr + i11 * nb11),
+                    (void *) (wdata_ptr + i11 * nbw1),
+                    4,
+                    ne10);
+            }
+
+            const int64_t i11_processed = ne11 - ne11 % 4;
+            for (int64_t i11 = i11_processed + ith; i11 < ne11; i11 += nth) {
+                from_float(
+                    (float *) (data_ptr + i11 * nb11),
+                    (void *) (wdata_ptr + i11 * nbw1),
+                    ne10);
+            }
+        }
+
+        const bool disable_chunking = ggml_is_numa();
+        const int64_t nr0 = region.out_size;
+
+        int     nth_scaled  = nth * 4;
+        int64_t chunk_size0 = (nr0 + nth_scaled - 1) / nth_scaled;
+        int64_t nchunk0     = (nr0 + chunk_size0 - 1) / chunk_size0;
+        int64_t nchunk1     = ne12;
+
+        const int64_t min_chunk_size = NB_COLS;
+        if (nchunk0 > 0 && (nr0 / nchunk0) < min_chunk_size && nr0 >= min_chunk_size) {
+            nchunk0 = (nr0 + min_chunk_size - 1) / min_chunk_size;
+        }
+
+        int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
+        if (nth == 1 ||
+            ((nchunk0 < nth || disable_chunking) &&
+             (nr0 + nth - 1) / nth >= min_chunk_size)) {
+            nchunk0 = nth;
+            dr0 = (nr0 + nchunk0 - 1) / nchunk0;
+        }
+
+        const int64_t max_nchunk = (nr0 + min_chunk_size - 1) / min_chunk_size;
+        nchunk0 = MIN(nchunk0, max_nchunk);
+
+        if (ith == 0) {
+            ggml_threadpool_chunk_set(params->threadpool, nth);
+        }
+
+        ggml_barrier(params->threadpool);
+
+        int current_chunk = ith;
+        while (current_chunk < nchunk0 * nchunk1) {
+            const int64_t ith0 = current_chunk % nchunk0;
+            const int64_t ith1 = current_chunk / nchunk0;
+
+            int64_t local_out_start = dr0 * ith0;
+            int64_t local_out_end   = MIN(local_out_start + dr0, nr0);
+
+            local_out_start = GGML_PAD(local_out_start, NB_COLS);
+            local_out_end   = MIN((int64_t) GGML_PAD(local_out_end, NB_COLS), nr0);
+
+            if (local_out_start < local_out_end) {
+                forward_mul_mat_src0_region_one_chunk(
+                    params,
+                    dst,
+                    region,
+                    local_out_start,
+                    local_out_end,
+                    ith1 * ne11,
+                    (ith1 + 1) * ne11);
+            }
 
             current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
         }
@@ -4788,6 +5031,22 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
             //    return true;
             //}
             // may be possible if Q8_0 packed...
+        } else if (op->op == GGML_OP_MUL_MAT_SRC0_REGION
+                && op->src[0]->buffer
+                && op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type()) {
+            // Weight-buffer selection probes supports_op() before init_tensor()
+            // has populated src0->extra. Query the same optimal trait that
+            // init_tensor() will install so CPU_REPACK covers are selectable
+            // during model loading as well as executable at runtime.
+            auto * traits = (const ggml::cpu::repack::tensor_traits_base *)
+                ggml_repack_get_optimal_repack_type(op->src[0]);
+            if (traits == nullptr || !traits->supports_src0_region(op)) {
+                return false;
+            }
+            if (op->src[1]->buffer && !ggml_backend_buft_is_host(op->src[1]->buffer->buft)) {
+                return false;
+            }
+            return true;
         } else if (op->op == GGML_OP_MUL_MAT_ID
                 && op->src[0]->buffer
                 && (ggml_n_dims(op->src[0]) == 3)
@@ -4808,7 +5067,9 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
     }
 
     ggml::cpu::tensor_traits * get_tensor_traits(const struct ggml_tensor * op) override {
-        if (op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID) {
+        if (op->op == GGML_OP_MUL_MAT ||
+            op->op == GGML_OP_MUL_MAT_SRC0_REGION ||
+            op->op == GGML_OP_MUL_MAT_ID) {
             if (op->src[0]->buffer && op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type()) {
                 return (ggml::cpu::tensor_traits *) op->src[0]->extra;
             }

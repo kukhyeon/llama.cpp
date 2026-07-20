@@ -83,7 +83,21 @@ enum htp_op_code {
     HTP_OP_FILL,
     HTP_OP_DIAG,
     HTP_OP_SOLVE_TRI,
+    HTP_OP_MUL_MAT_SRC0_REGION,
     HTP_OP_INVALID
+};
+
+// Wire-compatible with ggml_mul_mat_src0_region_params.  Keep this definition
+// local to the HTP ABI because the DSP build cannot include the full ggml.h.
+#define HTP_MUL_MAT_SRC0_REGION_PARAMS_VERSION 1
+
+struct htp_mul_mat_src0_region_params {
+    int32_t version;
+    int32_t reserved;
+    int64_t k_start;
+    int64_t k_size;
+    int64_t out_start;
+    int64_t out_size;
 };
 
 #define HTP_OP_MAX_DIMS    4    // aka GGML_MAX_DIMS

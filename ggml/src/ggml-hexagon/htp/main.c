@@ -527,6 +527,9 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_MUL_MAT_ID:
             return op_matmul_id(octx);
 
+        case HTP_OP_MUL_MAT_SRC0_REGION:
+            return op_matmul_src0_region(octx);
+
         case HTP_OP_MUL:
         case HTP_OP_ADD:
         case HTP_OP_SUB:
@@ -719,7 +722,7 @@ static void prep_tensors(struct htp_context *ctx, struct htp_buf_desc *bufs, str
     }
 }
 
-static void proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, uint32_t idx, struct htp_op_desc * op) {
+static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, uint32_t idx, struct htp_op_desc * op) {
     memcpy(octx->op_params, op->params, sizeof(octx->op_params));
     octx->flags = op->flags;
     octx->op    = op->opcode;
@@ -750,7 +753,12 @@ static void proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, 
     FARF(HIGH, "prep-dst #%u: data %p size %u : %u:%u:%u:%u", op->dst, (void*) dst->data, dst->size,
         dst->ne[0], dst->ne[1], dst->ne[3], dst->ne[3]);
 
-    (void) execute_op(octx);
+    const int op_status = execute_op(octx);
+    if (octx->op == HTP_OP_MUL_MAT_SRC0_REGION &&
+        op_status != HTP_STATUS_OK) {
+        FARF(ERROR, "proc-op #%u: region matmul failed with status %d", idx, op_status);
+        return op_status;
+    }
 
     // flush buffers on output
     hex_l2flush((void *) dst->data, dst->size);
@@ -758,6 +766,8 @@ static void proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, 
 
     FARF(HIGH, "post-dst #%u: data %p size %u : %u:%u:%u:%u", op->dst, (void*) dst->data, dst->size,
         dst->ne[0], dst->ne[1], dst->ne[3], dst->ne[3]);
+
+    return HTP_STATUS_OK;
 }
 
 #define DSPQUEUE_POLL_TIMEOUT_USEC 100
@@ -825,6 +835,7 @@ static void htp_packet_callback(dspqueue_t queue, int error, void * context) {
         struct htp_tensor*   tens = (struct htp_tensor*)    m_ptr; m_ptr += t_size;
         struct htp_op_desc*   ops = (struct htp_op_desc*)   m_ptr; m_ptr += o_size;
         struct htp_prof_desc* pds = (struct htp_prof_desc*) m_ptr;
+        memset(pds, 0, p_size);
 
         prep_op_bufs(ctx, bufs, n_bufs);
         prep_tensors(ctx, bufs, tens, n_tens);
@@ -834,12 +845,13 @@ static void htp_packet_callback(dspqueue_t queue, int error, void * context) {
         octx->n_threads = ctx->n_threads;
         octx->ctx       = ctx;
 
+        uint32_t batch_status = HTP_STATUS_OK;
         for (uint32_t i=0; i < n_ops; i++) {
             struct profile_data prof;
 
             profile_start(ctx->profiler, &prof);
 
-            proc_op_req(octx, tens, i, &ops[i]);
+            const int op_status = proc_op_req(octx, tens, i, &ops[i]);
 
             profile_stop(ctx->profiler, &prof);
 
@@ -851,13 +863,18 @@ static void htp_packet_callback(dspqueue_t queue, int error, void * context) {
                     pds[i].pmu[j] = prof.pmu_counters[j];
                 }
             }
+
+            if (op_status != HTP_STATUS_OK) {
+                batch_status = op_status;
+                break;
+            }
         }
 
         // dspqueue_write_early_wakeup_noblock(ctx->queue, 10, 0);
 
         struct htp_opbatch_rsp rsp;
         rsp.id        = req.id;
-        rsp.status    = HTP_STATUS_OK;
+        rsp.status    = batch_status;
         rsp.n_bufs    = n_bufs;
         rsp.n_tensors = n_tens;
         rsp.n_ops     = n_ops;

@@ -1438,6 +1438,31 @@ UseGgmlGemm2:;
     }
 }
 
+static void ggml_compute_forward_mul_mat_src0_region(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor         * dst) {
+    const struct ggml_tensor * src0 = dst->src[0];
+
+    struct ggml_mul_mat_src0_region_params region;
+    GGML_ASSERT(ggml_mul_mat_src0_region_get_params(dst, &region));
+
+    // Canonical CPU tensors can express the selected rectangle as a temporary
+    // logical view.  Keep the parent's row/batch strides so a K slice advances
+    // correctly from one parent row to the next.
+    struct ggml_tensor src0_region = *src0;
+    src0_region.ne[0] = region.k_size;
+    src0_region.ne[1] = region.out_size;
+    src0_region.data  = (char *) src0->data +
+        region.out_start * src0->nb[1] +
+        (region.k_start / ggml_blck_size(src0->type)) * src0->nb[0];
+
+    struct ggml_tensor dst_region = *dst;
+    dst_region.op     = GGML_OP_MUL_MAT;
+    dst_region.src[0] = &src0_region;
+
+    ggml_compute_forward_mul_mat(params, &dst_region);
+}
+
 // ggml_compute_forward_mul_mat_id
 
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
@@ -1823,6 +1848,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_MUL_MAT:
             {
                 ggml_compute_forward_mul_mat(params, tensor);
+            } break;
+        case GGML_OP_MUL_MAT_SRC0_REGION:
+            {
+                ggml_compute_forward_mul_mat_src0_region(params, tensor);
             } break;
         case GGML_OP_MUL_MAT_ID:
             {
@@ -2292,6 +2321,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_GROUP_NORM:
         case GGML_OP_CONCAT:
         case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_SRC0_REGION:
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_OUT_PROD:
             {
@@ -2808,6 +2838,7 @@ struct ggml_cplan ggml_graph_plan(
                         cur = ggml_type_size(node->type)*n_tasks;
                     } break;
                 case GGML_OP_MUL_MAT:
+                case GGML_OP_MUL_MAT_SRC0_REGION:
                     {
                         const enum ggml_type vec_dot_type = type_traits_cpu[node->src[0]->type].vec_dot_type;
 

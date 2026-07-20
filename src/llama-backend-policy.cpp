@@ -576,7 +576,7 @@ ffn_parallel_policy parse_ffn_parallel(const json & root, const std::string & so
     }
 
     // The graph requires one contiguous, aligned partition starting at zero.
-    // Reject gaps/overlaps during policy loading so an invalid shard-only
+    // Reject gaps/overlaps during policy loading so an invalid cover-only
     // policy cannot allocate weights successfully and abort much later.
     auto sorted_splits = out.splits;
     std::sort(sorted_splits.begin(), sorted_splits.end(), [](const auto & lhs, const auto & rhs) {
@@ -1561,7 +1561,7 @@ bool llama_backend_policy_build_ffn_residency_plan(
     std::map<std::string, backend_intervals> grouped;
     out.enabled = true;
     out.keep_full_source = false;
-    out.source = "ffn_parallel atomic union";
+    out.source = "ffn_parallel connected cover union";
     bool has_all_phase_root = false;
 
     for (const auto & policy : policies) {
@@ -1613,39 +1613,56 @@ bool llama_backend_policy_build_ffn_residency_plan(
 
     for (const auto & kv : grouped) {
         const backend_intervals & entry = kv.second;
-        std::vector<int64_t> boundaries;
-        boundaries.reserve(entry.ranges.size() * 2);
-        for (const auto & range : entry.ranges) {
-            boundaries.push_back(range.first);
-            boundaries.push_back(range.second);
-        }
-        std::sort(boundaries.begin(), boundaries.end());
-        boundaries.erase(std::unique(boundaries.begin(), boundaries.end()), boundaries.end());
+        std::vector<std::pair<int64_t, int64_t>> ranges = entry.ranges;
+        std::sort(ranges.begin(), ranges.end(), [](const auto & lhs, const auto & rhs) {
+            if (lhs.first != rhs.first) {
+                return lhs.first < rhs.first;
+            }
+            return lhs.second < rhs.second;
+        });
 
-        for (size_t i = 1; i < boundaries.size(); ++i) {
-            const int64_t start = boundaries[i - 1];
-            const int64_t end = boundaries[i];
-            if (start == end) {
+        int64_t cover_start = -1;
+        int64_t cover_end = -1;
+        const auto append_cover = [&]() {
+            if (cover_start < 0 || cover_end <= cover_start) {
+                return;
+            }
+
+            llama_backend_policy_ffn_split cover;
+            cover.id = "cover." + kv.first + "." + std::to_string(cover_start) + "." +
+                std::to_string(cover_end - cover_start);
+            cover.start = cover_start;
+            cover.size = cover_end - cover_start;
+            cover.backend = entry.backend;
+            out.covers.push_back(std::move(cover));
+        };
+
+        for (const auto & range : ranges) {
+            if (range.second <= range.first) {
+                continue;
+            }
+            if (cover_start < 0) {
+                cover_start = range.first;
+                cover_end = range.second;
                 continue;
             }
 
-            const bool covered = std::any_of(entry.ranges.begin(), entry.ranges.end(), [&](const auto & range) {
-                return range.first <= start && end <= range.second;
-            });
-            if (!covered) {
+            // Merge both overlapping and touching intervals. A gap, however,
+            // must remain a separate allocation rather than being filled by a
+            // convex hull that no runtime profile requested.
+            if (range.first <= cover_end) {
+                cover_end = std::max(cover_end, range.second);
                 continue;
             }
 
-            llama_backend_policy_ffn_split tile;
-            tile.id = "tile." + kv.first + "." + std::to_string(start) + "." + std::to_string(end - start);
-            tile.start = start;
-            tile.size = end - start;
-            tile.backend = entry.backend;
-            out.tiles.push_back(std::move(tile));
+            append_cover();
+            cover_start = range.first;
+            cover_end = range.second;
         }
+        append_cover();
     }
 
-    return !out.tiles.empty();
+    return !out.covers.empty();
 }
 
 bool llama_backend_policy_buft_matches(

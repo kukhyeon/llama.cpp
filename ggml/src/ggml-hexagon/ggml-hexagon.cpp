@@ -164,6 +164,7 @@ struct ggml_hexagon_session {
     bool             valid_iface;
 
     std::atomic<int>      op_pending;
+    std::atomic<int>      op_status;
     ggml_hexagon_opbatch* op_batch;
     ggml_hexagon_opqueue* op_queue;
 
@@ -1953,7 +1954,10 @@ void ggml_hexagon_session::flush_pending(bool all) {
 
         if (rsp.status != HTP_STATUS_OK) {
             GGML_LOG_ERROR("ggml-hex: %s dspcall : dsp-rsp: %s\n", this->c_name(), status_to_str(rsp.status));
-            // TODO: handle errors
+            // Preserve the DSP failure until graph_compute() has drained every
+            // pending batch. Returning success here would expose incomplete
+            // region outputs (and skipped dependent nodes) as valid inference.
+            this->op_status.store((int) rsp.status, std::memory_order_relaxed);
         }
 
         const int64_t pop_t0_us = breakdown ? ggml_time_us() : 0;
@@ -2094,7 +2098,8 @@ void ggml_hexagon_session::allocate(int dev_id) noexcept(false) {
     this->dev_id     = dev_id;
     this->name       = std::string("HTP") + std::to_string(dev_id);
 
-    this->op_pending  = 0;
+    this->op_pending = 0;
+    this->op_status  = HTP_STATUS_OK;
 
     GGML_LOG_DEBUG("ggml-hex: %s allocating new session\n", this->name.c_str());
 
@@ -2415,6 +2420,60 @@ static bool ggml_hexagon_supported_mul_mat(const struct ggml_hexagon_session * s
         default:
             return false;
     }
+
+    return true;
+}
+
+static bool ggml_hexagon_supported_mul_mat_src0_region(
+        const struct ggml_hexagon_session * sess,
+        const struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    if (!src0 || !src1 || !ggml_hexagon_supported_mul_mat(sess, dst)) {
+        return false;
+    }
+
+    // The DSP region implementation currently handles the Q8_0 FFN cover
+    // layout only.  It deliberately falls back at scheduling time for other
+    // types instead of silently interpreting a parent-repacked row as a
+    // compact ordinary matmul row.
+    if (src0->type != GGML_TYPE_Q8_0 ||
+        src1->type != GGML_TYPE_F32 ||
+        src0->ne[2] != 1 || src0->ne[3] != 1 ||
+        src1->ne[2] != 1 || src1->ne[3] != 1 ||
+        ggml_nrows(src1) > 1024) {
+        return false;
+    }
+
+    struct ggml_mul_mat_src0_region_params params;
+    if (!ggml_mul_mat_src0_region_get_params(dst, &params)) {
+        return false;
+    }
+
+    // The HTP Q8_0 physical format is grouped in x4x2 (256-element)
+    // super-blocks.  Active starts/sizes must preserve that grouping.
+    if ((src0->ne[0] % QK_Q8_0x4x2) != 0 ||
+        (params.k_start % QK_Q8_0x4x2) != 0 ||
+        (params.k_size  % QK_Q8_0x4x2) != 0) {
+        return false;
+    }
+
+    const size_t dense_row_size =
+        (size_t) src0->ne[0] + (size_t) src0->ne[0] / 16;
+    if (src0->nb[1] != dense_row_size) {
+        return false;
+    }
+
+    if (!src0->buffer ||
+        !ggml_backend_buffer_is_hexagon_repack(src0->buffer)) {
+        return false;
+    }
+
+    static_assert(
+        sizeof(struct ggml_mul_mat_src0_region_params) ==
+        sizeof(struct htp_mul_mat_src0_region_params),
+        "host and HTP region parameter layouts must match");
 
     return true;
 }
@@ -2886,6 +2945,8 @@ static htp_op_code op_remap_to_htp(const ggml_tensor * t) {
         case GGML_OP_FLASH_ATTN_EXT: return HTP_OP_FLASH_ATTN_EXT;
         case GGML_OP_MUL_MAT:        return HTP_OP_MUL_MAT;
         case GGML_OP_MUL_MAT_ID:     return HTP_OP_MUL_MAT_ID;
+        case GGML_OP_MUL_MAT_SRC0_REGION:
+            return HTP_OP_MUL_MAT_SRC0_REGION;
         case GGML_OP_MUL:            return HTP_OP_MUL;
         case GGML_OP_ADD:            return HTP_OP_ADD;
         case GGML_OP_ADD_ID:         return HTP_OP_ADD_ID;
@@ -2947,6 +3008,8 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
     const bool breakdown = ggml_backend_op_load_profile_breakdown_enabled();
     const int64_t graph_t0_us = breakdown ? ggml_time_us() : 0;
 
+    sess->op_status.store(HTP_STATUS_OK, std::memory_order_relaxed);
+
     HEX_VERBOSE("ggml-hex: %s graph-compute n_nodes %d\n", sess->c_name(), graph->n_nodes);
 
     for (int i = 0; i < graph->n_nodes; ++i) {
@@ -2966,7 +3029,9 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                 ggml_time_us() - graph_t0_us);
     }
 
-    return GGML_STATUS_SUCCESS;
+    return sess->op_status.load(std::memory_order_relaxed) == HTP_STATUS_OK
+        ? GGML_STATUS_SUCCESS
+        : GGML_STATUS_FAILED;
 }
 
 static void ggml_backend_hexagon_synchronize(ggml_backend_t backend) {
@@ -3011,6 +3076,7 @@ struct node_info {
         switch (this->op()) {
             case GGML_OP_MUL_MAT:
             case GGML_OP_MUL_MAT_ID:
+            case GGML_OP_MUL_MAT_SRC0_REGION:
                 return ggml_is_quantized(this->src0()->type);
             default:
                 return false;
@@ -3358,6 +3424,10 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
 
         case GGML_OP_MUL_MAT:
             supp = ggml_hexagon_supported_mul_mat(sess, op);
+            break;
+
+        case GGML_OP_MUL_MAT_SRC0_REGION:
+            supp = ggml_hexagon_supported_mul_mat_src0_region(sess, op);
             break;
 
         case GGML_OP_MUL_MAT_ID:

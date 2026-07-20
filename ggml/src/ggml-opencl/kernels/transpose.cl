@@ -116,6 +116,13 @@ kernel void kernel_transpose_32_16(__read_only image1d_buffer_t input, __write_o
 
     const int i = get_global_id(0);
     const int j = get_global_id(1);
+
+    // Some callers round the launch up to a complete work-group. The kernel
+    // has no barriers, so padded work-items can safely stop before image I/O.
+    if ((uint) i >= cols || (uint) j >= padded_rows) {
+        return;
+    }
+
     const int i_2 = i<<2;
     const int j_2 = j<<2;
     half4 temp0 = {0,0,0,0}; // initialize outputs to 0
@@ -140,4 +147,50 @@ kernel void kernel_transpose_32_16(__read_only image1d_buffer_t input, __write_o
     write_imageh(output, (i_2+1)*padded_rows+j, (half4)(temp0.s1, temp1.s1, temp2.s1, temp3.s1));
     write_imageh(output, (i_2+2)*padded_rows+j, (half4)(temp0.s2, temp1.s2, temp2.s2, temp3.s2));
     write_imageh(output, (i_2+3)*padded_rows+j, (half4)(temp0.s3, temp1.s3, temp2.s3, temp3.s3));
+}
+
+// Region-matmul activation transpose. Unlike the legacy kernel above,
+// actual_rows is the exact token count rather than a count of 4-row tiles.
+// This makes n=2,3,5,... safe while retaining zero padding to a multiple of 8.
+kernel void kernel_transpose_32_16_region(
+        __read_only  image1d_buffer_t input,
+        __write_only image1d_buffer_t output,
+        const uint actual_rows,
+        const uint cols,
+        const uint padded_rows) {
+    const uint i = get_global_id(0);
+    const uint j = get_global_id(1);
+
+    if (i >= cols || j >= padded_rows) {
+        return;
+    }
+
+    const uint i_2 = i << 2;
+    const uint j_2 = j << 2;
+    half4 temp0 = (half4) 0;
+    half4 temp1 = (half4) 0;
+    half4 temp2 = (half4) 0;
+    half4 temp3 = (half4) 0;
+
+    if (j_2 + 0 < actual_rows) {
+        temp0 = read_imageh(input, (j_2 + 0) * cols + i);
+    }
+    if (j_2 + 1 < actual_rows) {
+        temp1 = read_imageh(input, (j_2 + 1) * cols + i);
+    }
+    if (j_2 + 2 < actual_rows) {
+        temp2 = read_imageh(input, (j_2 + 2) * cols + i);
+    }
+    if (j_2 + 3 < actual_rows) {
+        temp3 = read_imageh(input, (j_2 + 3) * cols + i);
+    }
+
+    write_imageh(output, (i_2 + 0) * padded_rows + j,
+                 (half4) (temp0.s0, temp1.s0, temp2.s0, temp3.s0));
+    write_imageh(output, (i_2 + 1) * padded_rows + j,
+                 (half4) (temp0.s1, temp1.s1, temp2.s1, temp3.s1));
+    write_imageh(output, (i_2 + 2) * padded_rows + j,
+                 (half4) (temp0.s2, temp1.s2, temp2.s2, temp3.s2));
+    write_imageh(output, (i_2 + 3) * padded_rows + j,
+                 (half4) (temp0.s3, temp1.s3, temp2.s3, temp3.s3));
 }

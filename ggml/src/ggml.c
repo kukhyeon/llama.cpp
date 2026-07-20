@@ -1078,9 +1078,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "MUL_MAT_SRC0_REGION",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1188,9 +1190,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "X[k0:k1,o0:o1]*Y",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3252,6 +3256,104 @@ struct ggml_tensor * ggml_mul_mat(
     result->src[1] = b;
 
     return result;
+}
+
+static bool ggml_mul_mat_src0_region_params_are_valid(
+        const struct ggml_tensor                     * tensor,
+        const struct ggml_mul_mat_src0_region_params * params) {
+    if (tensor == NULL || params == NULL ||
+        tensor->op != GGML_OP_MUL_MAT_SRC0_REGION ||
+        tensor->src[0] == NULL || tensor->src[1] == NULL ||
+        params->version != GGML_MUL_MAT_SRC0_REGION_PARAMS_VERSION ||
+        params->reserved != 0) {
+        return false;
+    }
+
+    const struct ggml_tensor * src0 = tensor->src[0];
+    const struct ggml_tensor * src1 = tensor->src[1];
+
+    if (params->k_start < 0 || params->k_size <= 0 ||
+        params->out_start < 0 || params->out_size <= 0 ||
+        params->k_start > src0->ne[0] - params->k_size ||
+        params->out_start > src0->ne[1] - params->out_size) {
+        return false;
+    }
+
+    const int64_t block_size = ggml_blck_size(src0->type);
+    if (params->k_start % block_size != 0 || params->k_size % block_size != 0) {
+        return false;
+    }
+
+    return src1->ne[0] == params->k_size &&
+           src1->ne[2] % src0->ne[2] == 0 &&
+           src1->ne[3] % src0->ne[3] == 0 &&
+           tensor->ne[0] == params->out_size &&
+           tensor->ne[1] == src1->ne[1] &&
+           tensor->ne[2] == src1->ne[2] &&
+           tensor->ne[3] == src1->ne[3] &&
+           tensor->type == GGML_TYPE_F32 &&
+           !ggml_is_transposed(src0);
+}
+
+struct ggml_tensor * ggml_mul_mat_src0_region(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * src0,
+        struct ggml_tensor  * src1,
+        int64_t               k_start,
+        int64_t               k_size,
+        int64_t               out_start,
+        int64_t               out_size) {
+    GGML_ASSERT(src0 != NULL && src1 != NULL);
+    GGML_ASSERT(!ggml_is_transposed(src0));
+    GGML_ASSERT(k_start >= 0 && k_size > 0);
+    GGML_ASSERT(out_start >= 0 && out_size > 0);
+    GGML_ASSERT(k_size <= src0->ne[0] && k_start <= src0->ne[0] - k_size);
+    GGML_ASSERT(out_size <= src0->ne[1] && out_start <= src0->ne[1] - out_size);
+    GGML_ASSERT(k_start % ggml_blck_size(src0->type) == 0);
+    GGML_ASSERT(k_size  % ggml_blck_size(src0->type) == 0);
+    GGML_ASSERT(src1->ne[0] == k_size);
+    GGML_ASSERT(src1->ne[2] % src0->ne[2] == 0);
+    GGML_ASSERT(src1->ne[3] % src0->ne[3] == 0);
+
+    const int64_t ne[4] = { out_size, src1->ne[1], src1->ne[2], src1->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    static_assert(sizeof(struct ggml_mul_mat_src0_region_params) == 40,
+                  "region matmul parameter ABI changed; bump its version");
+    const struct ggml_mul_mat_src0_region_params params = {
+        .version   = GGML_MUL_MAT_SRC0_REGION_PARAMS_VERSION,
+        .reserved  = 0,
+        .k_start   = k_start,
+        .k_size    = k_size,
+        .out_start = out_start,
+        .out_size  = out_size,
+    };
+    static_assert(sizeof(params) <= GGML_MAX_OP_PARAMS, "region matmul parameters do not fit in op_params");
+    memcpy(result->op_params, &params, sizeof(params));
+
+    result->op     = GGML_OP_MUL_MAT_SRC0_REGION;
+    result->src[0] = src0;
+    result->src[1] = src1;
+
+    GGML_ASSERT(ggml_mul_mat_src0_region_params_are_valid(result, &params));
+    return result;
+}
+
+bool ggml_mul_mat_src0_region_get_params(
+        const struct ggml_tensor               * tensor,
+        struct ggml_mul_mat_src0_region_params * params) {
+    if (tensor == NULL || params == NULL || tensor->op != GGML_OP_MUL_MAT_SRC0_REGION) {
+        return false;
+    }
+
+    struct ggml_mul_mat_src0_region_params decoded;
+    memcpy(&decoded, tensor->op_params, sizeof(decoded));
+    if (!ggml_mul_mat_src0_region_params_are_valid(tensor, &decoded)) {
+        return false;
+    }
+
+    *params = decoded;
+    return true;
 }
 
 void ggml_mul_mat_set_prec(

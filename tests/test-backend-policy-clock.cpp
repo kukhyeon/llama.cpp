@@ -227,7 +227,7 @@ bool test_failed_load_is_transactional(const char * invalid_policy_path) {
     return true;
 }
 
-bool test_atomic_residency_plan(const char * union_policy_path) {
+bool test_cover_residency_plan(const char * union_policy_path) {
     llama_backend_policy_clear();
     CHECK(llama_backend_policy_load(union_policy_path, false, false));
 
@@ -236,11 +236,11 @@ bool test_atomic_residency_plan(const char * union_policy_path) {
     CHECK(plan.enabled);
     CHECK(!plan.keep_full_source);
 
-    auto backend_tiles = [&](const char * backend) {
+    auto backend_covers = [&](const char * backend) {
         std::vector<llama_backend_policy_ffn_split> result;
-        for (const auto & tile : plan.tiles) {
-            if (tile.backend == backend) {
-                result.push_back(tile);
+        for (const auto & cover : plan.covers) {
+            if (cover.backend == backend) {
+                result.push_back(cover);
             }
         }
         std::sort(result.begin(), result.end(), [](const auto & lhs, const auto & rhs) {
@@ -250,15 +250,15 @@ bool test_atomic_residency_plan(const char * union_policy_path) {
     };
 
     auto check_contiguous_union = [&](const char * backend, int64_t expected_start, int64_t expected_end, int64_t & payload) {
-        const auto tiles = backend_tiles(backend);
-        CHECK(!tiles.empty());
+        const auto covers = backend_covers(backend);
+        CHECK(!covers.empty());
         int64_t covered = expected_start;
         payload = 0;
-        for (const auto & tile : tiles) {
-            CHECK(tile.start == covered);
-            CHECK(tile.size > 0);
-            covered += tile.size;
-            payload += tile.size;
+        for (const auto & cover : covers) {
+            CHECK(cover.start == covered);
+            CHECK(cover.size > 0);
+            covered += cover.size;
+            payload += cover.size;
         }
         CHECK(covered == expected_end);
         return true;
@@ -276,25 +276,20 @@ bool test_atomic_residency_plan(const char * union_policy_path) {
     CHECK(npu_payload + gpu_payload + cpu_payload == 11456);
     CHECK(std::fabs((double) (npu_payload + gpu_payload + cpu_payload) / 8192.0 - 1.3984375) < 1.0e-12);
 
-    // Keep every profile endpoint as an atomic boundary; merging adjacent
-    // intervals would reintroduce unsafe REPACK subviews at runtime.
-    const auto npu_tiles = backend_tiles("HTP0-REPACK");
-    const auto gpu_tiles = backend_tiles("OpenCL");
-    const auto cpu_tiles = backend_tiles("CPU_REPACK");
-    CHECK(npu_tiles.size() == 4);
-    CHECK(npu_tiles[0].start == 0    && npu_tiles[0].size == 4096);
-    CHECK(npu_tiles[1].start == 4096 && npu_tiles[1].size == 768);
-    CHECK(npu_tiles[2].start == 4864 && npu_tiles[2].size == 256);
-    CHECK(npu_tiles[3].start == 5120 && npu_tiles[3].size == 768);
-    CHECK(gpu_tiles.size() == 7);
-    CHECK(gpu_tiles.front().start == 4096 && gpu_tiles.front().size == 768);
-    CHECK(gpu_tiles.back().start == 6720 && gpu_tiles.back().size == 256);
-    CHECK(cpu_tiles.size() == 4);
-    CHECK(cpu_tiles.front().start == 5504 && cpu_tiles.front().size == 640);
-    CHECK(cpu_tiles.back().start == 6976 && cpu_tiles.back().size == 1216);
+    // All overlapping/touching profile ranges for a processor collapse into
+    // one independently packed cover.
+    const auto npu_covers = backend_covers("HTP0-REPACK");
+    const auto gpu_covers = backend_covers("OpenCL");
+    const auto cpu_covers = backend_covers("CPU_REPACK");
+    CHECK(npu_covers.size() == 1);
+    CHECK(npu_covers[0].start == 0 && npu_covers[0].size == 5888);
+    CHECK(gpu_covers.size() == 1);
+    CHECK(gpu_covers[0].start == 4096 && gpu_covers[0].size == 2880);
+    CHECK(cpu_covers.size() == 1);
+    CHECK(cpu_covers[0].start == 5504 && cpu_covers[0].size == 2688);
 
     // A union is not a convex hull. Preserve the intentionally uncovered gap.
-    const auto disjoint = backend_tiles("DISJOINT");
+    const auto disjoint = backend_covers("DISJOINT");
     CHECK(disjoint.size() == 2);
     CHECK(disjoint[0].start == 0 && disjoint[0].size == 64);
     CHECK(disjoint[1].start == 8128 && disjoint[1].size == 64);
@@ -567,7 +562,7 @@ int main() {
             llama_backend_policy_clear();
             return 1;
         }
-        if (!test_atomic_residency_plan(union_file.path())) {
+        if (!test_cover_residency_plan(union_file.path())) {
             llama_backend_policy_clear();
             return 1;
         }
