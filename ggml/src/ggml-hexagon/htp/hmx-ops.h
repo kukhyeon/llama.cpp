@@ -61,6 +61,29 @@ int hmx_mat_mul_permuted_qk_0_d16a32(struct htp_context *ctx,
                                       int m, int k, int n,
                                       int weight_type);
 
+// Region metadata for a compact K slice stored inside a parent x4x2 row.
+//
+// The parent row remains laid out as:
+//   [all parent quants][all parent scales]
+// so a partial K range needs two DMA transfers before the existing compact
+// dequantize/HMX path can consume it.  parent_row_stride is measured in bytes.
+typedef struct {
+    int    parent_k;
+    int    k_start;
+    size_t parent_row_stride;
+} hmx_matmul_qk_region_params_t;
+
+// HMX matrix multiplication over a K slice of parent-repacked Q8_0 weights.
+// The ordinary API above remains the compact/full-row fast path.
+int hmx_mat_mul_permuted_qk_0_d16a32_region(
+                                      struct htp_context *ctx,
+                                      float *restrict dst,
+                                      const float *activation,
+                                      const uint8_t *permuted_weight,
+                                      int m, int k, int n,
+                                      int weight_type,
+                                      const hmx_matmul_qk_region_params_t *region);
+
 // HMX flash attention
 int hmx_flash_attn_ext(struct htp_ops_context * octx);
 

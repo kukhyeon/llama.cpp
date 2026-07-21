@@ -8188,6 +8188,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         GGML_TYPE_Q8_0, 256, 32, 1, 64, 128, 0, 32));
     test_cases.emplace_back(new test_mul_mat_src0_region(
         GGML_TYPE_Q8_0, 256, 32, 8, 64, 128, 8, 16));
+    // HTP Q8x4x2-aligned wide-cover slices: pure HMX, HMX + M tail,
+    // and the large-K out-stationary path.
+    test_cases.emplace_back(new test_mul_mat_src0_region(
+        GGML_TYPE_Q8_0, 512, 64, 64, 0, 256, 0, 64));
+    test_cases.emplace_back(new test_mul_mat_src0_region(
+        GGML_TYPE_Q8_0, 512, 64, 63, 256, 256, 0, 64));
+    test_cases.emplace_back(new test_mul_mat_src0_region(
+        GGML_TYPE_Q8_0, 1536, 1056, 128, 256, 1280, 0, 1056));
 
 #if 0
     // > 4GB A matrix. Too slow to be enabled by default.

@@ -33,6 +33,23 @@ def test_backend_ops_htp0(type_a):
     assert result.returncode == 0, f"test-backend-ops type_a={type_a} failed (exit {result.returncode})"
 
 
+def test_backend_ops_htp0_src0_region():
+    cmd = (
+        f"{CMD_PREFIX} GGML_HEXAGON_HOSTBUF=0 GGML_HEXAGON_USE_HMX=1 "
+        "GGML_HEXAGON_EXPERIMENTAL=1 "
+        f"{BIN_PATH}/test-backend-ops -b HTP0 -o MUL_MAT_SRC0_REGION"
+    )
+    result = run_adb_command(
+        cmd,
+        check=False,
+    )
+    write_qdc_log("backend_ops_mul_mat_src0_region.log", result.stdout or "")
+    assert result.returncode == 0, (
+        "test-backend-ops MUL_MAT_SRC0_REGION failed "
+        f"(exit {result.returncode})"
+    )
+
+
 if __name__ == "__main__":
     ret = pytest.main(["-s", "--junitxml=results.xml", os.path.realpath(__file__)])
     if os.path.exists("results.xml"):

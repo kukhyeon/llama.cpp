@@ -6,6 +6,7 @@
 #include <HAP_farf.h>
 #include <HAP_perf.h>
 
+#include <limits.h>
 #include <math.h>
 #include <string.h>
 
@@ -2873,6 +2874,25 @@ static int htp_matmul_region_validate(
         return HTP_STATUS_INVAL_PARAMS;
     }
 
+    const uint64_t src1_row_size =
+        (uint64_t) src1->ne[0] * sizeof(float);
+    const uint64_t dst_row_size =
+        (uint64_t) dst->ne[0] * sizeof(float);
+    if (src1->ne[1] == 0 || dst->ne[1] == 0 ||
+        src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float) ||
+        src1->nb[1] < src1_row_size || dst->nb[1] < dst_row_size) {
+        return HTP_STATUS_INVAL_PARAMS;
+    }
+
+    const uint64_t src1_last_row_end =
+        (uint64_t) (src1->ne[1] - 1) * src1->nb[1] + src1_row_size;
+    const uint64_t dst_last_row_end =
+        (uint64_t) (dst->ne[1] - 1) * dst->nb[1] + dst_row_size;
+    if (src1_last_row_end > src1->size ||
+        dst_last_row_end > dst->size) {
+        return HTP_STATUS_INVAL_PARAMS;
+    }
+
     // A repacked Q8_0 row is [parent-K quants][parent-K/16 scale bytes].
     const uint64_t parent_row_size = (uint64_t) src0->ne[0] + src0->ne[0] / 16;
     const uint64_t last_row_end =
@@ -3052,7 +3072,7 @@ static void matmul_src0_region_q8(unsigned int nth, unsigned int ith, void * dat
     (void) nth;
 }
 
-int op_matmul_src0_region(struct htp_ops_context * octx) {
+static int op_matmul_src0_region_fallback(struct htp_ops_context * octx) {
     struct htp_mul_mat_src0_region_params params = {0};
     const int validation = htp_matmul_region_validate(octx, &params);
     if (validation != HTP_STATUS_OK) {
@@ -3075,8 +3095,8 @@ int op_matmul_src0_region(struct htp_ops_context * octx) {
     // Up/gate regions keep the complete K row and only select output rows.
     // A whole repacked row is independently addressable, so this case can
     // use the existing HMX/HVX implementation with a temporary logical
-    // tensor descriptor.  K-sliced down projections take the gather path
-    // below because their parent quant/scale sections are non-contiguous.
+    // tensor descriptor.  Partial-K requests reach the gather code below
+    // only as an explicit HVX fallback or as an HMX M-tail.
     if (params.k_start == 0 && params.k_size == src0->ne[0]) {
         struct htp_tensor selected_src0 = *src0;
         selected_src0.data +=
@@ -3098,6 +3118,13 @@ int op_matmul_src0_region(struct htp_ops_context * octx) {
         octx->src[0] = src0;
         octx->src[1] = src1;
         octx->dst    = dst;
+
+        // op_matmul() may process an M tail through a stack-local tensor
+        // descriptor.  Preserve a valid activation cache only when it still
+        // refers to the original source tensor.
+        if (octx->src1_spad.src != src1) {
+            octx->src1_spad.src = NULL;
+        }
 
         // Some legacy HMX paths return zero on success whereas the HTP ABI
         // uses HTP_STATUS_OK (1).  Normalize at this new opcode boundary.
@@ -3155,8 +3182,8 @@ int op_matmul_src0_region(struct htp_ops_context * octx) {
     octx->src0_spad.data = octx->src1_spad.data + octx->src1_spad.size;
     octx->dst_spad.data  = octx->src0_spad.data + octx->src0_spad.size;
 
-    // HMX currently has no parent-row region ABI.  Never reinterpret this
-    // op as ordinary compact HMX matmul; use the explicit HVX gather path.
+    // This helper is the correctness-first HVX path.  Parent quant and scale
+    // sections remain non-contiguous and are explicitly gathered per row.
     octx->src1_spad.src =
         (src1 == octx->src1_spad.src) ? src1 : NULL;
     octx->src0_spad.src = NULL;
@@ -3201,6 +3228,173 @@ int op_matmul_src0_region(struct htp_ops_context * octx) {
          src1_nrows);
 
     return HTP_STATUS_OK;
+}
+
+int op_matmul_src0_region(struct htp_ops_context * octx) {
+    struct htp_mul_mat_src0_region_params params = {0};
+    const int validation = htp_matmul_region_validate(octx, &params);
+    if (validation != HTP_STATUS_OK) {
+        // Keep validation diagnostics and status handling in one place.
+        return op_matmul_src0_region_fallback(octx);
+    }
+
+    const struct htp_tensor * src0 = octx->src[0];
+    const struct htp_tensor * src1 = octx->src[1];
+    const struct htp_tensor * dst  = octx->dst;
+
+    // Complete K rows (up/gate and exact-cover down) already use the
+    // ordinary compact HMX/HVX implementation in the fallback helper.
+    if (params.k_start == 0 && params.k_size == src0->ne[0]) {
+        return op_matmul_src0_region_fallback(octx);
+    }
+
+#ifndef HTP_HAS_HMX
+    return op_matmul_src0_region_fallback(octx);
+#else
+    if (!octx->ctx->hmx_enabled ||
+        (octx->flags & HTP_OPFLAGS_SKIP_COMPUTE)) {
+        return op_matmul_src0_region_fallback(octx);
+    }
+
+    if (src0->ne[0] > INT_MAX ||
+        src1->ne[1] > INT_MAX ||
+        params.k_start > INT_MAX ||
+        params.k_size > INT_MAX ||
+        params.out_start > INT_MAX ||
+        params.out_size > INT_MAX) {
+        return op_matmul_src0_region_fallback(octx);
+    }
+
+    const int m_total = (int) src1->ne[1];
+    const int m_tail  = m_total % 32;
+    const int m_hmx   = m_total - m_tail;
+
+    // The quantized HMX kernel consumes compact activation/output rows and
+    // 32-row/column tiles.  Requests outside those constraints retain the
+    // correctness-first HVX implementation.
+    if (m_hmx == 0 ||
+        ((uint32_t) params.out_size % 32) != 0 ||
+        src1->nb[1] != (uint32_t) params.k_size * sizeof(float) ||
+        dst->nb[1]  != (uint32_t) params.out_size * sizeof(float)) {
+        return op_matmul_src0_region_fallback(octx);
+    }
+
+    const uint64_t selected_row_offset =
+        (uint64_t) params.out_start * src0->nb[1];
+    const uint8_t * selected_weight =
+        (const uint8_t *) src0->data + selected_row_offset;
+
+    if ((((uintptr_t) selected_weight |
+          (uintptr_t) src1->data |
+          (uintptr_t) dst->data) & (VLEN - 1)) != 0) {
+        return op_matmul_src0_region_fallback(octx);
+    }
+
+    const hmx_matmul_qk_region_params_t region = {
+        .parent_k         = (int) src0->ne[0],
+        .k_start          = (int) params.k_start,
+        .parent_row_stride = src0->nb[1],
+    };
+
+    if (m_tail > 0) {
+        // Compute the tail first.  If it fails, no HMX prefix has modified
+        // the output yet.  If the subsequent HMX call fails, the full HVX
+        // fallback below safely overwrites this tail.
+        struct htp_tensor src1_tail = *src1;
+        struct htp_tensor dst_tail  = *dst;
+        const uint64_t src1_tail_offset =
+            (uint64_t) m_hmx * src1->nb[1];
+        const uint64_t dst_tail_offset =
+            (uint64_t) m_hmx * dst->nb[1];
+
+        if (src1_tail_offset > src1_tail.size ||
+            dst_tail_offset > dst_tail.size ||
+            src1_tail_offset > UINT32_MAX ||
+            dst_tail_offset > UINT32_MAX) {
+            return op_matmul_src0_region_fallback(octx);
+        }
+
+        src1_tail.data += (uint32_t) src1_tail_offset;
+        src1_tail.size -= (uint32_t) src1_tail_offset;
+        dst_tail.data  += (uint32_t) dst_tail_offset;
+        dst_tail.size  -= (uint32_t) dst_tail_offset;
+        src1_tail.ne[1] = (uint32_t) m_tail;
+        dst_tail.ne[1]  = (uint32_t) m_tail;
+        src1_tail.nb[2] = src1_tail.nb[1] * src1_tail.ne[1];
+        src1_tail.nb[3] = src1_tail.nb[2];
+        dst_tail.nb[2]  = dst_tail.nb[1] * dst_tail.ne[1];
+        dst_tail.nb[3]  = dst_tail.nb[2];
+
+        octx->src[1] = &src1_tail;
+        octx->dst    = &dst_tail;
+        const int tail_status = op_matmul_src0_region_fallback(octx);
+        octx->src[0] = src0;
+        octx->src[1] = src1;
+        octx->dst    = dst;
+
+        // The fallback caches VTCM tensor identities.  The descriptors above
+        // are stack-local, and HMX will reuse VTCM next, so never retain them.
+        octx->src0_spad.src = NULL;
+        octx->src1_spad.src = NULL;
+        octx->src2_spad.src = NULL;
+        octx->src3_spad.src = NULL;
+        octx->dst_spad.src  = NULL;
+
+        if (tail_status != 0 && tail_status != HTP_STATUS_OK) {
+            return tail_status;
+        }
+    }
+
+    const int hmx_status =
+        hmx_mat_mul_permuted_qk_0_d16a32_region(
+            octx->ctx,
+            (float *) dst->data,
+            (const float *) src1->data,
+            selected_weight,
+            m_hmx,
+            (int) params.k_size,
+            (int) params.out_size,
+            (int) src0->type,
+            &region);
+
+    if (hmx_status != 0) {
+        FARF(HIGH,
+             "matmul-src0-region: HMX region failed (ret=%d), "
+             "falling back to HVX parent=%ux%u k=%lld+%lld out=%lld+%lld",
+             hmx_status,
+             src0->ne[0],
+             src0->ne[1],
+             (long long) params.k_start,
+             (long long) params.k_size,
+             (long long) params.out_start,
+             (long long) params.out_size);
+        octx->src0_spad.src = NULL;
+        octx->src1_spad.src = NULL;
+        octx->src2_spad.src = NULL;
+        octx->src3_spad.src = NULL;
+        octx->dst_spad.src  = NULL;
+        return op_matmul_src0_region_fallback(octx);
+    }
+
+    FARF(HIGH,
+         "matmul-src0-region: HMX region parent=%ux%u k=%lld+%lld "
+         "out=%lld+%lld input-rows=%d tail=%d",
+         src0->ne[0],
+         src0->ne[1],
+         (long long) params.k_start,
+         (long long) params.k_size,
+         (long long) params.out_start,
+         (long long) params.out_size,
+         m_hmx,
+         m_tail);
+
+    octx->src0_spad.src = NULL;
+    octx->src1_spad.src = NULL;
+    octx->src2_spad.src = NULL;
+    octx->src3_spad.src = NULL;
+    octx->dst_spad.src  = NULL;
+    return HTP_STATUS_OK;
+#endif
 }
 
 static int op_matmul_hvx(struct htp_ops_context * octx) {
