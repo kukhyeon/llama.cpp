@@ -71,6 +71,133 @@ static inline size_t get_x4x2_row_stride(int weight_type, int k) {
     }
 }
 
+typedef struct {
+    size_t parent_row_stride;
+    size_t compact_row_stride;
+    size_t quant_offset;
+    size_t quant_width;
+    size_t scale_offset;
+    size_t scale_width;
+    bool   compact_full_row;
+} hmx_x4x2_slice_layout_t;
+
+// Describe a super-block-aligned logical K slice without changing the parent
+// DDR row layout.  The compact destination row consumed by the existing
+// dequantizers is [slice quants][slice scales].
+static int hmx_x4x2_slice_layout(
+        int weight_type,
+        int parent_k,
+        int k_start,
+        int k_size,
+        size_t parent_row_stride,
+        hmx_x4x2_slice_layout_t *layout) {
+    if (!layout ||
+        parent_k <= 0 || k_start < 0 || k_size <= 0 ||
+        k_start > parent_k || k_size > parent_k - k_start ||
+        parent_k % QK_Q4_0x4x2 != 0 ||
+        k_start  % QK_Q4_0x4x2 != 0 ||
+        k_size   % QK_Q4_0x4x2 != 0) {
+        return -1;
+    }
+
+    size_t quant_block_size;
+    size_t scale_block_size;
+    switch (weight_type) {
+        case HTP_TYPE_Q4_0:
+        case HTP_TYPE_IQ4_NL:
+            quant_block_size = QK_Q4_0x4x2 / 2;
+            scale_block_size = HMX_X4X2_DBLK_SIZE;
+            break;
+        case HTP_TYPE_Q8_0:
+            quant_block_size = QK_Q8_0x4x2;
+            scale_block_size = HMX_X4X2_DBLK_SIZE;
+            break;
+        case HTP_TYPE_MXFP4:
+            quant_block_size = QK_MXFP4x4x2 / 2;
+            scale_block_size = HMX_X4X2_MXFP4_EBLK_SIZE;
+            break;
+        default:
+            return -1;
+    }
+
+    const size_t parent_blocks = (size_t) parent_k / QK_Q4_0x4x2;
+    const size_t start_block   = (size_t) k_start  / QK_Q4_0x4x2;
+    const size_t active_blocks = (size_t) k_size   / QK_Q4_0x4x2;
+    const size_t expected_parent_stride =
+        parent_blocks * (quant_block_size + scale_block_size);
+
+    if (parent_row_stride != expected_parent_stride) {
+        return -1;
+    }
+
+    layout->parent_row_stride  = parent_row_stride;
+    layout->compact_row_stride =
+        active_blocks * (quant_block_size + scale_block_size);
+    layout->quant_offset = start_block * quant_block_size;
+    layout->quant_width  = active_blocks * quant_block_size;
+    layout->scale_offset =
+        parent_blocks * quant_block_size + start_block * scale_block_size;
+    layout->scale_width = active_blocks * scale_block_size;
+    layout->compact_full_row =
+        k_start == 0 && k_size == parent_k &&
+        layout->compact_row_stride == parent_row_stride;
+
+    return 0;
+}
+
+// Queue one compact full-row transfer, or two parent-region transfers that
+// gather quants and scales into a compact VTCM row.  A positive return value is
+// the number of DMA descriptors that the caller must pop.  On failure, -(n+1)
+// encodes how many descriptors were successfully queued before the failure.
+static int hmx_queue_x4x2_slice_dma(
+        dma_queue *dma,
+        uint8_t *dst,
+        const uint8_t *src,
+        size_t n_rows,
+        const hmx_x4x2_slice_layout_t *layout) {
+    if (!dma || !dst || !src || !layout || n_rows == 0) {
+        return -1;
+    }
+
+    if (layout->compact_full_row) {
+        return dma_queue_push(
+            dma,
+            dma_make_ptr(dst, src),
+            layout->compact_row_stride,
+            layout->parent_row_stride,
+            layout->compact_row_stride,
+            n_rows) ? 1 : -1;
+    }
+
+    if (!dma_queue_push(
+            dma,
+            dma_make_ptr(dst, src + layout->quant_offset),
+            layout->compact_row_stride,
+            layout->parent_row_stride,
+            layout->quant_width,
+            n_rows)) {
+        return -1;
+    }
+
+    if (!dma_queue_push(
+            dma,
+            dma_make_ptr(dst + layout->quant_width, src + layout->scale_offset),
+            layout->compact_row_stride,
+            layout->parent_row_stride,
+            layout->scale_width,
+            n_rows)) {
+        return -2; // one quant descriptor was queued
+    }
+
+    return 2;
+}
+
+static void hmx_pop_dma_count(dma_queue *dma, int count) {
+    for (int i = 0; i < count; ++i) {
+        (void) dma_queue_pop(dma);
+    }
+}
+
 // --- Overflow-safe arithmetic for VTCM budget calculation ---
 
 static inline bool hmx_mul_overflow(size_t a, size_t b, size_t *out) {
@@ -851,12 +978,21 @@ static void core_mma_chunk_fp16(__fp16 *restrict c, const __fp16 *restrict a, co
 
 static __attribute__((noinline)) int mat_mul_qk_0_d16a32_out_stationary(struct htp_context *ctx,
                                        float *restrict out, const float *restrict x, const uint8_t *restrict w,
-                                       int m, int k, int n, int weight_type) {
+                                       int m, int k, int n, int weight_type,
+                                       const hmx_matmul_qk_region_params_t *region) {
     // assume k % 32 == 0 && n % 32 == 0
-    const size_t row_stride = get_x4x2_row_stride(weight_type, k);
-    if (row_stride == 0) {
+    hmx_x4x2_slice_layout_t active_layout;
+    if (!region ||
+        hmx_x4x2_slice_layout(
+            weight_type,
+            region->parent_k,
+            region->k_start,
+            k,
+            region->parent_row_stride,
+            &active_layout) != 0) {
         return -1;
     }
+    const size_t parent_row_stride = active_layout.parent_row_stride;
 
     const size_t vtcm_budget = ctx->vtcm_size;
 
@@ -969,25 +1105,38 @@ static __attribute__((noinline)) int mat_mul_qk_0_d16a32_out_stationary(struct h
 
                 // fetch weight block into VTCM (x4x2 sub-block: quants + scales)
                 const size_t sub_row_stride = get_x4x2_row_stride(weight_type, k_blk_sz);
+                int weight_dma_count = -1;
                 {
-                    const int blk_start       = kk / QK_Q4_0x4x2;
-                    const int nb_sub          = (k_blk_sz + QK_Q4_0x4x2 - 1) / QK_Q4_0x4x2;
-                    const int  full_qrow      = (weight_type == HTP_TYPE_Q8_0) ? k : (k / 2);
-                    const int  scale_blk_size = (weight_type == HTP_TYPE_MXFP4) ? HMX_X4X2_MXFP4_EBLK_SIZE : HMX_X4X2_DBLK_SIZE;
-                    uint8_t       *dst        = vtcm_scratch0;
-                    const uint8_t *src        = w + nc * row_stride;
-                    const size_t  n_rows      = n_blk_sz;
-                    const size_t  src_stride  = row_stride;
-                    const size_t  dst_stride  = sub_row_stride;
-                    const size_t  quant_off   = (weight_type == HTP_TYPE_Q8_0) ? (blk_start * QK_Q8_0x4x2) : (blk_start * (QK_Q4_0x4x2 / 2));
-                    const size_t  quant_width = (weight_type == HTP_TYPE_Q8_0) ? (nb_sub    * QK_Q8_0x4x2) : (nb_sub    * (QK_Q4_0x4x2 / 2));
-                    const size_t  scale_off   = full_qrow + blk_start * scale_blk_size;
-                    const size_t  scale_width = nb_sub * scale_blk_size;
+                    hmx_x4x2_slice_layout_t block_layout;
+                    if (hmx_x4x2_slice_layout(
+                            weight_type,
+                            region->parent_k,
+                            region->k_start + (int) kk,
+                            (int) k_blk_sz,
+                            parent_row_stride,
+                            &block_layout) != 0 ||
+                        block_layout.compact_row_stride != sub_row_stride) {
+                        (void) dma_queue_pop(ctx->dma[0]); // activation DMA
+                        HAP_compute_res_hmx_unlock(ctx->vtcm_rctx);
+                        return -1;
+                    }
 
-                    // 2D DMA: quants sub-range
-                    dma_queue_push(ctx->dma[0], dma_make_ptr(dst, src + quant_off), dst_stride, src_stride, quant_width, n_rows);
-                    // 2D DMA: scales sub-range
-                    dma_queue_push(ctx->dma[0], dma_make_ptr(dst + quant_width, src + scale_off), dst_stride, src_stride, scale_width, n_rows);
+                    const uint8_t *src = w + nc * parent_row_stride;
+                    weight_dma_count = hmx_queue_x4x2_slice_dma(
+                        ctx->dma[0],
+                        vtcm_scratch0,
+                        src,
+                        n_blk_sz,
+                        &block_layout);
+                    if (weight_dma_count <= 0) {
+                        // The activation descriptor precedes any partially
+                        // queued weight descriptors.
+                        const int queued = -weight_dma_count - 1;
+                        (void) dma_queue_pop(ctx->dma[0]);
+                        hmx_pop_dma_count(ctx->dma[0], queued);
+                        HAP_compute_res_hmx_unlock(ctx->vtcm_rctx);
+                        return -1;
+                    }
                 }
                 TIMER_STOP(fetch);
 
@@ -1002,8 +1151,7 @@ static __attribute__((noinline)) int mat_mul_qk_0_d16a32_out_stationary(struct h
                 TIMER_START(wt_dequant);
                 // dequantize weight block
                 {
-                    dma_queue_pop(ctx->dma[0]);
-                    dma_queue_pop(ctx->dma[0]);
+                    hmx_pop_dma_count(ctx->dma[0], weight_dma_count);
                     // vtcm_scratch0 is used to store the qweight chunk
                     // worker_pool_run_func already returned, so fetch is done
                     dequantize_x4x2_weight_chunk_to_fp16_tiles(ctx, vtcm_weight, vtcm_scratch0,
@@ -1037,19 +1185,40 @@ static __attribute__((noinline)) int mat_mul_qk_0_d16a32_out_stationary(struct h
     return 0;
 }
 
-int hmx_mat_mul_permuted_qk_0_d16a32(struct htp_context *ctx, float *restrict dst, const float *restrict activation,
-                                     const uint8_t *restrict permuted_weight, int m, int k, int n,
-                                     int weight_type) {
-    if (!dst || !activation || !permuted_weight || !m || !n || !k) { return -1; }
+static int hmx_mat_mul_permuted_qk_0_d16a32_impl(
+                                     struct htp_context *ctx,
+                                     float *restrict dst,
+                                     const float *restrict activation,
+                                     const uint8_t *restrict permuted_weight,
+                                     int m, int k, int n,
+                                     int weight_type,
+                                     const hmx_matmul_qk_region_params_t *region) {
+    if (!ctx || !dst || !activation || !permuted_weight ||
+        !region || !m || !n || !k) {
+        return -1;
+    }
     if (k % 32 != 0 || n % 32 != 0) { return -1; }
 
     if (!hex_is_aligned(dst, VLEN) || !hex_is_aligned(activation, VLEN) || !hex_is_aligned(permuted_weight, VLEN)) {
         return -1;
     }
 
+    hmx_x4x2_slice_layout_t active_layout;
+    if (hmx_x4x2_slice_layout(
+            weight_type,
+            region->parent_k,
+            region->k_start,
+            k,
+            region->parent_row_stride,
+            &active_layout) != 0) {
+        return -1;
+    }
+
     // for large m, k (e.g. prefill FFN Down), use out-stationary version
     if (m >= 128 && k > n && n > 1024) {
-        int rc = mat_mul_qk_0_d16a32_out_stationary(ctx, dst, activation, permuted_weight, m, k, n, weight_type);
+        int rc = mat_mul_qk_0_d16a32_out_stationary(
+            ctx, dst, activation, permuted_weight,
+            m, k, n, weight_type, region);
         if (rc != FALLBACK_TO_STANDARD) {
             return rc;  // 0 success, -1 error
         }
@@ -1057,10 +1226,8 @@ int hmx_mat_mul_permuted_qk_0_d16a32(struct htp_context *ctx, float *restrict ds
         // fall through to standard path
     }
 
-    size_t row_stride = get_x4x2_row_stride(weight_type, k);
-    if (row_stride == 0) {
-        return -1;
-    }
+    const size_t row_stride        = active_layout.compact_row_stride;
+    const size_t parent_row_stride = active_layout.parent_row_stride;
 
     FARF(HIGH, "hmx_matmul_qk: STANDARD path m=%d k=%d n=%d type=%d", m, k, n, weight_type);
 
@@ -1172,9 +1339,22 @@ int hmx_mat_mul_permuted_qk_0_d16a32(struct htp_context *ctx, float *restrict ds
             void *buf_curr = vtcm_scratch0;
             void *buf_next = vtcm_scratch1;
 
+            int current_weight_dma_count;
             {
                 const size_t n_cols_first = hex_smin(n, n_chunk_n_cols);
-                dma_queue_push(ctx->dma[0], dma_make_ptr(buf_curr, permuted_weight), row_stride, row_stride, row_stride, n_cols_first);
+                current_weight_dma_count = hmx_queue_x4x2_slice_dma(
+                    ctx->dma[0],
+                    (uint8_t *) buf_curr,
+                    permuted_weight,
+                    n_cols_first,
+                    &active_layout);
+                if (current_weight_dma_count <= 0) {
+                    hmx_pop_dma_count(
+                        ctx->dma[0],
+                        -current_weight_dma_count - 1);
+                    HAP_compute_res_hmx_unlock(ctx->vtcm_rctx);
+                    return -1;
+                }
             }
 
             for (size_t nc = 0; nc < n; nc += n_chunk_n_cols) {
@@ -1183,15 +1363,30 @@ int hmx_mat_mul_permuted_qk_0_d16a32(struct htp_context *ctx, float *restrict ds
 
                 TIMER_START(weight_load);
                 {
-                    dma_queue_pop(ctx->dma[0]);  // wait until current weight chunk become ready
+                    // Wait until both quant and scale regions (or the compact
+                    // full row) for the current weight chunk are ready.
+                    hmx_pop_dma_count(ctx->dma[0], current_weight_dma_count);
 
                     const size_t nc_next = nc + n_chunk_n_cols;
                     if (nc_next < n) {
                         const size_t n_cols_next = hex_smin(n - nc_next, n_chunk_n_cols);
 
-                        const uint8_t *next_weight_chunk = permuted_weight + nc_next * row_stride;
+                        const uint8_t *next_weight_chunk =
+                            permuted_weight + nc_next * parent_row_stride;
 
-                        dma_queue_push(ctx->dma[0], dma_make_ptr(buf_next, next_weight_chunk), row_stride, row_stride, row_stride, n_cols_next);
+                        current_weight_dma_count = hmx_queue_x4x2_slice_dma(
+                            ctx->dma[0],
+                            (uint8_t *) buf_next,
+                            next_weight_chunk,
+                            n_cols_next,
+                            &active_layout);
+                        if (current_weight_dma_count <= 0) {
+                            hmx_pop_dma_count(
+                                ctx->dma[0],
+                                -current_weight_dma_count - 1);
+                            HAP_compute_res_hmx_unlock(ctx->vtcm_rctx);
+                            return -1;
+                        }
                     }
 
                     // Dequant + vscatter writes directly to [K, N] transposed tiles.
@@ -1241,10 +1436,23 @@ int hmx_mat_mul_permuted_qk_0_d16a32(struct htp_context *ctx, float *restrict ds
 
             // prologue: A0
             const size_t n_cols_A0 = hex_smin(n - 0 * n_chunk_n_cols, n_chunk_n_cols);
+            int pending_weight_dma_count;
             {
-                // Use 2D DMA (n_cols rows x row_stride) to avoid 16-bit roiwidth overflow.
-                const uint8_t *qweight_chunk_A0 = permuted_weight;
-                dma_queue_push(ctx->dma[0], dma_make_ptr(vtcm_qweight, qweight_chunk_A0), row_stride, row_stride, row_stride, n_cols_A0);
+                pending_weight_dma_count = hmx_queue_x4x2_slice_dma(
+                    ctx->dma[0],
+                    (uint8_t *) vtcm_qweight,
+                    permuted_weight,
+                    n_cols_A0,
+                    &active_layout);
+                if (pending_weight_dma_count <= 0) {
+                    hmx_pop_dma_count(
+                        ctx->dma[0],
+                        -pending_weight_dma_count - 1);
+                    // A previous M chunk may have left the worker holding the
+                    // HMX resource lock even though its last job was popped.
+                    hmx_queue_suspend(ctx->hmx_queue);
+                    return -1;
+                }
             }
 
             {
@@ -1255,14 +1463,30 @@ int hmx_mat_mul_permuted_qk_0_d16a32(struct htp_context *ctx, float *restrict ds
             // prologue: B0, A1, submit C0 (async), B1 (overlaps C0)
             {
                 // B0: wait for DMA, dequant weight chunk 0
-                dma_queue_pop(ctx->dma[0]);
+                hmx_pop_dma_count(ctx->dma[0], pending_weight_dma_count);
                 dequantize_x4x2_weight_chunk_to_fp16_tiles(ctx, vtcm_weight_bufs[0], vtcm_qweight, n_cols_A0, k, row_stride, weight_type);
 
                 // A1: issue DMA for weight chunk 1
                 const size_t n_cols_A1 = hex_smin(n - 1 * n_chunk_n_cols, n_chunk_n_cols);
                 if (1 < n_chunk_cnt) {
-                    const uint8_t *qweight_chunk_A1 = permuted_weight + n_chunk_n_cols * row_stride;
-                    dma_queue_push(ctx->dma[0], dma_make_ptr(vtcm_qweight, qweight_chunk_A1), row_stride, row_stride, row_stride, n_cols_A1);
+                    const uint8_t *qweight_chunk_A1 =
+                        permuted_weight + n_chunk_n_cols * parent_row_stride;
+                    pending_weight_dma_count = hmx_queue_x4x2_slice_dma(
+                        ctx->dma[0],
+                        (uint8_t *) vtcm_qweight,
+                        qweight_chunk_A1,
+                        n_cols_A1,
+                        &active_layout);
+                    if (pending_weight_dma_count <= 0) {
+                        hmx_pop_dma_count(
+                            ctx->dma[0],
+                            -pending_weight_dma_count - 1);
+                        // No job for this M chunk has been submitted yet, but
+                        // the worker can still own the lock from the previous
+                        // chunk.  Always suspend before falling back to HVX.
+                        hmx_queue_suspend(ctx->hmx_queue);
+                        return -1;
+                    }
                 }
 
                 // submit C0 (non-blocking — HMX worker executes in parallel)
@@ -1274,7 +1498,7 @@ int hmx_mat_mul_permuted_qk_0_d16a32(struct htp_context *ctx, float *restrict ds
 
                 // B1: DMA pop + dequant (runs in parallel with C0 on HMX worker)
                 if (1 < n_chunk_cnt) {
-                    dma_queue_pop(ctx->dma[0]);
+                    hmx_pop_dma_count(ctx->dma[0], pending_weight_dma_count);
                     dequantize_x4x2_weight_chunk_to_fp16_tiles(ctx, vtcm_weight_bufs[1], vtcm_qweight, n_cols_A1, k, row_stride, weight_type);
                 }
             }
@@ -1291,8 +1515,23 @@ int hmx_mat_mul_permuted_qk_0_d16a32(struct htp_context *ctx, float *restrict ds
 
                 // issue A_{i+2}: DMA push (non-blocking)
                 if (i + 2 < n_chunk_cnt) {
-                    const uint8_t *qweight_chunk_p2 = permuted_weight + nc_p2 * row_stride;
-                    dma_queue_push(ctx->dma[0], dma_make_ptr(vtcm_qweight, qweight_chunk_p2), row_stride, row_stride, row_stride, n_cols_p2);
+                    const uint8_t *qweight_chunk_p2 =
+                        permuted_weight + nc_p2 * parent_row_stride;
+                    pending_weight_dma_count = hmx_queue_x4x2_slice_dma(
+                        ctx->dma[0],
+                        (uint8_t *) vtcm_qweight,
+                        qweight_chunk_p2,
+                        n_cols_p2,
+                        &active_layout);
+                    if (pending_weight_dma_count <= 0) {
+                        // C_i may already be running asynchronously.
+                        hmx_queue_pop(ctx->hmx_queue);
+                        hmx_queue_suspend(ctx->hmx_queue);
+                        hmx_pop_dma_count(
+                            ctx->dma[0],
+                            -pending_weight_dma_count - 1);
+                        return -1;
+                    }
                 }
 
                 // wait C_i: block until prologue/previous C completes
@@ -1316,7 +1555,7 @@ int hmx_mat_mul_permuted_qk_0_d16a32(struct htp_context *ctx, float *restrict ds
 
                 // B_{i+2}: DMA pop + dequant (multi-thread HVX, parallel with C_{i+1})
                 if (i + 2 < n_chunk_cnt) {
-                    dma_queue_pop(ctx->dma[0]);
+                    hmx_pop_dma_count(ctx->dma[0], pending_weight_dma_count);
                     dequantize_x4x2_weight_chunk_to_fp16_tiles(ctx, vtcm_weight_bufs[(i + 2) % 2], vtcm_qweight, n_cols_p2, k, row_stride, weight_type);
                 }
             }
@@ -1339,6 +1578,49 @@ int hmx_mat_mul_permuted_qk_0_d16a32(struct htp_context *ctx, float *restrict ds
 #endif
 
     return 0;
+}
+
+int hmx_mat_mul_permuted_qk_0_d16a32(
+        struct htp_context *ctx,
+        float *restrict dst,
+        const float *restrict activation,
+        const uint8_t *restrict permuted_weight,
+        int m, int k, int n,
+        int weight_type) {
+    const size_t row_stride = get_x4x2_row_stride(weight_type, k);
+    if (row_stride == 0) {
+        return -1;
+    }
+
+    const hmx_matmul_qk_region_params_t compact = {
+        .parent_k         = k,
+        .k_start          = 0,
+        .parent_row_stride = row_stride,
+    };
+
+    return hmx_mat_mul_permuted_qk_0_d16a32_impl(
+        ctx, dst, activation, permuted_weight,
+        m, k, n, weight_type, &compact);
+}
+
+int hmx_mat_mul_permuted_qk_0_d16a32_region(
+        struct htp_context *ctx,
+        float *restrict dst,
+        const float *activation,
+        const uint8_t *permuted_weight,
+        int m, int k, int n,
+        int weight_type,
+        const hmx_matmul_qk_region_params_t *region) {
+    // The current GGML/HTP region operation deliberately supports Q8_0
+    // covers only.  Keep this internal entry point equally narrow until the
+    // host-side region contract is extended to additional quant formats.
+    if (weight_type != HTP_TYPE_Q8_0) {
+        return -1;
+    }
+
+    return hmx_mat_mul_permuted_qk_0_d16a32_impl(
+        ctx, dst, activation, permuted_weight,
+        m, k, n, weight_type, region);
 }
 
 //
