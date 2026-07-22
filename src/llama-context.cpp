@@ -509,6 +509,11 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
+
+    // The scheduler owns persistent FFN host workers. Destroy it while the
+    // backend objects are still alive instead of relying on reverse member
+    // destruction order (where `backends` would otherwise be released first).
+    sched.reset();
 }
 
 void llama_context::sched_reserve() {
