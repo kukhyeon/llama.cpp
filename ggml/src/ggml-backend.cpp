@@ -21,12 +21,19 @@
 #include <string.h>
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
+#include <condition_variable>
 #include <cstdint>
+#include <exception>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
+
+#if defined(__linux__)
+#include <sched.h>
+#endif
 
 #ifdef __APPLE__
 #include <sys/types.h>
@@ -778,6 +785,8 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+struct ggml_backend_sched_ffn_executor;
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
@@ -822,6 +831,11 @@ struct ggml_backend_sched {
 
     int cpu_threads;
     int ffn_parallel_reduce_threads;
+    int ffn_device_worker_cpu;
+
+    // Non-trivial worker state is owned separately because this scheduler is
+    // allocated with calloc/free.
+    ggml_backend_sched_ffn_executor * ffn_device_executor;
 
     char * context_buffer;
     size_t context_buffer_size;
@@ -836,6 +850,330 @@ struct ggml_backend_sched {
     int debug_graph_size;
     int debug_prev_graph_size;
 };
+
+using ggml_backend_sched_ffn_job_fn = void (*)(void *);
+
+static bool ggml_backend_sched_pin_current_thread_to_cpu(int cpu) {
+    if (cpu < 0) {
+        return true;
+    }
+
+#if defined(__linux__)
+    if (cpu >= CPU_SETSIZE) {
+        errno = EINVAL;
+        return false;
+    }
+
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(cpu, &cpuset);
+    return sched_setaffinity(0, sizeof(cpuset), &cpuset) == 0;
+#else
+    errno = EINVAL;
+    return false;
+#endif
+}
+
+struct ggml_backend_sched_ffn_executor {
+    struct job {
+        ggml_backend_sched_ffn_job_fn fn = nullptr;
+        void * context = nullptr;
+        enum ggml_status * status = nullptr;
+        uint64_t ticket = 0;
+    };
+
+    struct worker {
+        int backend_id;
+        std::string backend_name;
+        int affinity_cpu;
+
+        std::mutex mutex;
+        std::condition_variable work_cv;
+        std::condition_variable state_cv;
+        std::thread thread;
+
+        job queue[GGML_SCHED_MAX_BACKENDS];
+        int queue_head = 0;
+        int queue_tail = 0;
+        int queue_size = 0;
+        uint64_t next_ticket = 1;
+        uint64_t completed_ticket = 0;
+        bool ready = false;
+        bool stopping = false;
+
+        worker(int backend_id, const char * backend_name, int affinity_cpu) :
+            backend_id(backend_id),
+            backend_name(backend_name ? backend_name : "unknown"),
+            affinity_cpu(affinity_cpu) {
+        }
+
+        ~worker() {
+            stop();
+        }
+
+        bool start() {
+            try {
+                thread = std::thread(&worker::run, this);
+            } catch (const std::exception & error) {
+                GGML_LOG_ERROR(
+                        "%s: failed to start persistent FFN worker for backend %s: %s\n",
+                        __func__, backend_name.c_str(), error.what());
+                return false;
+            } catch (...) {
+                GGML_LOG_ERROR(
+                        "%s: failed to start persistent FFN worker for backend %s\n",
+                        __func__, backend_name.c_str());
+                return false;
+            }
+
+            std::unique_lock<std::mutex> lock(mutex);
+            state_cv.wait(lock, [&]() { return ready; });
+            return true;
+        }
+
+        bool submit(
+                ggml_backend_sched_ffn_job_fn fn,
+                void * context,
+                enum ggml_status * status,
+                uint64_t * ticket) {
+            GGML_ASSERT(fn != nullptr);
+            GGML_ASSERT(status != nullptr);
+            GGML_ASSERT(ticket != nullptr);
+
+            std::lock_guard<std::mutex> lock(mutex);
+            if (stopping || queue_size >= GGML_SCHED_MAX_BACKENDS) {
+                return false;
+            }
+
+            const uint64_t current_ticket = next_ticket++;
+            queue[queue_tail] = { fn, context, status, current_ticket };
+            queue_tail = (queue_tail + 1) % GGML_SCHED_MAX_BACKENDS;
+            ++queue_size;
+            *ticket = current_ticket;
+            work_cv.notify_one();
+            return true;
+        }
+
+        void wait(uint64_t ticket) {
+            std::unique_lock<std::mutex> lock(mutex);
+            state_cv.wait(lock, [&]() { return completed_ticket >= ticket; });
+        }
+
+        void stop() {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                stopping = true;
+            }
+            work_cv.notify_one();
+            if (thread.joinable()) {
+                thread.join();
+            }
+        }
+
+        void apply_affinity() {
+            if (affinity_cpu < 0) {
+                return;
+            }
+
+            if (!ggml_backend_sched_pin_current_thread_to_cpu(affinity_cpu)) {
+                const int error = errno;
+                GGML_LOG_WARN(
+                        "%s: failed to pin persistent FFN worker backend %s to CPU %d: %s\n",
+                        __func__, backend_name.c_str(), affinity_cpu, strerror(error));
+            } else {
+                GGML_LOG_INFO(
+                        "%s: pinned persistent FFN worker backend %s to CPU %d\n",
+                        __func__, backend_name.c_str(), affinity_cpu);
+            }
+        }
+
+        void run() {
+            apply_affinity();
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                ready = true;
+            }
+            state_cv.notify_all();
+
+            for (;;) {
+                job current;
+                {
+                    std::unique_lock<std::mutex> lock(mutex);
+                    work_cv.wait(lock, [&]() { return stopping || queue_size > 0; });
+                    if (stopping && queue_size == 0) {
+                        break;
+                    }
+
+                    current = queue[queue_head];
+                    queue_head = (queue_head + 1) % GGML_SCHED_MAX_BACKENDS;
+                    --queue_size;
+                }
+
+                try {
+                    current.fn(current.context);
+                } catch (const std::exception & error) {
+                    *current.status = GGML_STATUS_FAILED;
+                    GGML_LOG_ERROR(
+                            "%s: persistent FFN worker backend %s caught an unexpected exception: %s\n",
+                            __func__, backend_name.c_str(), error.what());
+                } catch (...) {
+                    *current.status = GGML_STATUS_FAILED;
+                    GGML_LOG_ERROR(
+                            "%s: persistent FFN worker backend %s caught an unexpected exception\n",
+                            __func__, backend_name.c_str());
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    completed_ticket = current.ticket;
+                }
+                state_cv.notify_all();
+            }
+        }
+    };
+
+    int n_backends = 0;
+    worker * workers[GGML_SCHED_MAX_BACKENDS] = {};
+
+    ~ggml_backend_sched_ffn_executor() {
+        shutdown();
+    }
+
+    bool initialize(ggml_backend_t * backends, int backend_count, int affinity_cpu) {
+        GGML_ASSERT(backends != nullptr);
+        GGML_ASSERT(backend_count > 0 && backend_count <= GGML_SCHED_MAX_BACKENDS);
+        n_backends = backend_count;
+
+        for (int backend_id = 0; backend_id < n_backends; ++backend_id) {
+            ggml_backend_t backend = backends[backend_id];
+            ggml_backend_dev_t device = ggml_backend_get_device(backend);
+            if (device != nullptr && ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                continue;
+            }
+
+            worker * current = nullptr;
+            try {
+                current = new worker(backend_id, ggml_backend_name(backend), affinity_cpu);
+            } catch (const std::exception & error) {
+                GGML_LOG_ERROR(
+                        "%s: failed to allocate persistent FFN worker for backend %s: %s\n",
+                        __func__, ggml_backend_name(backend), error.what());
+                shutdown();
+                return false;
+            } catch (...) {
+                GGML_LOG_ERROR(
+                        "%s: failed to allocate persistent FFN worker for backend %s\n",
+                        __func__, ggml_backend_name(backend));
+                shutdown();
+                return false;
+            }
+
+            workers[backend_id] = current;
+            if (!current->start()) {
+                shutdown();
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    bool submit(
+            int backend_id,
+            ggml_backend_sched_ffn_job_fn fn,
+            void * context,
+            enum ggml_status * status,
+            uint64_t * ticket) {
+        if (backend_id < 0 || backend_id >= n_backends || workers[backend_id] == nullptr) {
+            return false;
+        }
+        return workers[backend_id]->submit(fn, context, status, ticket);
+    }
+
+    void wait(int backend_id, uint64_t ticket) {
+        GGML_ASSERT(backend_id >= 0 && backend_id < n_backends);
+        GGML_ASSERT(workers[backend_id] != nullptr);
+        workers[backend_id]->wait(ticket);
+    }
+
+    void shutdown() {
+        for (int backend_id = 0; backend_id < n_backends; ++backend_id) {
+            delete workers[backend_id];
+            workers[backend_id] = nullptr;
+        }
+        n_backends = 0;
+    }
+};
+
+static bool ggml_backend_sched_ffn_persistent_workers_enabled() {
+    const char * value = getenv("GGML_FFN_PERSISTENT_DEVICE_WORKERS");
+    if (value == nullptr || value[0] == '\0') {
+        return false;
+    }
+    return strcmp(value, "1") == 0 || strcmp(value, "on") == 0 || strcmp(value, "ON") == 0 ||
+        strcmp(value, "true") == 0 || strcmp(value, "TRUE") == 0 ||
+        strcmp(value, "yes") == 0 || strcmp(value, "YES") == 0;
+}
+
+static int ggml_backend_sched_ffn_device_worker_cpu() {
+    const char * value = getenv("GGML_FFN_DEVICE_WORKER_CPU");
+    if (value == nullptr || value[0] == '\0') {
+        return -1;
+    }
+
+    errno = 0;
+    char * end = nullptr;
+    const long cpu = strtol(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || cpu < -1 || cpu > INT_MAX) {
+        GGML_LOG_WARN(
+                "%s: invalid GGML_FFN_DEVICE_WORKER_CPU='%s'; persistent FFN workers will not be pinned\n",
+                __func__, value);
+        return -1;
+    }
+    return (int) cpu;
+}
+
+struct ggml_backend_sched_ffn_device_job {
+    ggml_backend_t backend = nullptr;
+    struct ggml_cgraph * graph = nullptr;
+    enum ggml_status * status = nullptr;
+    int64_t * dt_us = nullptr;
+};
+
+static void ggml_backend_sched_run_ffn_device_job(void * context) {
+    auto * job = (ggml_backend_sched_ffn_device_job *) context;
+    GGML_ASSERT(job != nullptr);
+    GGML_ASSERT(job->backend != nullptr);
+    GGML_ASSERT(job->graph != nullptr);
+    GGML_ASSERT(job->status != nullptr);
+    GGML_ASSERT(job->dt_us != nullptr);
+
+    const int64_t t0_us = ggml_time_us();
+    enum ggml_status status = GGML_STATUS_FAILED;
+    try {
+        status = ggml_backend_graph_compute_async(job->backend, job->graph);
+        if (status == GGML_STATUS_SUCCESS) {
+            // Parallel FFN device branches must finish before the reduce split can
+            // consume them. Keep this synchronization on the backend's dedicated
+            // persistent host thread.
+            ggml_backend_synchronize(job->backend);
+        }
+    } catch (const std::exception & error) {
+        status = GGML_STATUS_FAILED;
+        GGML_LOG_ERROR(
+                "%s: backend %s threw while executing a persistent FFN job: %s\n",
+                __func__, ggml_backend_name(job->backend), error.what());
+    } catch (...) {
+        status = GGML_STATUS_FAILED;
+        GGML_LOG_ERROR(
+                "%s: backend %s threw while executing a persistent FFN job\n",
+                __func__, ggml_backend_name(job->backend));
+    }
+    const int64_t t1_us = ggml_time_us();
+
+    *job->status = status;
+    *job->dt_us = t1_us - t0_us;
+}
 
 //
 // Backend scheduler profiling (process-global, lightweight)
@@ -912,6 +1250,8 @@ struct ggml_backend_sched_trace_row {
 struct ggml_backend_sched_trace_state {
     bool initialized = false;
     bool enabled = false;
+    bool trace_prefill = true;
+    bool trace_decode = true;
     bool warned_open = false;
     FILE * file = nullptr;
     std::string path = "output/scheduler_trace.csv";
@@ -940,6 +1280,22 @@ static bool ggml_sched_trace_env_enabled(const char * name) {
         strcmp(env, "true") == 0 || strcmp(env, "TRUE") == 0;
 }
 
+static bool ggml_sched_trace_str_eq_ci(const char * lhs, const char * rhs) {
+    if (lhs == nullptr || rhs == nullptr) {
+        return false;
+    }
+
+    while (*lhs != '\0' && *rhs != '\0') {
+        if (std::tolower((unsigned char) *lhs) != std::tolower((unsigned char) *rhs)) {
+            return false;
+        }
+        ++lhs;
+        ++rhs;
+    }
+
+    return *lhs == '\0' && *rhs == '\0';
+}
+
 static void ggml_sched_trace_init(void) {
     if (g_sched_trace.initialized) {
         return;
@@ -948,6 +1304,25 @@ static void ggml_sched_trace_init(void) {
     g_sched_trace.initialized = true;
     g_sched_trace.enabled = ggml_sched_trace_env_enabled("SCHED_TRACE") ||
         ggml_sched_trace_env_enabled("GGML_SCHED_TRACE");
+
+    const char * phase = getenv("SCHED_TRACE_PHASE");
+    if (phase == nullptr || phase[0] == '\0') {
+        phase = getenv("GGML_SCHED_TRACE_PHASE");
+    }
+    if (phase != nullptr && phase[0] != '\0') {
+        if (ggml_sched_trace_str_eq_ci(phase, "prefill")) {
+            g_sched_trace.trace_prefill = true;
+            g_sched_trace.trace_decode = false;
+        } else if (ggml_sched_trace_str_eq_ci(phase, "decode")) {
+            g_sched_trace.trace_prefill = false;
+            g_sched_trace.trace_decode = true;
+        } else if (!ggml_sched_trace_str_eq_ci(phase, "both") &&
+                   !ggml_sched_trace_str_eq_ci(phase, "all")) {
+            GGML_LOG_WARN(
+                    "%s: invalid scheduler trace phase '%s'; expected prefill, decode, or both; tracing both phases\n",
+                    __func__, phase);
+        }
+    }
 
     if (const char * path = getenv("SCHED_TRACE_PATH")) {
         if (path[0] != '\0') {
@@ -967,6 +1342,20 @@ static void ggml_sched_trace_init(void) {
 static bool ggml_sched_trace_enabled(void) {
     ggml_sched_trace_init();
     return g_sched_trace.enabled;
+}
+
+static bool ggml_sched_trace_current_phase_selected(void) {
+    return g_sched_profile_phase == GGML_BACKEND_SCHED_PROFILE_PREFILL
+        ? g_sched_trace.trace_prefill
+        : g_sched_trace.trace_decode;
+}
+
+static bool ggml_sched_trace_phase_enabled(void) {
+    if (!ggml_sched_trace_enabled()) {
+        return false;
+    }
+
+    return ggml_sched_trace_current_phase_selected();
 }
 
 static FILE * ggml_sched_trace_file(void) {
@@ -1150,7 +1539,8 @@ static inline int64_t ggml_sched_profile_time_us(void) {
     }
     // compute_splits initializes trace state once per graph, so the fast path
     // can avoid taking the trace mutex for every copy/wait timestamp.
-    return g_sched_trace.initialized && g_sched_trace.enabled ? ggml_time_us() : 0;
+    return g_sched_trace.initialized && g_sched_trace.enabled &&
+        ggml_sched_trace_current_phase_selected() ? ggml_time_us() : 0;
 }
 
 static ggml_sched_profile_backend_kind ggml_sched_profile_backend_bucket(ggml_backend_t backend) {
@@ -2982,7 +3372,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
-    const bool trace_enabled = ggml_sched_trace_enabled();
+    const bool trace_enabled = ggml_sched_trace_phase_enabled();
     const int64_t trace_graph_id = trace_enabled ? g_sched_trace.graph_id++ : -1;
 
     ggml_tensor * prev_ids_tensor = nullptr;
@@ -3371,14 +3761,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             : 0;
         if (ffn_group_size > 0) {
             std::vector<ggml_sched_profile_backend_kind> group_buckets(ffn_group_size);
+            bool group_backends_unique = true;
+            int cpu_branch_count = 0;
             for (int i = 0; i < ffn_group_size; ++i) {
                 struct ggml_backend_sched_split * group_split = &splits[split_id + i];
                 ggml_backend_t group_backend = sched->backends[group_split->backend_id];
                 group_buckets[i] = ggml_sched_profile_backend_bucket(group_backend);
+                cpu_branch_count += group_buckets[i] == GGML_SCHED_PROFILE_BACKEND_CPU ? 1 : 0;
+                for (int j = 0; j < i; ++j) {
+                    if (splits[split_id + j].backend_id == group_split->backend_id) {
+                        group_backends_unique = false;
+                        break;
+                    }
+                }
                 if (i > 0) {
                     ggml_sched_profile_note_layers(group_split->graph, group_buckets[i]);
                 }
             }
+            const bool run_group_serially = !group_backends_unique || cpu_branch_count > 1;
 
             const int64_t group_t0_us = ggml_time_us();
             const int64_t copy_t0_us = group_t0_us;
@@ -3396,22 +3796,129 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
             std::vector<int64_t> dt_us(ffn_group_size, 0);
             std::vector<enum ggml_status> status(ffn_group_size, GGML_STATUS_SUCCESS);
+            const bool use_persistent_device_workers = sched->ffn_device_executor != nullptr;
             std::vector<std::thread> workers;
-            workers.reserve(ffn_group_size > 0 ? ffn_group_size - 1 : 0);
+            if (!run_group_serially && !use_persistent_device_workers) {
+                workers.reserve(ffn_group_size > 0 ? ffn_group_size - 1 : 0);
+            }
+            ggml_backend_sched_ffn_device_job device_jobs[GGML_SCHED_MAX_BACKENDS];
+            uint64_t device_tickets[GGML_SCHED_MAX_BACKENDS] = {};
+            bool device_jobs_submitted[GGML_SCHED_MAX_BACKENDS] = {};
+
+            // The thread that calls a CPU graph also participates in the CPU
+            // thread pool as worker 0. Keep that role on the stable scheduler
+            // caller instead of assigning it to a new std::thread for every
+            // FFN group. Device backends only use their host threads to submit
+            // work and wait for completion, so run those branches in workers.
+            // Preserve the previous last-branch behavior when no CPU backend
+            // is present in the group.
+            int main_i = ffn_group_size - 1;
+            for (int i = 0; i < ffn_group_size; ++i) {
+                if (group_buckets[i] == GGML_SCHED_PROFILE_BACKEND_CPU) {
+                    main_i = i;
+                    break;
+                }
+            }
 
             const int64_t compute_t0_us = ggml_time_us();
-            for (int i = 0; i + 1 < ffn_group_size; ++i) {
-                workers.emplace_back([&, i]() {
-                    status[i] = compute_split_no_callback(&splits[split_id + i], &dt_us[i], true);
-                });
-            }
-            const int main_i = ffn_group_size - 1;
-            status[main_i] = compute_split_no_callback(&splits[split_id + main_i], &dt_us[main_i], true);
-            for (std::thread & worker : workers) {
-                worker.join();
+            if (run_group_serially) {
+                // A backend context must not be entered concurrently from the
+                // caller and its persistent worker. Duplicate backend IDs (or
+                // multiple CPU branches sharing the CPU thread pool) therefore
+                // fall back to deterministic serial execution.
+                for (int i = 0; i < ffn_group_size; ++i) {
+                    status[i] = compute_split_no_callback(
+                            &splits[split_id + i], &dt_us[i], true);
+                }
+            } else {
+                for (int i = 0; i < ffn_group_size; ++i) {
+                    if (i == main_i) {
+                        continue;
+                    }
+
+                    if (use_persistent_device_workers &&
+                            group_buckets[i] != GGML_SCHED_PROFILE_BACKEND_CPU) {
+                        struct ggml_backend_sched_split * device_split = &splits[split_id + i];
+                        device_jobs[i].backend = sched->backends[device_split->backend_id];
+                        device_jobs[i].graph = &device_split->graph;
+                        device_jobs[i].status = &status[i];
+                        device_jobs[i].dt_us = &dt_us[i];
+                        if (sched->ffn_device_executor->submit(
+                                device_split->backend_id,
+                                ggml_backend_sched_run_ffn_device_job,
+                                &device_jobs[i],
+                                &status[i],
+                                &device_tickets[i])) {
+                            device_jobs_submitted[i] = true;
+                        } else {
+                            GGML_LOG_ERROR(
+                                    "%s: failed to submit persistent FFN job for backend %s, layer %d\n",
+                                    __func__,
+                                    ggml_backend_name(device_jobs[i].backend),
+                                    ffn_group_infos[i].layer);
+                            status[i] = GGML_STATUS_FAILED;
+                        }
+                    } else {
+                        workers.emplace_back([&, i]() {
+                            // A transient fallback thread would otherwise
+                            // inherit the strict CPU worker-0 mask (CPU 7 in
+                            // the S25 layout) and contend with the CPU branch.
+                            ggml_backend_sched_pin_current_thread_to_cpu(
+                                    sched->ffn_device_worker_cpu);
+                            try {
+                                status[i] = compute_split_no_callback(
+                                        &splits[split_id + i], &dt_us[i], true);
+                            } catch (const std::exception & error) {
+                                status[i] = GGML_STATUS_FAILED;
+                                GGML_LOG_ERROR(
+                                        "%s: transient FFN worker backend %s threw an exception: %s\n",
+                                        __func__,
+                                        ggml_backend_name(sched->backends[splits[split_id + i].backend_id]),
+                                        error.what());
+                            } catch (...) {
+                                status[i] = GGML_STATUS_FAILED;
+                                GGML_LOG_ERROR(
+                                        "%s: transient FFN worker backend %s threw an exception\n",
+                                        __func__,
+                                        ggml_backend_name(sched->backends[splits[split_id + i].backend_id]));
+                            }
+                        });
+                    }
+                }
+
+                try {
+                    status[main_i] = compute_split_no_callback(
+                            &splits[split_id + main_i], &dt_us[main_i], true);
+                } catch (const std::exception & error) {
+                    status[main_i] = GGML_STATUS_FAILED;
+                    GGML_LOG_ERROR(
+                            "%s: caller FFN branch backend %s threw an exception: %s\n",
+                            __func__,
+                            ggml_backend_name(sched->backends[splits[split_id + main_i].backend_id]),
+                            error.what());
+                } catch (...) {
+                    status[main_i] = GGML_STATUS_FAILED;
+                    GGML_LOG_ERROR(
+                            "%s: caller FFN branch backend %s threw an exception\n",
+                            __func__,
+                            ggml_backend_name(sched->backends[splits[split_id + main_i].backend_id]));
+                }
+                for (int i = 0; i < ffn_group_size; ++i) {
+                    if (device_jobs_submitted[i]) {
+                        sched->ffn_device_executor->wait(
+                                splits[split_id + i].backend_id,
+                                device_tickets[i]);
+                    }
+                }
+                for (std::thread & worker : workers) {
+                    worker.join();
+                }
             }
             const int64_t compute_t1_us = ggml_time_us();
             const int64_t group_t1_us = compute_t1_us;
+            const char * group_timing_mode = run_group_serially
+                ? "serial_fallback"
+                : use_persistent_device_workers ? "persistent_synced_wall" : "synced_wall";
 
             for (int i = 0; i < ffn_group_size; ++i) {
                 if (status[i] != GGML_STATUS_SUCCESS) {
@@ -3489,7 +3996,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             split_id,
                             group_wall_us,
                             copy_us,
-                            "synced_wall");
+                            group_timing_mode);
                 }
             }
 
@@ -3582,6 +4089,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
+    sched->ffn_device_worker_cpu = ggml_backend_sched_ffn_device_worker_cpu();
 
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
@@ -3618,6 +4126,36 @@ ggml_backend_sched_t ggml_backend_sched_new(
         }
     }
 
+    if (ggml_backend_sched_ffn_persistent_workers_enabled()) {
+        const int affinity_cpu = sched->ffn_device_worker_cpu;
+        ggml_backend_sched_ffn_executor * executor = nullptr;
+        try {
+            executor = new ggml_backend_sched_ffn_executor();
+        } catch (const std::exception & error) {
+            GGML_LOG_ERROR(
+                    "%s: failed to allocate persistent FFN device executor: %s; using per-group threads\n",
+                    __func__, error.what());
+        } catch (...) {
+            GGML_LOG_ERROR(
+                    "%s: failed to allocate persistent FFN device executor; using per-group threads\n",
+                    __func__);
+        }
+
+        if (executor != nullptr) {
+            if (executor->initialize(sched->backends, n_backends, affinity_cpu)) {
+                sched->ffn_device_executor = executor;
+                GGML_LOG_INFO(
+                        "%s: persistent FFN device workers enabled (affinity CPU %d)\n",
+                        __func__, affinity_cpu);
+            } else {
+                delete executor;
+                GGML_LOG_ERROR(
+                        "%s: persistent FFN device worker initialization failed; using per-group threads\n",
+                        __func__);
+            }
+        }
+    }
+
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;
 
@@ -3630,6 +4168,12 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
     }
+
+    // Stop persistent workers before releasing backend events, graphs, or
+    // buffers they may reference.
+    delete sched->ffn_device_executor;
+    sched->ffn_device_executor = nullptr;
+
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
