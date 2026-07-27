@@ -1659,9 +1659,20 @@ int main(int argc, char ** argv) {
                     auto tmp = json_questions[current_question_index-1]; // only json requires -1
                     buffer += tmp;
 
-                    // context reset for new question
+                    // Reset the context for an independent JSON question. A token sampled
+                    // before entering this block is still pending in embd; carrying it
+                    // across the reset would evaluate a separate one-token graph before
+                    // the real prompt. Discard it, then queue a fresh BOS with the prompt
+                    // so the whole input is evaluated as one physical ubatch.
                     ctx_kv_cache_clear(ctx);
+                    embd.clear();
                     embd_inp.clear();
+                    if (llama_vocab_get_add_bos(vocab)) {
+                        const llama_token bos = llama_vocab_bos(vocab);
+                        if (bos != LLAMA_TOKEN_NULL) {
+                            embd_inp.push_back(bos);
+                        }
+                    }
                     llama_perf_context_reset(ctx);
                     if (ig->backend_compute_profile) {
                         ggml_backend_sched_profile_reset();
