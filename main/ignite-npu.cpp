@@ -1400,6 +1400,21 @@ int main(int argc, char ** argv) {
 
                 n_past += n_eval;
 
+                // STRICT_LIMIT=0 is an explicit prefill-only JSON query. Finish
+                // all asynchronous backend work now and enter the existing query
+                // transition path before common_sampler_sample() can enqueue a
+                // generated-token decode graph.
+                const bool prefill_only_done =
+                    is_prefill_eval &&
+                    params.strict_limit &&
+                    params.strict_limit_length == 0 &&
+                    n_consumed == (int) embd_inp.size();
+                if (prefill_only_done) {
+                    llama_synchronize(ctx);
+                    is_interacting = true;
+                    LOG_DBG("strict prefill-only query complete\n");
+                }
+
                 LOG_DBG("n_past = %d\n", n_past);
                 // Display total tokens alongside total time
                 if (params.n_print > 0 && n_past % params.n_print == 0) {
