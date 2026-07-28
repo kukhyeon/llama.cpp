@@ -832,6 +832,8 @@ struct ggml_backend_sched {
     int cpu_threads;
     int ffn_parallel_reduce_threads;
     int ffn_device_worker_cpu;
+    int ffn_gpu_worker_cpu;
+    int ffn_npu_worker_cpu;
 
     // Non-trivial worker state is owned separately because this scheduler is
     // allocated with calloc/free.
@@ -1039,9 +1041,10 @@ struct ggml_backend_sched_ffn_executor {
         shutdown();
     }
 
-    bool initialize(ggml_backend_t * backends, int backend_count, int affinity_cpu) {
+    bool initialize(ggml_backend_t * backends, int backend_count, const int * affinity_cpus) {
         GGML_ASSERT(backends != nullptr);
         GGML_ASSERT(backend_count > 0 && backend_count <= GGML_SCHED_MAX_BACKENDS);
+        GGML_ASSERT(affinity_cpus != nullptr);
         n_backends = backend_count;
 
         for (int backend_id = 0; backend_id < n_backends; ++backend_id) {
@@ -1053,7 +1056,7 @@ struct ggml_backend_sched_ffn_executor {
 
             worker * current = nullptr;
             try {
-                current = new worker(backend_id, ggml_backend_name(backend), affinity_cpu);
+                current = new worker(backend_id, ggml_backend_name(backend), affinity_cpus[backend_id]);
             } catch (const std::exception & error) {
                 GGML_LOG_ERROR(
                         "%s: failed to allocate persistent FFN worker for backend %s: %s\n",
@@ -1115,10 +1118,12 @@ static bool ggml_backend_sched_ffn_persistent_workers_enabled() {
         strcmp(value, "yes") == 0 || strcmp(value, "YES") == 0;
 }
 
-static int ggml_backend_sched_ffn_device_worker_cpu() {
-    const char * value = getenv("GGML_FFN_DEVICE_WORKER_CPU");
+static int ggml_backend_sched_ffn_worker_cpu(const char * env_name, int fallback_cpu) {
+    GGML_ASSERT(env_name != nullptr);
+
+    const char * value = getenv(env_name);
     if (value == nullptr || value[0] == '\0') {
-        return -1;
+        return fallback_cpu;
     }
 
     errno = 0;
@@ -1126,9 +1131,9 @@ static int ggml_backend_sched_ffn_device_worker_cpu() {
     const long cpu = strtol(value, &end, 10);
     if (errno != 0 || end == value || *end != '\0' || cpu < -1 || cpu > INT_MAX) {
         GGML_LOG_WARN(
-                "%s: invalid GGML_FFN_DEVICE_WORKER_CPU='%s'; persistent FFN workers will not be pinned\n",
-                __func__, value);
-        return -1;
+                "%s: invalid %s='%s'; using fallback CPU %d\n",
+                __func__, env_name, value, fallback_cpu);
+        return fallback_cpu;
     }
     return (int) cpu;
 }
@@ -3863,8 +3868,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             // A transient fallback thread would otherwise
                             // inherit the strict CPU worker-0 mask (CPU 7 in
                             // the S25 layout) and contend with the CPU branch.
+                            const int worker_cpu = group_buckets[i] == GGML_SCHED_PROFILE_BACKEND_HTP
+                                ? sched->ffn_npu_worker_cpu
+                                : group_buckets[i] == GGML_SCHED_PROFILE_BACKEND_GPU
+                                    ? sched->ffn_gpu_worker_cpu
+                                    : sched->ffn_device_worker_cpu;
                             ggml_backend_sched_pin_current_thread_to_cpu(
-                                    sched->ffn_device_worker_cpu);
+                                    worker_cpu);
                             try {
                                 status[i] = compute_split_no_callback(
                                         &splits[split_id + i], &dt_us[i], true);
@@ -4089,7 +4099,12 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
-    sched->ffn_device_worker_cpu = ggml_backend_sched_ffn_device_worker_cpu();
+    sched->ffn_device_worker_cpu = ggml_backend_sched_ffn_worker_cpu(
+            "GGML_FFN_DEVICE_WORKER_CPU", -1);
+    sched->ffn_gpu_worker_cpu = ggml_backend_sched_ffn_worker_cpu(
+            "GGML_FFN_GPU_WORKER_CPU", sched->ffn_device_worker_cpu);
+    sched->ffn_npu_worker_cpu = ggml_backend_sched_ffn_worker_cpu(
+            "GGML_FFN_NPU_WORKER_CPU", sched->ffn_device_worker_cpu);
 
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
@@ -4127,7 +4142,21 @@ ggml_backend_sched_t ggml_backend_sched_new(
     }
 
     if (ggml_backend_sched_ffn_persistent_workers_enabled()) {
-        const int affinity_cpu = sched->ffn_device_worker_cpu;
+        int affinity_cpus[GGML_SCHED_MAX_BACKENDS];
+        for (int backend_id = 0; backend_id < n_backends; ++backend_id) {
+            switch (ggml_sched_profile_backend_bucket(sched->backends[backend_id])) {
+                case GGML_SCHED_PROFILE_BACKEND_CPU:
+                    affinity_cpus[backend_id] = -1;
+                    break;
+                case GGML_SCHED_PROFILE_BACKEND_HTP:
+                    affinity_cpus[backend_id] = sched->ffn_npu_worker_cpu;
+                    break;
+                case GGML_SCHED_PROFILE_BACKEND_GPU:
+                    affinity_cpus[backend_id] = sched->ffn_gpu_worker_cpu;
+                    break;
+            }
+        }
+
         ggml_backend_sched_ffn_executor * executor = nullptr;
         try {
             executor = new ggml_backend_sched_ffn_executor();
@@ -4142,11 +4171,15 @@ ggml_backend_sched_t ggml_backend_sched_new(
         }
 
         if (executor != nullptr) {
-            if (executor->initialize(sched->backends, n_backends, affinity_cpu)) {
+            if (executor->initialize(sched->backends, n_backends, affinity_cpus)) {
                 sched->ffn_device_executor = executor;
                 GGML_LOG_INFO(
-                        "%s: persistent FFN device workers enabled (affinity CPU %d)\n",
-                        __func__, affinity_cpu);
+                        "%s: persistent FFN device workers enabled "
+                        "(GPU CPU %d, NPU CPU %d, legacy CPU %d)\n",
+                        __func__,
+                        sched->ffn_gpu_worker_cpu,
+                        sched->ffn_npu_worker_cpu,
+                        sched->ffn_device_worker_cpu);
             } else {
                 delete executor;
                 GGML_LOG_ERROR(
