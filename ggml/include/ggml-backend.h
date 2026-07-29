@@ -508,13 +508,15 @@ extern "C" {
     // Selects the scheduler trace CSV path. If unset, SCHED_TRACE_PATH or
     // "output/scheduler_trace.csv" is used.
     GGML_API void ggml_backend_sched_trace_set_path(const char * path);
-    // Resets per-query graph numbering for scheduler trace rows.
+    // The lifecycle calls below also service the opt-in GGML_FFN_WORKER_TRACE
+    // stream so both CSVs share query and ubatch correlation fields.
+    // Resets per-query graph numbering for trace rows.
     GGML_API void ggml_backend_sched_trace_reset(void);
     // Attaches the current application query id to subsequent trace rows.
     GGML_API void ggml_backend_sched_trace_set_query_id(int query_id);
     // Attaches the current ubatch context to subsequent trace rows.
     GGML_API void ggml_backend_sched_trace_set_ubatch(int token_index, int n_past, int n_tokens);
-    // Writes buffered scheduler trace rows to the configured CSV file.
+    // Writes buffered scheduler and FFN worker trace rows to their CSV files.
     GGML_API void ggml_backend_sched_trace_flush(void);
 
     // Enables/disables process-global per-op load profiling.

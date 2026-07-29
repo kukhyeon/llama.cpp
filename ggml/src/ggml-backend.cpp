@@ -25,6 +25,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <exception>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -33,6 +34,8 @@
 
 #if defined(__linux__)
 #include <sched.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #endif
 
 #ifdef __APPLE__
@@ -855,6 +858,69 @@ struct ggml_backend_sched {
 
 using ggml_backend_sched_ffn_job_fn = void (*)(void *);
 
+enum ggml_backend_sched_ffn_worker_mode {
+    GGML_SCHED_FFN_WORKER_NONE = 0,
+    GGML_SCHED_FFN_WORKER_CALLER,
+    GGML_SCHED_FFN_WORKER_PERSISTENT,
+    GGML_SCHED_FFN_WORKER_TRANSIENT,
+    GGML_SCHED_FFN_WORKER_SERIAL,
+};
+
+enum ggml_backend_sched_ffn_collect_kind {
+    GGML_SCHED_FFN_COLLECT_NONE = 0,
+    GGML_SCHED_FFN_COLLECT_TICKET_WAIT,
+    GGML_SCHED_FFN_COLLECT_THREAD_JOIN,
+};
+
+// A timeline is owned by one scheduler FFN group and written by at most one
+// branch worker. The scheduler reads it only after the corresponding ticket
+// wait or thread join has completed. Keeping these records branch-local avoids
+// worker-side file I/O, allocation, and shared trace-buffer contention.
+struct alignas(64) ggml_backend_sched_ffn_worker_timeline {
+    enum ggml_backend_sched_ffn_worker_mode mode = GGML_SCHED_FFN_WORKER_NONE;
+    enum ggml_backend_sched_ffn_collect_kind collect_kind = GGML_SCHED_FFN_COLLECT_NONE;
+
+    uint64_t ticket = 0;
+    int queue_depth_at_submit = -1;
+    int64_t worker_tid = -1;
+    int affinity_cpu = -1;
+    int start_cpu = -1;
+    int end_cpu = -1;
+    int wait_blocked = -1;
+    int collect_order = -1;
+
+    int64_t dispatch_begin_us = -1;
+    int64_t dispatch_end_us = -1;
+    int64_t job_enqueued_us = -1;
+    int64_t worker_dequeue_us = -1;
+    int64_t job_start_us = -1;
+    int64_t backend_begin_us = -1;
+    int64_t graph_compute_return_us = -1;
+    int64_t sync_begin_us = -1;
+    int64_t sync_end_us = -1;
+    int64_t job_end_us = -1;
+    int64_t completion_publish_us = -1;
+    int64_t collect_begin_us = -1;
+    int64_t collect_end_us = -1;
+};
+
+static int64_t ggml_backend_sched_current_tid() {
+#if defined(__linux__) && defined(SYS_gettid)
+    return (int64_t) syscall(SYS_gettid);
+#else
+    return -1;
+#endif
+}
+
+static int ggml_backend_sched_current_cpu() {
+#if defined(__linux__) && defined(SYS_getcpu)
+    unsigned cpu = 0;
+    return syscall(SYS_getcpu, &cpu, nullptr, nullptr) == 0 ? (int) cpu : -1;
+#else
+    return -1;
+#endif
+}
+
 static bool ggml_backend_sched_pin_current_thread_to_cpu(int cpu) {
     if (cpu < 0) {
         return true;
@@ -882,6 +948,7 @@ struct ggml_backend_sched_ffn_executor {
         void * context = nullptr;
         enum ggml_status * status = nullptr;
         uint64_t ticket = 0;
+        ggml_backend_sched_ffn_worker_timeline * timeline = nullptr;
     };
 
     struct worker {
@@ -937,7 +1004,8 @@ struct ggml_backend_sched_ffn_executor {
                 ggml_backend_sched_ffn_job_fn fn,
                 void * context,
                 enum ggml_status * status,
-                uint64_t * ticket) {
+                uint64_t * ticket,
+                ggml_backend_sched_ffn_worker_timeline * timeline) {
             GGML_ASSERT(fn != nullptr);
             GGML_ASSERT(status != nullptr);
             GGML_ASSERT(ticket != nullptr);
@@ -948,7 +1016,13 @@ struct ggml_backend_sched_ffn_executor {
             }
 
             const uint64_t current_ticket = next_ticket++;
-            queue[queue_tail] = { fn, context, status, current_ticket };
+            if (timeline != nullptr) {
+                timeline->ticket = current_ticket;
+                timeline->queue_depth_at_submit = queue_size;
+                timeline->affinity_cpu = affinity_cpu;
+                timeline->job_enqueued_us = ggml_time_us();
+            }
+            queue[queue_tail] = { fn, context, status, current_ticket, timeline };
             queue_tail = (queue_tail + 1) % GGML_SCHED_MAX_BACKENDS;
             ++queue_size;
             *ticket = current_ticket;
@@ -956,9 +1030,18 @@ struct ggml_backend_sched_ffn_executor {
             return true;
         }
 
-        void wait(uint64_t ticket) {
+        void wait(uint64_t ticket, ggml_backend_sched_ffn_worker_timeline * timeline) {
+            if (timeline != nullptr) {
+                timeline->collect_begin_us = ggml_time_us();
+            }
             std::unique_lock<std::mutex> lock(mutex);
+            if (timeline != nullptr) {
+                timeline->wait_blocked = completed_ticket < ticket ? 1 : 0;
+            }
             state_cv.wait(lock, [&]() { return completed_ticket >= ticket; });
+            if (timeline != nullptr) {
+                timeline->collect_end_us = ggml_time_us();
+            }
         }
 
         void stop() {
@@ -1011,6 +1094,12 @@ struct ggml_backend_sched_ffn_executor {
                     --queue_size;
                 }
 
+                if (current.timeline != nullptr) {
+                    current.timeline->worker_dequeue_us = ggml_time_us();
+                    current.timeline->worker_tid = ggml_backend_sched_current_tid();
+                    current.timeline->start_cpu = ggml_backend_sched_current_cpu();
+                    current.timeline->job_start_us = ggml_time_us();
+                }
                 try {
                     current.fn(current.context);
                 } catch (const std::exception & error) {
@@ -1025,8 +1114,19 @@ struct ggml_backend_sched_ffn_executor {
                             __func__, backend_name.c_str());
                 }
 
+                if (current.timeline != nullptr) {
+                    current.timeline->end_cpu = ggml_backend_sched_current_cpu();
+                    current.timeline->job_end_us = ggml_time_us();
+                }
+
                 {
                     std::lock_guard<std::mutex> lock(mutex);
+                    if (current.timeline != nullptr) {
+                        // Publish the completed timeline under the same mutex
+                        // that releases worker::wait(). The caller never reads
+                        // this record before the ticket predicate is satisfied.
+                        current.timeline->completion_publish_us = ggml_time_us();
+                    }
                     completed_ticket = current.ticket;
                 }
                 state_cv.notify_all();
@@ -1086,17 +1186,21 @@ struct ggml_backend_sched_ffn_executor {
             ggml_backend_sched_ffn_job_fn fn,
             void * context,
             enum ggml_status * status,
-            uint64_t * ticket) {
+            uint64_t * ticket,
+            ggml_backend_sched_ffn_worker_timeline * timeline) {
         if (backend_id < 0 || backend_id >= n_backends || workers[backend_id] == nullptr) {
             return false;
         }
-        return workers[backend_id]->submit(fn, context, status, ticket);
+        return workers[backend_id]->submit(fn, context, status, ticket, timeline);
     }
 
-    void wait(int backend_id, uint64_t ticket) {
+    void wait(
+            int backend_id,
+            uint64_t ticket,
+            ggml_backend_sched_ffn_worker_timeline * timeline) {
         GGML_ASSERT(backend_id >= 0 && backend_id < n_backends);
         GGML_ASSERT(workers[backend_id] != nullptr);
-        workers[backend_id]->wait(ticket);
+        workers[backend_id]->wait(ticket, timeline);
     }
 
     void shutdown() {
@@ -1143,6 +1247,7 @@ struct ggml_backend_sched_ffn_device_job {
     struct ggml_cgraph * graph = nullptr;
     enum ggml_status * status = nullptr;
     int64_t * dt_us = nullptr;
+    ggml_backend_sched_ffn_worker_timeline * timeline = nullptr;
 };
 
 static void ggml_backend_sched_run_ffn_device_job(void * context) {
@@ -1154,14 +1259,26 @@ static void ggml_backend_sched_run_ffn_device_job(void * context) {
     GGML_ASSERT(job->dt_us != nullptr);
 
     const int64_t t0_us = ggml_time_us();
+    if (job->timeline != nullptr) {
+        job->timeline->backend_begin_us = t0_us;
+    }
     enum ggml_status status = GGML_STATUS_FAILED;
     try {
         status = ggml_backend_graph_compute_async(job->backend, job->graph);
+        if (job->timeline != nullptr) {
+            job->timeline->graph_compute_return_us = ggml_time_us();
+        }
         if (status == GGML_STATUS_SUCCESS) {
             // Parallel FFN device branches must finish before the reduce split can
             // consume them. Keep this synchronization on the backend's dedicated
             // persistent host thread.
+            if (job->timeline != nullptr) {
+                job->timeline->sync_begin_us = ggml_time_us();
+            }
             ggml_backend_synchronize(job->backend);
+            if (job->timeline != nullptr) {
+                job->timeline->sync_end_us = ggml_time_us();
+            }
         }
     } catch (const std::exception & error) {
         status = GGML_STATUS_FAILED;
@@ -1274,6 +1391,91 @@ struct ggml_backend_sched_trace_state {
 static ggml_backend_sched_trace_state g_sched_trace;
 static constexpr size_t GGML_SCHED_TRACE_ROW_RESERVE = 32768;
 
+struct ggml_backend_sched_ffn_worker_trace_row {
+    int schema_version = 1;
+    int64_t trace_session_id = -1;
+    int64_t group_seq = -1;
+    int64_t job_id = -1;
+
+    int query_id = -1;
+    enum ggml_backend_sched_profile_phase phase = GGML_BACKEND_SCHED_PROFILE_PREFILL;
+    int64_t graph_id = -1;
+    int token_index = -1;
+    int n_past = -1;
+    int n_tokens = -1;
+    int group_id = -1;
+    int split_id = -1;
+    int layer = -1;
+    int node_count = 0;
+
+    char backend[GGML_MAX_NAME] = {};
+    char ffn_branch[GGML_MAX_NAME] = {};
+    char first_node[GGML_MAX_NAME] = {};
+    char last_node[GGML_MAX_NAME] = {};
+    enum ggml_status status = GGML_STATUS_SUCCESS;
+
+    int64_t group_begin_us = -1;
+    int64_t copy_end_us = -1;
+    int64_t compute_begin_us = -1;
+    int64_t group_end_us = -1;
+    ggml_backend_sched_ffn_worker_timeline timeline;
+
+    // Additive partitions for common-path rows:
+    //   group_copy + post_copy_setup + group_compute_wall = group_wall
+    //   worker_setup + graph_call + post_graph_cleanup + sync_wait +
+    //       job_finalize = branch_wall
+    // sched_compute_wall mirrors scheduler_trace.csv and overlaps the branch
+    // partition. Dispatch and queue metrics may also overlap each other.
+    int64_t group_copy_us = -1;
+    int64_t post_copy_setup_us = -1;
+    int64_t dispatch_us = -1;
+    int64_t queue_delay_us = -1;
+    int64_t dispatch_to_start_us = -1;
+    int64_t worker_setup_us = -1;
+    int64_t graph_call_us = -1;
+    int64_t post_graph_cleanup_us = -1;
+    int64_t sync_wait_us = -1;
+    int64_t sched_compute_wall_us = -1;
+    int64_t job_finalize_us = -1;
+    int64_t branch_wall_us = -1;
+    int64_t publish_delay_us = -1;
+    int64_t collect_wait_us = -1;
+    int64_t start_offset_us = -1;
+    int64_t finish_offset_us = -1;
+    int64_t group_start_skew_us = -1;
+    int64_t group_tail_after_last_backend_us = -1;
+    int64_t group_tail_after_last_publish_us = -1;
+    int64_t group_compute_wall_us = -1;
+    int64_t group_wall_us = -1;
+    int is_longest_duration = 0;
+    int is_last_backend_finisher = 0;
+    int is_last_completion_publisher = 0;
+};
+
+struct ggml_backend_sched_ffn_worker_trace_state {
+    bool initialized = false;
+    bool enabled = false;
+    bool warned_open = false;
+    FILE * file = nullptr;
+    std::string path;
+
+    int64_t trace_session_id = -1;
+    int64_t graph_id = 0;
+    int64_t next_group_seq = 0;
+    int64_t next_job_id = 0;
+    int query_id = -1;
+    int token_index = -1;
+    int n_past = -1;
+    int n_tokens = -1;
+    std::unique_ptr<ggml_backend_sched_ffn_worker_timeline[]> timelines;
+    std::vector<ggml_backend_sched_ffn_worker_trace_row> rows;
+};
+
+static ggml_backend_sched_ffn_worker_trace_state g_ffn_worker_trace;
+// Covers a typical 50-token, 3-branch, 32-layer run without hot-path growth
+// while keeping the opt-in trace buffer substantially smaller than 32768 rows.
+static constexpr size_t GGML_FFN_WORKER_TRACE_ROW_RESERVE = 8192;
+
 static bool ggml_sched_trace_env_enabled(const char * name) {
     const char * env = getenv(name);
     if (env == nullptr) {
@@ -1344,6 +1546,37 @@ static void ggml_sched_trace_init(void) {
     }
 }
 
+static void ggml_ffn_worker_trace_init(void) {
+    if (g_ffn_worker_trace.initialized) {
+        return;
+    }
+
+    g_ffn_worker_trace.initialized = true;
+    g_ffn_worker_trace.enabled = ggml_sched_trace_env_enabled("GGML_FFN_WORKER_TRACE") ||
+        ggml_sched_trace_env_enabled("FFN_WORKER_TRACE");
+    if (!g_ffn_worker_trace.enabled) {
+        return;
+    }
+
+    const char * path = getenv("GGML_FFN_WORKER_TRACE_PATH");
+    if (path == nullptr || path[0] == '\0') {
+        path = getenv("FFN_WORKER_TRACE_PATH");
+    }
+    g_ffn_worker_trace.path = path != nullptr && path[0] != '\0'
+        ? path
+        : "output/ffn_worker_trace.csv";
+
+    g_ffn_worker_trace.trace_session_id = ggml_time_us();
+    g_ffn_worker_trace.timelines.reset(
+            new ggml_backend_sched_ffn_worker_timeline[GGML_SCHED_MAX_BACKENDS]);
+    g_ffn_worker_trace.rows.reserve(GGML_FFN_WORKER_TRACE_ROW_RESERVE);
+}
+
+static bool ggml_ffn_worker_trace_enabled(void) {
+    ggml_ffn_worker_trace_init();
+    return g_ffn_worker_trace.enabled;
+}
+
 static bool ggml_sched_trace_enabled(void) {
     ggml_sched_trace_init();
     return g_sched_trace.enabled;
@@ -1353,6 +1586,15 @@ static bool ggml_sched_trace_current_phase_selected(void) {
     return g_sched_profile_phase == GGML_BACKEND_SCHED_PROFILE_PREFILL
         ? g_sched_trace.trace_prefill
         : g_sched_trace.trace_decode;
+}
+
+static bool ggml_ffn_worker_trace_phase_enabled(void) {
+    if (!ggml_ffn_worker_trace_enabled()) {
+        return false;
+    }
+
+    ggml_sched_trace_init();
+    return ggml_sched_trace_current_phase_selected();
 }
 
 static bool ggml_sched_trace_phase_enabled(void) {
@@ -1414,6 +1656,242 @@ static void ggml_sched_trace_csv_cell(FILE * f, const char * value) {
 
 static const char * ggml_sched_profile_phase_name(enum ggml_backend_sched_profile_phase phase) {
     return phase == GGML_BACKEND_SCHED_PROFILE_PREFILL ? "prefill" : "decode";
+}
+
+static const char * ggml_ffn_worker_mode_name(enum ggml_backend_sched_ffn_worker_mode mode) {
+    switch (mode) {
+        case GGML_SCHED_FFN_WORKER_CALLER:     return "caller";
+        case GGML_SCHED_FFN_WORKER_PERSISTENT: return "persistent";
+        case GGML_SCHED_FFN_WORKER_TRANSIENT:  return "transient";
+        case GGML_SCHED_FFN_WORKER_SERIAL:     return "serial_fallback";
+        case GGML_SCHED_FFN_WORKER_NONE:       return "none";
+    }
+    return "unknown";
+}
+
+static const char * ggml_ffn_collect_kind_name(enum ggml_backend_sched_ffn_collect_kind kind) {
+    switch (kind) {
+        case GGML_SCHED_FFN_COLLECT_TICKET_WAIT: return "ticket_wait";
+        case GGML_SCHED_FFN_COLLECT_THREAD_JOIN: return "thread_join";
+        case GGML_SCHED_FFN_COLLECT_NONE:        return "none";
+    }
+    return "unknown";
+}
+
+static void ggml_ffn_worker_trace_optional_i64(FILE * f, int64_t value) {
+    if (value >= 0) {
+        fprintf(f, "%lld", (long long) value);
+    }
+}
+
+static constexpr char GGML_FFN_WORKER_TRACE_CSV_HEADER[] =
+        "schema_version,trace_session_id,group_seq,job_id,"
+        "query_id,phase,graph_id,token_index,n_past,n_tokens,"
+        "group_id,split_id,layer,backend,ffn_branch,node_count,first_node,last_node,"
+        "worker_mode,collect_kind,status,ticket,queue_depth_at_submit,worker_tid,"
+        "affinity_cpu,start_cpu,end_cpu,wait_blocked,collect_order,"
+        "group_begin_us,copy_end_us,compute_begin_us,dispatch_begin_us,dispatch_end_us,"
+        "job_enqueued_us,worker_dequeue_us,job_start_us,backend_begin_us,"
+        "graph_compute_return_us,sync_begin_us,sync_end_us,job_end_us,"
+        "completion_publish_us,collect_begin_us,collect_end_us,group_end_us,"
+        "group_copy_us,post_copy_setup_us,dispatch_us,queue_delay_us,dispatch_to_start_us,"
+        "worker_setup_us,graph_call_us,post_graph_cleanup_us,sync_wait_us,"
+        "sched_compute_wall_us,job_finalize_us,"
+        "branch_wall_us,publish_delay_us,collect_wait_us,"
+        "start_offset_us,finish_offset_us,group_start_skew_us,"
+        "group_tail_after_last_backend_us,group_tail_after_last_publish_us,"
+        "group_compute_wall_us,group_wall_us,"
+        "is_longest_duration,is_last_backend_finisher,is_last_completion_publisher\n";
+
+static FILE * ggml_ffn_worker_trace_file(void) {
+    ggml_ffn_worker_trace_init();
+    if (!g_ffn_worker_trace.enabled) {
+        return nullptr;
+    }
+
+    if (g_ffn_worker_trace.file != nullptr) {
+        return g_ffn_worker_trace.file;
+    }
+
+    g_ffn_worker_trace.file = fopen(g_ffn_worker_trace.path.c_str(), "a+");
+    if (g_ffn_worker_trace.file == nullptr) {
+        if (!g_ffn_worker_trace.warned_open) {
+            GGML_LOG_WARN(
+                    "%s: failed to open FFN worker trace CSV '%s'\n",
+                    __func__, g_ffn_worker_trace.path.c_str());
+            g_ffn_worker_trace.warned_open = true;
+        }
+        return nullptr;
+    }
+
+    if (fseek(g_ffn_worker_trace.file, 0, SEEK_END) != 0) {
+        if (!g_ffn_worker_trace.warned_open) {
+            GGML_LOG_WARN(
+                    "%s: failed to seek FFN worker trace CSV '%s'\n",
+                    __func__, g_ffn_worker_trace.path.c_str());
+        }
+        fclose(g_ffn_worker_trace.file);
+        g_ffn_worker_trace.file = nullptr;
+        g_ffn_worker_trace.warned_open = true;
+        return nullptr;
+    }
+    const long pos = ftell(g_ffn_worker_trace.file);
+    if (pos < 0) {
+        if (!g_ffn_worker_trace.warned_open) {
+            GGML_LOG_WARN(
+                    "%s: failed to inspect FFN worker trace CSV '%s'\n",
+                    __func__, g_ffn_worker_trace.path.c_str());
+        }
+        fclose(g_ffn_worker_trace.file);
+        g_ffn_worker_trace.file = nullptr;
+        g_ffn_worker_trace.warned_open = true;
+        return nullptr;
+    }
+    if (pos == 0) {
+        if (fputs(GGML_FFN_WORKER_TRACE_CSV_HEADER, g_ffn_worker_trace.file) == EOF) {
+            if (!g_ffn_worker_trace.warned_open) {
+                GGML_LOG_WARN(
+                        "%s: failed to write FFN worker trace CSV header '%s'\n",
+                        __func__, g_ffn_worker_trace.path.c_str());
+            }
+            fclose(g_ffn_worker_trace.file);
+            g_ffn_worker_trace.file = nullptr;
+            g_ffn_worker_trace.warned_open = true;
+            return nullptr;
+        }
+    } else {
+        char existing_header[sizeof(GGML_FFN_WORKER_TRACE_CSV_HEADER)];
+        if (fseek(g_ffn_worker_trace.file, 0, SEEK_SET) != 0 ||
+                fgets(existing_header, sizeof(existing_header), g_ffn_worker_trace.file) == nullptr ||
+                strcmp(existing_header, GGML_FFN_WORKER_TRACE_CSV_HEADER) != 0) {
+            if (!g_ffn_worker_trace.warned_open) {
+                GGML_LOG_WARN(
+                        "%s: FFN worker trace CSV schema mismatch at '%s'; refusing to append\n",
+                        __func__, g_ffn_worker_trace.path.c_str());
+            }
+            fclose(g_ffn_worker_trace.file);
+            g_ffn_worker_trace.file = nullptr;
+            g_ffn_worker_trace.warned_open = true;
+            return nullptr;
+        }
+        if (fseek(g_ffn_worker_trace.file, 0, SEEK_END) != 0) {
+            if (!g_ffn_worker_trace.warned_open) {
+                GGML_LOG_WARN(
+                        "%s: failed to restore FFN worker trace CSV position '%s'\n",
+                        __func__, g_ffn_worker_trace.path.c_str());
+            }
+            fclose(g_ffn_worker_trace.file);
+            g_ffn_worker_trace.file = nullptr;
+            g_ffn_worker_trace.warned_open = true;
+            return nullptr;
+        }
+    }
+
+    return g_ffn_worker_trace.file;
+}
+
+static void ggml_ffn_worker_trace_flush_rows(void) {
+    if (g_ffn_worker_trace.rows.empty()) {
+        return;
+    }
+
+    FILE * f = ggml_ffn_worker_trace_file();
+    if (f == nullptr) {
+        g_ffn_worker_trace.rows.clear();
+        return;
+    }
+
+    for (const auto & row : g_ffn_worker_trace.rows) {
+        fprintf(f, "%d,%lld,%lld,%lld,%d,%s,%lld,%d,%d,%d,%d,%d,%d,",
+                row.schema_version,
+                (long long) row.trace_session_id,
+                (long long) row.group_seq,
+                (long long) row.job_id,
+                row.query_id,
+                ggml_sched_profile_phase_name(row.phase),
+                (long long) row.graph_id,
+                row.token_index,
+                row.n_past,
+                row.n_tokens,
+                row.group_id,
+                row.split_id,
+                row.layer);
+        ggml_sched_trace_csv_cell(f, row.backend);
+        fputc(',', f);
+        ggml_sched_trace_csv_cell(f, row.ffn_branch);
+        fprintf(f, ",%d,", row.node_count);
+        ggml_sched_trace_csv_cell(f, row.first_node);
+        fputc(',', f);
+        ggml_sched_trace_csv_cell(f, row.last_node);
+        fprintf(f, ",%s,%s,%d,",
+                ggml_ffn_worker_mode_name(row.timeline.mode),
+                ggml_ffn_collect_kind_name(row.timeline.collect_kind),
+                (int) row.status);
+
+        const int64_t values[] = {
+            row.timeline.ticket > 0 ? (int64_t) row.timeline.ticket : -1,
+            row.timeline.queue_depth_at_submit,
+            row.timeline.worker_tid,
+            row.timeline.affinity_cpu,
+            row.timeline.start_cpu,
+            row.timeline.end_cpu,
+            row.timeline.wait_blocked,
+            row.timeline.collect_order,
+            row.group_begin_us,
+            row.copy_end_us,
+            row.compute_begin_us,
+            row.timeline.dispatch_begin_us,
+            row.timeline.dispatch_end_us,
+            row.timeline.job_enqueued_us,
+            row.timeline.worker_dequeue_us,
+            row.timeline.job_start_us,
+            row.timeline.backend_begin_us,
+            row.timeline.graph_compute_return_us,
+            row.timeline.sync_begin_us,
+            row.timeline.sync_end_us,
+            row.timeline.job_end_us,
+            row.timeline.completion_publish_us,
+            row.timeline.collect_begin_us,
+            row.timeline.collect_end_us,
+            row.group_end_us,
+            row.group_copy_us,
+            row.post_copy_setup_us,
+            row.dispatch_us,
+            row.queue_delay_us,
+            row.dispatch_to_start_us,
+            row.worker_setup_us,
+            row.graph_call_us,
+            row.post_graph_cleanup_us,
+            row.sync_wait_us,
+            row.sched_compute_wall_us,
+            row.job_finalize_us,
+            row.branch_wall_us,
+            row.publish_delay_us,
+            row.collect_wait_us,
+            row.start_offset_us,
+            row.finish_offset_us,
+            row.group_start_skew_us,
+            row.group_tail_after_last_backend_us,
+            row.group_tail_after_last_publish_us,
+            row.group_compute_wall_us,
+            row.group_wall_us,
+            row.is_longest_duration,
+            row.is_last_backend_finisher,
+            row.is_last_completion_publisher,
+        };
+        for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+            ggml_ffn_worker_trace_optional_i64(f, values[i]);
+            fputc(i + 1 == sizeof(values) / sizeof(values[0]) ? '\n' : ',', f);
+        }
+    }
+
+    if (fflush(f) != 0 && !g_ffn_worker_trace.warned_open) {
+        GGML_LOG_WARN(
+                "%s: failed to flush FFN worker trace CSV '%s'\n",
+                __func__, g_ffn_worker_trace.path.c_str());
+        g_ffn_worker_trace.warned_open = true;
+    }
+    g_ffn_worker_trace.rows.clear();
 }
 
 static void ggml_sched_trace_flush_rows(void) {
@@ -1504,38 +1982,67 @@ void ggml_backend_sched_trace_set_path(const char * path) {
 }
 
 void ggml_backend_sched_trace_reset(void) {
-    if (!ggml_sched_trace_enabled()) {
+    const bool sched_trace_enabled = ggml_sched_trace_enabled();
+    const bool worker_trace_enabled = ggml_ffn_worker_trace_enabled();
+    if (!sched_trace_enabled && !worker_trace_enabled) {
         return;
     }
 
-    ggml_sched_trace_flush_rows();
-    g_sched_trace.graph_id = 0;
-    g_sched_trace.token_index = -1;
-    g_sched_trace.n_past = -1;
-    g_sched_trace.n_tokens = -1;
+    if (sched_trace_enabled) {
+        ggml_sched_trace_flush_rows();
+        g_sched_trace.graph_id = 0;
+        g_sched_trace.token_index = -1;
+        g_sched_trace.n_past = -1;
+        g_sched_trace.n_tokens = -1;
+    }
+    if (worker_trace_enabled) {
+        ggml_ffn_worker_trace_flush_rows();
+        g_ffn_worker_trace.graph_id = 0;
+        g_ffn_worker_trace.token_index = -1;
+        g_ffn_worker_trace.n_past = -1;
+        g_ffn_worker_trace.n_tokens = -1;
+    }
 }
 
 void ggml_backend_sched_trace_set_query_id(int query_id) {
-    if (!ggml_sched_trace_enabled()) {
+    const bool sched_trace_enabled = ggml_sched_trace_enabled();
+    const bool worker_trace_enabled = ggml_ffn_worker_trace_enabled();
+    if (!sched_trace_enabled && !worker_trace_enabled) {
         return;
     }
-    g_sched_trace.query_id = query_id;
+    if (sched_trace_enabled) {
+        g_sched_trace.query_id = query_id;
+    }
+    if (worker_trace_enabled) {
+        g_ffn_worker_trace.query_id = query_id;
+    }
 }
 
 void ggml_backend_sched_trace_set_ubatch(int token_index, int n_past, int n_tokens) {
-    if (!ggml_sched_trace_enabled()) {
+    const bool sched_trace_enabled = ggml_sched_trace_enabled();
+    const bool worker_trace_enabled = ggml_ffn_worker_trace_enabled();
+    if (!sched_trace_enabled && !worker_trace_enabled) {
         return;
     }
-    g_sched_trace.token_index = token_index;
-    g_sched_trace.n_past = n_past;
-    g_sched_trace.n_tokens = n_tokens;
+    if (sched_trace_enabled) {
+        g_sched_trace.token_index = token_index;
+        g_sched_trace.n_past = n_past;
+        g_sched_trace.n_tokens = n_tokens;
+    }
+    if (worker_trace_enabled) {
+        g_ffn_worker_trace.token_index = token_index;
+        g_ffn_worker_trace.n_past = n_past;
+        g_ffn_worker_trace.n_tokens = n_tokens;
+    }
 }
 
 void ggml_backend_sched_trace_flush(void) {
-    if (!g_sched_trace.initialized || g_sched_trace.rows.empty()) {
-        return;
+    if (g_sched_trace.initialized && !g_sched_trace.rows.empty()) {
+        ggml_sched_trace_flush_rows();
     }
-    ggml_sched_trace_flush_rows();
+    if (g_ffn_worker_trace.initialized && !g_ffn_worker_trace.rows.empty()) {
+        ggml_ffn_worker_trace_flush_rows();
+    }
 }
 
 static inline int64_t ggml_sched_profile_time_us(void) {
@@ -3373,12 +3880,158 @@ static void ggml_backend_sched_trace_append_split(
     ggml_sched_trace_copy_string(row.timing_mode, sizeof(row.timing_mode), timing_mode);
 }
 
+static int64_t ggml_ffn_worker_trace_delta(int64_t end_us, int64_t begin_us) {
+    return end_us >= 0 && begin_us >= 0 ? end_us - begin_us : -1;
+}
+
+static void ggml_backend_sched_ffn_worker_trace_append_group(
+        ggml_backend_sched_t sched,
+        int64_t graph_id,
+        int split_id,
+        int ffn_group_size,
+        const std::vector<ggml_backend_sched_ffn_branch_info> & ffn_group_infos,
+        const ggml_backend_sched_ffn_worker_timeline * timelines,
+        const std::vector<enum ggml_status> & statuses,
+        const std::vector<int64_t> & sched_compute_wall_us,
+        int64_t group_begin_us,
+        int64_t copy_end_us,
+        int64_t compute_begin_us,
+        int64_t group_end_us) {
+    GGML_ASSERT(sched != nullptr);
+    GGML_ASSERT(graph_id >= 0);
+    GGML_ASSERT(ffn_group_size > 0);
+    GGML_ASSERT((int) ffn_group_infos.size() == ffn_group_size);
+    GGML_ASSERT(timelines != nullptr);
+    GGML_ASSERT((int) statuses.size() == ffn_group_size);
+    GGML_ASSERT((int) sched_compute_wall_us.size() == ffn_group_size);
+
+    int64_t first_backend_begin_us = -1;
+    int64_t last_backend_begin_us = -1;
+    int64_t last_backend_finish_us = -1;
+    int64_t last_completion_publish_us = -1;
+    int64_t longest_branch_wall_us = -1;
+
+    for (int i = 0; i < ffn_group_size; ++i) {
+        const ggml_backend_sched_ffn_worker_timeline & timeline = timelines[i];
+        if (timeline.backend_begin_us >= 0) {
+            first_backend_begin_us = first_backend_begin_us < 0
+                ? timeline.backend_begin_us
+                : std::min(first_backend_begin_us, timeline.backend_begin_us);
+            last_backend_begin_us = std::max(last_backend_begin_us, timeline.backend_begin_us);
+        }
+        if (timeline.sync_end_us >= 0) {
+            last_backend_finish_us = std::max(last_backend_finish_us, timeline.sync_end_us);
+        }
+        if (timeline.completion_publish_us >= 0) {
+            last_completion_publish_us = std::max(
+                    last_completion_publish_us, timeline.completion_publish_us);
+        }
+        longest_branch_wall_us = std::max(
+                longest_branch_wall_us,
+                ggml_ffn_worker_trace_delta(timeline.job_end_us, timeline.job_start_us));
+    }
+
+    const int64_t group_seq = g_ffn_worker_trace.next_group_seq++;
+    const int64_t group_start_skew_us = ggml_ffn_worker_trace_delta(
+            last_backend_begin_us, first_backend_begin_us);
+    const int64_t group_tail_after_last_backend_us = ggml_ffn_worker_trace_delta(
+            group_end_us, last_backend_finish_us);
+    const int64_t group_tail_after_last_publish_us = ggml_ffn_worker_trace_delta(
+            group_end_us, last_completion_publish_us);
+
+    for (int i = 0; i < ffn_group_size; ++i) {
+        const struct ggml_backend_sched_split * split = &sched->splits[split_id + i];
+        const ggml_cgraph & graph = split->graph;
+        const ggml_tensor * first = graph.n_nodes > 0 ? graph.nodes[0] : nullptr;
+        const ggml_tensor * last = graph.n_nodes > 0 ? graph.nodes[graph.n_nodes - 1] : nullptr;
+
+        g_ffn_worker_trace.rows.emplace_back();
+        ggml_backend_sched_ffn_worker_trace_row & row = g_ffn_worker_trace.rows.back();
+        row.trace_session_id = g_ffn_worker_trace.trace_session_id;
+        row.group_seq = group_seq;
+        row.job_id = g_ffn_worker_trace.next_job_id++;
+        row.query_id = g_ffn_worker_trace.query_id;
+        row.phase = g_sched_profile_phase;
+        row.graph_id = graph_id;
+        row.token_index = g_ffn_worker_trace.token_index;
+        row.n_past = g_ffn_worker_trace.n_past;
+        row.n_tokens = g_ffn_worker_trace.n_tokens;
+        row.group_id = split_id;
+        row.split_id = split_id + i;
+        row.layer = ffn_group_infos[i].layer;
+        row.node_count = graph.n_nodes;
+        row.status = statuses[i];
+        row.sched_compute_wall_us = sched_compute_wall_us[i] > 0
+            ? sched_compute_wall_us[i]
+            : -1;
+        row.group_begin_us = group_begin_us;
+        row.copy_end_us = copy_end_us;
+        row.compute_begin_us = compute_begin_us;
+        row.group_end_us = group_end_us;
+        row.timeline = timelines[i];
+
+        ggml_sched_trace_copy_string(
+                row.backend, sizeof(row.backend),
+                ggml_backend_name(sched->backends[split->backend_id]));
+        ggml_sched_trace_copy_string(
+                row.ffn_branch, sizeof(row.ffn_branch), ffn_group_infos[i].branch.c_str());
+        ggml_sched_trace_copy_string(
+                row.first_node, sizeof(row.first_node), first ? first->name : "");
+        ggml_sched_trace_copy_string(
+                row.last_node, sizeof(row.last_node), last ? last->name : "");
+
+        const ggml_backend_sched_ffn_worker_timeline & timeline = row.timeline;
+        row.group_copy_us = ggml_ffn_worker_trace_delta(copy_end_us, group_begin_us);
+        row.post_copy_setup_us = ggml_ffn_worker_trace_delta(compute_begin_us, copy_end_us);
+        row.dispatch_us = ggml_ffn_worker_trace_delta(
+                timeline.dispatch_end_us, timeline.dispatch_begin_us);
+        row.queue_delay_us = ggml_ffn_worker_trace_delta(
+                timeline.worker_dequeue_us, timeline.job_enqueued_us);
+        row.dispatch_to_start_us = ggml_ffn_worker_trace_delta(
+                timeline.job_start_us, timeline.dispatch_begin_us);
+        row.worker_setup_us = ggml_ffn_worker_trace_delta(
+                timeline.backend_begin_us, timeline.job_start_us);
+        row.graph_call_us = ggml_ffn_worker_trace_delta(
+                timeline.graph_compute_return_us, timeline.backend_begin_us);
+        row.post_graph_cleanup_us = ggml_ffn_worker_trace_delta(
+                timeline.sync_begin_us, timeline.graph_compute_return_us);
+        row.sync_wait_us = ggml_ffn_worker_trace_delta(
+                timeline.sync_end_us, timeline.sync_begin_us);
+        row.job_finalize_us = ggml_ffn_worker_trace_delta(
+                timeline.job_end_us, timeline.sync_end_us);
+        row.branch_wall_us = ggml_ffn_worker_trace_delta(
+                timeline.job_end_us, timeline.job_start_us);
+        row.publish_delay_us = ggml_ffn_worker_trace_delta(
+                timeline.completion_publish_us, timeline.job_end_us);
+        row.collect_wait_us = ggml_ffn_worker_trace_delta(
+                timeline.collect_end_us, timeline.collect_begin_us);
+        row.start_offset_us = ggml_ffn_worker_trace_delta(
+                timeline.backend_begin_us, compute_begin_us);
+        row.finish_offset_us = ggml_ffn_worker_trace_delta(
+                timeline.sync_end_us, compute_begin_us);
+        row.group_start_skew_us = group_start_skew_us;
+        row.group_tail_after_last_backend_us = group_tail_after_last_backend_us;
+        row.group_tail_after_last_publish_us = group_tail_after_last_publish_us;
+        row.group_compute_wall_us = ggml_ffn_worker_trace_delta(group_end_us, compute_begin_us);
+        row.group_wall_us = ggml_ffn_worker_trace_delta(group_end_us, group_begin_us);
+        row.is_longest_duration =
+            row.branch_wall_us >= 0 && row.branch_wall_us == longest_branch_wall_us ? 1 : 0;
+        row.is_last_backend_finisher =
+            timeline.sync_end_us >= 0 && timeline.sync_end_us == last_backend_finish_us ? 1 : 0;
+        row.is_last_completion_publisher =
+            timeline.completion_publish_us >= 0 &&
+            timeline.completion_publish_us == last_completion_publish_us ? 1 : 0;
+    }
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
     const bool trace_enabled = ggml_sched_trace_phase_enabled();
     const int64_t trace_graph_id = trace_enabled ? g_sched_trace.graph_id++ : -1;
+    const bool worker_trace_enabled = ggml_ffn_worker_trace_phase_enabled();
+    const int64_t worker_trace_graph_id = worker_trace_enabled ? g_ffn_worker_trace.graph_id++ : -1;
 
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
@@ -3671,10 +4324,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
     };
 
-    auto compute_split_no_callback = [&](struct ggml_backend_sched_split * split, int64_t * dt_us, bool sync_after) {
+    auto compute_split_no_callback = [&](
+            struct ggml_backend_sched_split * split,
+            int64_t * dt_us,
+            bool sync_after,
+            ggml_backend_sched_ffn_worker_timeline * timeline) {
         ggml_backend_t split_backend = sched->backends[split->backend_id];
         ggml_backend_set_n_threads_t set_n_threads = ffn_reduce_set_n_threads(split);
         const int64_t t0_us = ggml_time_us();
+        if (timeline != nullptr) {
+            timeline->backend_begin_us = t0_us;
+        }
         enum ggml_status ec;
         {
             ffn_reduce_thread_guard guard(
@@ -3683,11 +4343,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     sched->ffn_parallel_reduce_threads,
                     sched->cpu_threads);
             ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            if (timeline != nullptr) {
+                timeline->graph_compute_return_us = ggml_time_us();
+            }
         }
         if (ec == GGML_STATUS_SUCCESS && sync_after) {
             // FFN parallel groups need backend completion inside the parallel section.
             // Otherwise async backends can defer the real wait to the following split.
+            if (timeline != nullptr) {
+                timeline->sync_begin_us = ggml_time_us();
+            }
             ggml_backend_synchronize(split_backend);
+            if (timeline != nullptr) {
+                timeline->sync_end_us = ggml_time_us();
+            }
         }
         const int64_t t1_us = ggml_time_us();
         *dt_us = t1_us - t0_us;
@@ -3765,6 +4434,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     splits, sched->n_splits, split_id, allow_single_ffn_group, &ffn_group_infos)
             : 0;
         if (ffn_group_size > 0) {
+            ggml_backend_sched_ffn_worker_timeline * group_timelines = nullptr;
+            if (worker_trace_enabled) {
+                group_timelines = g_ffn_worker_trace.timelines.get();
+                for (int i = 0; i < ffn_group_size; ++i) {
+                    group_timelines[i] = {};
+                }
+            }
+
             std::vector<ggml_sched_profile_backend_kind> group_buckets(ffn_group_size);
             bool group_backends_unique = true;
             int cpu_branch_count = 0;
@@ -3832,8 +4509,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 // multiple CPU branches sharing the CPU thread pool) therefore
                 // fall back to deterministic serial execution.
                 for (int i = 0; i < ffn_group_size; ++i) {
+                    ggml_backend_sched_ffn_worker_timeline * timeline =
+                        group_timelines != nullptr ? &group_timelines[i] : nullptr;
+                    if (timeline != nullptr) {
+                        timeline->mode = GGML_SCHED_FFN_WORKER_SERIAL;
+                        timeline->worker_tid = ggml_backend_sched_current_tid();
+                        timeline->start_cpu = ggml_backend_sched_current_cpu();
+                        timeline->job_start_us = ggml_time_us();
+                    }
                     status[i] = compute_split_no_callback(
-                            &splits[split_id + i], &dt_us[i], true);
+                            &splits[split_id + i], &dt_us[i], true, timeline);
+                    if (timeline != nullptr) {
+                        timeline->end_cpu = ggml_backend_sched_current_cpu();
+                        timeline->job_end_us = ggml_time_us();
+                        timeline->completion_publish_us = timeline->job_end_us;
+                    }
                 }
             } else {
                 for (int i = 0; i < ffn_group_size; ++i) {
@@ -3844,18 +4534,34 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     if (use_persistent_device_workers &&
                             group_buckets[i] != GGML_SCHED_PROFILE_BACKEND_CPU) {
                         struct ggml_backend_sched_split * device_split = &splits[split_id + i];
+                        ggml_backend_sched_ffn_worker_timeline * timeline =
+                            group_timelines != nullptr ? &group_timelines[i] : nullptr;
+                        if (timeline != nullptr) {
+                            timeline->mode = GGML_SCHED_FFN_WORKER_PERSISTENT;
+                            timeline->collect_kind = GGML_SCHED_FFN_COLLECT_TICKET_WAIT;
+                            timeline->dispatch_begin_us = ggml_time_us();
+                        }
                         device_jobs[i].backend = sched->backends[device_split->backend_id];
                         device_jobs[i].graph = &device_split->graph;
                         device_jobs[i].status = &status[i];
                         device_jobs[i].dt_us = &dt_us[i];
-                        if (sched->ffn_device_executor->submit(
+                        device_jobs[i].timeline = timeline;
+                        const bool submitted = sched->ffn_device_executor->submit(
                                 device_split->backend_id,
                                 ggml_backend_sched_run_ffn_device_job,
                                 &device_jobs[i],
                                 &status[i],
-                                &device_tickets[i])) {
+                                &device_tickets[i],
+                                timeline);
+                        if (timeline != nullptr) {
+                            timeline->dispatch_end_us = ggml_time_us();
+                        }
+                        if (submitted) {
                             device_jobs_submitted[i] = true;
                         } else {
+                            if (timeline != nullptr) {
+                                timeline->collect_kind = GGML_SCHED_FFN_COLLECT_NONE;
+                            }
                             GGML_LOG_ERROR(
                                     "%s: failed to submit persistent FFN job for backend %s, layer %d\n",
                                     __func__,
@@ -3864,7 +4570,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             status[i] = GGML_STATUS_FAILED;
                         }
                     } else {
+                        ggml_backend_sched_ffn_worker_timeline * timeline =
+                            group_timelines != nullptr ? &group_timelines[i] : nullptr;
+                        if (timeline != nullptr) {
+                            timeline->mode = GGML_SCHED_FFN_WORKER_TRANSIENT;
+                            timeline->collect_kind = GGML_SCHED_FFN_COLLECT_THREAD_JOIN;
+                            timeline->dispatch_begin_us = ggml_time_us();
+                        }
                         workers.emplace_back([&, i]() {
+                            ggml_backend_sched_ffn_worker_timeline * worker_timeline =
+                                group_timelines != nullptr ? &group_timelines[i] : nullptr;
+                            if (worker_timeline != nullptr) {
+                                worker_timeline->worker_dequeue_us = ggml_time_us();
+                                worker_timeline->worker_tid = ggml_backend_sched_current_tid();
+                            }
                             // A transient fallback thread would otherwise
                             // inherit the strict CPU worker-0 mask (CPU 7 in
                             // the S25 layout) and contend with the CPU branch.
@@ -3873,11 +4592,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 : group_buckets[i] == GGML_SCHED_PROFILE_BACKEND_GPU
                                     ? sched->ffn_gpu_worker_cpu
                                     : sched->ffn_device_worker_cpu;
+                            if (worker_timeline != nullptr) {
+                                worker_timeline->affinity_cpu = worker_cpu;
+                            }
                             ggml_backend_sched_pin_current_thread_to_cpu(
                                     worker_cpu);
+                            if (worker_timeline != nullptr) {
+                                worker_timeline->start_cpu = ggml_backend_sched_current_cpu();
+                                worker_timeline->job_start_us = ggml_time_us();
+                            }
                             try {
                                 status[i] = compute_split_no_callback(
-                                        &splits[split_id + i], &dt_us[i], true);
+                                        &splits[split_id + i], &dt_us[i], true, worker_timeline);
                             } catch (const std::exception & error) {
                                 status[i] = GGML_STATUS_FAILED;
                                 GGML_LOG_ERROR(
@@ -3892,13 +4618,29 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                         __func__,
                                         ggml_backend_name(sched->backends[splits[split_id + i].backend_id]));
                             }
+                            if (worker_timeline != nullptr) {
+                                worker_timeline->end_cpu = ggml_backend_sched_current_cpu();
+                                worker_timeline->job_end_us = ggml_time_us();
+                                worker_timeline->completion_publish_us = ggml_time_us();
+                            }
                         });
+                        if (timeline != nullptr) {
+                            timeline->dispatch_end_us = ggml_time_us();
+                        }
                     }
                 }
 
+                ggml_backend_sched_ffn_worker_timeline * main_timeline =
+                    group_timelines != nullptr ? &group_timelines[main_i] : nullptr;
+                if (main_timeline != nullptr) {
+                    main_timeline->mode = GGML_SCHED_FFN_WORKER_CALLER;
+                    main_timeline->worker_tid = ggml_backend_sched_current_tid();
+                    main_timeline->start_cpu = ggml_backend_sched_current_cpu();
+                    main_timeline->job_start_us = ggml_time_us();
+                }
                 try {
                     status[main_i] = compute_split_no_callback(
-                            &splits[split_id + main_i], &dt_us[main_i], true);
+                            &splits[split_id + main_i], &dt_us[main_i], true, main_timeline);
                 } catch (const std::exception & error) {
                     status[main_i] = GGML_STATUS_FAILED;
                     GGML_LOG_ERROR(
@@ -3913,15 +4655,40 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             __func__,
                             ggml_backend_name(sched->backends[splits[split_id + main_i].backend_id]));
                 }
+                if (main_timeline != nullptr) {
+                    main_timeline->end_cpu = ggml_backend_sched_current_cpu();
+                    main_timeline->job_end_us = ggml_time_us();
+                    main_timeline->completion_publish_us = main_timeline->job_end_us;
+                }
+                int collect_order = 0;
                 for (int i = 0; i < ffn_group_size; ++i) {
                     if (device_jobs_submitted[i]) {
+                        ggml_backend_sched_ffn_worker_timeline * timeline =
+                            group_timelines != nullptr ? &group_timelines[i] : nullptr;
+                        if (timeline != nullptr) {
+                            timeline->collect_order = collect_order++;
+                        }
                         sched->ffn_device_executor->wait(
                                 splits[split_id + i].backend_id,
-                                device_tickets[i]);
+                                device_tickets[i],
+                                timeline);
                     }
                 }
-                for (std::thread & worker : workers) {
-                    worker.join();
+                for (size_t worker_index = 0; worker_index < workers.size(); ++worker_index) {
+                    const int branch_index = (int) worker_index < main_i
+                        ? (int) worker_index
+                        : (int) worker_index + 1;
+                    ggml_backend_sched_ffn_worker_timeline * timeline = group_timelines != nullptr
+                        ? &group_timelines[branch_index]
+                        : nullptr;
+                    if (timeline != nullptr) {
+                        timeline->collect_order = collect_order++;
+                        timeline->collect_begin_us = ggml_time_us();
+                    }
+                    workers[worker_index].join();
+                    if (timeline != nullptr) {
+                        timeline->collect_end_us = ggml_time_us();
+                    }
                 }
             }
             const int64_t compute_t1_us = ggml_time_us();
@@ -3929,6 +4696,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             const char * group_timing_mode = run_group_serially
                 ? "serial_fallback"
                 : use_persistent_device_workers ? "persistent_synced_wall" : "synced_wall";
+
+            if (worker_trace_graph_id >= 0) {
+                ggml_backend_sched_ffn_worker_trace_append_group(
+                        sched,
+                        worker_trace_graph_id,
+                        split_id,
+                        ffn_group_size,
+                        ffn_group_infos,
+                        group_timelines,
+                        status,
+                        dt_us,
+                        group_t0_us,
+                        copy_t1_us,
+                        compute_t0_us,
+                        group_t1_us);
+            }
 
             for (int i = 0; i < ffn_group_size; ++i) {
                 if (status[i] != GGML_STATUS_SUCCESS) {
@@ -4022,7 +4805,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         if (!sched->callback_eval) {
             int64_t dt_us = 0;
-            enum ggml_status ec = compute_split_no_callback(split, &dt_us, false);
+            enum ggml_status ec = compute_split_no_callback(split, &dt_us, false, nullptr);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }

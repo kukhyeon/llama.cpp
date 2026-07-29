@@ -116,6 +116,10 @@ static bool should_write_sched_trace_csv() {
     return env_flag_enabled("SCHED_TRACE") || env_flag_enabled("GGML_SCHED_TRACE");
 }
 
+static bool should_write_ffn_worker_trace_csv() {
+    return env_flag_enabled("GGML_FFN_WORKER_TRACE") || env_flag_enabled("FFN_WORKER_TRACE");
+}
+
 // Appends per-op CSV headers for the optional op breakdown section.
 // Each ggml op contributes six columns:
 // prefill_cpu, decode_cpu, prefill_htp, decode_htp, prefill_gpu, decode_gpu.
@@ -473,6 +477,8 @@ int main(int argc, char ** argv) {
     const bool csv_op_load_breakdown = should_write_op_load_breakdown_csv();
     const bool csv_load = csv_op_load || csv_op_load_breakdown;
     const bool sched_trace = should_write_sched_trace_csv();
+    const bool ffn_worker_trace = should_write_ffn_worker_trace_csv();
+    const bool any_sched_trace = sched_trace || ffn_worker_trace;
     ggml_backend_op_load_profile_set_enabled(csv_op_load);
     ggml_backend_op_load_profile_set_breakdown_enabled(csv_op_load_breakdown);
     ggml_backend_op_load_profile_set_ops_from_env(std::getenv("CSV_OP_LOAD_OPS"));
@@ -1427,7 +1433,7 @@ int main(int argc, char ** argv) {
                     if (csv_load && output_path_load != "/inference_load.csv") {
                         llama_op_load_profile_print_custom(output_path_load, current_question_index, start_sys_time, csv_op_load, csv_op_load_breakdown);
                     }
-                    if (sched_trace) {
+                    if (any_sched_trace) {
                         ggml_backend_sched_trace_flush();
                     }
                     inference_started = false;
@@ -1625,7 +1631,7 @@ int main(int argc, char ** argv) {
                     if (csv_load && output_path_load != "/inference_load.csv") {
                         llama_op_load_profile_print_custom(output_path_load, current_question_index, start_sys_time, csv_op_load, csv_op_load_breakdown);
                     }
-                    if (sched_trace) {
+                    if (any_sched_trace) {
                         ggml_backend_sched_trace_flush();
                     }
                     //check_hardware(device_name);
@@ -1692,7 +1698,7 @@ int main(int argc, char ** argv) {
                     if (ig->backend_compute_profile) {
                         ggml_backend_sched_profile_reset();
                     }
-                    if (sched_trace) {
+                    if (any_sched_trace) {
                         ggml_backend_sched_trace_reset();
                         ggml_backend_sched_trace_set_query_id((int) current_question_index);
                     }
@@ -1853,7 +1859,7 @@ int main(int argc, char ** argv) {
 
     LOG("\n\n");
     common_perf_print(ctx, smpl);
-    if (sched_trace) {
+    if (any_sched_trace) {
         ggml_backend_sched_trace_flush();
     }
 
