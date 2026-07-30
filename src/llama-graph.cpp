@@ -972,6 +972,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     n_tokens         (ubatch.n_tokens),
     n_outputs        (params.n_outputs),
     n_ctx_orig       (cparams.n_ctx_orig_yarn),
+    runtime_route_candidates(params.runtime_route_candidates),
+    runtime_ffn_profile(params.runtime_ffn_profile),
     pooling_type     (cparams.pooling_type),
     rope_type        (hparams.rope_type),
     model            (params.model),
@@ -983,6 +985,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cross            (params.cross),
     samplers         (params.samplers),
     cb_func          (params.cb),
+    route_subgraph_cb_func(params.route_subgraph_cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
@@ -992,6 +995,23 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
 void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il, const char * backend_hint) const {
     if (cb_func) {
         cb_func(ubatch, cur, name, il, backend_hint);
+    }
+}
+
+void llm_graph_context::cb_route(
+        ggml_tensor * cur, const char * name, int il, const char * backend_hint) const {
+    cb(cur, name, il, backend_hint);
+    if (sched == nullptr || backend_hint == nullptr || backend_hint[0] == '\0') {
+        GGML_ABORT("runtime route %s layer %d has no concrete backend", name, il);
+    }
+
+    ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, cur);
+    if (backend == nullptr ||
+            !llama_backend_policy_backend_matches(backend, backend_hint) ||
+            !ggml_backend_supports_op(backend, cur)) {
+        GGML_ABORT(
+                "runtime route %s layer %d failed to bind requested backend %s",
+                name, il, backend_hint);
     }
 }
 
@@ -1187,13 +1207,26 @@ ggml_tensor * llm_graph_context::build_ffn(
          ggml_tensor * act_scales,
      llm_ffn_op_type   type_op,
      llm_ffn_gate_type   type_gate,
-                 int   il) const {
+                 int   il,
+    const llama_backend_policy_ffn_parallel * policy_override,
+         const char * route_tag) const {
     llama_backend_policy_ffn_parallel ffn_policy;
     const bool is_prefill = n_tokens > 1;
+    const bool has_policy_override = policy_override != nullptr;
+    if (has_policy_override) {
+        ffn_policy = *policy_override;
+    }
     const bool requires_parallel =
         (up   != nullptr && up->buffer   == nullptr) ||
         (gate != nullptr && gate->buffer == nullptr) ||
         (down != nullptr && down->buffer == nullptr);
+    auto cb_parallel = [&](ggml_tensor * node, const char * name, const char * backend_hint) {
+        if (has_policy_override) {
+            cb_route(node, name, il, backend_hint);
+        } else {
+            cb(node, name, il, backend_hint);
+        }
+    };
     const bool can_try_parallel =
         model != nullptr &&
         up != nullptr && gate != nullptr && down != nullptr &&
@@ -1204,7 +1237,8 @@ ggml_tensor * llm_graph_context::build_ffn(
         (loras == nullptr || loras->empty()) &&
         type_op == LLM_FFN_SILU &&
         type_gate == LLM_FFN_PAR &&
-        llama_backend_policy_match_ffn_parallel(il, is_prefill, ffn_policy);
+        (has_policy_override ||
+         llama_backend_policy_match_ffn_parallel(il, is_prefill, ffn_policy));
 
     if (can_try_parallel) {
         const int64_t n_ff = up->ne[1];
@@ -1245,9 +1279,12 @@ ggml_tensor * llm_graph_context::build_ffn(
                 return a.start < b.start;
             });
 
+            const std::string route_suffix = route_tag != nullptr && route_tag[0] != '\0'
+                ? std::string(".") + route_tag : std::string();
+
             auto reduce_add = [&](ggml_tensor * lhs, ggml_tensor * rhs) {
                 ggml_tensor * acc = ggml_add(ctx0, lhs, rhs);
-                cb(acc, "ffn_parallel_sum", il,
+                cb_parallel(acc, ("ffn_parallel_sum" + route_suffix).c_str(),
                         ffn_policy.reduce_backend.empty() ? nullptr : ffn_policy.reduce_backend.c_str());
                 return acc;
             };
@@ -1281,7 +1318,8 @@ ggml_tensor * llm_graph_context::build_ffn(
                     break;
                 }
 
-                const std::string suffix = "." + (split.id.empty() ? split.backend : split.id);
+                const std::string suffix = route_suffix + "." +
+                    (split.id.empty() ? split.backend : split.id);
 
                 const bool covers_consistent =
                     up_cover.cover_start == gate_cover.cover_start &&
@@ -1313,29 +1351,29 @@ ggml_tensor * llm_graph_context::build_ffn(
                         ctx0, up_cover.tensor, cur,
                         0, up_cover.tensor->ne[0],
                         up_cover.local_start, split.size);
-                cb(up_cur, ("ffn_up" + suffix).c_str(), il, split.backend.c_str());
+                cb_parallel(up_cur, ("ffn_up" + suffix).c_str(), split.backend.c_str());
 
                 ggml_tensor * gate_cur = ggml_mul_mat_src0_region(
                         ctx0, gate_cover.tensor, cur,
                         0, gate_cover.tensor->ne[0],
                         gate_cover.local_start, split.size);
-                cb(gate_cur, ("ffn_gate" + suffix).c_str(), il, split.backend.c_str());
+                cb_parallel(gate_cur, ("ffn_gate" + suffix).c_str(), split.backend.c_str());
 
                 ggml_tensor * act = ggml_swiglu_split(ctx0, gate_cur, up_cur);
-                cb(act, ("ffn_swiglu" + suffix).c_str(), il, split.backend.c_str());
+                cb_parallel(act, ("ffn_swiglu" + suffix).c_str(), split.backend.c_str());
 
                 ggml_tensor * branch = ggml_mul_mat_src0_region(
                         ctx0, down_cover.tensor, act,
                         down_cover.local_start, split.size,
                         0, down_cover.tensor->ne[1]);
-                cb(branch, ("ffn_down" + suffix).c_str(), il, split.backend.c_str());
+                cb_parallel(branch, ("ffn_down" + suffix).c_str(), split.backend.c_str());
 
                 branch_outs.push_back(branch);
             }
 
             if (valid && !branch_outs.empty()) {
                 ggml_tensor * acc = reduce_branches(branch_outs);
-                cb(acc, "ffn_parallel_out", il,
+                cb_parallel(acc, ("ffn_parallel_out" + route_suffix).c_str(),
                         ffn_policy.reduce_backend.empty() ? nullptr : ffn_policy.reduce_backend.c_str());
                 return acc;
             }

@@ -23,6 +23,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <thread>
+#include <unordered_set>
 
 //
 // llama_context
@@ -40,6 +41,12 @@ static const char * llama_module_bench_type_name(llama_module_bench_type type) {
         case LLAMA_MODULE_BENCH_FFN_NORM:        return "ffn_norm";
         case LLAMA_MODULE_BENCH_FFN_CORE:        return "ffn_core";
         case LLAMA_MODULE_BENCH_L_OUT:           return "l_out";
+        case LLAMA_MODULE_BENCH_ATTN_RMS_NORM:   return "attn_rms_norm";
+        case LLAMA_MODULE_BENCH_ATTN_NORM_MUL:   return "attn_norm_mul";
+        case LLAMA_MODULE_BENCH_FFN_RMS_NORM:    return "ffn_rms_norm";
+        case LLAMA_MODULE_BENCH_FFN_NORM_MUL:     return "ffn_norm_mul";
+        case LLAMA_MODULE_BENCH_FFN_PARALLEL_SUM: return "ffn_parallel_sum";
+        case LLAMA_MODULE_BENCH_FFN_OUT:         return "ffn_out";
     }
     return "unknown";
 }
@@ -89,7 +96,10 @@ static void llama_module_bench_trace_write(
         int n_past,
         int n_tokens,
         int repeat_idx,
-        int64_t wall_us) {
+        int64_t wall_us,
+        const char * requested_backend,
+        const char * resolved_backend,
+        const ggml_tensor * focus_node) {
     if (cparams.module_bench_trace_path.empty()) {
         return;
     }
@@ -97,7 +107,13 @@ static void llama_module_bench_trace_write(
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
 
+    static constexpr const char * trace_header =
+        "profile,semantic_role,node_name,op_type,tensor_type,ne0,ne1,ne2,ne3,nbytes,"
+        "phase,token_index,n_past,n_tokens,repeat_idx,layer_start,layer_end,"
+        "wall_us,timing_mode,requested_backend,resolved_backend";
+    static std::unordered_set<std::string> rejected_schema_paths;
     bool need_header = false;
+    bool schema_matches = true;
     {
         FILE * fr = std::fopen(cparams.module_bench_trace_path.c_str(), "r");
         if (fr == nullptr) {
@@ -105,8 +121,27 @@ static void llama_module_bench_trace_write(
         } else {
             std::fseek(fr, 0, SEEK_END);
             need_header = std::ftell(fr) == 0;
+            if (!need_header) {
+                std::rewind(fr);
+                char existing_header[512] = {};
+                if (std::fgets(existing_header, sizeof(existing_header), fr) == nullptr) {
+                    schema_matches = false;
+                } else {
+                    existing_header[std::strcspn(existing_header, "\r\n")] = '\0';
+                    schema_matches = std::strcmp(existing_header, trace_header) == 0;
+                }
+            }
             std::fclose(fr);
         }
+    }
+
+    if (!schema_matches) {
+        if (rejected_schema_paths.insert(cparams.module_bench_trace_path).second) {
+            LLAMA_LOG_ERROR(
+                    "%s: module-bench trace '%s' uses an older/incompatible CSV schema; use a new output path\n",
+                    __func__, cparams.module_bench_trace_path.c_str());
+        }
+        return;
     }
 
     FILE * f = std::fopen(cparams.module_bench_trace_path.c_str(), "a");
@@ -116,7 +151,7 @@ static void llama_module_bench_trace_write(
     }
 
     if (need_header) {
-        std::fprintf(f, "profile,module,phase,token_index,n_past,n_tokens,repeat_idx,layer_start,layer_end,wall_us,timing_mode\n");
+        std::fprintf(f, "%s\n", trace_header);
     }
     int layer_start = cparams.module_bench_layer_start;
     int layer_end   = cparams.module_bench_layer_end;
@@ -124,9 +159,28 @@ static void llama_module_bench_trace_write(
         layer_start = 0;
         layer_end   = 0;
     }
-    std::fprintf(f, "%s,%s,%s,%d,%d,%d,%d,%d,%d,%lld,sync_wall\n",
+    const char * node_name = focus_node != nullptr && ggml_get_name(focus_node)[0] != '\0'
+        ? ggml_get_name(focus_node) : "unknown";
+    const char * op_type = focus_node != nullptr ? ggml_op_name(focus_node->op) : "unknown";
+    const char * tensor_type = focus_node != nullptr ? ggml_type_name(focus_node->type) : "unknown";
+    const int64_t ne0 = focus_node != nullptr ? focus_node->ne[0] : 0;
+    const int64_t ne1 = focus_node != nullptr ? focus_node->ne[1] : 0;
+    const int64_t ne2 = focus_node != nullptr ? focus_node->ne[2] : 0;
+    const int64_t ne3 = focus_node != nullptr ? focus_node->ne[3] : 0;
+    const size_t nbytes = focus_node != nullptr ? ggml_nbytes(focus_node) : 0;
+    std::fprintf(f,
+            "%s,%s,%s,%s,%s,%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 ",%zu,"
+            "%s,%d,%d,%d,%d,%d,%d,%lld,sync_wall,%s,%s\n",
             cparams.module_bench_profile.c_str(),
             llama_module_bench_type_name(cparams.module_bench_type),
+            node_name,
+            op_type,
+            tensor_type,
+            ne0,
+            ne1,
+            ne2,
+            ne3,
+            nbytes,
             phase,
             token_index,
             n_past,
@@ -134,8 +188,87 @@ static void llama_module_bench_trace_write(
             repeat_idx,
             layer_start,
             layer_end,
-            (long long) wall_us);
+            (long long) wall_us,
+            requested_backend != nullptr && requested_backend[0] != '\0'
+                ? requested_backend : "scheduler",
+            resolved_backend != nullptr && resolved_backend[0] != '\0'
+                ? resolved_backend : "unknown");
     std::fclose(f);
+}
+
+static bool llama_runtime_route_source_is_weight(const ggml_tensor * src) {
+    while (src != nullptr && src->view_src != nullptr) {
+        src = src->view_src;
+    }
+    return src != nullptr && src->buffer != nullptr &&
+        ggml_backend_buffer_get_usage(src->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+}
+
+static bool llama_runtime_route_candidate_is_safe(
+        const ggml_tensor * node,
+        int use_count,
+        bool allow_multiple_consumers = false) {
+    if (node == nullptr || node->view_src != nullptr ||
+        (allow_multiple_consumers ? use_count < 1 : use_count != 1) ||
+        ggml_nbytes(node) == 0 || !ggml_is_contiguous(node) ||
+        (node->flags & (GGML_TENSOR_FLAG_INPUT |
+                        GGML_TENSOR_FLAG_OUTPUT |
+                        GGML_TENSOR_FLAG_PARAM |
+                        GGML_TENSOR_FLAG_LOSS)) != 0) {
+        return false;
+    }
+
+    switch (node->op) {
+        case GGML_OP_ADD:
+        case GGML_OP_MUL:
+        case GGML_OP_RMS_NORM:
+        case GGML_OP_SCALE:
+            break;
+        case GGML_OP_UNARY:
+            if (ggml_get_unary_op(node) != GGML_UNARY_OP_SILU) {
+                return false;
+            }
+            break;
+        default:
+            return false;
+    }
+
+    // The first rollout is intentionally F32/contiguous-only. This avoids
+    // backend-specific implicit conversions while the route mechanism itself
+    // is being validated.
+    if (node->type != GGML_TYPE_F32) {
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        const ggml_tensor * src = node->src[i];
+        if (src == nullptr) {
+            continue;
+        }
+        if (llama_runtime_route_source_is_weight(src) || !ggml_is_contiguous(src)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static ggml_tensor * llama_runtime_route_clone_node(
+        ggml_context * ctx,
+        const ggml_tensor * node,
+        const char * backend_name) {
+    ggml_tensor * clone = ggml_dup_tensor(ctx, node);
+    clone->op = node->op;
+    std::memcpy(clone->op_params, node->op_params, sizeof(clone->op_params));
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        clone->src[i] = node->src[i];
+    }
+    // ggml_graph_add_node() does not propagate the forward-root flag. Route
+    // clones are scheduler-selected executable roots, so mark them at their
+    // creation site instead of mutating arbitrary registered graph nodes
+    // later during scheduler preparation.
+    clone->flags |= GGML_TENSOR_FLAG_COMPUTE;
+    ggml_format_name(clone, "route.%s.%s",
+            backend_name ? backend_name : "backend", ggml_get_name(node));
+    return clone;
 }
 
 llama_context::llama_context(
@@ -469,6 +602,14 @@ llama_context::llama_context(
 
         if (cparams.pipeline_parallel) {
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
+        }
+
+        llama_backend_policy_runtime_routes route_catalog;
+        runtime_routes_configured =
+            llama_backend_policy_resolve_runtime_routes(true, route_catalog) ||
+            llama_backend_policy_resolve_runtime_routes(false, route_catalog);
+        if (runtime_routes_configured) {
+            LLAMA_LOG_INFO("%s: prepared layer runtime routes requested by backend policy\n", __func__);
         }
 
         sched_reserve();
@@ -807,6 +948,110 @@ const llama_cparams & llama_context::get_cparams() const {
 
 ggml_backend_sched_t llama_context::get_sched() const {
     return sched.get();
+}
+
+bool llama_context::runtime_route_request_profile(const char * profile) {
+    if (!runtime_routes_configured || sched == nullptr) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(runtime_route_mutex);
+    llama_backend_policy_runtime_routes routes;
+    if (!llama_backend_policy_resolve_runtime_routes(
+                runtime_route_current_is_prefill, routes) || routes.mode == "off") {
+        return false;
+    }
+
+    const std::string requested =
+        profile != nullptr && profile[0] != '\0' ? profile : routes.initial_profile;
+    if (std::find(routes.profiles.begin(), routes.profiles.end(), requested) == routes.profiles.end()) {
+        LLAMA_LOG_WARN("runtime_routes: requested unknown/unprepared profile '%s'\n", requested.c_str());
+        return false;
+    }
+    if (routes.mode != "clock" && requested != routes.initial_profile) {
+        LLAMA_LOG_WARN("runtime_routes: mode '%s' does not accept runtime plan changes\n", routes.mode.c_str());
+        return false;
+    }
+
+    const uint64_t active_plan_id =
+        ggml_backend_sched_layer_checkpoint_get_active_plan_id(sched.get());
+    std::string current_profile;
+    const auto active_it = runtime_route_plan_names.find(active_plan_id);
+    if (active_it != runtime_route_plan_names.end()) {
+        current_profile = active_it->second;
+    } else if (runtime_route_plan_names.find(
+                    llama_backend_policy_runtime_route_plan_id(runtime_route_requested_profile_name.c_str())) !=
+               runtime_route_plan_names.end()) {
+        // Before the first graph dispatch there is no scheduler-owned active
+        // plan yet. The prepared/requested route is the only legal transition
+        // origin in that short initialization window.
+        current_profile = runtime_route_requested_profile_name;
+    } else {
+        current_profile = routes.initial_profile;
+    }
+
+    if (!current_profile.empty() && current_profile != requested) {
+        std::vector<std::string> legal;
+        if (!llama_backend_policy_list_runtime_route_next_profiles(
+                    current_profile.c_str(),
+                    runtime_route_current_is_prefill, legal) ||
+            std::find(legal.begin(), legal.end(), requested) == legal.end()) {
+            LLAMA_LOG_WARN(
+                    "runtime_routes: transition %s -> %s is not prepared/allowed\n",
+                    current_profile.c_str(), requested.c_str());
+            return false;
+        }
+    }
+
+    const uint64_t plan_id = llama_backend_policy_runtime_route_plan_id(requested.c_str());
+    const auto plan_it = runtime_route_plan_names.find(plan_id);
+    if (plan_it == runtime_route_plan_names.end() || plan_it->second != requested) {
+        LLAMA_LOG_WARN("runtime_routes: profile '%s' is not resident in the current graph\n", requested.c_str());
+        return false;
+    }
+
+    runtime_route_requested_profile_name = requested;
+    ggml_backend_sched_layer_checkpoint_set_plan_id(sched.get(), plan_id);
+    return true;
+}
+
+const char * llama_context::runtime_route_active_profile() const {
+    static thread_local std::string profile;
+    std::lock_guard<std::mutex> lock(runtime_route_mutex);
+    profile.clear();
+    if (sched == nullptr) {
+        return profile.c_str();
+    }
+
+    const uint64_t active_plan_id =
+        ggml_backend_sched_layer_checkpoint_get_active_plan_id(sched.get());
+    const auto active_it = runtime_route_plan_names.find(active_plan_id);
+    if (active_it != runtime_route_plan_names.end()) {
+        profile = active_it->second;
+    } else {
+        // Graph-start acceptance has not run yet. Report the resident request
+        // so the query-boundary clock selector still has a valid origin. The
+        // last accepted name deliberately remains observable while a phase
+        // without runtime routes is executing.
+        profile = runtime_route_requested_profile_name;
+    }
+    return profile.c_str();
+}
+
+bool llama_context::runtime_route_set_layer_producer(
+        llama_runtime_route_layer_producer producer,
+        void * user_data) {
+    if (!runtime_routes_configured || sched == nullptr) {
+        return false;
+    }
+
+    // Registration is documented as graph-idle only. The mutex protects the
+    // callback/userdata pair from the scheduler-side copy and, importantly,
+    // is released before invoking application code.
+    std::lock_guard<std::mutex> lock(runtime_route_mutex);
+    runtime_route_layer_producer_callback = producer;
+    runtime_route_layer_producer_user_data = producer != nullptr ? user_data : nullptr;
+    return true;
 }
 
 uint32_t llama_context::n_ctx() const {
@@ -1368,7 +1613,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         const bool profile_backend_compute = igparams.backend_compute_profile;
         const int64_t t_build_us = profile_backend_compute ? ggml_time_us() : 0;
 
+        if (runtime_routes_configured) {
+            runtime_route_graph_begin(lp_is_prefill);
+        }
         gf = model.build_graph(gparams);
+
+        if (runtime_routes_configured && gf != nullptr &&
+                !runtime_route_prepare_graph(res, gf, lp_is_prefill)) {
+            LLAMA_LOG_ERROR("%s: failed to prepare layer runtime routes\n", __func__);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
         if (profile_backend_compute) {
@@ -1423,6 +1678,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             const int64_t wall_us = ggml_time_us() - t_module_us;
             const int trace_n_past = ubatch.pos && ubatch.n_tokens > 0 ? (int) ubatch.pos[0] : -1;
             const int trace_token_index = lp_is_prefill ? -1 : trace_n_past;
+            ggml_backend_t resolved_backend = res->t_embd != nullptr
+                ? ggml_backend_sched_get_tensor_backend(sched.get(), res->t_embd)
+                : nullptr;
             llama_module_bench_trace_write(
                     cparams,
                     lp_is_prefill ? "prefill" : "decode",
@@ -1430,7 +1688,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     trace_n_past,
                     (int) ubatch.n_tokens,
                     ir,
-                    wall_us);
+                    wall_us,
+                    cparams.module_bench_backend.c_str(),
+                    resolved_backend != nullptr ? ggml_backend_name(resolved_backend) : nullptr,
+                    res->t_embd);
         }
     }
 
@@ -2268,6 +2529,712 @@ void llama_context::output_reorder() {
 // graph
 //
 
+void llama_context::runtime_route_graph_begin(bool is_prefill) {
+    runtime_route_collect_metadata = false;
+    runtime_route_node_metadata.clear();
+    runtime_route_subgraphs.clear();
+
+    if (!runtime_routes_configured) {
+        return;
+    }
+
+    ggml_backend_sched_clear_route_candidates(sched.get());
+    ggml_backend_sched_clear_layer_checkpoints(sched.get());
+
+    llama_backend_policy_runtime_routes routes;
+    if (!llama_backend_policy_resolve_runtime_routes(is_prefill, routes) ||
+        routes.mode == "off" ||
+        llama_module_bench_phase_matches(cparams, is_prefill)) {
+        std::lock_guard<std::mutex> lock(runtime_route_mutex);
+        runtime_route_mode = "off";
+        return;
+    }
+
+    const bool incompatible = cparams.pipeline_parallel || cparams.cb_eval != nullptr || lp_enable;
+    if (incompatible) {
+        const char * reason = cparams.pipeline_parallel ? "pipeline parallelism" :
+            cparams.cb_eval != nullptr ? "evaluation callback" : "layer-pause callback";
+        if (routes.strict) {
+            throw std::runtime_error(
+                    std::string("runtime_routes is incompatible with ") + reason);
+        }
+        LLAMA_LOG_WARN("runtime_routes: disabled for this graph because %s is active\n", reason);
+        std::lock_guard<std::mutex> lock(runtime_route_mutex);
+        runtime_route_mode = "off";
+        return;
+    }
+
+    runtime_route_collect_metadata = true;
+    std::lock_guard<std::mutex> lock(runtime_route_mutex);
+    runtime_route_mode = routes.mode;
+    runtime_route_current_is_prefill = is_prefill;
+    runtime_route_min_dwell_layers = routes.min_dwell_layers;
+}
+
+bool llama_context::runtime_route_prepare_graph(
+        llm_graph_result * res,
+        ggml_cgraph * gf,
+        bool is_prefill) {
+    if (!runtime_route_collect_metadata) {
+        return true;
+    }
+
+    llama_backend_policy_runtime_routes routes;
+    if (!llama_backend_policy_resolve_runtime_routes(is_prefill, routes) ||
+        routes.mode == "off") {
+        return true;
+    }
+
+    struct route_registration {
+        ggml_tensor * canonical_first;
+        ggml_tensor * canonical;
+        ggml_tensor * variant_first;
+        ggml_tensor * variant;
+        uint64_t plan_id;
+        int layer;
+        bool subgraph;
+    };
+    struct profile_choice {
+        std::string profile;
+        uint64_t plan_id;
+        ggml_backend_t backend = nullptr;
+        bool matched = false;
+    };
+
+    std::unordered_map<std::string, uint64_t> plan_ids;
+    std::unordered_map<uint64_t, std::string> plan_names;
+    for (const std::string & profile : routes.profiles) {
+        const uint64_t id = llama_backend_policy_runtime_route_plan_id(profile.c_str());
+        if (!plan_names.emplace(id, profile).second) {
+            LLAMA_LOG_ERROR("runtime_routes: plan-id collision for profile '%s'\n", profile.c_str());
+            return false;
+        }
+        plan_ids.emplace(profile, id);
+    }
+
+    const auto initial_it = plan_ids.find(routes.initial_profile);
+    if (initial_it == plan_ids.end()) {
+        LLAMA_LOG_ERROR("runtime_routes: initial profile '%s' is not prepared\n",
+                routes.initial_profile.c_str());
+        return false;
+    }
+
+    const int original_n_nodes = ggml_graph_n_nodes(gf);
+    std::vector<ggml_tensor *> original_nodes;
+    original_nodes.reserve(original_n_nodes);
+    std::unordered_map<ggml_tensor *, int> original_node_indices;
+    original_node_indices.reserve((size_t) original_n_nodes);
+    for (int i = 0; i < original_n_nodes; ++i) {
+        ggml_tensor * node = ggml_graph_node(gf, i);
+        original_nodes.push_back(node);
+        original_node_indices.emplace(node, i);
+    }
+
+    // Prebuilt weighted/FFN variants are already complete route ranges. Keep
+    // the generic weightless candidate pass from cloning an interior RMS/ADD
+    // node and creating overlapping scheduler groups.
+    std::vector<bool> prebuilt_subgraph_nodes((size_t) original_n_nodes, false);
+    for (const auto & subgraph : runtime_route_subgraphs) {
+        const auto first_it = original_node_indices.find(subgraph.first);
+        const auto output_it = original_node_indices.find(subgraph.output);
+        if (first_it == original_node_indices.end() ||
+                output_it == original_node_indices.end() ||
+                output_it->second < first_it->second) {
+            LLAMA_LOG_ERROR(
+                    "runtime_routes: prebuilt %s subgraph %s layer %d is missing or reversed\n",
+                    subgraph.kind.c_str(), subgraph.profile.c_str(), subgraph.layer);
+            return false;
+        }
+        for (int i = first_it->second; i <= output_it->second; ++i) {
+            prebuilt_subgraph_nodes[(size_t) i] = true;
+        }
+    }
+    std::unordered_map<ggml_tensor *, int> use_counts;
+    use_counts.reserve(original_nodes.size());
+    for (int i = 0; i < original_n_nodes; ++i) {
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            if (original_nodes[i]->src[j] != nullptr) {
+                ++use_counts[original_nodes[i]->src[j]];
+            }
+        }
+    }
+
+    std::vector<int> ffn_start(model.hparams.n_layer, -1);
+    std::vector<int> layer_end(model.hparams.n_layer, -1);
+    std::vector<ggml_tensor *> boundary_by_layer(model.hparams.n_layer, nullptr);
+
+    auto find_backend = [&](const std::vector<std::string> & names, ggml_tensor * node) {
+        for (const std::string & backend_name : names) {
+            for (const auto & backend : backends) {
+                ggml_backend_t backend_ptr = backend.get();
+                if (llama_backend_policy_backend_matches(backend_ptr, backend_name) &&
+                    ggml_backend_supports_op(backend_ptr, node)) {
+                    return backend_ptr;
+                }
+            }
+        }
+        return (ggml_backend_t) nullptr;
+    };
+
+    // Resolve semantic layer anchors before creating candidates. A checkpoint
+    // backend failure must not leave a partially modified graph behind.
+    for (int i = 0; i < original_n_nodes; ++i) {
+        ggml_tensor * node = original_nodes[i];
+        const auto meta_it = runtime_route_node_metadata.find(node);
+        if (meta_it == runtime_route_node_metadata.end()) {
+            continue;
+        }
+        const auto & meta = meta_it->second;
+        if (meta.layer < 0 || meta.layer >= (int) model.hparams.n_layer) {
+            continue;
+        }
+        if (meta.ffn_inp && ffn_start[meta.layer] >= 0 && ffn_start[meta.layer] != i) {
+            LLAMA_LOG_ERROR("runtime_routes: duplicate ffn_inp anchor for layer %d\n", meta.layer);
+            return false;
+        }
+        if (meta.ffn_inp) {
+            ffn_start[meta.layer] = i;
+        }
+        if (meta.layer_out && layer_end[meta.layer] >= 0 && layer_end[meta.layer] != i) {
+            LLAMA_LOG_ERROR("runtime_routes: duplicate l_out anchor for layer %d\n", meta.layer);
+            return false;
+        }
+        if (meta.layer_out) {
+            layer_end[meta.layer] = i;
+        }
+        const bool is_boundary =
+            (routes.boundary_node == "l_out" && meta.layer_out) ||
+            meta.base_name == routes.boundary_node;
+        if (!is_boundary) {
+            continue;
+        }
+
+        if (boundary_by_layer[meta.layer] != nullptr && boundary_by_layer[meta.layer] != node) {
+            LLAMA_LOG_ERROR(
+                    "runtime_routes: duplicate boundary '%s' for layer %d\n",
+                    routes.boundary_node.c_str(), meta.layer);
+            return false;
+        }
+        boundary_by_layer[meta.layer] = node;
+    }
+
+    int previous_layer_end = -1;
+    for (int layer = 0; layer < (int) model.hparams.n_layer; ++layer) {
+        if (layer_end[layer] <= previous_layer_end ||
+                ffn_start[layer] <= previous_layer_end ||
+                ffn_start[layer] >= layer_end[layer]) {
+            LLAMA_LOG_ERROR(
+                    "runtime_routes: missing or out-of-order ffn_inp/l_out anchors for layer %d\n",
+                    layer);
+            return false;
+        }
+        if (routes.mode != "prepare" && boundary_by_layer[layer] == nullptr) {
+            LLAMA_LOG_ERROR(
+                    "runtime_routes: missing boundary '%s' for layer %d\n",
+                    routes.boundary_node.c_str(), layer);
+            return false;
+        }
+        previous_layer_end = layer_end[layer];
+    }
+
+    // Semantic graph callbacks intentionally name only selected tensors. Infer
+    // ownership for every original node from the ordered layer-output anchors
+    // so op-only rules can also reach unnamed RMS_NORM/SCALE/etc. nodes.
+    std::vector<int> node_layers((size_t) original_n_nodes, -1);
+    int range_begin = 0;
+    for (int layer = 0; layer < (int) model.hparams.n_layer; ++layer) {
+        for (int i = range_begin; i <= layer_end[layer]; ++i) {
+            node_layers[(size_t) i] = layer;
+        }
+        range_begin = layer_end[layer] + 1;
+    }
+
+    std::vector<ggml_tensor *> ordered_nodes;
+    std::vector<route_registration> registrations;
+    std::unordered_map<std::string, size_t> supported_matches;
+    size_t dry_run_candidate_groups = 0;
+    size_t static_initial_placements = 0;
+    for (const std::string & profile : routes.profiles) {
+        supported_matches.emplace(profile, 0);
+    }
+    ordered_nodes.reserve(res->get_max_nodes());
+
+    const bool wants_weightless_stateless =
+        std::find(routes.candidate_kinds.begin(), routes.candidate_kinds.end(),
+                "weightless_stateless") != routes.candidate_kinds.end();
+
+    for (int node_index = 0; node_index < original_n_nodes; ++node_index) {
+        ggml_tensor * canonical = original_nodes[node_index];
+        ordered_nodes.push_back(canonical);
+
+        const auto meta_it = runtime_route_node_metadata.find(canonical);
+        runtime_route_node_meta meta;
+        if (meta_it != runtime_route_node_metadata.end()) {
+            meta = meta_it->second;
+        }
+        const int inferred_layer = node_layers[(size_t) node_index];
+        if (meta.layer >= 0 && inferred_layer >= 0 && meta.layer != inferred_layer) {
+            LLAMA_LOG_ERROR(
+                    "runtime_routes: semantic/topology layer mismatch for %s (%d != %d)\n",
+                    ggml_get_name(canonical), meta.layer, inferred_layer);
+            return false;
+        }
+        meta.layer = inferred_layer;
+        if (meta.base_name.empty()) {
+            meta.base_name = ggml_get_name(canonical);
+        }
+        const bool valid_layer =
+            meta.layer >= 0 && meta.layer < (int) model.hparams.n_layer;
+        // ffn_inp is the residual ADD immediately before every prebuilt FFN
+        // variant. It is not part of any variant range and all of its
+        // consumers occur after its alternate candidate, so canonical commit
+        // makes its deliberately high fan-out safe. The remaining
+        // ffn_inp..l_out interval stays excluded to prevent overlapping route
+        // groups and to keep l_out exclusively owned by the checkpoint.
+        const bool inside_ffn = valid_layer &&
+            ffn_start[meta.layer] >= 0 && layer_end[meta.layer] >= ffn_start[meta.layer] &&
+            node_index > ffn_start[meta.layer] && node_index <= layer_end[meta.layer];
+        const int use_count = use_counts.count(canonical) ? use_counts.at(canonical) : 0;
+
+        // candidate_kinds=weightless_stateless defines the routable universe.
+        // Stateful, weighted, FFN, global, and layout-unsafe nodes are ignored
+        // before profile matching, so an op-only rule such as RMS_NORM can
+        // naturally target the attention-side instance without touching FFN.
+        if (!wants_weightless_stateless || prebuilt_subgraph_nodes[(size_t) node_index] ||
+                !valid_layer || inside_ffn || meta.excluded ||
+                !llama_runtime_route_candidate_is_safe(
+                        canonical, use_count, meta.ffn_inp)) {
+            continue;
+        }
+
+        // build_norm() historically names both the attention-side and
+        // FFN-side RMS nodes "norm". The FFN interval is excluded above, so
+        // expose the remaining one to runtime-route profiles under its stable
+        // semantic role without changing legacy graph/debug tensor names.
+        std::string route_base_name = meta.base_name;
+        std::string route_tensor_name = ggml_get_name(canonical);
+        const bool has_semantic_alias =
+            canonical->op == GGML_OP_RMS_NORM && route_base_name == "norm";
+        if (has_semantic_alias) {
+            route_base_name = "attn_rms_norm";
+            route_tensor_name = route_base_name + "-" + std::to_string(meta.layer);
+        }
+
+        std::vector<profile_choice> choices;
+        choices.reserve(routes.profiles.size());
+        bool any_profile_match = false;
+        for (const std::string & profile : routes.profiles) {
+            profile_choice choice = { profile, plan_ids.at(profile) };
+            llama_backend_policy_match match;
+            choice.matched = llama_backend_policy_match_op_for_profile(
+                    profile.c_str(), route_base_name.c_str(), route_tensor_name.c_str(),
+                    canonical->op, meta.layer, is_prefill, match);
+            // Preserve compatibility with pre-semantic runtime profiles that
+            // explicitly selected the historical "norm" name.
+            if (!choice.matched && has_semantic_alias) {
+                choice.matched = llama_backend_policy_match_op_for_profile(
+                        profile.c_str(), meta.base_name.c_str(), ggml_get_name(canonical),
+                        canonical->op, meta.layer, is_prefill, match);
+            }
+            any_profile_match = any_profile_match || choice.matched;
+            if (choice.matched) {
+                choice.backend = find_backend(match.backends, canonical);
+                if (choice.backend == nullptr && routes.strict) {
+                    LLAMA_LOG_ERROR(
+                            "runtime_routes: profile '%s' matched %s but no requested backend supports it\n",
+                            profile.c_str(), ggml_get_name(canonical));
+                    return false;
+                }
+                if (choice.backend != nullptr) {
+                    ++supported_matches.at(profile);
+                }
+            }
+            choices.push_back(std::move(choice));
+        }
+
+        if (!any_profile_match) {
+            continue;
+        }
+
+        ggml_backend_t canonical_backend = nullptr;
+        for (const auto & choice : choices) {
+            if (choice.profile == routes.initial_profile) {
+                canonical_backend = choice.backend;
+                break;
+            }
+        }
+
+        // fixed mode is also useful as the static/no-switch control. Apply
+        // the initial profile even when it is the only profile and therefore
+        // has no alternate candidate at all. prepare remains graph-inert.
+        if (routes.mode != "prepare" && canonical_backend != nullptr) {
+            ggml_backend_sched_set_tensor_backend(sched.get(), canonical, canonical_backend);
+            ++static_initial_placements;
+        }
+
+        bool has_alternate = false;
+        for (const auto & choice : choices) {
+            if (choice.backend != nullptr && choice.backend != canonical_backend) {
+                has_alternate = true;
+                break;
+            }
+        }
+        if (!has_alternate) {
+            continue;
+        }
+        ++dry_run_candidate_groups;
+
+        // Prepare mode is a graph-inert validation pass. It proves that policy
+        // rules resolve to safe operations and supported backends, but does not
+        // change placement, append scratch tensors, or register scheduler splits.
+        if (routes.mode == "prepare") {
+            continue;
+        }
+
+        std::unordered_map<ggml_backend_t, ggml_tensor *> variants;
+        if (canonical_backend != nullptr) {
+            variants.emplace(canonical_backend, canonical);
+        }
+
+        for (const auto & choice : choices) {
+            ggml_tensor * variant = canonical;
+            if (choice.backend != nullptr && choice.backend != canonical_backend) {
+                auto variant_it = variants.find(choice.backend);
+                if (variant_it == variants.end()) {
+                    if (ggml_graph_n_nodes(gf) >= res->get_max_nodes()) {
+                        LLAMA_LOG_ERROR("runtime_routes: graph capacity exhausted while preparing candidates\n");
+                        return false;
+                    }
+                    ggml_tensor * clone = llama_runtime_route_clone_node(
+                            res->get_ctx(), canonical, ggml_backend_name(choice.backend));
+                    bool same_layout = clone->type == canonical->type;
+                    for (int d = 0; same_layout && d < GGML_MAX_DIMS; ++d) {
+                        same_layout = clone->ne[d] == canonical->ne[d] &&
+                            clone->nb[d] == canonical->nb[d];
+                    }
+                    if (!same_layout || !ggml_backend_supports_op(choice.backend, clone)) {
+                        LLAMA_LOG_ERROR(
+                                "runtime_routes: candidate clone for %s is not layout/backend compatible\n",
+                                ggml_get_name(canonical));
+                        return false;
+                    }
+                    ggml_backend_sched_set_tensor_backend(sched.get(), clone, choice.backend);
+                    ggml_graph_add_node(gf, clone);
+                    ordered_nodes.push_back(clone);
+                    variants.emplace(choice.backend, clone);
+                    variant = clone;
+                } else {
+                    variant = variant_it->second;
+                }
+            }
+            registrations.push_back({
+                    canonical, canonical, variant, variant,
+                    choice.plan_id, meta.layer, false });
+        }
+    }
+
+    std::vector<std::string> requested_subgraph_kinds;
+    if (std::find(routes.candidate_kinds.begin(), routes.candidate_kinds.end(),
+                "weighted_norm") != routes.candidate_kinds.end()) {
+        requested_subgraph_kinds.emplace_back("weighted_norm");
+    }
+    if (std::find(routes.candidate_kinds.begin(), routes.candidate_kinds.end(),
+                "ffn_block") != routes.candidate_kinds.end()) {
+        requested_subgraph_kinds.emplace_back("ffn_block");
+    }
+
+    size_t route_subgraph_groups = 0;
+    if (routes.mode != "prepare") {
+        for (const std::string & kind : requested_subgraph_kinds) {
+            for (int layer = 0; layer < (int) model.hparams.n_layer; ++layer) {
+                auto find_unique_subgraph = [&](const std::string & profile) {
+                    const runtime_route_subgraph_meta * result = nullptr;
+                    for (const auto & candidate : runtime_route_subgraphs) {
+                        if (candidate.kind != kind || candidate.layer != layer ||
+                                candidate.profile != profile) {
+                            continue;
+                        }
+                        if (result != nullptr) {
+                            return (const runtime_route_subgraph_meta *) nullptr;
+                        }
+                        result = &candidate;
+                    }
+                    return result;
+                };
+
+                const runtime_route_subgraph_meta * canonical =
+                    find_unique_subgraph(routes.initial_profile);
+                if (canonical == nullptr) {
+                    LLAMA_LOG_ERROR(
+                            "runtime_routes: missing or duplicate initial %s subgraph for layer %d profile %s\n",
+                            kind.c_str(), layer, routes.initial_profile.c_str());
+                    return false;
+                }
+
+                for (const std::string & profile : routes.profiles) {
+                    const runtime_route_subgraph_meta * variant =
+                        find_unique_subgraph(profile);
+                    if (variant == nullptr) {
+                        LLAMA_LOG_ERROR(
+                                "runtime_routes: missing or duplicate %s subgraph for layer %d profile %s\n",
+                                kind.c_str(), layer, profile.c_str());
+                        return false;
+                    }
+                    registrations.push_back({
+                            canonical->first, canonical->output,
+                            variant->first, variant->output,
+                            plan_ids.at(profile), layer, true });
+                    ++supported_matches.at(profile);
+                }
+                ++route_subgraph_groups;
+            }
+        }
+    }
+
+    if (routes.mode == "prepare") {
+        if (routes.strict && dry_run_candidate_groups == 0) {
+            LLAMA_LOG_ERROR("runtime_routes: strict prepare found no safe alternate candidate groups\n");
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(runtime_route_mutex);
+        runtime_route_plan_names = plan_names;
+        runtime_route_mode = "prepare";
+        runtime_route_current_is_prefill = is_prefill;
+        runtime_route_min_dwell_layers = routes.min_dwell_layers;
+        if (plan_ids.find(runtime_route_requested_profile_name) == plan_ids.end()) {
+            runtime_route_requested_profile_name = routes.initial_profile;
+        }
+        LLAMA_LOG_INFO(
+                "runtime_routes: prepare dry-run validated %zu candidate groups; graph unchanged\n",
+                dry_run_candidate_groups);
+        for (const auto & profile : routes.profiles) {
+            LLAMA_LOG_INFO(
+                    "runtime_routes: prepare profile=%s supported_matches=%zu\n",
+                    profile.c_str(), supported_matches.at(profile));
+        }
+        return true;
+    }
+
+    // A permissive policy can legitimately resolve to no safe alternate. In
+    // that case do not force a boundary backend or enable checkpoint dispatch:
+    // the graph remains on the legacy scheduler path. fixed mode may still
+    // have applied its initial profile as an ordinary static placement.
+    if (registrations.empty()) {
+        if (routes.strict && routes.mode == "clock") {
+            LLAMA_LOG_ERROR("runtime_routes: strict clock mode found no safe alternate candidate groups\n");
+            return false;
+        }
+        if (routes.strict && static_initial_placements == 0) {
+            LLAMA_LOG_ERROR("runtime_routes: strict mode matched no supported route candidates\n");
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(runtime_route_mutex);
+        runtime_route_plan_names = plan_names;
+        runtime_route_requested_profile_name = routes.initial_profile;
+        runtime_route_mode = routes.mode == "fixed" ? "fixed" : "off";
+        runtime_route_current_is_prefill = is_prefill;
+        LLAMA_LOG_WARN(
+                "runtime_routes: no safe alternate candidates; using legacy dispatch with %zu static placements\n",
+                static_initial_placements);
+        return true;
+    }
+
+    std::vector<ggml_tensor *> boundaries;
+    boundaries.reserve(model.hparams.n_layer);
+    for (int layer = 0; layer < (int) model.hparams.n_layer; ++layer) {
+        ggml_tensor * boundary = boundary_by_layer[layer];
+        if (routes.boundary_backend != "auto") {
+            ggml_backend_t boundary_backend = find_backend({ routes.boundary_backend }, boundary);
+            if (boundary_backend == nullptr) {
+                LLAMA_LOG_ERROR(
+                        "runtime_routes: boundary %s (layer %d) is unsupported on %s\n",
+                        ggml_get_name(boundary), layer, routes.boundary_backend.c_str());
+                return false;
+            }
+            ggml_backend_sched_set_tensor_backend(sched.get(), boundary, boundary_backend);
+        }
+        boundaries.push_back(boundary);
+    }
+
+    if ((int) ordered_nodes.size() != ggml_graph_n_nodes(gf)) {
+        LLAMA_LOG_ERROR("runtime_routes: internal candidate graph ordering mismatch\n");
+        return false;
+    }
+    std::copy(ordered_nodes.begin(), ordered_nodes.end(), ggml_graph_nodes(gf));
+
+    for (const auto & registration : registrations) {
+        const bool registered = registration.subgraph
+            ? ggml_backend_sched_register_route_subgraph(
+                    sched.get(), registration.canonical_first, registration.canonical,
+                    registration.variant_first, registration.variant,
+                    registration.plan_id, registration.layer)
+            : ggml_backend_sched_register_route_candidate(
+                    sched.get(), registration.canonical, registration.variant,
+                    registration.plan_id, registration.layer);
+        if (!registered) {
+            LLAMA_LOG_ERROR(
+                    "runtime_routes: failed to register candidate for %s (plan=%llu, layer=%d)\n",
+                    ggml_get_name(registration.canonical),
+                    (unsigned long long) registration.plan_id,
+                    registration.layer);
+            return false;
+        }
+    }
+
+    // Install the context thunk for every clock-routed prefill graph. The
+    // thunk checks the application callback at each boundary, so registering
+    // or unregistering a producer while graph compute is idle takes effect
+    // immediately even when the same graph is reused.
+    const ggml_backend_sched_layer_checkpoint_request_producer request_producer =
+        routes.mode == "clock" && is_prefill
+            ? runtime_route_checkpoint_request_producer
+            : nullptr;
+
+    if (!ggml_backend_sched_prepare_layer_checkpoints(
+                sched.get(), gf, boundaries.data(), (int) boundaries.size(),
+                request_producer,
+                runtime_route_checkpoint_callback, this)) {
+        LLAMA_LOG_ERROR("runtime_routes: failed to prepare layer checkpoints\n");
+        return false;
+    }
+
+    uint64_t requested_plan_id = initial_it->second;
+    {
+        std::lock_guard<std::mutex> lock(runtime_route_mutex);
+        runtime_route_plan_names = plan_names;
+        runtime_route_mode = routes.mode;
+        runtime_route_current_is_prefill = is_prefill;
+        runtime_route_min_dwell_layers = routes.min_dwell_layers;
+
+        const auto requested_it = plan_ids.find(runtime_route_requested_profile_name);
+        if (routes.mode == "clock" && requested_it != plan_ids.end()) {
+            requested_plan_id = requested_it->second;
+        } else {
+            runtime_route_requested_profile_name = routes.initial_profile;
+        }
+        runtime_route_layers_since_switch = routes.min_dwell_layers;
+    }
+    ggml_backend_sched_layer_checkpoint_set_plan_id(sched.get(), requested_plan_id);
+
+    LLAMA_LOG_INFO(
+            "runtime_routes: prepared %zu route mappings (%zu prebuilt subgraphs), %d alternate nodes, %zu boundaries; mode=%s initial=%s\n",
+            registrations.size(), route_subgraph_groups,
+            ggml_graph_n_nodes(gf) - original_n_nodes, boundaries.size(),
+            routes.mode.c_str(), routes.initial_profile.c_str());
+    return true;
+}
+
+void llama_context::runtime_route_checkpoint_request_producer(
+        int checkpoint_index,
+        const struct ggml_tensor * boundary,
+        int split_end,
+        uint64_t active_plan_id,
+        void * user_data) {
+    GGML_UNUSED(split_end);
+    GGML_UNUSED(active_plan_id);
+
+    auto * ctx = static_cast<llama_context *>(user_data);
+    if (checkpoint_index < 0 ||
+            checkpoint_index + 1 >= (int) ctx->model.hparams.n_layer) {
+        // Graph start is excluded by the scheduler. The final l_out has no
+        // following transformer layer, so sampling there can only leak a
+        // stale request into a later graph.
+        return;
+    }
+
+    llama_runtime_route_layer_producer producer = nullptr;
+    void * producer_user_data = nullptr;
+    const int32_t ubatch_tokens = boundary != nullptr && boundary->ne[1] > 0 &&
+            boundary->ne[1] <= std::numeric_limits<int32_t>::max()
+        ? (int32_t) boundary->ne[1]
+        : 0;
+    {
+        std::lock_guard<std::mutex> lock(ctx->runtime_route_mutex);
+        if (!ctx->runtime_route_current_is_prefill ||
+                ctx->runtime_route_mode != "clock") {
+            return;
+        }
+        producer = ctx->runtime_route_layer_producer_callback;
+        producer_user_data = ctx->runtime_route_layer_producer_user_data;
+    }
+
+    if (producer != nullptr) {
+        producer(ctx, checkpoint_index, ubatch_tokens, producer_user_data);
+    }
+}
+
+uint64_t llama_context::runtime_route_checkpoint_callback(
+        int checkpoint_index,
+        const struct ggml_tensor * boundary,
+        int split_end,
+        uint64_t active_plan_id,
+        uint64_t requested_plan_id,
+        void * user_data) {
+    auto * ctx = static_cast<llama_context *>(user_data);
+    std::lock_guard<std::mutex> lock(ctx->runtime_route_mutex);
+
+    if (checkpoint_index >= 0) {
+        ++ctx->runtime_route_layers_since_switch;
+    }
+    if (requested_plan_id == active_plan_id) {
+        return active_plan_id;
+    }
+
+    const auto requested_it = ctx->runtime_route_plan_names.find(requested_plan_id);
+    const auto active_it = ctx->runtime_route_plan_names.find(active_plan_id);
+    if (requested_it == ctx->runtime_route_plan_names.end()) {
+        return active_plan_id;
+    }
+
+    // No scheduler-owned route exists before the first prepared graph starts.
+    // Establish the resident request without treating initialization as a
+    // runtime transition.
+    if (active_it == ctx->runtime_route_plan_names.end()) {
+        ctx->runtime_route_requested_profile_name = requested_it->second;
+        return requested_plan_id;
+    }
+
+    // Publication validates against the scheduler-active plan visible to the
+    // notifying thread, but that plan can advance after the request mutex is
+    // released and before the scheduler stores a callback result. Revalidate
+    // the direct edge against the active/requested snapshot delivered to this
+    // checkpoint so a stale A->C publication cannot become an illegal B->C
+    // transition at the next boundary.
+    std::vector<std::string> legal_profiles;
+    if (!llama_backend_policy_list_runtime_route_next_profiles(
+                active_it->second.c_str(),
+                ctx->runtime_route_current_is_prefill,
+                legal_profiles) ||
+            std::find(
+                legal_profiles.begin(), legal_profiles.end(), requested_it->second) ==
+                legal_profiles.end()) {
+        LLAMA_LOG_WARN(
+                "runtime_routes: checkpoint rejected stale/illegal transition %s -> %s\n",
+                active_it->second.c_str(), requested_it->second.c_str());
+        return active_plan_id;
+    }
+
+    const bool can_switch =
+        ctx->runtime_route_mode == "clock" &&
+        ctx->runtime_route_layers_since_switch >= ctx->runtime_route_min_dwell_layers;
+    if (!can_switch) {
+        // Returning active rejects only this snapshot. The scheduler leaves
+        // requested_plan_id untouched, so it is retried at the next boundary.
+        return active_plan_id;
+    }
+
+    const std::string previous = active_it->second;
+    ctx->runtime_route_requested_profile_name = requested_it->second;
+    ctx->runtime_route_layers_since_switch = 0;
+    LLAMA_LOG_DEBUG(
+            "runtime_routes: checkpoint=%d boundary=%s split_end=%d switched %s -> %s\n",
+            checkpoint_index,
+            boundary ? ggml_get_name(boundary) : "",
+            split_end,
+            previous.c_str(), requested_it->second.c_str());
+    return requested_plan_id;
+}
+
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     uint64_t res;
     if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) {
@@ -2283,6 +3250,45 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         llama_backend_policy_ffn_residency_plan plan;
         if (llama_backend_policy_build_ffn_residency_plan((int) il, plan)) {
             res += 4u * plan.covers.size();
+        }
+    }
+
+    if (runtime_routes_configured) {
+        // A canonical node needs at most one clone per alternate concrete
+        // backend, even when several profiles select that same backend. This
+        // conservative metadata reserve keeps all candidate construction out
+        // of the inference path after context initialization.
+        // Keep room for the original canonical node plus one clone for every
+        // concrete backend. The initial profile may leave canonical placement
+        // unspecified while the remaining profiles cover every backend.
+        const uint64_t backend_variants = 1u + backends.size();
+        res *= backend_variants;
+
+        llama_backend_policy_runtime_routes routes;
+        if (n_tokens > 1 &&
+                llama_backend_policy_resolve_runtime_routes(true, routes) &&
+                (routes.mode == "clock" || routes.mode == "fixed") &&
+                std::find(routes.candidate_kinds.begin(), routes.candidate_kinds.end(),
+                        "ffn_block") != routes.candidate_kinds.end()) {
+            // Each prebuilt dense-FFN route contains weighted RMS+MUL, three
+            // four-op shard branches, and a short reduction chain. Keep this
+            // reserve separate from weightless single-node clones so 24 clock
+            // profiles x 28 layers cannot exhaust graph metadata.
+            constexpr uint64_t nodes_per_ffn_variant = 20;
+            res += (uint64_t) model.hparams.n_layer * routes.profiles.size() *
+                nodes_per_ffn_variant;
+        }
+        if (n_tokens > 1 &&
+                llama_backend_policy_resolve_runtime_routes(true, routes) &&
+                (routes.mode == "clock" || routes.mode == "fixed") &&
+                std::find(routes.candidate_kinds.begin(), routes.candidate_kinds.end(),
+                        "weighted_norm") != routes.candidate_kinds.end()) {
+            // Attention-side weighted norm candidates contain exactly one
+            // RMS_NORM and one MUL per layer/profile. Their weights live in
+            // model residency buffers and do not consume graph metadata.
+            constexpr uint64_t nodes_per_weighted_norm_variant = 2;
+            res += (uint64_t) model.hparams.n_layer * routes.profiles.size() *
+                nodes_per_weighted_norm_variant;
         }
     }
 
@@ -2339,7 +3345,19 @@ ggml_cgraph * llama_context::graph_reserve(
 
     res->reset();
 
+    const bool reserve_is_prefill = n_tokens > 1;
+    if (runtime_routes_configured) {
+        runtime_route_graph_begin(reserve_is_prefill);
+    }
+
     auto * gf = model.build_graph(gparams);
+
+    if (runtime_routes_configured && gf != nullptr &&
+            !runtime_route_prepare_graph(res, gf, reserve_is_prefill)) {
+        LLAMA_LOG_ERROR("%s: failed to prepare layer runtime routes\n", __func__);
+        this->n_outputs = save_n_outputs;
+        return nullptr;
+    }
 
     this->n_outputs = save_n_outputs;
 
@@ -2364,6 +3382,39 @@ llm_graph_params llama_context::graph_params(
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const {
+    // Derive the phase from the graph being built. graph_reserve() calls this
+    // before process_ubatch() has updated lp_is_prefill, so consulting the
+    // cached member here can silently build a decode-shaped reserve graph for
+    // a prefill ubatch (and omit all prebuilt runtime-route candidates).
+    const bool graph_is_prefill = ubatch.n_tokens > 1;
+    const bool module_bench_active =
+        llama_module_bench_phase_matches(cparams, graph_is_prefill);
+
+    std::string runtime_ffn_profile;
+    if (runtime_routes_configured && !graph_is_prefill) {
+        llama_backend_policy_runtime_routes routes;
+        const bool layer_plan_owns_ffn =
+            llama_backend_policy_resolve_runtime_routes(true, routes) &&
+            std::find(routes.candidate_kinds.begin(), routes.candidate_kinds.end(),
+                    "ffn_block") != routes.candidate_kinds.end();
+        if (layer_plan_owns_ffn) {
+            std::lock_guard<std::mutex> lock(runtime_route_mutex);
+            const uint64_t active_plan_id =
+                ggml_backend_sched_layer_checkpoint_get_active_plan_id(sched.get());
+            const auto active_it = runtime_route_plan_names.find(active_plan_id);
+            if (active_it != runtime_route_plan_names.end()) {
+                runtime_ffn_profile = active_it->second;
+            } else {
+                // During initial reserve no graph has run yet, so there is no
+                // accepted plan. The resident initial request is the only
+                // possible decode partition in that state.
+                runtime_ffn_profile = runtime_route_requested_profile_name.empty()
+                    ? routes.initial_profile
+                    : runtime_route_requested_profile_name;
+            }
+        }
+    }
+
     return {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
@@ -2379,8 +3430,21 @@ llm_graph_params llama_context::graph_params(
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
-        /*.module_bench_active =*/ llama_module_bench_phase_matches(cparams, lp_is_prefill),
+        /*.module_bench_active =*/ module_bench_active,
+        /*.runtime_route_candidates =*/ runtime_routes_configured && graph_is_prefill &&
+            !cparams.pipeline_parallel && cparams.cb_eval == nullptr && !lp_enable &&
+            !module_bench_active,
+        /*.runtime_ffn_profile =*/ std::move(runtime_ffn_profile),
         /*.cb          =*/ graph_get_cb(),
+        /*.route_subgraph_cb =*/ [this](
+                const char * kind, const char * profile, int il,
+                ggml_tensor * first, ggml_tensor * output) {
+            if (!runtime_route_collect_metadata || kind == nullptr || profile == nullptr ||
+                    first == nullptr || output == nullptr || il < 0) {
+                return;
+            }
+            runtime_route_subgraphs.push_back({ kind, profile, il, first, output });
+        },
         /*.res         =*/ res,
     };
 }
@@ -2484,6 +3548,24 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
             ggml_set_name(cur, name);
+        }
+
+        if (runtime_route_collect_metadata && il >= 0) {
+            auto & meta = runtime_route_node_metadata[cur];
+            meta.layer = il;
+            meta.base_name = name ? name : "";
+            meta.ffn_inp = meta.ffn_inp || meta.base_name == "ffn_inp";
+            meta.layer_out = meta.layer_out || meta.base_name == "l_out";
+
+            // Exclusion is monotonic because one tensor can be named more than
+            // once (for example ffn_out and then l_out). Never make such a
+            // tensor routable again just because its final display name changed.
+            const bool is_routable_ffn_input =
+                meta.base_name == "ffn_inp" && cur->op == GGML_OP_ADD;
+            const bool is_ffn_internal =
+                meta.base_name.size() >= 4 && meta.base_name.compare(0, 4, "ffn_") == 0;
+            meta.excluded = meta.excluded ||
+                (is_ffn_internal && !is_routable_ffn_input) || meta.layer_out;
         }
 
         if (llama_backend_policy_residency_enabled()) {
@@ -3699,6 +4781,23 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
 
 void llama_synchronize(llama_context * ctx) {
     ctx->synchronize();
+}
+
+bool llama_runtime_route_request_profile(
+        llama_context * ctx,
+        const char * profile) {
+    return ctx != nullptr && ctx->runtime_route_request_profile(profile);
+}
+
+bool llama_runtime_route_set_layer_producer(
+        llama_context * ctx,
+        llama_runtime_route_layer_producer producer,
+        void * user_data) {
+    return ctx != nullptr && ctx->runtime_route_set_layer_producer(producer, user_data);
+}
+
+const char * llama_runtime_route_active_profile(const llama_context * ctx) {
+    return ctx != nullptr ? ctx->runtime_route_active_profile() : "";
 }
 
 float * llama_get_logits(llama_context * ctx) {

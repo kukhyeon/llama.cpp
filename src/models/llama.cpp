@@ -1,7 +1,9 @@
 #include "models.h"
+#include "llama-backend-policy.h"
 #include "llama-kv-cache.h"
 
 #include <algorithm>
+#include <cstdio>
 
 void llama_model_llama::load_arch_hparams(llama_model_loader & ml) {
     const auto n_vocab = vocab.n_tokens();
@@ -134,11 +136,26 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
             cb(cur, name, il, module_backend_hint);
         };
 
+        auto module_resident_norm_weight = [&](ggml_tensor * weight) {
+            if (cparams.module_bench_backend.empty()) {
+                return weight;
+            }
+            std::vector<std::string> candidates = { cparams.module_bench_backend };
+            if (cparams.module_bench_backend.find("REPACK") == std::string::npos &&
+                    cparams.module_bench_backend.find("repack") == std::string::npos) {
+                // HTP execution is normally named HTP0 while immutable
+                // weighted-MUL operands live in HTP0-REPACK. CPU/OpenCL match
+                // the first entry, so this fallback is harmless for them.
+                candidates.push_back(cparams.module_bench_backend + "-REPACK");
+            }
+            return model.get_backend_policy_residency_tensor(weight, candidates);
+        };
+
         auto build_named_rms_norm = [&](ggml_tensor * inp, ggml_tensor * weight, const char * rms_name, const char * out_name, int il) {
             ggml_tensor * out = ggml_rms_norm(ctx0, inp, hparams.f_norm_rms_eps);
-            cb(out, rms_name, il);
+            cb_module(out, rms_name, il);
             out = ggml_mul(ctx0, out, weight);
-            cb(out, out_name, il);
+            cb_module(out, out_name, il);
             return out;
         };
 
@@ -147,7 +164,7 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                 for (int il = il_start; il <= il_end; ++il) {
                     ggml_tensor * inp = build_module_inp("module_attn_norm_inp", n_embd, n_tokens);
                     cb(inp, "module_attn_norm_inp", il);
-                    finish(build_named_rms_norm(inp, model.layers[il].attn_norm, "attn_rms_norm", "attn_norm", il));
+                    finish(build_named_rms_norm(inp, model.layers[il].attn_norm, "norm", "attn_norm", il));
                 }
                 break;
 
@@ -257,7 +274,7 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                 for (int il = il_start; il <= il_end; ++il) {
                     ggml_tensor * inp = build_module_inp("module_ffn_norm_inp", n_embd, module_ffn_tokens(il));
                     cb(inp, "module_ffn_norm_inp", il);
-                    finish(build_named_rms_norm(inp, model.layers[il].ffn_norm, "ffn_rms_norm", "ffn_norm", il));
+                    finish(build_named_rms_norm(inp, model.layers[il].ffn_norm, "norm", "ffn_norm", il));
                 }
                 break;
 
@@ -288,25 +305,104 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                     cb_module(rhs, "module_l_out_rhs", il);
                     ggml_tensor * out = ggml_add(ctx0, lhs, rhs);
                     cb_module(out, "l_out", il);
+                    // This benchmark targets the residual ADD itself. Do not
+                    // append the final norm/lm-head when il is the last layer.
+                    finish(out);
+                }
+                break;
 
-                    if (il == (int) n_layer - 1) {
-                        ggml_tensor * tail = ggml_rms_norm(ctx0, out, hparams.f_norm_rms_eps);
-                        cb(tail, "norm", -1, module_backend_hint);
-                        tail = ggml_mul(ctx0, tail, model.output_norm);
-                        cb(tail, "result_norm", -1, module_backend_hint);
-                        res->t_embd = tail;
+            case LLAMA_MODULE_BENCH_ATTN_RMS_NORM:
+                for (int il = il_start; il <= il_end; ++il) {
+                    ggml_tensor * inp = build_module_inp("module_attn_rms_norm_inp", n_embd, n_tokens);
+                    cb_module(inp, "module_attn_rms_norm_inp", il);
+                    ggml_tensor * out = ggml_rms_norm(ctx0, inp, hparams.f_norm_rms_eps);
+                    // Match the raw graph/debug name. The module-bench target
+                    // records the semantic attention-side role separately.
+                    cb_module(out, "norm", il);
+                    finish(out);
+                }
+                break;
 
-                        if constexpr (!embed) {
-                            tail = build_lora_mm(model.output, tail);
-                            cb(tail, "result_output", -1, module_backend_hint);
-                            res->t_logits = tail;
+            case LLAMA_MODULE_BENCH_ATTN_NORM_MUL:
+                for (int il = il_start; il <= il_end; ++il) {
+                    ggml_tensor * inp = build_module_inp(
+                            "module_attn_norm_mul_inp", n_embd, n_tokens);
+                    cb_module(inp, "module_attn_norm_mul_inp", il);
+                    ggml_tensor * weight = model.layers[il].attn_norm;
+                    if (!cparams.module_bench_backend.empty()) {
+                        weight = module_resident_norm_weight(weight);
+                        if (weight == nullptr) {
+                            GGML_ABORT(
+                                    "module-bench attn_norm_mul requires a resident attn_norm.weight on %s (layer %d)",
+                                    cparams.module_bench_backend.c_str(), il);
                         }
-
-                        ggml_build_forward_expand(gf, tail);
-                        last = tail;
-                    } else {
-                        finish(out);
                     }
+                    ggml_tensor * out = ggml_mul(ctx0, inp, weight);
+                    cb_module(out, "attn_norm", il);
+                    finish(out);
+                }
+                break;
+
+            case LLAMA_MODULE_BENCH_FFN_RMS_NORM:
+                for (int il = il_start; il <= il_end; ++il) {
+                    ggml_tensor * inp = build_module_inp(
+                            "module_ffn_rms_norm_inp", n_embd, module_ffn_tokens(il));
+                    cb_module(inp, "module_ffn_rms_norm_inp", il);
+                    ggml_tensor * out = ggml_rms_norm(ctx0, inp, hparams.f_norm_rms_eps);
+                    // build_norm() also calls the FFN-side RMS node "norm";
+                    // the trace's semantic_role field disambiguates it.
+                    cb_module(out, "norm", il);
+                    finish(out);
+                }
+                break;
+
+            case LLAMA_MODULE_BENCH_FFN_NORM_MUL:
+                for (int il = il_start; il <= il_end; ++il) {
+                    ggml_tensor * inp = build_module_inp(
+                            "module_ffn_norm_mul_inp", n_embd, module_ffn_tokens(il));
+                    cb_module(inp, "module_ffn_norm_mul_inp", il);
+                    ggml_tensor * weight = model.layers[il].ffn_norm;
+                    if (!cparams.module_bench_backend.empty()) {
+                        weight = module_resident_norm_weight(weight);
+                        if (weight == nullptr) {
+                            GGML_ABORT(
+                                    "module-bench ffn_norm_mul requires a resident ffn_norm.weight on %s (layer %d)",
+                                    cparams.module_bench_backend.c_str(), il);
+                        }
+                    }
+                    ggml_tensor * out = ggml_mul(ctx0, inp, weight);
+                    cb_module(out, "ffn_norm", il);
+                    finish(out);
+                }
+                break;
+
+            case LLAMA_MODULE_BENCH_FFN_PARALLEL_SUM:
+                for (int il = il_start; il <= il_end; ++il) {
+                    const int64_t n_ffn_tokens = module_ffn_tokens(il);
+                    ggml_tensor * lhs = build_module_inp(
+                            "module_ffn_parallel_sum_lhs", n_embd, n_ffn_tokens);
+                    ggml_tensor * rhs = build_module_inp(
+                            "module_ffn_parallel_sum_rhs", n_embd, n_ffn_tokens);
+                    cb_module(lhs, "module_ffn_parallel_sum_lhs", il);
+                    cb_module(rhs, "module_ffn_parallel_sum_rhs", il);
+                    ggml_tensor * out = ggml_add(ctx0, lhs, rhs);
+                    cb_module(out, "ffn_parallel_sum", il);
+                    finish(out);
+                }
+                break;
+
+            case LLAMA_MODULE_BENCH_FFN_OUT:
+                for (int il = il_start; il <= il_end; ++il) {
+                    const int64_t n_ffn_tokens = module_ffn_tokens(il);
+                    ggml_tensor * branch = build_module_inp(
+                            "module_ffn_out_branch", n_embd, n_ffn_tokens);
+                    ggml_tensor * partial_sum = build_module_inp(
+                            "module_ffn_out_partial_sum", n_embd, n_ffn_tokens);
+                    cb_module(branch, "module_ffn_out_branch", il);
+                    cb_module(partial_sum, "module_ffn_out_partial_sum", il);
+                    ggml_tensor * out = ggml_add(ctx0, branch, partial_sum);
+                    cb_module(out, "ffn_out", il);
+                    finish(out);
                 }
                 break;
 
@@ -320,6 +416,27 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
 
     ggml_tensor * cur;
     ggml_tensor * inpL;
+
+    llama_backend_policy_runtime_routes runtime_routes;
+    const bool runtime_layer_routes = runtime_route_candidates && n_tokens > 1 &&
+        llama_backend_policy_resolve_runtime_routes(true, runtime_routes) &&
+        (runtime_routes.mode == "clock" || runtime_routes.mode == "fixed");
+    const bool runtime_ffn_routes = runtime_layer_routes &&
+        std::find(runtime_routes.candidate_kinds.begin(), runtime_routes.candidate_kinds.end(),
+                "ffn_block") != runtime_routes.candidate_kinds.end();
+    const bool runtime_weighted_norm_routes = runtime_layer_routes &&
+        std::find(runtime_routes.candidate_kinds.begin(), runtime_routes.candidate_kinds.end(),
+                "weighted_norm") != runtime_routes.candidate_kinds.end();
+    std::vector<std::string> runtime_route_profiles;
+    if (runtime_ffn_routes || runtime_weighted_norm_routes) {
+        runtime_route_profiles.reserve(runtime_routes.profiles.size());
+        runtime_route_profiles.push_back(runtime_routes.initial_profile);
+        for (const std::string & profile : runtime_routes.profiles) {
+            if (profile != runtime_routes.initial_profile) {
+                runtime_route_profiles.push_back(profile);
+            }
+        }
+    }
 
     inpL = build_inp_embd(model.tok_embd);
 
@@ -340,11 +457,66 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * inpSA = inpL;
 
-        // norm
-        cur = build_norm(inpL,
-                model.layers[il].attn_norm, NULL,
-                LLM_NORM_RMS, il);
-        cb(cur, "attn_norm", il);
+        // Attention-side norm is stateless but its final MUL is weighted. In
+        // route mode, prebuild one compact RMS+MUL candidate per clock profile
+        // using a backend-resident duplicate of attn_norm.weight. This does not
+        // alter the Q/K/V or KV-cache topology; only the norm feeding QKV is
+        // selected at the layer's already-latched plan.
+        if (runtime_weighted_norm_routes) {
+            ggml_tensor * canonical_norm = nullptr;
+            for (const std::string & profile : runtime_route_profiles) {
+                llama_backend_policy_match rms_match;
+                llama_backend_policy_match mul_match;
+                const bool have_rms = llama_backend_policy_match_op_for_profile(
+                        profile.c_str(), "attn_rms_norm", "attn_rms_norm",
+                        GGML_OP_RMS_NORM, il, true, rms_match);
+                const bool have_mul = llama_backend_policy_match_op_for_profile(
+                        profile.c_str(), "attn_norm", "attn_norm",
+                        GGML_OP_MUL, il, true, mul_match);
+                if (!have_rms || rms_match.backends.empty() ||
+                        !have_mul || mul_match.backends.empty()) {
+                    GGML_ABORT(
+                            "runtime_routes: profile %s is missing layer %d attention RMS/weighted-MUL policy",
+                            profile.c_str(), il);
+                }
+
+                ggml_tensor * norm_weight = model.get_backend_policy_residency_tensor(
+                        model.layers[il].attn_norm, mul_match.backends);
+                if (norm_weight == nullptr) {
+                    GGML_ABORT(
+                            "runtime_routes: profile %s has no resident attn_norm.weight for layer %d backend %s",
+                            profile.c_str(), il, mul_match.backends.front().c_str());
+                }
+
+                char route_tag[24];
+                snprintf(route_tag, sizeof(route_tag), "%s", profile.c_str());
+                ggml_tensor * first = ggml_rms_norm(ctx0, inpL, hparams.f_norm_rms_eps);
+                cb_route(first, (std::string("attn_rms_norm.") + route_tag).c_str(), il,
+                        rms_match.backends.front().c_str());
+                ggml_tensor * weighted = ggml_mul(ctx0, first, norm_weight);
+                cb_route(weighted, (std::string("attn_norm.") + route_tag).c_str(), il,
+                        mul_match.backends.front().c_str());
+                ggml_build_forward_expand(gf, weighted);
+
+                if (route_subgraph_cb_func) {
+                    route_subgraph_cb_func(
+                            "weighted_norm", profile.c_str(), il, first, weighted);
+                }
+                if (profile == runtime_routes.initial_profile) {
+                    canonical_norm = weighted;
+                }
+            }
+            if (canonical_norm == nullptr) {
+                GGML_ABORT("runtime_routes: initial attention norm profile %s was not built",
+                        runtime_routes.initial_profile.c_str());
+            }
+            cur = canonical_norm;
+        } else {
+            cur = build_norm(inpL,
+                    model.layers[il].attn_norm, NULL,
+                    LLM_NORM_RMS, il);
+            cb(cur, "attn_norm", il);
+        }
 
         // self-attention
         {
@@ -392,19 +564,94 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
 
         // feed-forward network (non-MoE)
         if (model.layers[il].ffn_gate_inp == nullptr) {
+            if (runtime_ffn_routes) {
+                ggml_tensor * canonical_out = nullptr;
+                for (const std::string & profile : runtime_route_profiles) {
+                    llama_backend_policy_ffn_parallel ffn_policy;
+                    llama_backend_policy_match rms_match;
+                    llama_backend_policy_match mul_match;
+                    const bool have_ffn = llama_backend_policy_match_ffn_parallel_for_profile(
+                            profile.c_str(), il, true, ffn_policy);
+                    const bool have_rms = llama_backend_policy_match_op_for_profile(
+                            profile.c_str(), "ffn_rms_norm", "ffn_rms_norm",
+                            GGML_OP_RMS_NORM, il, true, rms_match);
+                    const bool have_mul = llama_backend_policy_match_op_for_profile(
+                            profile.c_str(), "ffn_norm", "ffn_norm",
+                            GGML_OP_MUL, il, true, mul_match);
+                    if (!have_ffn || !have_rms || rms_match.backends.empty() ||
+                            !have_mul || mul_match.backends.empty()) {
+                        GGML_ABORT(
+                                "runtime_routes: profile %s is missing layer %d FFN/RMS/weighted-MUL policy",
+                                profile.c_str(), il);
+                    }
 
-            cur = build_norm(ffn_inp,
-                    model.layers[il].ffn_norm, NULL,
-                    LLM_NORM_RMS, il);
-            cb(cur, "ffn_norm", il);
+                    ggml_tensor * norm_weight = model.get_backend_policy_residency_tensor(
+                            model.layers[il].ffn_norm, mul_match.backends);
+                    if (norm_weight == nullptr) {
+                        GGML_ABORT(
+                                "runtime_routes: profile %s has no resident ffn_norm.weight for layer %d backend %s",
+                                profile.c_str(), il, mul_match.backends.front().c_str());
+                    }
 
-            cur = build_ffn(cur,
-                    model.layers[il].ffn_up,   model.layers[il].ffn_up_b,   model.layers[il].ffn_up_s,
-                    model.layers[il].ffn_gate, model.layers[il].ffn_gate_b, model.layers[il].ffn_gate_s,
-                    model.layers[il].ffn_down, model.layers[il].ffn_down_b, model.layers[il].ffn_down_s,
-                    NULL,
-                    LLM_FFN_SILU, LLM_FFN_PAR, il);
-            cb(cur, "ffn_out", il);
+                    char route_tag[24];
+                    // Keep the profile visible in scheduler_trace.csv branch
+                    // and node names. The scheduler still routes by the stable
+                    // numeric plan ID; this tag is observability only.
+                    snprintf(route_tag, sizeof(route_tag), "%s", profile.c_str());
+
+                    ggml_tensor * first = ggml_rms_norm(ctx0, ffn_inp, hparams.f_norm_rms_eps);
+                    cb_route(first, (std::string("ffn_rms_norm.") + route_tag).c_str(), il,
+                            rms_match.backends.front().c_str());
+
+                    ggml_tensor * weighted = ggml_mul(ctx0, first, norm_weight);
+                    cb_route(weighted, (std::string("ffn_norm.") + route_tag).c_str(), il,
+                            mul_match.backends.front().c_str());
+
+                    ggml_tensor * route_out = build_ffn(weighted,
+                            model.layers[il].ffn_up,   model.layers[il].ffn_up_b,   model.layers[il].ffn_up_s,
+                            model.layers[il].ffn_gate, model.layers[il].ffn_gate_b, model.layers[il].ffn_gate_s,
+                            model.layers[il].ffn_down, model.layers[il].ffn_down_b, model.layers[il].ffn_down_s,
+                            NULL,
+                            LLM_FFN_SILU, LLM_FFN_PAR, il, &ffn_policy, route_tag);
+                    cb(route_out, (std::string("ffn_route_out.") + route_tag).c_str(), il);
+                    ggml_build_forward_expand(gf, route_out);
+
+                    if (route_subgraph_cb_func) {
+                        route_subgraph_cb_func(
+                                "ffn_block", profile.c_str(), il, first, route_out);
+                    }
+                    if (profile == runtime_routes.initial_profile) {
+                        canonical_out = route_out;
+                    }
+                }
+                if (canonical_out == nullptr) {
+                    GGML_ABORT("runtime_routes: initial FFN profile %s was not built",
+                            runtime_routes.initial_profile.c_str());
+                }
+                cur = canonical_out;
+            } else {
+                cur = build_norm(ffn_inp,
+                        model.layers[il].ffn_norm, NULL,
+                        LLM_NORM_RMS, il);
+                cb(cur, "ffn_norm", il);
+
+                llama_backend_policy_ffn_parallel carried_ffn_policy;
+                const bool have_carried_ffn_policy =
+                    !runtime_ffn_profile.empty() &&
+                    llama_backend_policy_match_ffn_parallel_for_profile(
+                            runtime_ffn_profile.c_str(), il, n_tokens > 1,
+                            carried_ffn_policy);
+
+                cur = build_ffn(cur,
+                        model.layers[il].ffn_up,   model.layers[il].ffn_up_b,   model.layers[il].ffn_up_s,
+                        model.layers[il].ffn_gate, model.layers[il].ffn_gate_b, model.layers[il].ffn_gate_s,
+                        model.layers[il].ffn_down, model.layers[il].ffn_down_b, model.layers[il].ffn_down_s,
+                        NULL,
+                        LLM_FFN_SILU, LLM_FFN_PAR, il,
+                        have_carried_ffn_policy ? &carried_ffn_policy : nullptr,
+                        have_carried_ffn_policy ? runtime_ffn_profile.c_str() : nullptr);
+                cb(cur, "ffn_out", il);
+            }
         } else {
             // MoE branch
             cur = build_norm(ffn_inp,

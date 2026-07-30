@@ -313,6 +313,77 @@ extern "C" {
     //
     typedef bool (*ggml_backend_sched_eval_callback)(struct ggml_tensor * t, bool ask, void * user_data);
 
+    // Called on the scheduler thread after the split containing a prepared
+    // layer-boundary tensor has been submitted. When checkpoints are combined
+    // with route candidates, it is also called at graph start with
+    // checkpoint_index -1, boundary NULL, and split_end 0. requested_plan_id
+    // is one atomic snapshot taken before the callback. Requests published
+    // while the callback is running remain pending for the
+    // next checkpoint. Return the plan to accept as active. This is a dispatch
+    // checkpoint; it does not imply that asynchronous backend work completed.
+    typedef uint64_t (*ggml_backend_sched_layer_checkpoint_callback)(
+            int checkpoint_index,
+            const struct ggml_tensor * boundary,
+            int split_end,
+            uint64_t active_plan_id,
+            uint64_t requested_plan_id,
+            void * user_data);
+
+    // Called on the scheduler thread at a real layer checkpoint, before the
+    // scheduler takes the single requested-plan snapshot passed to the policy
+    // callback above. A producer may publish a plan with
+    // ggml_backend_sched_layer_checkpoint_set_plan_id(), allowing an event
+    // observed after layer N was submitted to affect layer N+1. This hook is
+    // never called for the synthetic graph-start checkpoint.
+    typedef void (*ggml_backend_sched_layer_checkpoint_request_producer)(
+            int checkpoint_index,
+            const struct ggml_tensor * boundary,
+            int split_end,
+            uint64_t active_plan_id,
+            void * user_data);
+
+    struct ggml_backend_sched_layer_checkpoint_range {
+        int split_start;
+        int split_end;       // exclusive
+        int checkpoint_index; // -1 for the final range without a checkpoint
+    };
+
+    struct ggml_backend_sched_layer_checkpoint_stats {
+        uint64_t graph_runs;
+        uint64_t checkpoint_hits;
+        uint64_t callback_calls;
+        uint64_t plan_changes;
+        uint64_t callback_total_us;
+        uint64_t callback_max_us;
+        uint64_t producer_calls;
+        uint64_t producer_total_us;
+        uint64_t producer_max_us;
+        uint64_t last_plan_id; // last plan accepted as active
+        int last_checkpoint_index;
+        int prepared_ranges;
+    };
+
+    // Runtime route-candidate statistics. Inactive candidate splits are not
+    // submitted to a backend and therefore are intentionally absent from the
+    // normal scheduler profiling and trace streams.
+    struct ggml_backend_sched_route_candidate_stats {
+        uint64_t graph_runs;
+        uint64_t groups_executed;
+        uint64_t canonical_selected;
+        uint64_t alternate_selected;
+        uint64_t inactive_splits_skipped;
+        uint64_t plan_misses;
+        uint64_t canonical_commits;
+        uint64_t commit_wait_us;
+        uint64_t commit_copy_us;
+        uint64_t plan_latches;
+        uint64_t plan_changes;
+        uint64_t last_active_plan_id;
+        int registered_mappings;
+        int prepared_groups;
+        int prepared_candidate_splits;
+    };
+
     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
@@ -350,6 +421,76 @@ extern "C" {
 
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
+
+    // Prepare dispatch checkpoints for an unallocated graph. Boundaries must
+    // be unique, non-view graph nodes supplied in graph order. Splitting and
+    // allocation still happen through ggml_backend_sched_alloc_graph(). The
+    // prepared ranges are available after that call succeeds.
+    //
+    // The configuration APIs and callback are scheduler-thread-only. The plan
+    // setter and active-plan getter are thread-safe and may be called by an
+    // external policy/thermal notification thread once the lazy checkpoint
+    // state exists. Before that state is first created, the setter is a no-op
+    // and the getter returns 0. Clearing a prepared graph removes its callback
+    // and ranges but deliberately preserves the requested/active atomics for
+    // the next graph. The scheduler is the source of truth for the accepted
+    // active plan.
+    GGML_API bool ggml_backend_sched_prepare_layer_checkpoints(
+            ggml_backend_sched_t sched,
+            const struct ggml_cgraph * graph,
+            struct ggml_tensor * const * boundaries,
+            int n_boundaries,
+            ggml_backend_sched_layer_checkpoint_request_producer request_producer,
+            ggml_backend_sched_layer_checkpoint_callback callback,
+            void * user_data);
+    GGML_API void ggml_backend_sched_clear_layer_checkpoints(ggml_backend_sched_t sched);
+    GGML_API void ggml_backend_sched_layer_checkpoint_set_plan_id(ggml_backend_sched_t sched, uint64_t plan_id);
+    GGML_API uint64_t ggml_backend_sched_layer_checkpoint_get_active_plan_id(ggml_backend_sched_t sched);
+    GGML_API int  ggml_backend_sched_get_n_layer_checkpoint_ranges(ggml_backend_sched_t sched);
+    GGML_API bool ggml_backend_sched_get_layer_checkpoint_range(
+            ggml_backend_sched_t sched,
+            int range_index,
+            struct ggml_backend_sched_layer_checkpoint_range * range);
+    GGML_API void ggml_backend_sched_get_layer_checkpoint_stats(
+            ggml_backend_sched_t sched,
+            struct ggml_backend_sched_layer_checkpoint_stats * stats);
+    GGML_API void ggml_backend_sched_reset_layer_checkpoint_stats(ggml_backend_sched_t sched);
+
+    // Register one plan mapping for a prepared route-candidate group. The
+    // canonical tensor and all of its alternate variants must be non-view
+    // graph nodes. Alternate nodes must immediately follow their canonical
+    // node in the graph; the scheduler validates this when the graph is split.
+    // A variant may equal canonical, which selects the no-copy path for that
+    // plan. Unknown plan IDs safely fall back to the canonical node.
+    //
+    // Call after scheduler reset and before graph allocation. Every registered
+    // canonical and unique variant is forced into a pure compute split. Route
+    // candidates cannot be combined with the per-node eval callback.
+    GGML_API bool ggml_backend_sched_register_route_candidate(
+            ggml_backend_sched_t sched,
+            struct ggml_tensor * canonical,
+            struct ggml_tensor * variant,
+            uint64_t plan_id,
+            int layer);
+    // Register a contiguous multi-node route variant. The canonical range
+    // [canonical_first, canonical_output] must appear first in graph order,
+    // immediately followed by every alternate range. Only the selected range
+    // executes; an alternate output is committed to canonical_output once at
+    // the end of the range. This is intended for prebuilt layer-local segments
+    // such as weighted FFN norm plus a partitioned FFN topology.
+    GGML_API bool ggml_backend_sched_register_route_subgraph(
+            ggml_backend_sched_t sched,
+            struct ggml_tensor * canonical_first,
+            struct ggml_tensor * canonical_output,
+            struct ggml_tensor * variant_first,
+            struct ggml_tensor * variant_output,
+            uint64_t plan_id,
+            int layer);
+    GGML_API void ggml_backend_sched_clear_route_candidates(ggml_backend_sched_t sched);
+    GGML_API void ggml_backend_sched_get_route_candidate_stats(
+            ggml_backend_sched_t sched,
+            struct ggml_backend_sched_route_candidate_stats * stats);
+    GGML_API void ggml_backend_sched_reset_route_candidate_stats(ggml_backend_sched_t sched);
 
     // Override the active CPU threads only for FFN parallel reduce splits.
     // A non-positive reduce thread count disables the override.

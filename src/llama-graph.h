@@ -19,6 +19,7 @@ struct ggml_tensor;
 struct llama_cparams;
 struct llama_layer;
 struct llama_model;
+struct llama_backend_policy_ffn_parallel;
 
 struct llama_memory_context_i;
 
@@ -540,6 +541,9 @@ public:
 
 // callback that allows us to apply custom logic to each tensor (e.g. ggml-alloc, offloading, etc.)
 using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il, const char * backend_hint)>;
+using llm_graph_route_subgraph_cb = std::function<void(
+        const char * kind, const char * profile, int il,
+        ggml_tensor * first, ggml_tensor * output)>;
 
 class llm_graph_result;
 
@@ -582,8 +586,14 @@ struct llm_graph_params {
 
     uint32_t n_outputs;
     bool module_bench_active = false;
+    bool runtime_route_candidates = false;
+    // A layer-routed FFN plan selected during prefill remains the effective
+    // partition for later non-routed phases (currently decode). Keeping this
+    // context-local avoids using the process-global legacy active profile.
+    std::string runtime_ffn_profile;
 
     llm_graph_cb cb;
+    llm_graph_route_subgraph_cb route_subgraph_cb;
 
     llm_graph_result * res;
 
@@ -625,6 +635,12 @@ struct llm_graph_params {
         }
 
         if (module_bench_active != other.module_bench_active) {
+            return false;
+        }
+        if (runtime_route_candidates != other.runtime_route_candidates) {
+            return false;
+        }
+        if (runtime_ffn_profile != other.runtime_ffn_profile) {
             return false;
         }
 
@@ -774,6 +790,8 @@ struct llm_graph_context {
     const int64_t n_tokens;
     const int64_t n_outputs;
     const int32_t n_ctx_orig; // yarn
+    const bool runtime_route_candidates;
+    const std::string runtime_ffn_profile;
 
     const enum llama_pooling_type pooling_type;
     const enum llama_rope_type    rope_type;
@@ -792,6 +810,7 @@ struct llm_graph_context {
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     const llm_graph_cb & cb_func;
+    const llm_graph_route_subgraph_cb & route_subgraph_cb_func;
 
     llm_graph_result * res;
 
@@ -802,6 +821,11 @@ struct llm_graph_context {
     virtual ~llm_graph_context() = default;
 
     void cb(ggml_tensor * cur, const char * name, int il, const char * backend_hint = nullptr) const;
+
+    // Runtime-route candidates are strict: unlike ordinary placement hints,
+    // failure to bind the requested backend would make a profile appear to
+    // switch while silently executing elsewhere.
+    void cb_route(ggml_tensor * cur, const char * name, int il, const char * backend_hint) const;
 
     //
     // common
@@ -855,7 +879,9 @@ struct llm_graph_context {
              ggml_tensor * act_scales,
          llm_ffn_op_type   type_op,
        llm_ffn_gate_type   type_gate,
-                     int   il) const;
+                     int   il,
+        const llama_backend_policy_ffn_parallel * policy_override = nullptr,
+             const char * route_tag = nullptr) const;
 
     // build MoE FFN without bias tensors
     ggml_tensor * build_moe_ffn(

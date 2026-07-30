@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <condition_variable>
@@ -29,6 +30,8 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -781,6 +784,7 @@ struct ggml_backend_sched_split {
     int backend_id;
     int i_start;
     int i_end;
+    int checkpoint_index_after;
     bool is_ffn_parallel_reduce;
     struct ggml_tensor * inputs[GGML_SCHED_MAX_SPLIT_INPUTS];
     int n_inputs;
@@ -789,6 +793,107 @@ struct ggml_backend_sched_split {
 };
 
 struct ggml_backend_sched_ffn_executor;
+
+struct ggml_backend_sched_layer_checkpoint {
+    struct ggml_tensor * boundary = nullptr;
+    int node_index = -1;
+    int split_end = -1;
+};
+
+struct ggml_backend_sched_layer_checkpoint_state {
+    std::atomic<uint64_t> requested_plan_id { 0 };
+    std::atomic<uint64_t> active_plan_id { 0 };
+    bool enabled = false;
+    bool prepared = false;
+    const struct ggml_cgraph * configured_graph = nullptr;
+    ggml_backend_sched_layer_checkpoint_request_producer request_producer = nullptr;
+    ggml_backend_sched_layer_checkpoint_callback callback = nullptr;
+    void * callback_user_data = nullptr;
+    std::vector<ggml_backend_sched_layer_checkpoint> checkpoints;
+    std::vector<ggml_backend_sched_layer_checkpoint_range> ranges;
+    struct ggml_backend_sched_layer_checkpoint_stats stats = {};
+
+    ggml_backend_sched_layer_checkpoint_state() {
+        stats.last_checkpoint_index = -1;
+    }
+
+    void clear_configuration() {
+        enabled = false;
+        prepared = false;
+        configured_graph = nullptr;
+        request_producer = nullptr;
+        callback = nullptr;
+        callback_user_data = nullptr;
+        checkpoints.clear();
+        ranges.clear();
+        stats.prepared_ranges = 0;
+    }
+};
+
+struct ggml_backend_sched_route_candidate_registration {
+    struct ggml_tensor * canonical_first = nullptr;
+    struct ggml_tensor * canonical = nullptr;
+    struct ggml_tensor * variant_first = nullptr;
+    struct ggml_tensor * variant = nullptr;
+    uint64_t plan_id = 0;
+    int layer = -1;
+    bool subgraph = false;
+};
+
+struct ggml_backend_sched_route_candidate_variant {
+    struct ggml_tensor * first = nullptr;
+    struct ggml_tensor * tensor = nullptr;
+    int node_start = -1;
+    int node_end = -1;   // inclusive terminal/output node
+    int split_start = -1;
+    int split_end = -1;  // exclusive
+};
+
+struct ggml_backend_sched_route_candidate_plan {
+    uint64_t plan_id = 0;
+    int variant_index = -1;
+};
+
+struct ggml_backend_sched_route_candidate_group {
+    struct ggml_tensor * canonical = nullptr;
+    int layer = -1;
+    int canonical_node_index = -1;
+    int canonical_variant_index = -1;
+    std::vector<ggml_backend_sched_route_candidate_variant> variants;
+    std::vector<ggml_backend_sched_route_candidate_plan> plans;
+};
+
+struct ggml_backend_sched_route_candidate_state {
+    bool prepared = false;
+    const struct ggml_cgraph * configured_graph = nullptr;
+    std::vector<ggml_backend_sched_route_candidate_registration> registrations;
+    std::vector<ggml_backend_sched_route_candidate_group> groups;
+    std::vector<bool> candidate_nodes;
+    std::vector<int> node_to_group;
+    std::vector<int> node_to_variant;
+    std::vector<int> split_to_group;
+    std::vector<int> split_to_variant;
+    struct ggml_backend_sched_route_candidate_stats stats = {};
+
+    bool enabled() const {
+        return !registrations.empty();
+    }
+
+    void clear_configuration() {
+        prepared = false;
+        configured_graph = nullptr;
+        registrations.clear();
+        groups.clear();
+        candidate_nodes.clear();
+        node_to_group.clear();
+        node_to_variant.clear();
+        split_to_group.clear();
+        split_to_variant.clear();
+        stats.registered_mappings = 0;
+        stats.prepared_groups = 0;
+        stats.prepared_candidate_splits = 0;
+    }
+};
 
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
@@ -841,6 +946,8 @@ struct ggml_backend_sched {
     // Non-trivial worker state is owned separately because this scheduler is
     // allocated with calloc/free.
     ggml_backend_sched_ffn_executor * ffn_device_executor;
+    ggml_backend_sched_layer_checkpoint_state * layer_checkpoints;
+    ggml_backend_sched_route_candidate_state * route_candidates;
 
     char * context_buffer;
     size_t context_buffer_size;
@@ -855,6 +962,38 @@ struct ggml_backend_sched {
     int debug_graph_size;
     int debug_prev_graph_size;
 };
+
+static ggml_backend_sched_layer_checkpoint_state * ggml_backend_sched_ensure_layer_checkpoint_state(
+        ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched != nullptr);
+    if (sched->layer_checkpoints != nullptr) {
+        return sched->layer_checkpoints;
+    }
+    try {
+        sched->layer_checkpoints = new ggml_backend_sched_layer_checkpoint_state();
+    } catch (const std::exception & error) {
+        GGML_LOG_ERROR("%s: failed to allocate layer checkpoint state: %s\n", __func__, error.what());
+    } catch (...) {
+        GGML_LOG_ERROR("%s: failed to allocate layer checkpoint state\n", __func__);
+    }
+    return sched->layer_checkpoints;
+}
+
+static ggml_backend_sched_route_candidate_state * ggml_backend_sched_ensure_route_candidate_state(
+        ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched != nullptr);
+    if (sched->route_candidates != nullptr) {
+        return sched->route_candidates;
+    }
+    try {
+        sched->route_candidates = new ggml_backend_sched_route_candidate_state();
+    } catch (const std::exception & error) {
+        GGML_LOG_ERROR("%s: failed to allocate route candidate state: %s\n", __func__, error.what());
+    } catch (...) {
+        GGML_LOG_ERROR("%s: failed to allocate route candidate state\n", __func__);
+    }
+    return sched->route_candidates;
+}
 
 using ggml_backend_sched_ffn_job_fn = void (*)(void *);
 
@@ -3118,11 +3257,464 @@ static bool ggml_backend_sched_is_ffn_parallel_reduce_node(const struct ggml_ten
         ggml_backend_sched_collect_ffn_parallel_reduce_info(node, &info) && info.branches.size() >= 2;
 }
 
+static bool ggml_backend_sched_route_tensor_registered(
+        const ggml_backend_sched_route_candidate_state * state,
+        const struct ggml_tensor * tensor) {
+    if (state == nullptr || tensor == nullptr) {
+        return false;
+    }
+    for (const auto & registration : state->registrations) {
+        if (registration.canonical_first == tensor || registration.canonical == tensor ||
+                registration.variant_first == tensor || registration.variant == tensor) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ggml_backend_sched_prepare_route_candidate_graph(
+        ggml_backend_sched_t sched,
+        const struct ggml_cgraph * graph) {
+    GGML_ASSERT(sched != nullptr);
+    GGML_ASSERT(graph != nullptr);
+
+    ggml_backend_sched_route_candidate_state * state = sched->route_candidates;
+    GGML_ASSERT(state != nullptr);
+    state->candidate_nodes.assign((size_t) graph->n_nodes, false);
+    state->node_to_group.assign((size_t) graph->n_nodes, -1);
+    state->node_to_variant.assign((size_t) graph->n_nodes, -1);
+
+    state->prepared = false;
+    state->configured_graph = nullptr;
+    state->groups.clear();
+    state->split_to_group.clear();
+    state->split_to_variant.clear();
+    state->stats.prepared_groups = 0;
+    state->stats.prepared_candidate_splits = 0;
+
+    if (!state->enabled()) {
+        return true;
+    }
+    if (sched->callback_eval != nullptr) {
+        GGML_LOG_ERROR("%s: route candidates cannot be combined with callback_eval\n", __func__);
+        return false;
+    }
+
+    std::unordered_map<const struct ggml_tensor *, int> graph_node_indices;
+    graph_node_indices.reserve((size_t) graph->n_nodes);
+    for (int node_index = 0; node_index < graph->n_nodes; ++node_index) {
+        if (!graph_node_indices.emplace(graph->nodes[node_index], node_index).second) {
+            GGML_LOG_ERROR("%s: graph contains a duplicated node pointer\n", __func__);
+            return false;
+        }
+    }
+    auto graph_node_index = [&](const struct ggml_tensor * tensor) {
+        const auto it = graph_node_indices.find(tensor);
+        return it == graph_node_indices.end() ? -1 : it->second;
+    };
+    std::vector<std::vector<int>> graph_consumers((size_t) graph->n_nodes);
+    for (int consumer_index = 0; consumer_index < graph->n_nodes; ++consumer_index) {
+        const struct ggml_tensor * consumer = graph->nodes[consumer_index];
+        for (int src = 0; src < GGML_MAX_SRC; ++src) {
+            const int dependency_index = graph_node_index(consumer->src[src]);
+            if (dependency_index >= 0) {
+                graph_consumers[(size_t) dependency_index].push_back(consumer_index);
+            }
+        }
+    }
+
+    // First collect registrations by canonical tensor. Canonical is always a
+    // valid fallback even when no plan explicitly maps to it.
+    for (const auto & registration : state->registrations) {
+        struct ggml_tensor * canonical = registration.canonical;
+        struct ggml_tensor * variant = registration.variant;
+        if (registration.canonical_first == nullptr || canonical == nullptr ||
+                registration.variant_first == nullptr || variant == nullptr ||
+                registration.layer < 0 || ggml_is_view_op(canonical->op) ||
+                ggml_is_view_op(variant->op)) {
+            GGML_LOG_ERROR("%s: invalid route-candidate registration\n", __func__);
+            return false;
+        }
+        if (!registration.subgraph &&
+                (ggml_backend_sched_is_ffn_parallel_branch_node(canonical) ||
+                ggml_backend_sched_is_ffn_parallel_reduce_node(canonical) ||
+                ggml_backend_sched_is_ffn_parallel_branch_node(variant) ||
+                ggml_backend_sched_is_ffn_parallel_reduce_node(variant))) {
+            GGML_LOG_ERROR(
+                    "%s: FFN branch/reduce node cannot be a route candidate (%s -> %s)\n",
+                    __func__, canonical->name, variant->name);
+            return false;
+        }
+        if (!ggml_are_same_layout(canonical, variant) ||
+                (!registration.subgraph &&
+                 (canonical->op != variant->op ||
+                  memcmp(canonical->op_params, variant->op_params, GGML_MAX_OP_PARAMS) != 0))) {
+            GGML_LOG_ERROR(
+                    "%s: route variant %s does not match canonical op/layout %s\n",
+                    __func__, variant->name, canonical->name);
+            return false;
+        }
+        if (!registration.subgraph) {
+            for (int src = 0; src < GGML_MAX_SRC; ++src) {
+                if (canonical->src[src] != variant->src[src]) {
+                    GGML_LOG_ERROR(
+                            "%s: route variant %s must share canonical sources with %s\n",
+                            __func__, variant->name, canonical->name);
+                    return false;
+                }
+            }
+        }
+
+        int group_index = -1;
+        for (int i = 0; i < (int) state->groups.size(); ++i) {
+            if (state->groups[i].canonical == canonical) {
+                group_index = i;
+                break;
+            }
+        }
+        if (group_index < 0) {
+            ggml_backend_sched_route_candidate_group group;
+            group.canonical = canonical;
+            group.layer = registration.layer;
+            group.variants.push_back({
+                    registration.canonical_first, canonical,
+                    -1, -1, -1, -1 });
+            state->groups.push_back(std::move(group));
+            group_index = (int) state->groups.size() - 1;
+        }
+
+        ggml_backend_sched_route_candidate_group & group = state->groups[group_index];
+        if (group.layer != registration.layer) {
+            GGML_LOG_ERROR(
+                    "%s: canonical %s was registered for more than one layer\n",
+                    __func__, canonical->name);
+            return false;
+        }
+        if (group.variants.empty() ||
+                group.variants[0].first != registration.canonical_first) {
+            GGML_LOG_ERROR(
+                    "%s: canonical route subgraph for %s has inconsistent first node\n",
+                    __func__, canonical->name);
+            return false;
+        }
+        for (const auto & plan : group.plans) {
+            if (plan.plan_id == registration.plan_id) {
+                GGML_LOG_ERROR(
+                        "%s: duplicate route plan %llu for canonical %s\n",
+                        __func__, (unsigned long long) registration.plan_id, canonical->name);
+                return false;
+            }
+        }
+
+        int variant_index = -1;
+        for (int i = 0; i < (int) group.variants.size(); ++i) {
+            if (group.variants[i].tensor == variant &&
+                    group.variants[i].first == registration.variant_first) {
+                variant_index = i;
+                break;
+            }
+        }
+        if (variant_index < 0) {
+            group.variants.push_back({
+                    registration.variant_first, variant,
+                    -1, -1, -1, -1 });
+            variant_index = (int) group.variants.size() - 1;
+        }
+        group.plans.push_back({ registration.plan_id, variant_index });
+    }
+
+    // No candidate tensor may participate in two groups in any role.
+    for (int group_index = 0; group_index < (int) state->groups.size(); ++group_index) {
+        const auto & group = state->groups[group_index];
+        for (const auto & variant : group.variants) {
+            for (int other_index = 0; other_index < (int) state->groups.size(); ++other_index) {
+                if (other_index == group_index) {
+                    continue;
+                }
+                const auto & other = state->groups[other_index];
+                if (other.canonical == variant.tensor) {
+                    GGML_LOG_ERROR(
+                            "%s: route tensor %s belongs to multiple candidate groups\n",
+                            __func__, variant.tensor->name);
+                    return false;
+                }
+                for (const auto & other_variant : other.variants) {
+                    if (other_variant.tensor == variant.tensor) {
+                        GGML_LOG_ERROR(
+                                "%s: route tensor %s belongs to multiple candidate groups\n",
+                                __func__, variant.tensor->name);
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    // Resolve graph order. A variant may be a single node or a contiguous
+    // subgraph. The canonical range is first, immediately followed by each
+    // alternate range. This lets the scheduler skip complete inactive ranges
+    // without suppressing unrelated graph work.
+    for (auto & group : state->groups) {
+        for (auto & variant : group.variants) {
+            variant.node_start = graph_node_index(variant.first);
+            variant.node_end = graph_node_index(variant.tensor);
+            if (variant.node_start < 0 || variant.node_end < variant.node_start) {
+                GGML_LOG_ERROR(
+                        "%s: route subgraph %s -> %s is missing, duplicated, or reversed in graph\n",
+                        __func__, variant.first->name, variant.tensor->name);
+                return false;
+            }
+            for (int node_index = variant.node_start; node_index <= variant.node_end; ++node_index) {
+                if (ggml_is_view_op(graph->nodes[node_index]->op)) {
+                    GGML_LOG_ERROR(
+                            "%s: route subgraph %s -> %s contains unsupported view node %s\n",
+                            __func__, variant.first->name, variant.tensor->name,
+                            graph->nodes[node_index]->name);
+                    return false;
+                }
+                if ((graph->nodes[node_index]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                    GGML_LOG_ERROR(
+                            "%s: route subgraph node %s is not marked for computation\n",
+                            __func__, graph->nodes[node_index]->name);
+                    return false;
+                }
+            }
+        }
+
+        std::sort(group.variants.begin() + 1, group.variants.end(),
+                [](const auto & lhs, const auto & rhs) { return lhs.node_start < rhs.node_start; });
+        group.canonical_variant_index = 0;
+        group.canonical_node_index = group.variants[0].node_start;
+        if (group.variants[0].tensor != group.canonical ||
+                group.variants[0].first == nullptr) {
+            GGML_LOG_ERROR("%s: internal canonical route ordering failure\n", __func__);
+            return false;
+        }
+        int expected_start = group.canonical_node_index;
+        for (int i = 0; i < (int) group.variants.size(); ++i) {
+            auto & variant = group.variants[i];
+            if (variant.node_start != expected_start) {
+                GGML_LOG_ERROR(
+                        "%s: alternate subgraphs for %s must be contiguous in graph order\n",
+                        __func__, group.canonical->name);
+                return false;
+            }
+            expected_start = variant.node_end + 1;
+            if (i > 0 && (variant.tensor->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) {
+                GGML_LOG_ERROR(
+                        "%s: alternate route terminal %s cannot be a graph output\n",
+                        __func__, variant.tensor->name);
+                return false;
+            }
+        }
+
+        // Sorting unique variants invalidates the temporary registration-time
+        // indices, so resolve every plan again from the source registrations.
+        group.plans.clear();
+        for (const auto & registration : state->registrations) {
+            if (registration.canonical != group.canonical) {
+                continue;
+            }
+            int variant_index = -1;
+            for (int i = 0; i < (int) group.variants.size(); ++i) {
+                if (group.variants[i].first == registration.variant_first &&
+                        group.variants[i].tensor == registration.variant) {
+                    variant_index = i;
+                    break;
+                }
+            }
+            GGML_ASSERT(variant_index >= 0);
+            group.plans.push_back({ registration.plan_id, variant_index });
+        }
+    }
+
+    std::sort(state->groups.begin(), state->groups.end(),
+            [](const auto & lhs, const auto & rhs) {
+                return lhs.canonical_node_index < rhs.canonical_node_index;
+            });
+    int previous_layer = -1;
+    int previous_group_end = -1;
+    for (int group_index = 0; group_index < (int) state->groups.size(); ++group_index) {
+        const auto & group = state->groups[group_index];
+        if (group.layer < previous_layer || group.canonical_node_index <= previous_group_end) {
+            GGML_LOG_ERROR("%s: route candidate groups/layers are not in graph order\n", __func__);
+            return false;
+        }
+        previous_layer = group.layer;
+        previous_group_end = group.variants.back().node_end;
+        for (int variant_index = 0; variant_index < (int) group.variants.size(); ++variant_index) {
+            const auto & variant = group.variants[variant_index];
+            for (int node_index = variant.node_start; node_index <= variant.node_end; ++node_index) {
+                if (state->candidate_nodes[node_index]) {
+                    GGML_LOG_ERROR(
+                            "%s: route subgraph node %s belongs to overlapping groups\n",
+                            __func__, graph->nodes[node_index]->name);
+                    return false;
+                }
+                state->candidate_nodes[node_index] = true;
+                state->node_to_group[node_index] = group_index;
+                state->node_to_variant[node_index] = variant_index;
+            }
+        }
+    }
+
+    // Every non-terminal value is private to its own variant. Alternate
+    // terminals are scratch results consumed only by the scheduler's commit;
+    // canonical-terminal consumers must begin after all alternate ranges.
+    for (const auto & group : state->groups) {
+        const int group_end = group.variants.back().node_end;
+        for (int variant_index = 0; variant_index < (int) group.variants.size(); ++variant_index) {
+            const auto & variant = group.variants[variant_index];
+            for (int dependency_index = variant.node_start;
+                    dependency_index <= variant.node_end; ++dependency_index) {
+                const struct ggml_tensor * dependency = graph->nodes[dependency_index];
+                for (int node_index : graph_consumers[(size_t) dependency_index]) {
+                    const struct ggml_tensor * node = graph->nodes[node_index];
+                    const bool dependency_is_terminal = dependency == variant.tensor;
+                    const bool consumer_inside_variant =
+                        node_index >= variant.node_start && node_index <= variant.node_end;
+                    const bool allowed_canonical_consumer =
+                        variant_index == group.canonical_variant_index &&
+                        dependency_is_terminal && node_index > group_end;
+                    if (!consumer_inside_variant && !allowed_canonical_consumer) {
+                        GGML_LOG_ERROR(
+                                "%s: route value %s escapes variant %s -> %s through node %s\n",
+                                __func__, dependency->name, variant.first->name,
+                                variant.tensor->name, node->name);
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    state->configured_graph = graph;
+    return true;
+}
+
+static bool ggml_backend_sched_resolve_route_candidate_splits(
+        ggml_backend_sched_t sched,
+        const struct ggml_cgraph * graph) {
+    ggml_backend_sched_route_candidate_state * state = sched->route_candidates;
+    GGML_ASSERT(state != nullptr && state->enabled());
+    if (state->configured_graph != graph) {
+        GGML_LOG_ERROR("%s: route candidates were prepared for a different graph\n", __func__);
+        return false;
+    }
+
+    state->split_to_group.assign((size_t) sched->n_splits, -1);
+    state->split_to_variant.assign((size_t) sched->n_splits, -1);
+    for (auto & group : state->groups) {
+        for (auto & variant : group.variants) {
+            variant.split_start = -1;
+            variant.split_end = -1;
+        }
+    }
+
+    // A split may contain several nodes from one selected subgraph, but it may
+    // never mix route and non-route work or two different variants.
+    for (int split_id = 0; split_id < sched->n_splits; ++split_id) {
+        const auto & split = sched->splits[split_id];
+        int split_group = -1;
+        int split_variant = -1;
+        bool saw_compute = false;
+        for (int node_index = split.i_start; node_index < split.i_end; ++node_index) {
+            if (ggml_is_view_op(graph->nodes[node_index]->op)) {
+                continue;
+            }
+            const int node_group = state->node_to_group[node_index];
+            const int node_variant = state->node_to_variant[node_index];
+            if (!saw_compute) {
+                split_group = node_group;
+                split_variant = node_variant;
+                saw_compute = true;
+            } else if (node_group != split_group || node_variant != split_variant) {
+                GGML_LOG_ERROR("%s: split %d mixes route-candidate ranges\n", __func__, split_id);
+                return false;
+            }
+        }
+        if (saw_compute && split_group >= 0) {
+            state->split_to_group[split_id] = split_group;
+            state->split_to_variant[split_id] = split_variant;
+
+            auto & variant = state->groups[split_group].variants[split_variant];
+            if (variant.split_start < 0) {
+                variant.split_start = split_id;
+            } else if (variant.split_end != split_id) {
+                GGML_LOG_ERROR(
+                        "%s: route subgraph %s -> %s resolved to a non-contiguous split range\n",
+                        __func__, variant.first->name, variant.tensor->name);
+                return false;
+            }
+            variant.split_end = split_id + 1;
+        }
+    }
+
+    for (const auto & group : state->groups) {
+        for (const auto & variant : group.variants) {
+            if (variant.split_start < 0 || variant.split_end <= variant.split_start) {
+                GGML_LOG_ERROR(
+                        "%s: route subgraph %s -> %s did not resolve to splits\n",
+                        __func__, variant.first->name,
+                        variant.tensor->name);
+                return false;
+            }
+        }
+    }
+
+    state->prepared = true;
+    state->stats.prepared_groups = (int) state->groups.size();
+    int n_candidate_splits = 0;
+    for (int group_index : state->split_to_group) {
+        n_candidate_splits += group_index >= 0 ? 1 : 0;
+    }
+    state->stats.prepared_candidate_splits = n_candidate_splits;
+    return true;
+}
+
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     // reset splits
     sched->n_splits = 0;
     sched->n_graph_inputs = 0;
     sched->is_reset = false;
+
+    ggml_backend_sched_layer_checkpoint_state * checkpoint_state = sched->layer_checkpoints;
+    const bool checkpoint_mode = checkpoint_state != nullptr && checkpoint_state->enabled;
+    if (checkpoint_mode) {
+        checkpoint_state->prepared = false;
+        checkpoint_state->ranges.clear();
+        checkpoint_state->stats.prepared_ranges = 0;
+        for (auto & checkpoint : checkpoint_state->checkpoints) {
+            checkpoint.split_end = -1;
+        }
+        if (checkpoint_state->configured_graph != graph) {
+            GGML_LOG_ERROR(
+                    "%s: layer checkpoints were prepared for a different graph; "
+                    "prepare them again after rebuilding the graph\n",
+                    __func__);
+        }
+    }
+
+    ggml_backend_sched_route_candidate_state * route_state = sched->route_candidates;
+    const bool route_candidate_mode = route_state != nullptr && route_state->enabled();
+    if (route_candidate_mode && !ggml_backend_sched_prepare_route_candidate_graph(sched, graph)) {
+        return;
+    }
+    if (route_candidate_mode && checkpoint_mode) {
+        for (const auto & checkpoint : checkpoint_state->checkpoints) {
+            const bool endpoint_conflict =
+                ggml_backend_sched_route_tensor_registered(route_state, checkpoint.boundary);
+            const bool interior_conflict = checkpoint.node_index >= 0 &&
+                checkpoint.node_index < (int) route_state->node_to_group.size() &&
+                route_state->node_to_group[(size_t) checkpoint.node_index] >= 0;
+            if (endpoint_conflict || interior_conflict) {
+                GGML_LOG_ERROR(
+                        "%s: route subgraph node %s cannot also be a layer checkpoint boundary\n",
+                        __func__, checkpoint.boundary != nullptr ? checkpoint.boundary->name : "");
+                return;
+            }
+        }
+    }
 
     struct ggml_init_params params = {
         /* .mem_size =   */ sched->context_buffer_size,
@@ -3364,12 +3956,19 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         }
         split->i_start = 0;
         split->n_inputs = 0;
+        split->checkpoint_index_after = -1;
         split->is_ffn_parallel_reduce = false;
         int cur_backend_id = split->backend_id;
+        int pending_checkpoint_index = -1;
+        size_t next_checkpoint = 0;
         bool cur_split_has_ffn_parallel_branch = false;
         bool cur_split_needs_ffn_branch_isolation = false;
         bool cur_split_has_ffn_parallel_reduce = false;
-        std::vector<std::pair<int, std::string>> ffn_parallel_branch_keys;
+        int cur_route_group = -1;
+        int cur_route_variant = -1;
+        bool cur_split_has_compute_node = false;
+        std::unordered_map<int, std::unordered_set<std::string>>
+            ffn_parallel_branches_by_layer;
         std::vector<bool> ffn_parallel_reduce_nodes(graph->n_nodes, false);
         for (int j = 0; j < graph->n_nodes; ++j) {
             const struct ggml_tensor * node = graph->nodes[j];
@@ -3380,13 +3979,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 continue;
             }
 
-            const auto duplicate = std::find_if(ffn_parallel_branch_keys.begin(), ffn_parallel_branch_keys.end(),
-                    [&](const std::pair<int, std::string> & prev) {
-                        return prev.first == layer && prev.second == branch;
-                    });
-            if (duplicate == ffn_parallel_branch_keys.end()) {
-                ffn_parallel_branch_keys.emplace_back(layer, std::move(branch));
-            }
+            ffn_parallel_branches_by_layer[layer].insert(std::move(branch));
         }
         auto ffn_layer_has_multiple_branches = [&](const struct ggml_tensor * node) {
             std::string branch;
@@ -3395,14 +3988,46 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 return false;
             }
 
-            int n_layer_branches = 0;
-            for (const auto & key : ffn_parallel_branch_keys) {
-                if (key.first == layer && ++n_layer_branches >= 2) {
-                    return true;
-                }
-            }
-            return false;
+            const auto it = ffn_parallel_branches_by_layer.find(layer);
+            return it != ffn_parallel_branches_by_layer.end() && it->second.size() >= 2;
         };
+
+        // tensor_id_copy() is shared by the whole graph, but a route graph
+        // contains mutually-exclusive execution domains. If an inactive
+        // variant is the first domain that creates a copy, it must not be the
+        // only split responsible for refreshing that copy. Track one input
+        // attachment per (source, target backend, route variant); ordinary
+        // non-route work is represented by the {-1, -1} domain.
+        struct route_copy_attachment {
+            int backend_id;
+            int group;
+            int variant;
+        };
+        using route_copy_attachment_map =
+            std::unordered_map<const struct ggml_tensor *, std::vector<route_copy_attachment>>;
+        std::unique_ptr<route_copy_attachment_map> route_copy_attachments;
+        if (route_candidate_mode) {
+            route_copy_attachments = std::make_unique<route_copy_attachment_map>();
+        }
+        auto route_copy_is_attached = [&](const struct ggml_tensor * src, int backend_id,
+                                          int group, int variant) {
+            GGML_ASSERT(route_copy_attachments != nullptr);
+            const auto it = route_copy_attachments->find(src);
+            if (it == route_copy_attachments->end()) {
+                return false;
+            }
+            return std::any_of(it->second.begin(), it->second.end(),
+                    [&](const route_copy_attachment & attachment) {
+                        return attachment.backend_id == backend_id &&
+                            attachment.group == group && attachment.variant == variant;
+                    });
+        };
+        auto attach_route_copy = [&](const struct ggml_tensor * src, int backend_id,
+                                     int group, int variant) {
+            GGML_ASSERT(route_copy_attachments != nullptr);
+            (*route_copy_attachments)[src].push_back({ backend_id, group, variant });
+        };
+
         for (; i < graph->n_nodes; i++) {
             struct ggml_tensor * node = graph->nodes[i];
 
@@ -3413,6 +4038,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             const int node_backend_id = tensor_backend_id(node);
             const bool node_is_ffn_parallel_branch = ggml_backend_sched_is_ffn_parallel_branch_node(node);
             const bool node_is_ffn_parallel_reduce = ffn_parallel_reduce_nodes[i];
+            const int node_route_group = route_candidate_mode
+                ? route_state->node_to_group[i] : -1;
+            const int node_route_variant = route_candidate_mode
+                ? route_state->node_to_variant[i] : -1;
             const bool node_needs_ffn_branch_isolation =
                 node_is_ffn_parallel_branch &&
                 (sched->debug >= 2 || ffn_layer_has_multiple_branches(node));
@@ -3421,6 +4050,14 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
             // check if we should start a new split based on the sources of the current node
             bool need_new_split = false;
+            if (cur_split_has_compute_node &&
+                    (node_route_group != cur_route_group ||
+                     node_route_variant != cur_route_variant)) {
+                // A split may contain multiple nodes from one route subgraph,
+                // but never route/non-route work or two variants. Inactive
+                // ranges can then be skipped without suppressing other work.
+                need_new_split = true;
+            }
             if (node_backend_id == cur_backend_id &&
                     cur_split_has_ffn_parallel_branch != node_is_ffn_parallel_branch &&
                     (cur_split_needs_ffn_branch_isolation ||
@@ -3451,6 +4088,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 need_new_split = true;
             }
             if (node_backend_id == cur_backend_id && split->n_inputs > 0) {
+                int additional_inputs = 0;
+                std::vector<const struct ggml_tensor *> additional_input_sources;
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     struct ggml_tensor * src = node->src[j];
                     if (src == NULL) {
@@ -3465,22 +4104,51 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                             break;
                         }
                     }
-                    // check if the split has too many inputs
-                    // FIXME: count the number of inputs instead of only checking when full
-                    if (split->n_inputs == GGML_SCHED_MAX_SPLIT_INPUTS) {
+                    if (route_candidate_mode) {
                         const size_t id = hash_id(src);
-                        int src_backend_id = sched->hv_tensor_backend_ids[id];
-                        bool supported = ggml_backend_sched_buffer_supported(sched, src, cur_backend_id);
-                        if (src_backend_id != cur_backend_id && tensor_id_copy(id, cur_backend_id, 0) == NULL && !supported) {
+                        const int src_backend_id = sched->hv_tensor_backend_ids[id];
+                        const bool supported =
+                            ggml_backend_sched_buffer_supported(sched, src, cur_backend_id);
+                        if (src_backend_id != cur_backend_id && !supported &&
+                                !route_copy_is_attached(
+                                    src, cur_backend_id, node_route_group, node_route_variant) &&
+                                std::find(additional_input_sources.begin(),
+                                    additional_input_sources.end(), src) ==
+                                additional_input_sources.end()) {
+                            additional_input_sources.push_back(src);
+                            ++additional_inputs;
+                        }
+                    } else if (split->n_inputs == GGML_SCHED_MAX_SPLIT_INPUTS) {
+                        // Legacy scheduler path: keep the original full-split
+                        // check exactly as it was when route candidates are off.
+                        const size_t id = hash_id(src);
+                        const int src_backend_id = sched->hv_tensor_backend_ids[id];
+                        const bool supported =
+                            ggml_backend_sched_buffer_supported(sched, src, cur_backend_id);
+                        if (src_backend_id != cur_backend_id &&
+                                tensor_id_copy(id, cur_backend_id, 0) == NULL && !supported) {
                             need_new_split = true;
                             break;
                         }
                     }
                 }
+                if (route_candidate_mode &&
+                        split->n_inputs + additional_inputs > GGML_SCHED_MAX_SPLIT_INPUTS) {
+                    need_new_split = true;
+                }
+            }
+
+            if (pending_checkpoint_index >= 0) {
+                need_new_split = true;
             }
 
             if (node_backend_id != cur_backend_id || need_new_split) {
                 split->i_end = i;
+                if (pending_checkpoint_index >= 0) {
+                    split->checkpoint_index_after = pending_checkpoint_index;
+                    checkpoint_state->checkpoints[pending_checkpoint_index].split_end = i_split + 1;
+                    pending_checkpoint_index = -1;
+                }
                 i_split++;
                 if (i_split >= sched->splits_capacity) {
                     sched->splits_capacity *= 2;
@@ -3492,11 +4160,15 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 split->backend_id = node_backend_id;
                 split->i_start = i;
                 split->n_inputs = 0;
+                split->checkpoint_index_after = -1;
                 split->is_ffn_parallel_reduce = false;
                 cur_backend_id = node_backend_id;
                 cur_split_has_ffn_parallel_branch = false;
                 cur_split_needs_ffn_branch_isolation = false;
                 cur_split_has_ffn_parallel_reduce = false;
+                cur_route_group = -1;
+                cur_route_variant = -1;
+                cur_split_has_compute_node = false;
             }
 
             if (node_is_ffn_parallel_branch) {
@@ -3508,6 +4180,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 cur_split_has_ffn_parallel_reduce = true;
                 split->is_ffn_parallel_reduce = true;
             }
+            cur_route_group = node_route_group;
+            cur_route_variant = node_route_variant;
+            cur_split_has_compute_node = true;
 
             // find inputs that are not on the same backend
             for (int j = 0; j < GGML_MAX_SRC; j++) {
@@ -3543,8 +4218,18 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 }
 
                 if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
-                    // create a copy of the input in the split's backend
-                    if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
+                    const bool copy_missing =
+                        tensor_id_copy(src_id, cur_backend_id, 0) == NULL;
+                    const bool needs_attachment = route_candidate_mode
+                        ? !route_copy_is_attached(
+                                src, cur_backend_id, node_route_group, node_route_variant)
+                        : copy_missing;
+
+                    // Create one physical copy per source/backend as before,
+                    // but make every mutually-exclusive route variant own a
+                    // refresh point so selected work never depends on a copy
+                    // hidden behind an inactive split.
+                    if (copy_missing) {
                         ggml_backend_t backend = sched->backends[cur_backend_id];
                         for (int c = 0; c < sched->n_copies; c++) {
                             struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
@@ -3556,16 +4241,75 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                             tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
                             SET_CAUSE(tensor_copy, "4.cpy");
                         }
+                    }
+                    if (needs_attachment) {
                         int n_inputs = split->n_inputs++;
                         GGML_ASSERT(n_inputs < GGML_SCHED_MAX_SPLIT_INPUTS);
                         split->inputs[n_inputs] = src;
+                        if (route_candidate_mode) {
+                            attach_route_copy(
+                                    src, cur_backend_id,
+                                    node_route_group, node_route_variant);
+                        }
                     }
                     node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
                 }
             }
+
+            if (checkpoint_mode && checkpoint_state->configured_graph == graph &&
+                    next_checkpoint < checkpoint_state->checkpoints.size() &&
+                    checkpoint_state->checkpoints[next_checkpoint].node_index == i) {
+                pending_checkpoint_index = (int) next_checkpoint;
+                ++next_checkpoint;
+            }
         }
         split->i_end = graph->n_nodes;
+        if (pending_checkpoint_index >= 0) {
+            split->checkpoint_index_after = pending_checkpoint_index;
+            checkpoint_state->checkpoints[pending_checkpoint_index].split_end = i_split + 1;
+            pending_checkpoint_index = -1;
+        }
         sched->n_splits = i_split + 1;
+
+        if (checkpoint_mode && checkpoint_state->configured_graph == graph) {
+            bool valid = next_checkpoint == checkpoint_state->checkpoints.size();
+            int split_start = 0;
+            for (size_t checkpoint_index = 0;
+                    valid && checkpoint_index < checkpoint_state->checkpoints.size();
+                    ++checkpoint_index) {
+                const int split_end = checkpoint_state->checkpoints[checkpoint_index].split_end;
+                valid = split_end > split_start && split_end <= sched->n_splits;
+                if (!valid) {
+                    break;
+                }
+                checkpoint_state->ranges.push_back({
+                    /* .split_start = */ split_start,
+                    /* .split_end = */ split_end,
+                    /* .checkpoint_index = */ (int) checkpoint_index,
+                });
+                split_start = split_end;
+            }
+            if (valid && split_start < sched->n_splits) {
+                checkpoint_state->ranges.push_back({
+                    /* .split_start = */ split_start,
+                    /* .split_end = */ sched->n_splits,
+                    /* .checkpoint_index = */ -1,
+                });
+            }
+            checkpoint_state->prepared = valid;
+            checkpoint_state->stats.prepared_ranges = valid
+                ? (int) checkpoint_state->ranges.size()
+                : 0;
+            if (!valid) {
+                checkpoint_state->ranges.clear();
+                GGML_LOG_ERROR("%s: failed to resolve layer checkpoints to split ranges\n", __func__);
+            }
+        }
+
+        if (route_candidate_mode &&
+                !ggml_backend_sched_resolve_route_candidate_splits(sched, graph)) {
+            return;
+        }
     }
 
     if (sched->debug) {
@@ -3583,7 +4327,15 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         sched->prev_leaf_backend_ids = tmp;
     }
 
-    int graph_size = std::max(graph->n_nodes, graph->n_leafs) + sched->n_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2*sched->n_copies;
+    int route_lifetime_dependencies = 0;
+    if (route_candidate_mode && route_state->prepared) {
+        for (const auto & group : route_state->groups) {
+            route_lifetime_dependencies += std::max(0, (int) group.variants.size() - 1);
+        }
+    }
+    int graph_size = std::max(graph->n_nodes, graph->n_leafs) +
+        sched->n_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2*sched->n_copies +
+        route_lifetime_dependencies;
 
     // remember the actual graph_size for performing reallocation checks later [GGML_SCHED_DEBUG_REALLOC]
     sched->debug_prev_graph_size = sched->debug_graph_size;
@@ -3600,6 +4352,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->graph.n_leafs = 0;
 
     struct ggml_cgraph * graph_copy = &sched->graph;
+    std::unique_ptr<std::unordered_set<struct ggml_tensor *>> allocated_split_input_copies;
+    if (route_candidate_mode) {
+        allocated_split_input_copies =
+            std::make_unique<std::unordered_set<struct ggml_tensor *>>();
+    }
 
     for (int i = 0; i < sched->n_splits; i++) {
         struct ggml_backend_sched_split * split = &sched->splits[i];
@@ -3611,21 +4368,26 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
         // add inputs to the graph copy so that they are allocated by ggml-alloc at the start of the split
         for (int j = 0; j < split->n_inputs; j++) {
-            assert(graph_copy->size > (graph_copy->n_nodes + 1));
-
             struct ggml_tensor * input = split->inputs[j];
             const size_t input_id = hash_id(input);
             struct ggml_tensor * input_cpy = tensor_id_copy(input_id, split->backend_id, sched->cur_copy);
 
             // add a dependency to the input source so that it is not freed before the copy is done
+            assert(graph_copy->size > graph_copy->n_nodes);
             struct ggml_tensor * input_dep = ggml_view_tensor(sched->ctx, input);
             input_dep->src[0] = input;
             sched->node_backend_ids[graph_copy->n_nodes] = sched->hv_tensor_backend_ids[input_id];
             graph_copy->nodes[graph_copy->n_nodes++] = input_dep;
 
-            // add a dependency to the input copy so that it is allocated at the start of the split
-            sched->node_backend_ids[graph_copy->n_nodes] = split->backend_id;
-            graph_copy->nodes[graph_copy->n_nodes++] = input_cpy;
+            // A physical input copy can be refreshed by several mutually
+            // exclusive route domains. Keep each domain's source dependency,
+            // but add the shared copy tensor to the allocation graph once.
+            if (!route_candidate_mode ||
+                    allocated_split_input_copies->insert(input_cpy).second) {
+                assert(graph_copy->size > graph_copy->n_nodes);
+                sched->node_backend_ids[graph_copy->n_nodes] = split->backend_id;
+                graph_copy->nodes[graph_copy->n_nodes++] = input_cpy;
+            }
         }
 
         for (int j = split->i_start; j < split->i_end; j++) {
@@ -3633,9 +4395,37 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             sched->node_backend_ids[graph_copy->n_nodes] = tensor_backend_id(graph->nodes[j]);
             graph_copy->nodes[graph_copy->n_nodes++] = graph->nodes[j];
         }
+
+        if (route_candidate_mode && route_state->prepared &&
+                route_state->split_to_group[i] >= 0) {
+            const int group_index = route_state->split_to_group[i];
+            const int variant_index = route_state->split_to_variant[i];
+            const auto & group = route_state->groups[group_index];
+            const auto & variant = group.variants[variant_index];
+            if (variant_index != group.canonical_variant_index &&
+                    i + 1 == variant.split_end) {
+                // Alternate terminals are consumed by the scheduler commit,
+                // not by an ordinary graph node. Give ggml-alloc an explicit
+                // post-terminal dependency so their scratch storage can be
+                // reused immediately after commit instead of remaining live
+                // until the end of the whole prefill graph.
+                assert(graph_copy->size > graph_copy->n_nodes);
+                struct ggml_tensor * lifetime_dep =
+                    ggml_view_tensor(sched->ctx, variant.tensor);
+                lifetime_dep->src[0] = variant.tensor;
+                sched->node_backend_ids[graph_copy->n_nodes] =
+                    tensor_backend_id(variant.tensor);
+                graph_copy->nodes[graph_copy->n_nodes++] = lifetime_dep;
+            }
+        }
     }
 
     if (sched->n_copies > 1) {
+        std::unique_ptr<std::unordered_set<struct ggml_tensor *>> allocated_copy_leafs;
+        if (route_candidate_mode) {
+            allocated_copy_leafs =
+                std::make_unique<std::unordered_set<struct ggml_tensor *>>();
+        }
         // add input copies as leafs so that they are allocated first
         for (int i = 0; i < sched->n_graph_inputs; i++) {
             struct ggml_tensor * input = sched->graph_inputs[i];
@@ -3643,6 +4433,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             int backend_id = tensor_backend_id(input);
             for (int c = 0; c < sched->n_copies; c++) {
                 struct ggml_tensor * input_cpy = tensor_id_copy(id, backend_id, c);
+                if (route_candidate_mode &&
+                        !allocated_copy_leafs->insert(input_cpy).second) {
+                    continue;
+                }
                 sched->leaf_backend_ids[graph_copy->n_leafs] = backend_id;
                 assert(graph_copy->size > graph_copy->n_leafs);
                 graph_copy->leafs[graph_copy->n_leafs++] = input_cpy;
@@ -3657,6 +4451,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 size_t id = hash_id(input);
                 for (int c = 0; c < sched->n_copies; c++) {
                     struct ggml_tensor * input_cpy = tensor_id_copy(id, backend_id, c);
+                    if (route_candidate_mode &&
+                            !allocated_copy_leafs->insert(input_cpy).second) {
+                        continue;
+                    }
                     sched->leaf_backend_ids[graph_copy->n_leafs] = backend_id;
                     assert(graph_copy->size > graph_copy->n_leafs);
                     graph_copy->leafs[graph_copy->n_leafs++] = input_cpy;
@@ -4024,9 +4822,156 @@ static void ggml_backend_sched_ffn_worker_trace_append_group(
     }
 }
 
-static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+static uint64_t ggml_backend_sched_accept_layer_checkpoint_plan(
+        ggml_backend_sched_t sched,
+        int checkpoint_index,
+        const struct ggml_tensor * boundary,
+        int split_end,
+        bool graph_start) {
+    ggml_backend_sched_layer_checkpoint_state * state = sched->layer_checkpoints;
+    GGML_ASSERT(state != nullptr);
+    GGML_ASSERT(state->enabled && state->prepared);
+    GGML_ASSERT(graph_start
+        ? checkpoint_index == -1 && boundary == nullptr && split_end == 0
+        : checkpoint_index >= 0 && checkpoint_index < (int) state->checkpoints.size());
+
+    const uint64_t active_before_callback =
+        state->active_plan_id.load(std::memory_order_acquire);
+    // Give the scheduler-thread producer one opportunity to publish a route
+    // observed at this boundary. It runs before the single request snapshot,
+    // so its request can affect the next layer without weakening the race
+    // guarantee for unrelated concurrent publishers during policy acceptance.
+    int64_t producer_us = 0;
+    if (!graph_start && state->request_producer != nullptr) {
+        const int64_t t0_us = ggml_time_us();
+        state->request_producer(
+                checkpoint_index,
+                boundary,
+                split_end,
+                active_before_callback,
+                state->callback_user_data);
+        producer_us = ggml_time_us() - t0_us;
+        state->stats.producer_calls++;
+        state->stats.producer_total_us += (uint64_t) std::max<int64_t>(producer_us, 0);
+        state->stats.producer_max_us = std::max<uint64_t>(
+                state->stats.producer_max_us,
+                (uint64_t) std::max<int64_t>(producer_us, 0));
+    }
+
+    // Take exactly one request snapshot after the synchronous producer. A
+    // writer that publishes while the policy callback runs remains pending
+    // for the next layer boundary.
+    const uint64_t requested_snapshot =
+        state->requested_plan_id.load(std::memory_order_acquire);
+    uint64_t accepted_plan_id = requested_snapshot;
+    state->stats.checkpoint_hits += graph_start ? 0 : 1;
+    state->stats.last_checkpoint_index = checkpoint_index;
+
+    int64_t callback_us = 0;
+    if (state->callback != nullptr) {
+        const int64_t t0_us = ggml_time_us();
+        accepted_plan_id = state->callback(
+                checkpoint_index,
+                boundary,
+                split_end,
+                active_before_callback,
+                requested_snapshot,
+                state->callback_user_data);
+        callback_us = ggml_time_us() - t0_us;
+        state->stats.callback_calls++;
+        state->stats.callback_total_us += (uint64_t) std::max<int64_t>(callback_us, 0);
+        state->stats.callback_max_us = std::max<uint64_t>(
+                state->stats.callback_max_us,
+                (uint64_t) std::max<int64_t>(callback_us, 0));
+    }
+
+    // Only the callback return value becomes active. Never write requested:
+    // rejecting this snapshot must not clobber a newer concurrent request.
+    state->active_plan_id.store(accepted_plan_id, std::memory_order_release);
+    const bool plan_changed = active_before_callback != accepted_plan_id;
+    state->stats.plan_changes += plan_changed ? 1 : 0;
+    state->stats.last_plan_id = accepted_plan_id;
+
+    GGML_LOG_DEBUG(
+            "sched: layer checkpoint %d split_end %d tensor %s active %llu request %llu accepted %llu%s producer %.3f ms callback %.3f ms\n",
+            checkpoint_index,
+            split_end,
+            boundary != nullptr ? boundary->name : "",
+            (unsigned long long) active_before_callback,
+            (unsigned long long) requested_snapshot,
+            (unsigned long long) accepted_plan_id,
+            plan_changed ? " (changed)" : "",
+            (double) producer_us / 1000.0,
+            (double) callback_us / 1000.0);
+    return accepted_plan_id;
+}
+
+static uint64_t ggml_backend_sched_reach_layer_checkpoint(
+        ggml_backend_sched_t sched, int split_id, uint64_t active_plan_id) {
+    ggml_backend_sched_layer_checkpoint_state * state = sched->layer_checkpoints;
+    GGML_ASSERT(state != nullptr);
+    GGML_ASSERT(state->enabled && state->prepared);
+    GGML_ASSERT(split_id >= 0 && split_id < sched->n_splits);
+
+    const int checkpoint_index = sched->splits[split_id].checkpoint_index_after;
+    if (checkpoint_index < 0) {
+        return active_plan_id;
+    }
+
+    GGML_ASSERT(checkpoint_index < (int) state->checkpoints.size());
+    const ggml_backend_sched_layer_checkpoint & checkpoint = state->checkpoints[checkpoint_index];
+    GGML_ASSERT(checkpoint.split_end == split_id + 1);
+    GGML_ASSERT(active_plan_id == state->active_plan_id.load(std::memory_order_acquire));
+
+    return ggml_backend_sched_accept_layer_checkpoint_plan(
+            sched,
+            checkpoint_index,
+            checkpoint.boundary,
+            checkpoint.split_end,
+            false);
+}
+
+template<bool UseLayerCheckpoints, bool UseRouteCandidates>
+static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
+
+    if constexpr (UseLayerCheckpoints) {
+        GGML_ASSERT(sched->layer_checkpoints != nullptr);
+        GGML_ASSERT(sched->layer_checkpoints->enabled && sched->layer_checkpoints->prepared);
+        sched->layer_checkpoints->stats.graph_runs++;
+    }
+
+    uint64_t active_plan_id = 0;
+    if constexpr (UseLayerCheckpoints && !UseRouteCandidates) {
+        active_plan_id = sched->layer_checkpoints->active_plan_id.load(std::memory_order_acquire);
+    }
+    if constexpr (UseRouteCandidates) {
+        GGML_ASSERT(sched->layer_checkpoints != nullptr);
+        GGML_ASSERT(sched->route_candidates != nullptr);
+        GGML_ASSERT(sched->route_candidates->enabled() && sched->route_candidates->prepared);
+        if (sched->callback_eval != nullptr) {
+            GGML_LOG_ERROR("%s: route candidates cannot be combined with callback_eval\n", __func__);
+            return GGML_STATUS_FAILED;
+        }
+        auto & route_stats = sched->route_candidates->stats;
+        if constexpr (UseLayerCheckpoints) {
+            // Run the same policy acceptance used at layer boundaries before
+            // selecting the first route candidate in this graph.
+            active_plan_id = ggml_backend_sched_accept_layer_checkpoint_plan(
+                    sched, -1, nullptr, 0, true);
+        } else {
+            // Route-only mode has no policy callback. Snapshot one request and
+            // make it the scheduler-owned active plan for the whole graph.
+            active_plan_id = sched->layer_checkpoints->requested_plan_id.load(std::memory_order_acquire);
+            sched->layer_checkpoints->active_plan_id.store(active_plan_id, std::memory_order_release);
+        }
+        route_stats.plan_changes += route_stats.plan_latches > 0 &&
+            route_stats.last_active_plan_id != active_plan_id ? 1 : 0;
+        route_stats.plan_latches++;
+        route_stats.last_active_plan_id = active_plan_id;
+        route_stats.graph_runs++;
+    }
 
     const bool trace_enabled = ggml_sched_trace_phase_enabled();
     const int64_t trace_graph_id = trace_enabled ? g_sched_trace.graph_id++ : -1;
@@ -4420,8 +5365,131 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
     };
 
+    auto route_selected_variant = [&](int group_index, bool * plan_miss) {
+        GGML_ASSERT(sched->route_candidates != nullptr);
+        const auto & group = sched->route_candidates->groups[group_index];
+        for (const auto & plan : group.plans) {
+            if (plan.plan_id == active_plan_id) {
+                *plan_miss = false;
+                return plan.variant_index;
+            }
+        }
+        *plan_miss = true;
+        return group.canonical_variant_index;
+    };
+
+    auto latch_route_plan = [&](uint64_t next_plan_id) {
+        if constexpr (UseRouteCandidates) {
+            auto & stats = sched->route_candidates->stats;
+            stats.plan_changes += active_plan_id != next_plan_id ? 1 : 0;
+            stats.plan_latches++;
+            stats.last_active_plan_id = next_plan_id;
+            active_plan_id = next_plan_id;
+        } else {
+            GGML_UNUSED(next_plan_id);
+        }
+    };
+
+    auto commit_route_alternate = [&](
+            int group_index,
+            int variant_index,
+            ggml_backend_sched_trace_io_times * trace_io_times) {
+        if constexpr (!UseRouteCandidates) {
+            GGML_UNUSED(group_index);
+            GGML_UNUSED(variant_index);
+            GGML_UNUSED(trace_io_times);
+            return;
+        } else {
+            auto & state = *sched->route_candidates;
+            auto & group = state.groups[group_index];
+            if (variant_index == group.canonical_variant_index) {
+                return;
+            }
+
+            struct ggml_tensor * variant = group.variants[variant_index].tensor;
+            struct ggml_tensor * canonical = group.canonical;
+            const int variant_split_id = group.variants[variant_index].split_end - 1;
+            const int canonical_split_id =
+                group.variants[group.canonical_variant_index].split_end - 1;
+            GGML_ASSERT(variant_split_id >= 0 && variant_split_id < sched->n_splits);
+            GGML_ASSERT(canonical_split_id >= 0 && canonical_split_id < sched->n_splits);
+            ggml_backend_t variant_backend = sched->backends[splits[variant_split_id].backend_id];
+            ggml_backend_t canonical_backend = sched->backends[splits[canonical_split_id].backend_id];
+
+            const int64_t wait_t0_us = ggml_time_us();
+            ggml_backend_synchronize(variant_backend);
+            // The canonical allocation may reuse storage whose previous user
+            // was submitted asynchronously on the canonical backend. A direct
+            // blocking tensor copy is not guaranteed to be ordered behind that
+            // backend queue, so wait for the destination as well before
+            // overwriting it. This is the correctness-first baseline until the
+            // canonical commit becomes a location-aware queued/zero-copy path.
+            if (canonical_backend != variant_backend) {
+                ggml_backend_synchronize(canonical_backend);
+            }
+            const int64_t wait_t1_us = ggml_time_us();
+            const int64_t copy_t0_us = wait_t1_us;
+            ggml_backend_tensor_copy(variant, canonical);
+            const int64_t copy_t1_us = ggml_time_us();
+            const int64_t wait_us = wait_t1_us - wait_t0_us;
+            const int64_t copy_us = copy_t1_us - copy_t0_us;
+
+            if (trace_io_times != nullptr) {
+                trace_io_times->wait_us += wait_us;
+                trace_io_times->copy_us += copy_us;
+            }
+            ggml_sched_profile_add_wait_us(wait_us);
+            ggml_sched_profile_add_copy_us(copy_us);
+            state.stats.canonical_commits++;
+            state.stats.commit_wait_us += (uint64_t) std::max<int64_t>(wait_us, 0);
+            state.stats.commit_copy_us += (uint64_t) std::max<int64_t>(copy_us, 0);
+        }
+    };
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
+
+        int route_group_index = -1;
+        int route_variant_index = -1;
+        int route_selected_variant_index = -1;
+        bool route_plan_miss = false;
+        if constexpr (UseRouteCandidates) {
+            route_group_index = sched->route_candidates->split_to_group[split_id];
+            route_variant_index = sched->route_candidates->split_to_variant[split_id];
+            if (route_group_index >= 0) {
+                const auto & route_group = sched->route_candidates->groups[route_group_index];
+                const int selected_variant = route_selected_variant(route_group_index, &route_plan_miss);
+                route_selected_variant_index = selected_variant;
+                const auto & route_variant = route_group.variants[route_variant_index];
+                if (split_id == route_variant.split_start) {
+                    auto & stats = sched->route_candidates->stats;
+                    if (route_variant_index == selected_variant) {
+                        stats.groups_executed++;
+                        stats.plan_misses += route_plan_miss ? 1 : 0;
+                        stats.canonical_selected +=
+                            selected_variant == route_group.canonical_variant_index ? 1 : 0;
+                        stats.alternate_selected +=
+                            selected_variant != route_group.canonical_variant_index ? 1 : 0;
+                    }
+                }
+                if (route_variant_index != selected_variant) {
+                    sched->route_candidates->stats.inactive_splits_skipped++;
+                    continue;
+                }
+                GGML_LOG_DEBUG(
+                        "sched: route query %d layer %d plan %llu group %d split %d backend %s tensor %s (%s)\n",
+                        g_sched_trace.query_id,
+                        route_group.layer,
+                        (unsigned long long) active_plan_id,
+                        route_group_index,
+                        split_id,
+                        ggml_backend_name(sched->backends[split->backend_id]),
+                        route_group.variants[route_variant_index].tensor->name,
+                        route_variant_index == route_group.canonical_variant_index
+                            ? "canonical" : "alternate");
+            }
+        }
+
         ggml_backend_t split_backend = sched->backends[split->backend_id];
         const ggml_sched_profile_backend_kind split_bucket = ggml_sched_profile_backend_bucket(split_backend);
 
@@ -4429,9 +5497,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         std::vector<ggml_backend_sched_ffn_branch_info> ffn_group_infos;
         const bool allow_single_ffn_group = sched->debug >= 2;
+        const int ffn_scan_end = route_group_index >= 0
+            ? sched->route_candidates->groups[route_group_index]
+                .variants[route_selected_variant_index].split_end
+            : sched->n_splits;
         const int ffn_group_size = !sched->callback_eval
             ? ggml_backend_sched_collect_parallel_ffn_group(
-                    splits, sched->n_splits, split_id, allow_single_ffn_group, &ffn_group_infos)
+                    splits, ffn_scan_end, split_id, allow_single_ffn_group, &ffn_group_infos)
             : 0;
         if (ffn_group_size > 0) {
             ggml_backend_sched_ffn_worker_timeline * group_timelines = nullptr;
@@ -4725,6 +5797,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 record_split_event(group_split);
             }
 
+            if constexpr (UseRouteCandidates) {
+                const int last_group_split_id = split_id + ffn_group_size - 1;
+                if (route_group_index >= 0 &&
+                        last_group_split_id + 1 ==
+                            sched->route_candidates->groups[route_group_index]
+                                .variants[route_variant_index].split_end) {
+                    commit_route_alternate(
+                            route_group_index,
+                            route_variant_index,
+                            trace_enabled ? &io_times[ffn_group_size - 1] : nullptr);
+                }
+            }
+
             const int64_t copy_us = copy_t1_us - copy_t0_us;
             const int64_t compute_wall_us = compute_t1_us - compute_t0_us;
             const int64_t group_wall_us = group_t1_us - group_t0_us;
@@ -4793,6 +5878,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
             }
 
+            if constexpr (UseLayerCheckpoints) {
+                const int last_group_split_id = split_id + ffn_group_size - 1;
+                if (splits[last_group_split_id].checkpoint_index_after >= 0) {
+                    const uint64_t next_plan_id = ggml_backend_sched_reach_layer_checkpoint(
+                            sched, last_group_split_id, active_plan_id);
+                    if constexpr (UseRouteCandidates) {
+                        latch_route_plan(next_plan_id);
+                    } else {
+                        active_plan_id = next_plan_id;
+                    }
+                }
+            }
             split_id += ffn_group_size - 1;
             continue;
         }
@@ -4808,6 +5905,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             enum ggml_status ec = compute_split_no_callback(split, &dt_us, false, nullptr);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
+            }
+            if constexpr (UseRouteCandidates) {
+                if (route_group_index >= 0 &&
+                        split_id + 1 == sched->route_candidates->groups[route_group_index]
+                            .variants[route_variant_index].split_end) {
+                    commit_route_alternate(
+                            route_group_index,
+                            route_variant_index,
+                            trace_enabled ? &io_times : nullptr);
+                }
             }
             prof_add(split->graph, split_bucket, dt_us);
             record_split_event(split);
@@ -4852,9 +5959,38 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         "callback");
             }
         }
+
+        if constexpr (UseLayerCheckpoints) {
+            if (split->checkpoint_index_after >= 0) {
+                const uint64_t next_plan_id = ggml_backend_sched_reach_layer_checkpoint(
+                        sched, split_id, active_plan_id);
+                if constexpr (UseRouteCandidates) {
+                    latch_route_plan(next_plan_id);
+                } else {
+                    active_plan_id = next_plan_id;
+                }
+            }
+        }
     }
 
     return GGML_STATUS_SUCCESS;
+}
+
+static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+    return ggml_backend_sched_compute_splits_impl<false, false>(sched);
+}
+
+static enum ggml_status ggml_backend_sched_compute_splits_layer_checkpoints(ggml_backend_sched_t sched) {
+    return ggml_backend_sched_compute_splits_impl<true, false>(sched);
+}
+
+static enum ggml_status ggml_backend_sched_compute_splits_route_candidates(ggml_backend_sched_t sched) {
+    return ggml_backend_sched_compute_splits_impl<false, true>(sched);
+}
+
+static enum ggml_status ggml_backend_sched_compute_splits_layer_checkpoints_route_candidates(
+        ggml_backend_sched_t sched) {
+    return ggml_backend_sched_compute_splits_impl<true, true>(sched);
 }
 
 ggml_backend_sched_t ggml_backend_sched_new(
@@ -4869,6 +6005,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
     GGML_ASSERT(ggml_backend_dev_type(ggml_backend_get_device(backends[n_backends - 1])) == GGML_BACKEND_DEVICE_TYPE_CPU);
 
     struct ggml_backend_sched * sched = (ggml_backend_sched *) calloc(1, sizeof(struct ggml_backend_sched));
+    GGML_ASSERT(sched != nullptr);
 
     const char * GGML_SCHED_DEBUG = getenv("GGML_SCHED_DEBUG");
     sched->debug = GGML_SCHED_DEBUG ? atoi(GGML_SCHED_DEBUG) : 0;
@@ -4989,6 +6126,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     // buffers they may reference.
     delete sched->ffn_device_executor;
     sched->ffn_device_executor = nullptr;
+    delete sched->layer_checkpoints;
+    sched->layer_checkpoints = nullptr;
+    delete sched->route_candidates;
+    sched->route_candidates = nullptr;
 
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
@@ -5013,6 +6154,12 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
 
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    if (sched->layer_checkpoints != nullptr) {
+        sched->layer_checkpoints->clear_configuration();
+    }
+    if (sched->route_candidates != nullptr) {
+        sched->route_candidates->clear_configuration();
+    }
     // reset state for the next run
     if (!sched->is_reset) {
         ggml_hash_set_reset(&sched->hash_set);
@@ -5028,7 +6175,18 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
     GGML_ASSERT(sizes);
 
-    ggml_backend_sched_reset(sched);
+    // Runtime-route/checkpoint registrations describe this exact measure
+    // graph. Clearing them here would collapse mutually-exclusive candidates
+    // back into an ordinary graph and make every alternate terminal appear
+    // live until graph end, producing a drastically inflated reserve size.
+    // Callers that install no dynamic configuration retain the legacy reset.
+    const bool has_layer_configuration =
+        sched->layer_checkpoints != nullptr && sched->layer_checkpoints->enabled;
+    const bool has_route_configuration =
+        sched->route_candidates != nullptr && sched->route_candidates->enabled();
+    if (!has_layer_configuration && !has_route_configuration) {
+        ggml_backend_sched_reset(sched);
+    }
 
     ggml_backend_sched_synchronize(sched);
 
@@ -5064,6 +6222,17 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     ggml_backend_sched_split_graph(sched, graph);
 
+    if (sched->layer_checkpoints != nullptr && sched->layer_checkpoints->enabled &&
+            !sched->layer_checkpoints->prepared) {
+        GGML_LOG_ERROR("%s: layer checkpoint preparation failed\n", __func__);
+        return false;
+    }
+    if (sched->route_candidates != nullptr && sched->route_candidates->enabled() &&
+            !sched->route_candidates->prepared) {
+        GGML_LOG_ERROR("%s: route candidate preparation failed\n", __func__);
+        return false;
+    }
+
     if (!ggml_backend_sched_alloc_splits(sched)) {
         return false;
     }
@@ -5091,6 +6260,27 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
         }
     }
 
+    const bool checkpoint_mode =
+        sched->layer_checkpoints != nullptr && sched->layer_checkpoints->enabled;
+    const bool route_candidate_mode =
+        sched->route_candidates != nullptr && sched->route_candidates->enabled();
+    if (route_candidate_mode) {
+        if (!sched->route_candidates->prepared || sched->callback_eval != nullptr) {
+            GGML_LOG_ERROR("%s: invalid prepared route-candidate state\n", __func__);
+            return GGML_STATUS_FAILED;
+        }
+        if (checkpoint_mode) {
+            GGML_ASSERT(sched->layer_checkpoints->prepared);
+            return ggml_backend_sched_compute_splits_layer_checkpoints_route_candidates(sched);
+        }
+        return ggml_backend_sched_compute_splits_route_candidates(sched);
+    }
+
+    if (checkpoint_mode) {
+        GGML_ASSERT(sched->layer_checkpoints->prepared);
+        return ggml_backend_sched_compute_splits_layer_checkpoints(sched);
+    }
+
     return ggml_backend_sched_compute_splits(sched);
 }
 
@@ -5109,8 +6299,335 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
 
 void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data) {
     GGML_ASSERT(sched);
+    if (callback != nullptr && sched->route_candidates != nullptr && sched->route_candidates->enabled()) {
+        GGML_LOG_ERROR("%s: callback_eval is incompatible with registered route candidates\n", __func__);
+        return;
+    }
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+bool ggml_backend_sched_prepare_layer_checkpoints(
+        ggml_backend_sched_t sched,
+        const struct ggml_cgraph * graph,
+        struct ggml_tensor * const * boundaries,
+        int n_boundaries,
+        ggml_backend_sched_layer_checkpoint_request_producer request_producer,
+        ggml_backend_sched_layer_checkpoint_callback callback,
+        void * user_data) {
+    GGML_ASSERT(sched != nullptr);
+
+    if (graph == nullptr || n_boundaries < 0 || (n_boundaries > 0 && boundaries == nullptr)) {
+        GGML_LOG_ERROR("%s: invalid layer checkpoint arguments\n", __func__);
+        return false;
+    }
+    if (sched->is_alloc) {
+        GGML_LOG_ERROR(
+                "%s: checkpoints must be prepared before graph allocation\n",
+                __func__);
+        return false;
+    }
+
+    if (n_boundaries == 0) {
+        if (sched->layer_checkpoints != nullptr) {
+            sched->layer_checkpoints->clear_configuration();
+        }
+        return true;
+    }
+
+    ggml_backend_sched_layer_checkpoint_state * state =
+        ggml_backend_sched_ensure_layer_checkpoint_state(sched);
+    if (state == nullptr) {
+        return false;
+    }
+
+    std::vector<ggml_backend_sched_layer_checkpoint> checkpoints;
+    try {
+        checkpoints.reserve((size_t) n_boundaries);
+    } catch (const std::exception & error) {
+        GGML_LOG_ERROR("%s: failed to reserve checkpoint metadata: %s\n", __func__, error.what());
+        return false;
+    } catch (...) {
+        GGML_LOG_ERROR("%s: failed to reserve checkpoint metadata\n", __func__);
+        return false;
+    }
+
+    int previous_node_index = -1;
+    for (int checkpoint_index = 0; checkpoint_index < n_boundaries; ++checkpoint_index) {
+        struct ggml_tensor * boundary = boundaries[checkpoint_index];
+        if (boundary == nullptr || ggml_is_view_op(boundary->op)) {
+            GGML_LOG_ERROR(
+                    "%s: checkpoint %d must reference a non-view graph node\n",
+                    __func__, checkpoint_index);
+            return false;
+        }
+        if (ggml_backend_sched_is_ffn_parallel_branch_node(boundary)) {
+            GGML_LOG_ERROR(
+                    "%s: checkpoint %d (%s) is inside an FFN parallel branch; "
+                    "use the complete layer output instead\n",
+                    __func__, checkpoint_index, boundary->name);
+            return false;
+        }
+        if (ggml_backend_sched_route_tensor_registered(sched->route_candidates, boundary)) {
+            GGML_LOG_ERROR(
+                    "%s: checkpoint %d (%s) cannot also be a route candidate\n",
+                    __func__, checkpoint_index, boundary->name);
+            return false;
+        }
+
+        int node_index = -1;
+        for (int i = previous_node_index + 1; i < graph->n_nodes; ++i) {
+            if (graph->nodes[i] == boundary) {
+                node_index = i;
+                break;
+            }
+        }
+        if (node_index < 0) {
+            GGML_LOG_ERROR(
+                    "%s: checkpoint %d (%s) is missing, duplicated, or not in graph order\n",
+                    __func__, checkpoint_index, boundary->name);
+            return false;
+        }
+
+        checkpoints.push_back({
+            /* .boundary = */ boundary,
+            /* .node_index = */ node_index,
+            /* .split_end = */ -1,
+        });
+        previous_node_index = node_index;
+    }
+
+    state->clear_configuration();
+    state->configured_graph = graph;
+    state->request_producer = request_producer;
+    state->callback = callback;
+    state->callback_user_data = user_data;
+    state->checkpoints = std::move(checkpoints);
+    state->enabled = true;
+    state->stats.last_checkpoint_index = -1;
+    return true;
+}
+
+void ggml_backend_sched_clear_layer_checkpoints(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched != nullptr);
+    if (sched->layer_checkpoints != nullptr) {
+        sched->layer_checkpoints->clear_configuration();
+    }
+}
+
+void ggml_backend_sched_layer_checkpoint_set_plan_id(ggml_backend_sched_t sched, uint64_t plan_id) {
+    GGML_ASSERT(sched != nullptr);
+    if (sched->layer_checkpoints != nullptr) {
+        sched->layer_checkpoints->requested_plan_id.store(plan_id, std::memory_order_release);
+    }
+}
+
+uint64_t ggml_backend_sched_layer_checkpoint_get_active_plan_id(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched != nullptr);
+    return sched->layer_checkpoints != nullptr
+        ? sched->layer_checkpoints->active_plan_id.load(std::memory_order_acquire)
+        : 0;
+}
+
+int ggml_backend_sched_get_n_layer_checkpoint_ranges(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched != nullptr);
+    const ggml_backend_sched_layer_checkpoint_state * state = sched->layer_checkpoints;
+    return state != nullptr && state->enabled && state->prepared
+        ? (int) state->ranges.size()
+        : 0;
+}
+
+bool ggml_backend_sched_get_layer_checkpoint_range(
+        ggml_backend_sched_t sched,
+        int range_index,
+        struct ggml_backend_sched_layer_checkpoint_range * range) {
+    GGML_ASSERT(sched != nullptr);
+    if (range == nullptr) {
+        return false;
+    }
+
+    const ggml_backend_sched_layer_checkpoint_state * state = sched->layer_checkpoints;
+    if (state == nullptr || !state->enabled || !state->prepared ||
+            range_index < 0 || range_index >= (int) state->ranges.size()) {
+        return false;
+    }
+
+    *range = state->ranges[range_index];
+    return true;
+}
+
+void ggml_backend_sched_get_layer_checkpoint_stats(
+        ggml_backend_sched_t sched,
+        struct ggml_backend_sched_layer_checkpoint_stats * stats) {
+    GGML_ASSERT(sched != nullptr);
+    GGML_ASSERT(stats != nullptr);
+    *stats = sched->layer_checkpoints != nullptr
+        ? sched->layer_checkpoints->stats
+        : ggml_backend_sched_layer_checkpoint_stats {};
+}
+
+void ggml_backend_sched_reset_layer_checkpoint_stats(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched != nullptr);
+    if (sched->layer_checkpoints == nullptr) {
+        return;
+    }
+    const int prepared_ranges = sched->layer_checkpoints->stats.prepared_ranges;
+    sched->layer_checkpoints->stats = {};
+    sched->layer_checkpoints->stats.last_checkpoint_index = -1;
+    sched->layer_checkpoints->stats.prepared_ranges = prepared_ranges;
+}
+
+static bool ggml_backend_sched_register_route_candidate_impl(
+        ggml_backend_sched_t sched,
+        struct ggml_tensor * canonical_first,
+        struct ggml_tensor * canonical,
+        struct ggml_tensor * variant_first,
+        struct ggml_tensor * variant,
+        uint64_t plan_id,
+        int layer,
+        bool subgraph) {
+    GGML_ASSERT(sched != nullptr);
+
+    if (sched->is_alloc) {
+        GGML_LOG_ERROR("%s: route candidates must be registered before graph allocation\n", __func__);
+        return false;
+    }
+    if (sched->n_copies > 1) {
+        GGML_LOG_ERROR(
+                "%s: route candidates do not yet support pipeline/multi-copy scheduling\n",
+                __func__);
+        return false;
+    }
+    if (sched->callback_eval != nullptr) {
+        GGML_LOG_ERROR("%s: route candidates cannot be combined with callback_eval\n", __func__);
+        return false;
+    }
+    if (canonical_first == nullptr || canonical == nullptr ||
+            variant_first == nullptr || variant == nullptr || layer < 0 ||
+            ggml_is_view_op(canonical_first->op) || ggml_is_view_op(canonical->op) ||
+            ggml_is_view_op(variant_first->op) || ggml_is_view_op(variant->op)) {
+        GGML_LOG_ERROR("%s: invalid route-candidate arguments\n", __func__);
+        return false;
+    }
+    if (!subgraph &&
+            (ggml_backend_sched_is_ffn_parallel_branch_node(canonical) ||
+            ggml_backend_sched_is_ffn_parallel_reduce_node(canonical) ||
+            ggml_backend_sched_is_ffn_parallel_branch_node(variant) ||
+            ggml_backend_sched_is_ffn_parallel_reduce_node(variant))) {
+        GGML_LOG_ERROR(
+                "%s: FFN branch/reduce node cannot be a route candidate (%s -> %s)\n",
+                __func__, canonical->name, variant->name);
+        return false;
+    }
+    if (sched->layer_checkpoints != nullptr && sched->layer_checkpoints->enabled) {
+        for (const auto & checkpoint : sched->layer_checkpoints->checkpoints) {
+            if (checkpoint.boundary == canonical_first || checkpoint.boundary == canonical ||
+                    checkpoint.boundary == variant_first || checkpoint.boundary == variant) {
+                GGML_LOG_ERROR(
+                        "%s: route candidate %s is already a checkpoint boundary\n",
+                        __func__, checkpoint.boundary->name);
+                return false;
+            }
+        }
+    }
+
+    auto * state = ggml_backend_sched_ensure_route_candidate_state(sched);
+    if (state == nullptr || ggml_backend_sched_ensure_layer_checkpoint_state(sched) == nullptr) {
+        return false;
+    }
+    for (const auto & registration : state->registrations) {
+        if (registration.canonical == canonical && registration.plan_id == plan_id) {
+            GGML_LOG_ERROR(
+                    "%s: duplicate plan %llu for canonical %s\n",
+                    __func__, (unsigned long long) plan_id, canonical->name);
+            return false;
+        }
+    }
+    try {
+        state->registrations.push_back({
+                canonical_first, canonical, variant_first, variant,
+                plan_id, layer, subgraph });
+    } catch (const std::exception & error) {
+        GGML_LOG_ERROR("%s: failed to store route candidate: %s\n", __func__, error.what());
+        return false;
+    } catch (...) {
+        GGML_LOG_ERROR("%s: failed to store route candidate\n", __func__);
+        return false;
+    }
+    state->prepared = false;
+    state->configured_graph = nullptr;
+    state->groups.clear();
+    state->candidate_nodes.clear();
+    state->node_to_group.clear();
+    state->node_to_variant.clear();
+    state->split_to_group.clear();
+    state->split_to_variant.clear();
+    state->stats.registered_mappings = (int) state->registrations.size();
+    state->stats.prepared_groups = 0;
+    state->stats.prepared_candidate_splits = 0;
+    return true;
+}
+
+bool ggml_backend_sched_register_route_candidate(
+        ggml_backend_sched_t sched,
+        struct ggml_tensor * canonical,
+        struct ggml_tensor * variant,
+        uint64_t plan_id,
+        int layer) {
+    return ggml_backend_sched_register_route_candidate_impl(
+            sched, canonical, canonical, variant, variant,
+            plan_id, layer, false);
+}
+
+bool ggml_backend_sched_register_route_subgraph(
+        ggml_backend_sched_t sched,
+        struct ggml_tensor * canonical_first,
+        struct ggml_tensor * canonical_output,
+        struct ggml_tensor * variant_first,
+        struct ggml_tensor * variant_output,
+        uint64_t plan_id,
+        int layer) {
+    return ggml_backend_sched_register_route_candidate_impl(
+            sched, canonical_first, canonical_output,
+            variant_first, variant_output,
+            plan_id, layer, true);
+}
+
+void ggml_backend_sched_clear_route_candidates(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched != nullptr);
+    if (sched->route_candidates == nullptr) {
+        return;
+    }
+    if (sched->is_alloc) {
+        GGML_LOG_ERROR("%s: reset the scheduler before clearing route candidates\n", __func__);
+        return;
+    }
+    sched->route_candidates->clear_configuration();
+}
+
+void ggml_backend_sched_get_route_candidate_stats(
+        ggml_backend_sched_t sched,
+        struct ggml_backend_sched_route_candidate_stats * stats) {
+    GGML_ASSERT(sched != nullptr);
+    GGML_ASSERT(stats != nullptr);
+    *stats = sched->route_candidates != nullptr
+        ? sched->route_candidates->stats
+        : ggml_backend_sched_route_candidate_stats {};
+}
+
+void ggml_backend_sched_reset_route_candidate_stats(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched != nullptr);
+    if (sched->route_candidates == nullptr) {
+        return;
+    }
+    auto * state = sched->route_candidates;
+    const int registered_mappings = state->stats.registered_mappings;
+    const int prepared_groups = state->stats.prepared_groups;
+    const int prepared_candidate_splits = state->stats.prepared_candidate_splits;
+    state->stats = {};
+    state->stats.registered_mappings = registered_mappings;
+    state->stats.prepared_groups = prepared_groups;
+    state->stats.prepared_candidate_splits = prepared_candidate_splits;
 }
 
 void ggml_backend_sched_set_ffn_parallel_reduce_threads(

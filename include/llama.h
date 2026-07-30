@@ -204,6 +204,15 @@ extern "C" {
         LLAMA_MODULE_BENCH_FFN_NORM,
         LLAMA_MODULE_BENCH_FFN_CORE,
         LLAMA_MODULE_BENCH_L_OUT,
+        // Semantic targets derived from the Llama 3.2 graph. Keep the role
+        // separate from the raw tensor name and ggml op: several nodes have
+        // the same name/shape/op but different dataflow roles.
+        LLAMA_MODULE_BENCH_ATTN_RMS_NORM,
+        LLAMA_MODULE_BENCH_ATTN_NORM_MUL,
+        LLAMA_MODULE_BENCH_FFN_RMS_NORM,
+        LLAMA_MODULE_BENCH_FFN_NORM_MUL,
+        LLAMA_MODULE_BENCH_FFN_PARALLEL_SUM,
+        LLAMA_MODULE_BENCH_FFN_OUT,
     };
 
     enum llama_module_bench_phase {
@@ -548,6 +557,56 @@ extern "C" {
             int64_t gold_khz,
             int64_t prime_khz,
             int64_t gpu_hz);
+
+    // Pre-built layer route selection. A plan may select weightless nodes,
+    // weighted norm subgraphs, and/or an FFN partition as one atomic unit.
+    // It reuses the existing FFN clock snapshot and producer.
+    struct llama_backend_policy_runtime_route_result {
+        bool enabled;
+        bool matched;
+        char profile[LLAMA_BACKEND_POLICY_PROFILE_NAME_MAX];
+        double distance;
+    };
+
+    LLAMA_API bool llama_backend_policy_runtime_route_clock_enabled(void);
+    LLAMA_API struct llama_backend_policy_runtime_route_result llama_backend_policy_select_layer_route_profile(
+            const char * current_profile,
+            bool is_prefill,
+            int32_t input_tokens,
+            int32_t ubatch_tokens,
+            int64_t gold_khz,
+            int64_t prime_khz,
+            int64_t gpu_hz);
+
+    // Optional scheduler-thread producer for pre-built layer routes. It is
+    // called after boundary_layer was dispatched and before the scheduler
+    // snapshots the request for the next layer. ubatch_tokens is taken from
+    // the dispatched l_out tensor, including a smaller final physical ubatch.
+    // The callback may call
+    // llama_runtime_route_request_profile(). Registration and unregistration
+    // must happen while no graph compute is running; userdata must remain
+    // alive until the callback is unregistered or the context is destroyed.
+    typedef void (*llama_runtime_route_layer_producer)(
+            struct llama_context * ctx,
+            int32_t boundary_layer,
+            int32_t ubatch_tokens,
+            void * user_data);
+
+    LLAMA_API bool llama_runtime_route_set_layer_producer(
+            struct llama_context * ctx,
+            llama_runtime_route_layer_producer producer,
+            void * user_data);
+
+    // Thread-safe publication. A request made while a graph is running takes
+    // effect only at the next prepared layer boundary.
+    LLAMA_API bool llama_runtime_route_request_profile(
+            struct llama_context * ctx,
+            const char * profile);
+    // Returns the last scheduler-accepted layer route. The value remains
+    // available while a non-routed phase is active so the next prefill clock
+    // snapshot can select a legal direct transition.
+    LLAMA_API const char * llama_runtime_route_active_profile(
+            const struct llama_context * ctx);
 
     //optional:
     LLAMA_API void llama_numa_init(enum ggml_numa_strategy numa);
