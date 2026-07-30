@@ -119,6 +119,8 @@ struct policy_state {
     std::string active_profile;
     uint64_t profile_generation = 0;
     std::map<std::string, profile_policy> profiles;
+
+    llama_backend_policy_runtime_routes runtime_routes;
 };
 
 std::mutex g_policy_mutex;
@@ -543,32 +545,79 @@ ffn_parallel_policy parse_ffn_parallel(const json & root, const std::string & so
     out.source = source;
     parse_layer_range(root, source, out.layer_start, out.layer_end);
 
-    if (!root.contains("splits") || !root["splits"].is_array()) {
-        throw std::runtime_error(source + ".splits must be an array");
-    }
-
     int i = 0;
     std::unordered_set<std::string> split_ids;
-    for (const auto & item : root["splits"]) {
-        if (!item.is_object()) {
-            throw std::runtime_error(source + ".splits entries must be objects");
+    if (root.contains("splits")) {
+        if (!root["splits"].is_array()) {
+            throw std::runtime_error(source + ".splits must be an array");
         }
-        llama_backend_policy_ffn_split split;
-        split.id = item.value("id", std::string("s") + std::to_string(i));
-        split.start = item.value("start", (int64_t) -1);
-        split.size = item.value("size", (int64_t) -1);
-        split.backend = item.value("backend", std::string());
-        if (split.start < 0 || split.size <= 0 || split.backend.empty()) {
-            throw std::runtime_error(source + ".splits[" + std::to_string(i) + "] requires backend, start, and positive size");
+        if (root.contains("split_layout") || root.contains("split_sizes")) {
+            throw std::runtime_error(
+                    source + " must use either splits or split_layout/split_sizes, not both");
         }
-        if (split.start > std::numeric_limits<int64_t>::max() - split.size) {
-            throw std::runtime_error(source + ".splits[" + std::to_string(i) + "] range overflows int64");
+        for (const auto & item : root["splits"]) {
+            if (!item.is_object()) {
+                throw std::runtime_error(source + ".splits entries must be objects");
+            }
+            llama_backend_policy_ffn_split split;
+            split.id = item.value("id", std::string("s") + std::to_string(i));
+            split.start = item.value("start", (int64_t) -1);
+            split.size = item.value("size", (int64_t) -1);
+            split.backend = item.value("backend", std::string());
+            if (split.start < 0 || split.size <= 0 || split.backend.empty()) {
+                throw std::runtime_error(source + ".splits[" + std::to_string(i) + "] requires backend, start, and positive size");
+            }
+            if (split.start > std::numeric_limits<int64_t>::max() - split.size) {
+                throw std::runtime_error(source + ".splits[" + std::to_string(i) + "] range overflows int64");
+            }
+            if (split.id.empty() || !split_ids.insert(split.id).second) {
+                throw std::runtime_error(source + ".splits ids must be non-empty and unique");
+            }
+            out.splits.push_back(std::move(split));
+            ++i;
         }
-        if (split.id.empty() || !split_ids.insert(split.id).second) {
-            throw std::runtime_error(source + ".splits ids must be non-empty and unique");
+    } else {
+        // Compact form for a family of clock profiles. split_layout carries
+        // the stable backend/id order once (normally through profile_defaults)
+        // while each profile supplies only its split_sizes object.
+        if (!root.contains("split_layout") || !root["split_layout"].is_array() ||
+                !root.contains("split_sizes") || !root["split_sizes"].is_object()) {
+            throw std::runtime_error(
+                    source + " requires splits or split_layout plus split_sizes");
         }
-        out.splits.push_back(std::move(split));
-        ++i;
+
+        int64_t start = 0;
+        for (const auto & item : root["split_layout"]) {
+            if (!item.is_object()) {
+                throw std::runtime_error(source + ".split_layout entries must be objects");
+            }
+            llama_backend_policy_ffn_split split;
+            split.id = item.value("id", std::string());
+            split.backend = item.value("backend", std::string());
+            if (split.id.empty() || split.backend.empty() || !split_ids.insert(split.id).second) {
+                throw std::runtime_error(
+                        source + ".split_layout requires unique non-empty id/backend entries");
+            }
+            if (!root["split_sizes"].contains(split.id) ||
+                    !root["split_sizes"][split.id].is_number_integer()) {
+                throw std::runtime_error(
+                        source + ".split_sizes." + split.id + " must be a positive integer");
+            }
+            split.size = root["split_sizes"][split.id].get<int64_t>();
+            split.start = start;
+            if (split.size <= 0 || start > std::numeric_limits<int64_t>::max() - split.size) {
+                throw std::runtime_error(
+                        source + ".split_sizes." + split.id + " must be a positive non-overflowing integer");
+            }
+            start += split.size;
+            out.splits.push_back(std::move(split));
+            ++i;
+        }
+
+        if ((int) root["split_sizes"].size() != i) {
+            throw std::runtime_error(
+                    source + ".split_sizes contains an id not declared by split_layout");
+        }
     }
 
     if (out.splits.empty()) {
@@ -680,8 +729,16 @@ llama_backend_policy_ffn_parallel materialize_ffn_policy(const ffn_parallel_poli
 
 bool effective_ffn_policy(llama_backend_policy_ffn_parallel & out) {
     ffn_parallel_policy policy = g_policy.ffn_parallel;
-    if (!g_policy.active_profile.empty()) {
-        const auto it = g_policy.profiles.find(g_policy.active_profile);
+    std::string selected_profile = g_policy.active_profile;
+    if (selected_profile.empty() && g_policy.runtime_routes.enabled &&
+            std::find(
+                g_policy.runtime_routes.candidate_kinds.begin(),
+                g_policy.runtime_routes.candidate_kinds.end(),
+                "ffn_block") != g_policy.runtime_routes.candidate_kinds.end()) {
+        selected_profile = g_policy.runtime_routes.initial_profile;
+    }
+    if (!selected_profile.empty()) {
+        const auto it = g_policy.profiles.find(selected_profile);
         if (it != g_policy.profiles.end() && it->second.ffn_parallel.configured) {
             policy = it->second.ffn_parallel;
         }
@@ -766,9 +823,6 @@ void parse_profile_section(
         out.clock_point = parse_clock_point(root["clock_point"], profile_source + ".clock_point");
         if (!out.input_tokens.configured) {
             throw std::runtime_error(profile_source + ".clock_point requires applicability.input_tokens");
-        }
-        if (!out.ffn_parallel.configured) {
-            throw std::runtime_error(profile_source + ".clock_point requires ffn_parallel");
         }
     }
 }
@@ -904,6 +958,91 @@ bool same_clock_frequencies(const ffn_clock_point & lhs, const ffn_clock_point &
            lhs.gpu.frequency == rhs.gpu.frequency;
 }
 
+struct clock_profile_selection {
+    bool matched = false;
+    std::string profile;
+    double distance = -1.0;
+};
+
+clock_profile_selection select_clock_profile_locked(
+        const std::vector<std::string> * candidates,
+        bool require_enabled_ffn,
+        int32_t input_tokens,
+        int32_t ubatch_tokens,
+        int64_t gold_khz,
+        int64_t prime_khz,
+        int64_t gpu_hz) {
+    clock_profile_selection result;
+    if (input_tokens <= 0 || ubatch_tokens <= 0 ||
+        gold_khz <= 0 || prime_khz <= 0 || gpu_hz <= 0) {
+        return result;
+    }
+
+    const profile_policy * best = nullptr;
+    std::string best_name;
+    long double best_distance = std::numeric_limits<long double>::infinity();
+    long double best_total_khz = std::numeric_limits<long double>::infinity();
+    constexpr long double tie_epsilon = 1.0e-15L;
+
+    const auto consider = [&](const std::string & profile_name, const profile_policy & profile) {
+        if (!profile.clock_point.configured ||
+            (require_enabled_ffn &&
+                (!profile.ffn_parallel.configured ||
+                 !env_enabled("LLAMA_FFN_PARALLEL", profile.ffn_parallel.enabled))) ||
+            !token_range_contains(profile.input_tokens, input_tokens) ||
+            !token_range_contains(profile.ubatch_tokens, ubatch_tokens)) {
+            return;
+        }
+
+        const auto relative_error = [](int64_t actual, int64_t target) {
+            return std::fabs((long double) actual - (long double) target) /
+                (long double) target;
+        };
+        const long double distance =
+            relative_error(prime_khz, profile.clock_point.prime.frequency) +
+            relative_error(gold_khz, profile.clock_point.gold.frequency) +
+            relative_error(gpu_hz, profile.clock_point.gpu.frequency);
+        const long double total_khz =
+            (long double) profile.clock_point.prime.frequency +
+            (long double) profile.clock_point.gold.frequency +
+            (long double) profile.clock_point.gpu.frequency / 1000.0L;
+
+        const bool distance_better = distance + tie_epsilon < best_distance;
+        const bool distance_tied = std::fabs(distance - best_distance) <= tie_epsilon;
+        const bool lower_frequency = total_khz + tie_epsilon < best_total_khz;
+        const bool fully_tied = distance_tied &&
+            std::fabs(total_khz - best_total_khz) <= tie_epsilon;
+        if (best == nullptr || distance_better ||
+            (distance_tied && lower_frequency) ||
+            (fully_tied && profile_name < best_name)) {
+            best = &profile;
+            best_name = profile_name;
+            best_distance = distance;
+            best_total_khz = total_khz;
+        }
+    };
+
+    if (candidates == nullptr) {
+        for (const auto & kv : g_policy.profiles) {
+            consider(kv.first, kv.second);
+        }
+    } else {
+        for (const auto & profile_name : *candidates) {
+            const auto it = g_policy.profiles.find(profile_name);
+            if (it != g_policy.profiles.end()) {
+                consider(it->first, it->second);
+            }
+        }
+    }
+
+    if (best != nullptr) {
+        result.matched = true;
+        result.profile = std::move(best_name);
+        result.distance = (double) best_distance;
+    }
+    return result;
+}
+
 bool ffn_policy_matches_layer(const llama_backend_policy_ffn_parallel & policy, int il) {
     if (policy.layer_start == -2) {
         return true;
@@ -955,6 +1094,361 @@ void validate_profile_reference(
     if (!profile.empty() && state.profiles.find(profile) == state.profiles.end()) {
         throw std::runtime_error(source + " references unknown profile '" + profile + "'");
     }
+}
+
+const llama_backend_policy_runtime_route_transition * find_runtime_route_transition(
+        const llama_backend_policy_runtime_routes & routes,
+        const std::string & from_profile) {
+    for (const auto & transition : routes.transitions) {
+        if (transition.from_profile == from_profile) {
+            return &transition;
+        }
+    }
+    return nullptr;
+}
+
+void parse_runtime_routes(const json & root, policy_state & state) {
+    if (!root.contains("runtime_routes")) {
+        return;
+    }
+    if (!root["runtime_routes"].is_object()) {
+        throw std::runtime_error("runtime_routes must be an object");
+    }
+
+    const auto & section = root["runtime_routes"];
+    const bool requested_enabled = section.value("enabled", false);
+    if (!requested_enabled) {
+        // Disabled catalogs are deliberately inert. This keeps a staged or
+        // partially authored section from affecting the legacy path.
+        return;
+    }
+
+    llama_backend_policy_runtime_routes routes;
+    routes.enabled = state.enabled;
+    routes.mode = lower(trim(section.value("mode", std::string("fixed"))));
+    if (routes.mode != "off" && routes.mode != "prepare" && routes.mode != "fixed" && routes.mode != "clock") {
+        throw std::runtime_error("runtime_routes.mode must be off, prepare, fixed, or clock");
+    }
+    if (!routes.enabled || routes.mode == "off") {
+        routes.enabled = false;
+        routes.mode = "off";
+        state.runtime_routes = std::move(routes);
+        return;
+    }
+
+    routes.phase = lower(trim(section.value("phase", std::string("prefill"))));
+    routes.initial_profile = section.value("initial_profile", std::string());
+    routes.profiles = parse_string_array(section, "profiles");
+    routes.candidate_kinds = parse_string_array(section, "candidate_kinds");
+    routes.output_mode = lower(trim(section.value("output_mode", std::string("canonical"))));
+    routes.strict = section.value("strict", false);
+
+    if (!str_eq_ci(routes.phase, "all") &&
+        !str_eq_ci(routes.phase, "prefill") &&
+        !str_eq_ci(routes.phase, "decode")) {
+        throw std::runtime_error("runtime_routes.phase must be all, prefill, or decode");
+    }
+    if (routes.mode == "clock" && routes.phase != "prefill") {
+        throw std::runtime_error(
+                "runtime_routes.mode=clock currently reuses the prefill FFN clock snapshot and requires phase=prefill");
+    }
+    if (routes.initial_profile.empty()) {
+        throw std::runtime_error("runtime_routes.initial_profile must be a non-empty profile name");
+    }
+    if (routes.profiles.empty()) {
+        throw std::runtime_error("runtime_routes.profiles must be a non-empty array");
+    }
+
+    std::unordered_set<std::string> allowed_profiles;
+    for (const auto & profile : routes.profiles) {
+        if (profile.empty()) {
+            throw std::runtime_error("runtime_routes.profiles entries must be non-empty");
+        }
+        if (!allowed_profiles.insert(profile).second) {
+            throw std::runtime_error("runtime_routes.profiles contains duplicate profile '" + profile + "'");
+        }
+        validate_profile_reference(state, profile, "runtime_routes.profiles");
+        if (routes.mode == "clock") {
+            const auto & policy = state.profiles.at(profile);
+            if (!policy.clock_point.configured || !policy.input_tokens.configured) {
+                throw std::runtime_error(
+                        "runtime_routes clock profile '" + profile +
+                        "' requires clock_point and applicability.input_tokens");
+            }
+        }
+    }
+    if (allowed_profiles.find(routes.initial_profile) == allowed_profiles.end()) {
+        throw std::runtime_error(
+                "runtime_routes.initial_profile '" + routes.initial_profile +
+                "' is not in runtime_routes.profiles");
+    }
+
+    if (routes.candidate_kinds.empty()) {
+        routes.candidate_kinds.push_back("weightless_stateless");
+    }
+    std::unordered_set<std::string> candidate_kinds;
+    for (std::string & kind : routes.candidate_kinds) {
+        kind = lower(trim(kind));
+        if (kind != "weightless_stateless" && kind != "weighted_norm" &&
+                kind != "ffn_block") {
+            throw std::runtime_error(
+                    "runtime_routes.candidate_kinds supports only weightless_stateless, weighted_norm, and ffn_block");
+        }
+        if (!candidate_kinds.insert(kind).second) {
+            throw std::runtime_error("runtime_routes.candidate_kinds contains duplicate '" + kind + "'");
+        }
+    }
+
+    if (section.contains("boundary")) {
+        if (!section["boundary"].is_object()) {
+            throw std::runtime_error("runtime_routes.boundary must be an object");
+        }
+        const auto & boundary = section["boundary"];
+        routes.boundary_node = trim(boundary.value("node", routes.boundary_node));
+        routes.boundary_backend = trim(boundary.value("backend", routes.boundary_backend));
+        routes.boundary_granularity = lower(trim(
+                boundary.value("granularity", routes.boundary_granularity)));
+    }
+    // Accept a top-level granularity as a convenience for early policy files,
+    // but reject conflicting declarations rather than silently choosing one.
+    if (section.contains("granularity")) {
+        const std::string granularity = lower(trim(section["granularity"].get<std::string>()));
+        if (section.contains("boundary") &&
+            section["boundary"].contains("granularity") &&
+            granularity != routes.boundary_granularity) {
+            throw std::runtime_error(
+                    "runtime_routes.granularity conflicts with runtime_routes.boundary.granularity");
+        }
+        routes.boundary_granularity = granularity;
+    }
+    if (routes.boundary_node.empty()) {
+        throw std::runtime_error("runtime_routes.boundary.node must be non-empty");
+    }
+    if (routes.mode == "clock" && routes.boundary_node != "l_out") {
+        throw std::runtime_error(
+                "runtime_routes.mode=clock requires boundary.node=l_out so a plan "
+                "observed after layer N can only affect layer N+1");
+    }
+    if (routes.boundary_backend.empty()) {
+        throw std::runtime_error("runtime_routes.boundary.backend must be non-empty");
+    }
+    if (str_eq_ci(routes.boundary_backend, "auto")) {
+        routes.boundary_backend = "auto";
+    }
+    if (routes.boundary_granularity != "layer") {
+        throw std::runtime_error("runtime_routes boundary granularity currently supports only layer");
+    }
+    if (routes.output_mode != "canonical") {
+        throw std::runtime_error("runtime_routes.output_mode currently supports only canonical");
+    }
+
+    if (section.contains("min_dwell_layers")) {
+        if (!section["min_dwell_layers"].is_number_integer()) {
+            throw std::runtime_error("runtime_routes.min_dwell_layers must be a non-negative integer");
+        }
+        const int64_t min_dwell_layers = section["min_dwell_layers"].get<int64_t>();
+        if (min_dwell_layers < 0 || min_dwell_layers > std::numeric_limits<int>::max()) {
+            throw std::runtime_error("runtime_routes.min_dwell_layers must be a non-negative integer");
+        }
+        routes.min_dwell_layers = (int) min_dwell_layers;
+    }
+
+    if (!section.contains("transitions")) {
+        throw std::runtime_error("runtime_routes.transitions is required");
+    }
+    if (section["transitions"].is_string()) {
+        const std::string shorthand = lower(trim(section["transitions"].get<std::string>()));
+        if (shorthand != "complete" && shorthand != "all") {
+            throw std::runtime_error(
+                    "runtime_routes.transitions string must be complete or all");
+        }
+        for (const std::string & from_profile : routes.profiles) {
+            llama_backend_policy_runtime_route_transition transition;
+            transition.from_profile = from_profile;
+            for (const std::string & destination : routes.profiles) {
+                if (destination != from_profile) {
+                    transition.to_profiles.push_back(destination);
+                }
+            }
+            routes.transitions.push_back(std::move(transition));
+        }
+    } else if (section["transitions"].is_object()) {
+        for (auto it = section["transitions"].begin(); it != section["transitions"].end(); ++it) {
+            const std::string from_profile = it.key();
+            if (allowed_profiles.find(from_profile) == allowed_profiles.end()) {
+                throw std::runtime_error(
+                        "runtime_routes.transitions references source profile '" +
+                        from_profile + "' outside runtime_routes.profiles");
+            }
+            if (!it.value().is_array()) {
+                throw std::runtime_error(
+                        "runtime_routes.transitions." + from_profile + " must be an array");
+            }
+
+            llama_backend_policy_runtime_route_transition transition;
+            transition.from_profile = from_profile;
+            std::unordered_set<std::string> destinations;
+            for (const auto & item : it.value()) {
+                if (!item.is_string()) {
+                    throw std::runtime_error(
+                            "runtime_routes.transitions." + from_profile + " entries must be strings");
+                }
+                const std::string destination = item.get<std::string>();
+                if (allowed_profiles.find(destination) == allowed_profiles.end()) {
+                    throw std::runtime_error(
+                            "runtime_routes.transitions." + from_profile + " references profile '" +
+                            destination + "' outside runtime_routes.profiles");
+                }
+                if (!destinations.insert(destination).second) {
+                    throw std::runtime_error(
+                            "runtime_routes.transitions." + from_profile + " contains duplicate profile '" +
+                            destination + "'");
+                }
+                transition.to_profiles.push_back(destination);
+            }
+            routes.transitions.push_back(std::move(transition));
+        }
+    } else {
+        throw std::runtime_error(
+                "runtime_routes.transitions must be an object or complete/all string");
+    }
+
+    auto require_profile_op = [&](const std::string & kind,
+                                  const char * semantic_name,
+                                  const char * op_name) {
+        for (const std::string & profile_name : routes.profiles) {
+            const auto & profile = state.profiles.at(profile_name);
+            const bool found = profile.ops_enabled &&
+                std::any_of(profile.op_rules.begin(), profile.op_rules.end(),
+                        [&](const policy_rule & rule) {
+                            return rule.name == semantic_name &&
+                                str_eq_ci(rule.op, op_name) &&
+                                (rule.phase.empty() || str_eq_ci(rule.phase, "all") ||
+                                 str_eq_ci(rule.phase, "prefill")) &&
+                                !rule.backends.empty();
+                        });
+            if (!found) {
+                throw std::runtime_error(
+                        "runtime_routes " + kind + " profile '" + profile_name +
+                        "' requires an enabled exact " + semantic_name +
+                        " " + op_name + " prefill op rule");
+            }
+        }
+    };
+
+    if (candidate_kinds.find("weighted_norm") != candidate_kinds.end()) {
+        require_profile_op("weighted_norm", "attn_rms_norm", "RMS_NORM");
+        require_profile_op("weighted_norm", "attn_norm", "MUL");
+    }
+
+    if (candidate_kinds.find("ffn_block") != candidate_kinds.end()) {
+        if (state.ffn_clock_switch_enabled) {
+            throw std::runtime_error(
+                    "runtime_routes ffn_block cannot be combined with legacy ffn_clock_switch; "
+                    "the layer plan must be the only FFN clock authority");
+        }
+        int expected_reduce_threads = -1;
+        for (const std::string & profile : routes.profiles) {
+            const auto & ffn = state.profiles.at(profile).ffn_parallel;
+            if (!ffn.configured || !ffn.enabled || ffn.splits.empty()) {
+                throw std::runtime_error(
+                        "runtime_routes ffn_block profile '" + profile +
+                        "' requires an enabled ffn_parallel section");
+            }
+            if (expected_reduce_threads < 0) {
+                expected_reduce_threads = ffn.reduce_threads;
+            } else if (ffn.reduce_threads != expected_reduce_threads) {
+                throw std::runtime_error(
+                        "runtime_routes ffn_block profiles must use the same reduce_threads");
+            }
+        }
+        require_profile_op("ffn_block", "ffn_rms_norm", "RMS_NORM");
+        require_profile_op("ffn_block", "ffn_norm", "MUL");
+    }
+
+    if ((candidate_kinds.find("weighted_norm") != candidate_kinds.end() ||
+         candidate_kinds.find("ffn_block") != candidate_kinds.end()) &&
+            (!state.residency_enabled || state.residency_rules.empty())) {
+        throw std::runtime_error(
+                "runtime_routes weighted_norm/ffn_block requires enabled norm-weight residency rules");
+    }
+
+    // The allowlist is also the model-load/cache memory contract. Requiring
+    // every entry to be reachable prevents a typo from silently expanding the
+    // resident union with candidates that can never be selected.
+    std::unordered_set<std::string> reachable;
+    std::vector<std::string> worklist = { routes.initial_profile };
+    while (!worklist.empty()) {
+        std::string profile = std::move(worklist.back());
+        worklist.pop_back();
+        if (!reachable.insert(profile).second) {
+            continue;
+        }
+        const auto * transition = find_runtime_route_transition(routes, profile);
+        if (transition == nullptr) {
+            continue;
+        }
+        for (const auto & destination : transition->to_profiles) {
+            if (reachable.find(destination) == reachable.end()) {
+                worklist.push_back(destination);
+            }
+        }
+    }
+    if (reachable.size() != routes.profiles.size()) {
+        for (const auto & profile : routes.profiles) {
+            if (reachable.find(profile) == reachable.end()) {
+                throw std::runtime_error(
+                        "runtime_routes profile '" + profile +
+                        "' is not reachable from initial_profile '" + routes.initial_profile + "'");
+            }
+        }
+    }
+
+    if (routes.mode == "clock") {
+        // Normal clocks must be able to walk every throttled route back to the
+        // initial profile through direct layer-safe transitions.
+        for (const auto & start : routes.profiles) {
+            std::unordered_set<std::string> seen;
+            std::vector<std::string> pending = { start };
+            while (!pending.empty()) {
+                std::string profile = std::move(pending.back());
+                pending.pop_back();
+                if (!seen.insert(profile).second || profile == routes.initial_profile) {
+                    continue;
+                }
+                const auto * transition = find_runtime_route_transition(routes, profile);
+                if (transition != nullptr) {
+                    pending.insert(
+                            pending.end(), transition->to_profiles.begin(), transition->to_profiles.end());
+                }
+            }
+            if (seen.find(routes.initial_profile) == seen.end()) {
+                throw std::runtime_error(
+                        "runtime_routes clock profile '" + start +
+                        "' has no transition path back to initial_profile '" +
+                        routes.initial_profile + "'");
+            }
+        }
+
+        // Equal clock points with overlapping token applicability cannot be
+        // distinguished by the reused snapshot selector.
+        for (size_t i = 0; i < routes.profiles.size(); ++i) {
+            const auto & lhs = state.profiles.at(routes.profiles[i]);
+            for (size_t j = i + 1; j < routes.profiles.size(); ++j) {
+                const auto & rhs = state.profiles.at(routes.profiles[j]);
+                if (same_clock_frequencies(lhs.clock_point, rhs.clock_point) &&
+                    token_ranges_overlap(lhs.input_tokens, rhs.input_tokens) &&
+                    token_ranges_overlap(lhs.ubatch_tokens, rhs.ubatch_tokens)) {
+                    throw std::runtime_error(
+                            "runtime_routes profiles '" + routes.profiles[i] + "' and '" +
+                            routes.profiles[j] +
+                            "' have an indistinguishable clock/token selector");
+                }
+            }
+        }
+    }
+
+    state.runtime_routes = std::move(routes);
 }
 
 } // namespace
@@ -1053,6 +1547,14 @@ bool llama_backend_policy_load(const char * path, bool enable_weights, bool enab
             next.thermal_state_file = thermal.value("state_file", std::string());
         }
 
+        json profile_defaults = json::object();
+        if (root.contains("profile_defaults")) {
+            if (!root["profile_defaults"].is_object()) {
+                throw std::runtime_error("profile_defaults must be an object");
+            }
+            profile_defaults = root["profile_defaults"];
+        }
+
         if (root.contains("profiles") && root["profiles"].is_object()) {
             for (auto it = root["profiles"].begin(); it != root["profiles"].end(); ++it) {
                 if (!it.value().is_object()) {
@@ -1063,8 +1565,15 @@ bool llama_backend_policy_load(const char * path, bool enable_weights, bool enab
                             "profile names must be non-empty and shorter than " +
                             std::to_string(LLAMA_BACKEND_POLICY_PROFILE_NAME_MAX) + " bytes");
                 }
+                // RFC 7396 merge-patch semantics make profile_defaults useful
+                // without changing the materialized policy representation:
+                // nested objects merge and arrays such as rules/splits replace.
+                json effective_profile = profile_defaults;
+                effective_profile.merge_patch(it.value());
                 profile_policy profile;
-                parse_profile_section(it.value(), it.key(), next.enabled, enable_weights, enable_ops, profile);
+                parse_profile_section(
+                        effective_profile, it.key(), next.enabled,
+                        enable_weights, enable_ops, profile);
                 next.profiles.emplace(it.key(), std::move(profile));
             }
         }
@@ -1076,13 +1585,15 @@ bool llama_backend_policy_load(const char * path, bool enable_weights, bool enab
         validate_profile_reference(next, next.hot_profile, "thermal_switch.hot_profile");
         validate_profile_reference(next, next.critical_profile, "thermal_switch.critical_profile");
 
+        parse_runtime_routes(root, next);
+
         if (next.ffn_clock_switch_enabled) {
             size_t selectable_profiles = 0;
             for (const auto & kv : next.profiles) {
                 if (kv.second.clock_point.configured &&
                     kv.second.input_tokens.configured &&
                     kv.second.ffn_parallel.configured &&
-                    kv.second.ffn_parallel.enabled) {
+                    env_enabled("LLAMA_FFN_PARALLEL", kv.second.ffn_parallel.enabled)) {
                     ++selectable_profiles;
                 }
             }
@@ -1097,11 +1608,15 @@ bool llama_backend_policy_load(const char * path, bool enable_weights, bool enab
             // Treat that as a configuration error instead of silently choosing
             // whichever profile name happens to sort first.
             for (auto lhs = next.profiles.begin(); lhs != next.profiles.end(); ++lhs) {
-                if (!lhs->second.clock_point.configured) {
+                if (!lhs->second.clock_point.configured ||
+                    !lhs->second.ffn_parallel.configured ||
+                    !env_enabled("LLAMA_FFN_PARALLEL", lhs->second.ffn_parallel.enabled)) {
                     continue;
                 }
                 for (auto rhs = std::next(lhs); rhs != next.profiles.end(); ++rhs) {
-                    if (!rhs->second.clock_point.configured) {
+                    if (!rhs->second.clock_point.configured ||
+                        !rhs->second.ffn_parallel.configured ||
+                        !env_enabled("LLAMA_FFN_PARALLEL", rhs->second.ffn_parallel.enabled)) {
                         continue;
                     }
                     if (same_clock_frequencies(lhs->second.clock_point, rhs->second.clock_point) &&
@@ -1132,6 +1647,14 @@ bool llama_backend_policy_load(const char * path, bool enable_weights, bool enab
                 g_policy.ffn_parallel.enabled ? "on" : "off",
                 g_policy.ffn_clock_switch_enabled ? "on" : "off",
                 g_policy.profiles.size());
+        if (g_policy.runtime_routes.enabled) {
+            LLAMA_LOG_INFO(
+                    "backend_policy: runtime routes enabled (mode=%s, phase=%s, initial=%s, profiles=%zu)\n",
+                    g_policy.runtime_routes.mode.c_str(),
+                    g_policy.runtime_routes.phase.c_str(),
+                    g_policy.runtime_routes.initial_profile.c_str(),
+                    g_policy.runtime_routes.profiles.size());
+        }
         return true;
     } catch (const std::exception & e) {
         LLAMA_LOG_ERROR("backend_policy: failed to parse '%s': %s\n", next.path.c_str(), e.what());
@@ -1186,7 +1709,13 @@ int llama_backend_policy_ffn_parallel_reduce_threads() {
 
 bool llama_backend_policy_ffn_clock_switch_enabled(void) {
     std::lock_guard<std::mutex> lock(g_policy_mutex);
+    const bool layer_plan_owns_ffn = g_policy.runtime_routes.enabled &&
+        g_policy.runtime_routes.mode != "off" &&
+        std::find(g_policy.runtime_routes.candidate_kinds.begin(),
+                g_policy.runtime_routes.candidate_kinds.end(),
+                "ffn_block") != g_policy.runtime_routes.candidate_kinds.end();
     return g_policy.loaded && g_policy.enabled &&
+        !layer_plan_owns_ffn &&
         env_enabled("LLAMA_BACKEND_POLICY_FFN_CLOCK_SWITCH", g_policy.ffn_clock_switch_enabled);
 }
 
@@ -1207,7 +1736,12 @@ struct llama_backend_policy_ffn_clock_result llama_backend_policy_select_ffn_clo
     result.distance = -1.0;
 
     std::lock_guard<std::mutex> lock(g_policy_mutex);
-    result.enabled = g_policy.loaded && g_policy.enabled &&
+    const bool layer_plan_owns_ffn = g_policy.runtime_routes.enabled &&
+        g_policy.runtime_routes.mode != "off" &&
+        std::find(g_policy.runtime_routes.candidate_kinds.begin(),
+                g_policy.runtime_routes.candidate_kinds.end(),
+                "ffn_block") != g_policy.runtime_routes.candidate_kinds.end();
+    result.enabled = g_policy.loaded && g_policy.enabled && !layer_plan_owns_ffn &&
         env_enabled("LLAMA_BACKEND_POLICY_FFN_CLOCK_SWITCH", g_policy.ffn_clock_switch_enabled);
     if (!result.enabled) {
         return result;
@@ -1220,51 +1754,10 @@ struct llama_backend_policy_ffn_clock_result llama_backend_policy_select_ffn_clo
         return result;
     }
 
-    const profile_policy * best = nullptr;
-    std::string best_name;
-    long double best_distance = std::numeric_limits<long double>::infinity();
-    long double best_total_khz = std::numeric_limits<long double>::infinity();
-    constexpr long double tie_epsilon = 1.0e-15L;
-
-    for (const auto & kv : g_policy.profiles) {
-        const auto & profile = kv.second;
-        if (!profile.clock_point.configured ||
-            !profile.ffn_parallel.configured ||
-            !env_enabled("LLAMA_FFN_PARALLEL", profile.ffn_parallel.enabled) ||
-            !token_range_contains(profile.input_tokens, input_tokens) ||
-            !token_range_contains(profile.ubatch_tokens, ubatch_tokens)) {
-            continue;
-        }
-
-        const auto relative_error = [](int64_t actual, int64_t target) {
-            return std::fabs((long double) actual - (long double) target) /
-                (long double) target;
-        };
-        const long double distance =
-            relative_error(prime_khz, profile.clock_point.prime.frequency) +
-            relative_error(gold_khz, profile.clock_point.gold.frequency) +
-            relative_error(gpu_hz, profile.clock_point.gpu.frequency);
-        const long double total_khz =
-            (long double) profile.clock_point.prime.frequency +
-            (long double) profile.clock_point.gold.frequency +
-            (long double) profile.clock_point.gpu.frequency / 1000.0L;
-
-        const bool distance_better = distance + tie_epsilon < best_distance;
-        const bool distance_tied = std::fabs(distance - best_distance) <= tie_epsilon;
-        const bool lower_frequency = total_khz + tie_epsilon < best_total_khz;
-        const bool fully_tied = distance_tied &&
-            std::fabs(total_khz - best_total_khz) <= tie_epsilon;
-        if (best == nullptr || distance_better ||
-            (distance_tied && lower_frequency) ||
-            (fully_tied && kv.first < best_name)) {
-            best = &profile;
-            best_name = kv.first;
-            best_distance = distance;
-            best_total_khz = total_khz;
-        }
-    }
-
-    if (best == nullptr) {
+    const auto selection = select_clock_profile_locked(
+            nullptr, /* require_enabled_ffn = */ true,
+            input_tokens, ubatch_tokens, gold_khz, prime_khz, gpu_hz);
+    if (!selection.matched) {
         if (!g_policy.pending_clock_profile.empty()) {
             g_policy.pending_clock_profile.clear();
             result.pending_changed = true;
@@ -1273,10 +1766,10 @@ struct llama_backend_policy_ffn_clock_result llama_backend_policy_select_ffn_clo
     }
 
     result.matched = true;
-    result.distance = (double) best_distance;
-    std::snprintf(result.profile, sizeof(result.profile), "%s", best_name.c_str());
-    result.pending_changed = best_name != g_policy.pending_clock_profile;
-    g_policy.pending_clock_profile = std::move(best_name);
+    result.distance = selection.distance;
+    std::snprintf(result.profile, sizeof(result.profile), "%s", selection.profile.c_str());
+    result.pending_changed = selection.profile != g_policy.pending_clock_profile;
+    g_policy.pending_clock_profile = selection.profile;
     return result;
 }
 
@@ -1284,6 +1777,17 @@ bool llama_backend_policy_update_runtime_profile(bool is_prefill) {
     std::lock_guard<std::mutex> lock(g_policy_mutex);
 
     if (!g_policy.loaded || !g_policy.enabled) {
+        return false;
+    }
+
+    // A layer-plan graph prebuilds every FFN topology and atomically latches
+    // one plan at l_out. Never let the legacy query-boundary global profile
+    // rebuild that graph or select a different FFN partition authority, even
+    // when an older launcher still exports FFN_CLOCK_SWITCH=on.
+    if (g_policy.runtime_routes.enabled && g_policy.runtime_routes.mode != "off" &&
+            std::find(g_policy.runtime_routes.candidate_kinds.begin(),
+                    g_policy.runtime_routes.candidate_kinds.end(),
+                    "ffn_block") != g_policy.runtime_routes.candidate_kinds.end()) {
         return false;
     }
 
@@ -1446,6 +1950,242 @@ bool llama_backend_policy_match_op(
     return match_op_rules(g_policy.op_rules, g_policy.fallback_priority, base, name, op, il, is_prefill, out);
 }
 
+bool llama_backend_policy_resolve_runtime_routes(
+        bool is_prefill,
+        llama_backend_policy_runtime_routes & out) {
+    std::lock_guard<std::mutex> lock(g_policy_mutex);
+    out = {};
+
+    if (!g_policy.loaded || !g_policy.enabled || !g_policy.runtime_routes.enabled ||
+        !phase_matches(g_policy.runtime_routes.phase, is_prefill)) {
+        return false;
+    }
+
+    out = g_policy.runtime_routes;
+    return true;
+}
+
+bool llama_backend_policy_list_runtime_route_profiles(
+        bool is_prefill,
+        std::vector<std::string> & out) {
+    std::lock_guard<std::mutex> lock(g_policy_mutex);
+    out.clear();
+
+    if (!g_policy.loaded || !g_policy.enabled || !g_policy.runtime_routes.enabled ||
+        !phase_matches(g_policy.runtime_routes.phase, is_prefill)) {
+        return false;
+    }
+
+    out = g_policy.runtime_routes.profiles;
+    return true;
+}
+
+bool llama_backend_policy_list_runtime_route_next_profiles(
+        const char * current_profile,
+        bool is_prefill,
+        std::vector<std::string> & out) {
+    std::lock_guard<std::mutex> lock(g_policy_mutex);
+    out.clear();
+
+    const auto & routes = g_policy.runtime_routes;
+    if (!g_policy.loaded || !g_policy.enabled || !routes.enabled ||
+        !phase_matches(routes.phase, is_prefill)) {
+        return false;
+    }
+
+    const std::string current = current_profile ? current_profile : "";
+    if (current.empty()) {
+        out = routes.profiles;
+        return true;
+    }
+    if (std::find(routes.profiles.begin(), routes.profiles.end(), current) == routes.profiles.end()) {
+        return false;
+    }
+
+    // Remaining on the current route is always legal. Transitions describe
+    // additional candidates, not an obligation to switch at every boundary.
+    out.push_back(current);
+    const auto * transition = find_runtime_route_transition(routes, current);
+    if (transition != nullptr) {
+        for (const auto & destination : transition->to_profiles) {
+            if (std::find(out.begin(), out.end(), destination) == out.end()) {
+                out.push_back(destination);
+            }
+        }
+    }
+    return true;
+}
+
+bool llama_backend_policy_match_op_for_profile(
+        const char * profile_name,
+        const char * base_name,
+        const char * tensor_name,
+        enum ggml_op op,
+        int il,
+        bool is_prefill,
+        llama_backend_policy_match & out) {
+    std::lock_guard<std::mutex> lock(g_policy_mutex);
+    out = {};
+
+    if (!g_policy.loaded || profile_name == nullptr || profile_name[0] == '\0') {
+        return false;
+    }
+    const auto it = g_policy.profiles.find(profile_name);
+    if (it == g_policy.profiles.end() || !it->second.ops_enabled) {
+        return false;
+    }
+
+    return match_op_rules(
+            it->second.op_rules,
+            g_policy.fallback_priority,
+            base_name ? base_name : "",
+            tensor_name ? tensor_name : "",
+            op,
+            il,
+            is_prefill,
+            out);
+}
+
+bool llama_backend_policy_select_runtime_route_profile(
+        const char * current_profile,
+        bool is_prefill,
+        int32_t input_tokens,
+        int32_t ubatch_tokens,
+        int64_t gold_khz,
+        int64_t prime_khz,
+        int64_t gpu_hz,
+        llama_backend_policy_runtime_route_selection & out) {
+    std::lock_guard<std::mutex> lock(g_policy_mutex);
+    out = {};
+
+    const auto & routes = g_policy.runtime_routes;
+    out.enabled = g_policy.loaded && g_policy.enabled && routes.enabled &&
+        routes.mode == "clock" && phase_matches(routes.phase, is_prefill);
+    if (!out.enabled) {
+        return false;
+    }
+
+    const std::string current = current_profile ? current_profile : "";
+    if (!current.empty() &&
+            std::find(routes.profiles.begin(), routes.profiles.end(), current) == routes.profiles.end()) {
+        return false;
+    }
+
+    // Pick the globally best clock profile first. A greedy choice restricted
+    // to current+successors can become permanently stuck when a legal recovery
+    // path contains a temporarily worse intermediate clock point.
+    const auto target = select_clock_profile_locked(
+            &routes.profiles, /* require_enabled_ffn = */ false,
+            input_tokens, ubatch_tokens, gold_khz, prime_khz, gpu_hz);
+    if (!target.matched) {
+        return false;
+    }
+
+    std::string selected_profile = target.profile;
+    if (!current.empty() && current != target.profile) {
+        // runtime_routes validation makes the catalog strongly connected for
+        // clock mode (initial reaches every profile and every profile reaches
+        // initial). Return only the first edge of a shortest legal path so a
+        // layer boundary never jumps across an unprepared transition.
+        std::vector<std::string> queue = { current };
+        std::map<std::string, std::string> predecessor;
+        predecessor.emplace(current, std::string());
+        const auto profile_applies_to_shape = [&](const std::string & profile_name) {
+            const auto profile_it = g_policy.profiles.find(profile_name);
+            return profile_it != g_policy.profiles.end() &&
+                token_range_contains(profile_it->second.input_tokens, input_tokens) &&
+                token_range_contains(profile_it->second.ubatch_tokens, ubatch_tokens);
+        };
+        for (size_t head = 0; head < queue.size() && predecessor.find(target.profile) == predecessor.end(); ++head) {
+            // Keep a value copy: queue growth below may reallocate and would
+            // invalidate a reference to queue[head].
+            const std::string from = queue[head];
+            const auto * transition = find_runtime_route_transition(routes, from);
+            if (transition == nullptr) {
+                continue;
+            }
+            for (const std::string & destination : transition->to_profiles) {
+                // Do not route through an unprofiled graph shape merely because
+                // it gives a shorter topological path. A longer path whose
+                // intermediate plans apply to this ubatch remains eligible.
+                if (!profile_applies_to_shape(destination)) {
+                    continue;
+                }
+                if (predecessor.emplace(destination, from).second) {
+                    queue.push_back(destination);
+                }
+            }
+        }
+        if (predecessor.find(target.profile) == predecessor.end()) {
+            return false;
+        }
+
+        selected_profile = target.profile;
+        while (predecessor.at(selected_profile) != current) {
+            selected_profile = predecessor.at(selected_profile);
+        }
+    }
+
+    // The steady-state path is sampled at every layer boundary, so avoid a
+    // temporary candidate vector and second lookup when the globally closest
+    // profile is already the direct request.
+    if (selected_profile == target.profile) {
+        out.matched = true;
+        out.profile = target.profile;
+        out.distance = target.distance;
+        return true;
+    }
+
+    // Report distance for the intermediate profile actually requested at this
+    // boundary, not the eventual terminal target. This also refuses an
+    // intermediate hop whose token applicability does not cover the current
+    // graph shape.
+    const std::vector<std::string> selected = { selected_profile };
+    const auto hop = select_clock_profile_locked(
+            &selected, /* require_enabled_ffn = */ false,
+            input_tokens, ubatch_tokens, gold_khz, prime_khz, gpu_hz);
+    if (!hop.matched) {
+        return false;
+    }
+
+    out.matched = true;
+    out.profile = hop.profile;
+    out.distance = hop.distance;
+    return true;
+}
+
+bool llama_backend_policy_runtime_route_clock_enabled(void) {
+    llama_backend_policy_runtime_routes routes;
+    if (llama_backend_policy_resolve_runtime_routes(true, routes) && routes.mode == "clock") {
+        return true;
+    }
+    return llama_backend_policy_resolve_runtime_routes(false, routes) && routes.mode == "clock";
+}
+
+struct llama_backend_policy_runtime_route_result llama_backend_policy_select_layer_route_profile(
+        const char * current_profile,
+        bool is_prefill,
+        int32_t input_tokens,
+        int32_t ubatch_tokens,
+        int64_t gold_khz,
+        int64_t prime_khz,
+        int64_t gpu_hz) {
+    llama_backend_policy_runtime_route_result result = {};
+    result.distance = -1.0;
+
+    llama_backend_policy_runtime_route_selection selection;
+    llama_backend_policy_select_runtime_route_profile(
+            current_profile, is_prefill, input_tokens, ubatch_tokens,
+            gold_khz, prime_khz, gpu_hz, selection);
+    result.enabled = selection.enabled;
+    result.matched = selection.matched;
+    result.distance = selection.distance;
+    if (selection.matched) {
+        std::snprintf(result.profile, sizeof(result.profile), "%s", selection.profile.c_str());
+    }
+    return result;
+}
+
 bool llama_backend_policy_match_ffn_parallel(
         int il,
         bool is_prefill,
@@ -1469,6 +2209,48 @@ bool llama_backend_policy_match_ffn_parallel(
     }
 
     return true;
+}
+
+bool llama_backend_policy_match_ffn_parallel_for_profile(
+        const char * profile_name,
+        int il,
+        bool is_prefill,
+        llama_backend_policy_ffn_parallel & out) {
+    std::lock_guard<std::mutex> lock(g_policy_mutex);
+    out = {};
+
+    if (!g_policy.loaded || profile_name == nullptr || profile_name[0] == '\0') {
+        return false;
+    }
+    const auto it = g_policy.profiles.find(profile_name);
+    if (it == g_policy.profiles.end() || !it->second.ffn_parallel.configured ||
+            !it->second.ffn_parallel.enabled) {
+        return false;
+    }
+
+    out = materialize_ffn_policy(it->second.ffn_parallel);
+    if (!out.enabled || !phase_matches(out.phase, is_prefill)) {
+        out = {};
+        return false;
+    }
+    if (out.layer_start != -2 &&
+            (il < out.layer_start || (out.layer_end != -2 && il > out.layer_end))) {
+        out = {};
+        return false;
+    }
+    return true;
+}
+
+uint64_t llama_backend_policy_runtime_route_plan_id(const char * profile_name) {
+    if (profile_name == nullptr || profile_name[0] == '\0') {
+        return 0;
+    }
+    uint64_t hash = 14695981039346656037ULL;
+    for (const unsigned char * ch = (const unsigned char *) profile_name; *ch != '\0'; ++ch) {
+        hash ^= *ch;
+        hash *= 1099511628211ULL;
+    }
+    return hash == 0 ? 1 : hash;
 }
 
 bool llama_backend_policy_match_ffn_parallel_layer(
@@ -1536,8 +2318,25 @@ bool llama_backend_policy_list_ffn_parallel_load_policies(
     }
     append_policy(std::move(base));
 
-    for (const auto & kv : g_policy.profiles) {
-        append_policy(kv.second.ffn_parallel);
+    const bool layer_routed_ffn = g_policy.runtime_routes.enabled &&
+        std::find(g_policy.runtime_routes.candidate_kinds.begin(),
+                g_policy.runtime_routes.candidate_kinds.end(),
+                "ffn_block") != g_policy.runtime_routes.candidate_kinds.end();
+    if (layer_routed_ffn) {
+        // runtime_routes.profiles is the explicit resident-candidate
+        // allowlist.  Profiles kept in the catalog for another experiment
+        // must not silently increase the connected FFN weight-cover union.
+        for (const std::string & profile_name : g_policy.runtime_routes.profiles) {
+            const auto it = g_policy.profiles.find(profile_name);
+            GGML_ASSERT(it != g_policy.profiles.end());
+            append_policy(it->second.ffn_parallel);
+        }
+    } else {
+        // Preserve the legacy query-boundary behavior when FFN blocks are not
+        // owned by the layer route plan.
+        for (const auto & kv : g_policy.profiles) {
+            append_policy(kv.second.ffn_parallel);
+        }
     }
 
     return !out.empty();

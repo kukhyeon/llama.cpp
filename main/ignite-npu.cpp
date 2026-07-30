@@ -74,6 +74,127 @@ static bool env_flag_enabled(const char * name) {
         std::strcmp(env, "true") == 0 || std::strcmp(env, "TRUE") == 0;
 }
 
+struct runtime_route_clock_producer_state {
+    const DVFS * dvfs = nullptr;
+    S25ClockSnapshot requested_clocks;
+    bool enabled = false;
+    bool prefill_active = false;
+    int32_t input_tokens = 0;
+    size_t query_id = 0;
+    uint32_t read_failure_streak = 0;
+    uint32_t skip_boundaries = 0;
+    uint64_t samples = 0;
+    uint64_t read_failures = 0;
+    uint64_t route_requests = 0;
+};
+
+static bool is_power_of_two(uint32_t value) {
+    return value != 0 && (value & (value - 1)) == 0;
+}
+
+static void runtime_route_clock_layer_producer(
+        llama_context * ctx,
+        int32_t boundary_layer,
+        int32_t ubatch_tokens,
+        void * user_data) {
+    auto * state = static_cast<runtime_route_clock_producer_state *>(user_data);
+    if (state == nullptr || !state->enabled || !state->prefill_active ||
+            state->dvfs == nullptr || state->input_tokens <= 0 ||
+            ubatch_tokens <= 0) {
+        return;
+    }
+
+    if (state->skip_boundaries > 0) {
+        --state->skip_boundaries;
+        return;
+    }
+
+    S25ClockSnapshot clocks;
+    ++state->samples;
+    if (!state->dvfs->read_s25_clock_snapshot(clocks)) {
+        ++state->read_failures;
+        ++state->read_failure_streak;
+
+        // A missing sysfs node should not add three failed open/read sequences
+        // to every remaining layer. Retry with an exponential layer-boundary
+        // backoff, capped at one attempt per 16 boundaries, and log only the
+        // first and power-of-two failures.
+        const uint32_t exponent = std::min<uint32_t>(state->read_failure_streak - 1, 4);
+        state->skip_boundaries = (1u << exponent) - 1;
+        if (state->read_failure_streak == 1 ||
+                is_power_of_two(state->read_failure_streak)) {
+            LOG_WRN(
+                    "runtime_routes: query=%zu failed to read layer clock snapshot "
+                    "after layer=%d (streak=%u, retry_after=%u boundaries)\n",
+                    state->query_id,
+                    boundary_layer,
+                    state->read_failure_streak,
+                    state->skip_boundaries);
+        }
+        return;
+    }
+
+    if (state->read_failure_streak > 0) {
+        LOG_DBG(
+                "runtime_routes: layer clock sampling recovered for query=%zu "
+                "after %u failures\n",
+                state->query_id,
+                state->read_failure_streak);
+    }
+    state->read_failure_streak = 0;
+    state->skip_boundaries = 0;
+
+    const std::string active_profile = llama_runtime_route_active_profile(ctx);
+    const auto selection = llama_backend_policy_select_layer_route_profile(
+            active_profile.c_str(),
+            true,
+            state->input_tokens,
+            ubatch_tokens,
+            clocks.cpu_gold_khz,
+            clocks.cpu_prime_khz,
+            clocks.gpu_hz);
+    if (!selection.matched) {
+        return;
+    }
+
+    // Publish every matched selection, including the currently active
+    // profile. A different profile can still be pending after a min-dwell
+    // rejection; republishing the active profile cancels that stale request
+    // before the scheduler takes this boundary's single request snapshot.
+    const bool requests_change = active_profile != selection.profile;
+    const bool accepted = llama_runtime_route_request_profile(ctx, selection.profile);
+    if (accepted && requests_change) {
+        ++state->route_requests;
+    }
+    if (!requests_change) {
+        if (!accepted) {
+            LOG_DBG(
+                    "runtime_routes: failed to refresh active profile=%s "
+                    "at boundary_layer=%d\n",
+                    selection.profile,
+                    boundary_layer);
+        }
+        return;
+    }
+    const bool thermal_drop =
+        clocks.cpu_gold_khz < state->requested_clocks.cpu_gold_khz ||
+        clocks.cpu_prime_khz < state->requested_clocks.cpu_prime_khz ||
+        clocks.gpu_hz < state->requested_clocks.gpu_hz;
+    LOG_DBG(
+            "runtime_routes: layer producer query=%zu boundary_layer=%d "
+            "clock(gold=%lld prime=%lld gpu=%lld) profile=%s distance=%.6f "
+            "thermal_drop=%s request=%s\n",
+            state->query_id,
+            boundary_layer,
+            clocks.cpu_gold_khz,
+            clocks.cpu_prime_khz,
+            clocks.gpu_hz,
+            selection.profile,
+            selection.distance,
+            thermal_drop ? "yes" : "no",
+            accepted ? "accepted" : "rejected");
+}
+
 static bool module_bench_done(
         const common_params & params,
         const std::vector<llama_token> & embd,
@@ -854,17 +975,51 @@ int main(int argc, char ** argv) {
     dvfs.output_filename = params.output_dir + "/hardware_stats.csv";
 
     const bool ffn_clock_switch_enabled = llama_backend_policy_ffn_clock_switch_enabled();
+    const bool runtime_route_clock_enabled = llama_backend_policy_runtime_route_clock_enabled();
     S25ClockSnapshot requested_prefill_clocks;
     const bool requested_prefill_clocks_valid = dvfs.get_s25_clock_targets(
             params.cpu_gold_clk_idx_p,
             params.cpu_prime_clk_idx_p,
             ig->gpu_clk_idx_p,
             requested_prefill_clocks);
+    const bool clock_snapshot_cache_ready =
+        (ffn_clock_switch_enabled || runtime_route_clock_enabled) &&
+        dvfs.init_s25_clock_snapshot_cache();
+    if ((ffn_clock_switch_enabled || runtime_route_clock_enabled) &&
+            !clock_snapshot_cache_ready) {
+        LOG_WRN(
+                "%s: failed to cache S25 current-clock descriptors; clock "
+                "selection will use rate-limited fallback reads\n",
+                __func__);
+    }
     if (ffn_clock_switch_enabled && !requested_prefill_clocks_valid) {
         LOG_WRN(
                 "%s: FFN clock switching requires valid S25 prefill Gold/Prime/GPU "
                 "indices; keeping the base policy until targets are available\n",
                 __func__);
+    }
+    if (runtime_route_clock_enabled && !requested_prefill_clocks_valid) {
+        LOG_WRN(
+                "%s: layer-route clock switching requires valid S25 prefill "
+                "Gold/Prime/GPU indices; keeping the initial route\n",
+                __func__);
+    }
+
+    runtime_route_clock_producer_state route_clock_producer;
+    bool route_clock_producer_registered = false;
+    if (runtime_route_clock_enabled && requested_prefill_clocks_valid) {
+        route_clock_producer.dvfs = &dvfs;
+        route_clock_producer.requested_clocks = requested_prefill_clocks;
+        route_clock_producer.enabled = true;
+        route_clock_producer_registered = llama_runtime_route_set_layer_producer(
+                ctx, runtime_route_clock_layer_producer, &route_clock_producer);
+        if (!route_clock_producer_registered) {
+            route_clock_producer.enabled = false;
+            LOG_WRN(
+                    "%s: failed to register the prefill layer clock producer; "
+                    "runtime routes will remain on their initial profile\n",
+                    __func__);
+        }
     }
 
     std::ofstream ffn_profile_trace;
@@ -1265,6 +1420,15 @@ int main(int argc, char ** argv) {
                 const bool is_prefill_eval =
                     !generation_started && profile_ubatch_tokens > 1;
                 const bool entering_prefill = is_prefill_eval && !prefill_active;
+                if (route_clock_producer_registered) {
+                    route_clock_producer.prefill_active = is_prefill_eval;
+                    route_clock_producer.input_tokens = (int32_t) embd_inp.size();
+                    route_clock_producer.query_id = current_question_index;
+                    if (entering_prefill) {
+                        route_clock_producer.read_failure_streak = 0;
+                        route_clock_producer.skip_boundaries = 0;
+                    }
+                }
                 if (is_prefill_eval) {
                     // prefill phase
                     if (!prefill_active && ig->is_ignite_active) {
@@ -1295,10 +1459,13 @@ int main(int argc, char ** argv) {
                     }
                 }
 
-                if (entering_prefill && ffn_clock_switch_enabled) {
+                if (entering_prefill &&
+                        (ffn_clock_switch_enabled || runtime_route_clock_enabled)) {
                     S25ClockSnapshot clocks;
                     llama_backend_policy_ffn_clock_result selection = {};
                     selection.distance = -1.0;
+                    llama_backend_policy_runtime_route_result route_selection = {};
+                    route_selection.distance = -1.0;
                     const bool clocks_valid = dvfs.read_s25_clock_snapshot(clocks);
                     bool thermal_throttled = false;
 
@@ -1308,62 +1475,100 @@ int main(int argc, char ** argv) {
                             clocks.cpu_prime_khz < requested_prefill_clocks.cpu_prime_khz ||
                             clocks.gpu_hz < requested_prefill_clocks.gpu_hz;
 
-                        if (thermal_throttled) {
+                        if (thermal_throttled && ffn_clock_switch_enabled) {
                             selection = llama_backend_policy_select_ffn_clock_profile(
                                     (int32_t) embd_inp.size(),
                                     (int32_t) profile_ubatch_tokens,
                                     clocks.cpu_gold_khz,
                                     clocks.cpu_prime_khz,
                                     clocks.gpu_hz);
-                        } else {
+                        } else if (ffn_clock_switch_enabled) {
                             selection.enabled = true;
                             selection.pending_changed =
                                 llama_backend_policy_reset_ffn_clock_profile();
                         }
 
-                        if (thermal_throttled && selection.matched) {
-                            LOG_INF(
-                                    "ffn_clock_switch: query=%zu tokens=%zu/%d "
-                                    "clock(gold=%lldkHz prime=%lldkHz gpu=%lldHz) "
-                                    "profile=%s distance=%.6f pending_changed=%s\n",
-                                    current_question_index,
-                                    embd_inp.size(), profile_ubatch_tokens,
+                        if (runtime_route_clock_enabled) {
+                            // Always run the route selector. A normal-clock
+                            // snapshot must walk hot -> warm -> cool through
+                            // the configured direct transitions instead of
+                            // attempting an illegal hot -> initial jump.
+                            route_selection = llama_backend_policy_select_layer_route_profile(
+                                    llama_runtime_route_active_profile(ctx),
+                                    true,
+                                    (int32_t) embd_inp.size(),
+                                    (int32_t) profile_ubatch_tokens,
                                     clocks.cpu_gold_khz,
                                     clocks.cpu_prime_khz,
-                                    clocks.gpu_hz,
-                                    selection.profile,
-                                    selection.distance,
-                                    selection.pending_changed ? "yes" : "no");
-                        } else if (thermal_throttled) {
-                            LOG_WRN(
-                                    "ffn_clock_switch: no profile matches query=%zu "
-                                    "tokens=%zu/%d; keeping the base FFN policy\n",
-                                    current_question_index,
-                                    embd_inp.size(), profile_ubatch_tokens);
-                        } else {
-                            LOG_INF(
-                                    "ffn_clock_switch: query=%zu has no clock drop "
-                                    "(actual gold=%lld prime=%lld gpu=%lld, "
-                                    "requested gold=%lld prime=%lld gpu=%lld); "
-                                    "using the base FFN policy%s\n",
-                                    current_question_index,
-                                    clocks.cpu_gold_khz,
-                                    clocks.cpu_prime_khz,
-                                    clocks.gpu_hz,
-                                    requested_prefill_clocks.cpu_gold_khz,
-                                    requested_prefill_clocks.cpu_prime_khz,
-                                    requested_prefill_clocks.gpu_hz,
-                                    selection.pending_changed ? " (profile reset)" : "");
+                                    clocks.gpu_hz);
+                        }
+
+                        if (ffn_clock_switch_enabled) {
+                            if (thermal_throttled && selection.matched) {
+                                LOG_INF(
+                                        "ffn_clock_switch: query=%zu tokens=%zu/%d "
+                                        "clock(gold=%lldkHz prime=%lldkHz gpu=%lldHz) "
+                                        "profile=%s distance=%.6f pending_changed=%s\n",
+                                        current_question_index,
+                                        embd_inp.size(), profile_ubatch_tokens,
+                                        clocks.cpu_gold_khz,
+                                        clocks.cpu_prime_khz,
+                                        clocks.gpu_hz,
+                                        selection.profile,
+                                        selection.distance,
+                                        selection.pending_changed ? "yes" : "no");
+                            } else if (thermal_throttled) {
+                                LOG_WRN(
+                                        "ffn_clock_switch: no profile matches query=%zu "
+                                        "tokens=%zu/%d; keeping the base FFN policy\n",
+                                        current_question_index,
+                                        embd_inp.size(), profile_ubatch_tokens);
+                            } else {
+                                LOG_INF(
+                                        "ffn_clock_switch: query=%zu has no clock drop "
+                                        "(actual gold=%lld prime=%lld gpu=%lld, "
+                                        "requested gold=%lld prime=%lld gpu=%lld); "
+                                        "using the base FFN policy%s\n",
+                                        current_question_index,
+                                        clocks.cpu_gold_khz,
+                                        clocks.cpu_prime_khz,
+                                        clocks.gpu_hz,
+                                        requested_prefill_clocks.cpu_gold_khz,
+                                        requested_prefill_clocks.cpu_prime_khz,
+                                        requested_prefill_clocks.gpu_hz,
+                                        selection.pending_changed ? " (profile reset)" : "");
+                            }
+                        }
+
+                        if (runtime_route_clock_enabled) {
+                            if (route_selection.matched) {
+                                const bool accepted = llama_runtime_route_request_profile(
+                                        ctx, route_selection.profile);
+                                LOG_INF(
+                                        "runtime_routes: query=%zu clock-selected profile=%s "
+                                        "distance=%.6f thermal_drop=%s request=%s\n",
+                                        current_question_index,
+                                        route_selection.profile,
+                                        route_selection.distance,
+                                        thermal_throttled ? "yes" : "no",
+                                        accepted ? "accepted" : "rejected");
+                            } else {
+                                LOG_WRN(
+                                        "runtime_routes: no layer route matches query=%zu "
+                                        "tokens=%zu/%d; keeping the current route\n",
+                                        current_question_index,
+                                        embd_inp.size(), profile_ubatch_tokens);
+                            }
                         }
                     } else if (!clocks_valid) {
                         LOG_WRN(
-                                "ffn_clock_switch: failed to read the S25 Gold/Prime/GPU "
-                                "clock snapshot for query=%zu; keeping the current FFN profile\n",
+                                "clock_switch: failed to read the S25 Gold/Prime/GPU "
+                                "clock snapshot for query=%zu; keeping current profiles\n",
                                 current_question_index);
                     } else {
                         LOG_WRN(
-                                "ffn_clock_switch: requested S25 prefill clocks are unavailable "
-                                "for query=%zu; keeping the current FFN profile\n",
+                                "clock_switch: requested S25 prefill clocks are unavailable "
+                                "for query=%zu; keeping current profiles\n",
                                 current_question_index);
                     }
 
@@ -1841,6 +2046,16 @@ int main(int argc, char ** argv) {
             n_remain = params.n_predict;
             is_interacting = true;
         }
+    }
+
+    if (route_clock_producer_registered) {
+        (void) llama_runtime_route_set_layer_producer(ctx, nullptr, nullptr);
+        route_clock_producer_registered = false;
+        LOG_DBG(
+                "runtime_routes: layer clock producer samples=%llu failures=%llu requests=%llu\n",
+                (unsigned long long) route_clock_producer.samples,
+                (unsigned long long) route_clock_producer.read_failures,
+                (unsigned long long) route_clock_producer.route_requests);
     }
     
     #if IGNITE_USE_SYSTEM_DVFS

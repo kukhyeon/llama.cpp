@@ -69,7 +69,10 @@ const std::map<std::string, std::vector<std::string>> DVFS::empty_thermal = {
 
 // consturctor
 DVFS::DVFS(const std::string& device_name) : Device(device_name) { output_filename = ""; }
-DVFS::~DVFS() { close_fd_cache(); }
+DVFS::~DVFS() {
+    close_s25_clock_snapshot_cache();
+    close_fd_cache();
+}
 
 
 const std::map<int, std::vector<int>>& DVFS::get_cpu_freq() const {
@@ -120,6 +123,20 @@ bool DVFS::read_s25_clock_snapshot(S25ClockSnapshot & snapshot) const {
         return false;
     }
 
+    {
+        std::lock_guard<std::mutex> lock(s25_clock_read_mu);
+        if (s25_clock_read_fds.ready) {
+            snapshot.cpu_gold_khz =
+                read_fd_positive_integer(s25_clock_read_fds.cpu_gold_fd);
+            snapshot.cpu_prime_khz =
+                read_fd_positive_integer(s25_clock_read_fds.cpu_prime_fd);
+            snapshot.gpu_hz = read_fd_positive_integer(s25_clock_read_fds.gpu_fd);
+            return snapshot.cpu_gold_khz > 0 &&
+                   snapshot.cpu_prime_khz > 0 &&
+                   snapshot.gpu_hz > 0;
+        }
+    }
+
     snapshot.cpu_gold_khz = read_first_positive_integer({
         "/sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq",
         "/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq",
@@ -141,6 +158,88 @@ bool DVFS::read_s25_clock_snapshot(S25ClockSnapshot & snapshot) const {
     return snapshot.cpu_gold_khz > 0 &&
            snapshot.cpu_prime_khz > 0 &&
            snapshot.gpu_hz > 0;
+}
+
+bool DVFS::try_open_read_first(
+        const std::vector<std::string> & candidates,
+        int & out_fd) {
+    for (const auto & path : candidates) {
+        const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            out_fd = fd;
+            return true;
+        }
+    }
+    out_fd = -1;
+    return false;
+}
+
+long long DVFS::read_fd_positive_integer(int fd) {
+    if (fd < 0) {
+        return -1;
+    }
+
+    char buffer[64];
+    ssize_t n;
+    do {
+        n = pread(fd, buffer, sizeof(buffer) - 1, 0);
+    } while (n < 0 && errno == EINTR);
+    if (n <= 0) {
+        return -1;
+    }
+    buffer[n] = '\0';
+
+    char * end = nullptr;
+    errno = 0;
+    const long long value = std::strtoll(buffer, &end, 10);
+    return errno == 0 && end != buffer && value > 0 ? value : -1;
+}
+
+bool DVFS::init_s25_clock_snapshot_cache() {
+    std::lock_guard<std::mutex> lock(s25_clock_read_mu);
+    close_s25_clock_snapshot_cache_nolock();
+
+    if (get_device_name() != "S25") {
+        return false;
+    }
+
+    const bool gold_ok = try_open_read_first({
+        "/sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq",
+        "/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq",
+        "/sys/devices/system/cpu/cpufreq/policy0/cpuinfo_cur_freq",
+        "/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_cur_freq",
+    }, s25_clock_read_fds.cpu_gold_fd);
+    const bool prime_ok = try_open_read_first({
+        "/sys/devices/system/cpu/cpufreq/policy6/scaling_cur_freq",
+        "/sys/devices/system/cpu/cpu6/cpufreq/scaling_cur_freq",
+        "/sys/devices/system/cpu/cpufreq/policy6/cpuinfo_cur_freq",
+        "/sys/devices/system/cpu/cpu6/cpufreq/cpuinfo_cur_freq",
+    }, s25_clock_read_fds.cpu_prime_fd);
+    const bool gpu_ok = try_open_read_first({
+        "/sys/class/devfreq/3d00000.qcom,kgsl-3d0/cur_freq",
+        "/sys/class/kgsl/kgsl-3d0/devfreq/cur_freq",
+        "/sys/devices/platform/soc/3d00000.qcom,kgsl-3d0/devfreq/3d00000.qcom,kgsl-3d0/cur_freq",
+    }, s25_clock_read_fds.gpu_fd);
+
+    if (!gold_ok || !prime_ok || !gpu_ok) {
+        close_s25_clock_snapshot_cache_nolock();
+        return false;
+    }
+
+    s25_clock_read_fds.ready = true;
+    return true;
+}
+
+void DVFS::close_s25_clock_snapshot_cache() {
+    std::lock_guard<std::mutex> lock(s25_clock_read_mu);
+    close_s25_clock_snapshot_cache_nolock();
+}
+
+void DVFS::close_s25_clock_snapshot_cache_nolock() {
+    close_fd(s25_clock_read_fds.cpu_gold_fd);
+    close_fd(s25_clock_read_fds.cpu_prime_fd);
+    close_fd(s25_clock_read_fds.gpu_fd);
+    s25_clock_read_fds.ready = false;
 }
 
 bool DVFS::get_s25_clock_targets(

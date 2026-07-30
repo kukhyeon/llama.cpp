@@ -48,6 +48,38 @@ struct llama_backend_policy_ffn_residency_plan {
     std::string source;
 };
 
+// Optional catalog for pre-built, layer-boundary backend routes. The catalog
+// is inert unless runtime_routes.enabled is true in the policy. Profiles are
+// kept in JSON order, while transitions contain only profiles reachable from
+// initial_profile after load-time validation.
+struct llama_backend_policy_runtime_route_transition {
+    std::string from_profile;
+    std::vector<std::string> to_profiles;
+};
+
+struct llama_backend_policy_runtime_routes {
+    bool enabled = false;
+    std::string mode = "off";
+    std::string phase = "prefill";
+    std::string initial_profile;
+    std::vector<std::string> profiles;
+    std::vector<llama_backend_policy_runtime_route_transition> transitions;
+    std::vector<std::string> candidate_kinds;
+    std::string boundary_node = "l_out";
+    std::string boundary_backend = "auto";
+    std::string boundary_granularity = "layer";
+    std::string output_mode = "canonical";
+    int min_dwell_layers = 1;
+    bool strict = false;
+};
+
+struct llama_backend_policy_runtime_route_selection {
+    bool enabled = false;
+    bool matched = false;
+    std::string profile;
+    double distance = -1.0;
+};
+
 bool llama_backend_policy_weights_enabled();
 bool llama_backend_policy_ops_enabled();
 bool llama_backend_policy_residency_enabled();
@@ -90,10 +122,66 @@ bool llama_backend_policy_match_op(
         bool is_prefill,
         llama_backend_policy_match & out);
 
+// Return the enabled runtime-route catalog when it applies to this phase.
+// With no runtime_routes section, or with enabled=false, these APIs return
+// false and leave their output empty so the legacy query-boundary path is
+// unchanged.
+bool llama_backend_policy_resolve_runtime_routes(
+        bool is_prefill,
+        llama_backend_policy_runtime_routes & out);
+
+bool llama_backend_policy_list_runtime_route_profiles(
+        bool is_prefill,
+        std::vector<std::string> & out);
+
+// List the current route and its direct outgoing transitions. If current is
+// null/empty, the whole validated reachable catalog is returned.
+bool llama_backend_policy_list_runtime_route_next_profiles(
+        const char * current_profile,
+        bool is_prefill,
+        std::vector<std::string> & out);
+
+// Match ops against a named profile without mutating the process-global active
+// profile. This is used while preparing multiple candidate graphs.
+bool llama_backend_policy_match_op_for_profile(
+        const char * profile_name,
+        const char * base_name,
+        const char * tensor_name,
+        enum ggml_op op,
+        int il,
+        bool is_prefill,
+        llama_backend_policy_match & out);
+
+// Select the nearest clock-point route from the current route plus its direct
+// successors. Passing no current route selects from the full reachable
+// catalog. Unlike the legacy FFN selector, profiles do not need ffn_parallel.
+bool llama_backend_policy_select_runtime_route_profile(
+        const char * current_profile,
+        bool is_prefill,
+        int32_t input_tokens,
+        int32_t ubatch_tokens,
+        int64_t gold_khz,
+        int64_t prime_khz,
+        int64_t gpu_hz,
+        llama_backend_policy_runtime_route_selection & out);
+
 bool llama_backend_policy_match_ffn_parallel(
         int il,
         bool is_prefill,
         llama_backend_policy_ffn_parallel & out);
+
+// Resolve one prepared profile without mutating the legacy process-global
+// active profile. Layer-boundary plans use this while constructing all FFN
+// variants up front.
+bool llama_backend_policy_match_ffn_parallel_for_profile(
+        const char * profile_name,
+        int il,
+        bool is_prefill,
+        llama_backend_policy_ffn_parallel & out);
+
+// Stable non-zero identifier shared by graph construction, scheduler route
+// registration, and runtime profile publication.
+uint64_t llama_backend_policy_runtime_route_plan_id(const char * profile_name);
 
 bool llama_backend_policy_match_ffn_parallel_layer(
         int il,

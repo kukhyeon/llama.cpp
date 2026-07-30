@@ -12,6 +12,9 @@
 #include "ggml-opt.h"
 
 #include <map>
+#include <mutex>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 struct llama_model;
@@ -248,6 +251,15 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    // Publish a pre-built layer route. The request is consumed only at a
+    // graph start or a prepared layer boundary; it never mutates the legacy
+    // active FFN profile or rebuilds the graph.
+    bool runtime_route_request_profile(const char * profile);
+    const char * runtime_route_active_profile() const;
+    bool runtime_route_set_layer_producer(
+            llama_runtime_route_layer_producer producer,
+            void * user_data);
+
 private:
     llm_graph_params graph_params(
                         llm_graph_result * res,
@@ -256,6 +268,41 @@ private:
                           llm_graph_type   gtype) const;
 
     llm_graph_cb graph_get_cb() const;
+
+    struct runtime_route_node_meta {
+        int layer = -1;
+        bool ffn_inp = false;
+        bool layer_out = false;
+        bool excluded = false;
+        std::string base_name;
+    };
+
+    struct runtime_route_subgraph_meta {
+        std::string kind;
+        std::string profile;
+        int layer = -1;
+        ggml_tensor * first = nullptr;
+        ggml_tensor * output = nullptr;
+    };
+
+    void runtime_route_graph_begin(bool is_prefill);
+    bool runtime_route_prepare_graph(
+            llm_graph_result * res,
+            ggml_cgraph * gf,
+            bool is_prefill);
+    static uint64_t runtime_route_checkpoint_callback(
+            int checkpoint_index,
+            const struct ggml_tensor * boundary,
+            int split_end,
+            uint64_t active_plan_id,
+            uint64_t requested_plan_id,
+            void * user_data);
+    static void runtime_route_checkpoint_request_producer(
+            int checkpoint_index,
+            const struct ggml_tensor * boundary,
+            int split_end,
+            uint64_t active_plan_id,
+            void * user_data);
 
     // TODO: read/write lora adapters and cvec
     size_t state_write_data(llama_io_write_i & io);
@@ -359,6 +406,24 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
+
+    // Optional prepared layer routes. All graph metadata remains empty
+    // when runtime_routes is absent/disabled, keeping the legacy graph and
+    // scheduler paths unchanged.
+    bool runtime_routes_configured = false;
+    mutable bool runtime_route_collect_metadata = false;
+    mutable std::unordered_map<ggml_tensor *, runtime_route_node_meta> runtime_route_node_metadata;
+    mutable std::vector<runtime_route_subgraph_meta> runtime_route_subgraphs;
+
+    mutable std::mutex runtime_route_mutex;
+    std::string runtime_route_requested_profile_name;
+    std::unordered_map<uint64_t, std::string> runtime_route_plan_names;
+    bool runtime_route_current_is_prefill = true;
+    std::string runtime_route_mode = "off";
+    int runtime_route_min_dwell_layers = 1;
+    int runtime_route_layers_since_switch = 0;
+    llama_runtime_route_layer_producer runtime_route_layer_producer_callback = nullptr;
+    void * runtime_route_layer_producer_user_data = nullptr;
 
     // perf
     mutable int64_t t_start_us  = 0;

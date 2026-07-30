@@ -22,7 +22,7 @@
 
 class Collector;
 
-// Actual S25 clocks sampled at a query boundary.
+// Actual S25 clocks sampled at a query or layer boundary.
 // CPU cpufreq values are exposed in kHz, while KGSL devfreq uses Hz.
 struct S25ClockSnapshot {
     long long cpu_gold_khz  = -1;
@@ -104,12 +104,21 @@ private:
         int ddrqos_prime_max_fd = -1;
     };
 
+    struct S25ClockReadFD {
+        int cpu_gold_fd = -1;
+        int cpu_prime_fd = -1;
+        int gpu_fd = -1;
+        bool ready = false;
+    };
+
     std::vector<CpuPolicyFD> cpu_fds;
     MifFD mif_fds;
     GpuFD gpu_fds;
     S25RamFD s25_ram_fds;
     bool fd_ready = false;
     std::mutex io_mu; // mutex lock guard for fd cache I/O
+    mutable S25ClockReadFD s25_clock_read_fds;
+    mutable std::mutex s25_clock_read_mu;
 
 public:
     std::string output_filename;
@@ -136,9 +145,14 @@ public:
 
     Collector get_collector() { return Collector(this->get_device_name()); }
 
-    // Read-only actual-clock sampling for query-boundary policy selection.
+    // Read-only actual-clock sampling for runtime policy selection.
     // Returns false for non-S25 devices or when any clock cannot be read.
     bool read_s25_clock_snapshot(S25ClockSnapshot & snapshot) const;
+
+    // Cache read-only current-clock descriptors for layer-boundary sampling.
+    // This is independent of the root-only DVFS write cache.
+    bool init_s25_clock_snapshot_cache();
+    void close_s25_clock_snapshot_cache();
 
     // Resolve requested S25 indices to the exact clocks written by the setters.
     bool get_s25_clock_targets(
@@ -158,7 +172,10 @@ private:
     static int write_fd_int(int fd, long long v);
     static void close_fd(int& fd);
     static bool try_open_first(const std::vector<std::string>& candidates, int& out_fd);
+    static bool try_open_read_first(const std::vector<std::string>& candidates, int& out_fd);
+    static long long read_fd_positive_integer(int fd);
     void close_fd_cache_nolock();
+    void close_s25_clock_snapshot_cache_nolock();
 };
 
 #endif //DVFS_H

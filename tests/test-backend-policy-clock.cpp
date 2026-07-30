@@ -316,6 +316,261 @@ bool test_profile_only_residency_keeps_full_source(const char * policy_path) {
     return true;
 }
 
+bool test_runtime_route_catalog(const char * policy_path) {
+    llama_backend_policy_clear();
+    CHECK(llama_backend_policy_load(policy_path, false, true));
+
+    llama_backend_policy_runtime_routes routes;
+    CHECK(llama_backend_policy_resolve_runtime_routes(true, routes));
+    CHECK(routes.enabled);
+    CHECK(routes.mode == "clock");
+    CHECK(routes.phase == "prefill");
+    CHECK(routes.initial_profile == "cool");
+    CHECK(routes.profiles == std::vector<std::string>({ "cool", "warm", "hot" }));
+    CHECK(routes.candidate_kinds == std::vector<std::string>({ "weightless_stateless" }));
+    CHECK(routes.boundary_node == "l_out");
+    CHECK(routes.boundary_backend == "CPU");
+    CHECK(routes.boundary_granularity == "layer");
+    CHECK(routes.output_mode == "canonical");
+    CHECK(routes.min_dwell_layers == 2);
+    CHECK(routes.strict);
+    CHECK(!llama_backend_policy_resolve_runtime_routes(false, routes));
+    CHECK(!routes.enabled);
+
+    std::vector<std::string> profiles;
+    CHECK(llama_backend_policy_list_runtime_route_profiles(true, profiles));
+    CHECK(profiles == std::vector<std::string>({ "cool", "warm", "hot" }));
+    CHECK(!llama_backend_policy_list_runtime_route_profiles(false, profiles));
+    CHECK(profiles.empty());
+
+    CHECK(llama_backend_policy_list_runtime_route_next_profiles("cool", true, profiles));
+    CHECK(profiles == std::vector<std::string>({ "cool", "warm" }));
+    CHECK(llama_backend_policy_list_runtime_route_next_profiles("warm", true, profiles));
+    CHECK(profiles == std::vector<std::string>({ "warm", "cool", "hot" }));
+    CHECK(llama_backend_policy_list_runtime_route_next_profiles(nullptr, true, profiles));
+    CHECK(profiles == std::vector<std::string>({ "cool", "warm", "hot" }));
+    CHECK(!llama_backend_policy_list_runtime_route_next_profiles("unknown", true, profiles));
+    CHECK(profiles.empty());
+
+    llama_backend_policy_match op_match;
+    CHECK(llama_backend_policy_match_op_for_profile(
+            "warm", "attn_rms_norm", "attn_rms_norm-1",
+            GGML_OP_RMS_NORM, 1, true, op_match));
+    CHECK(op_match.matched);
+    CHECK(!op_match.backends.empty());
+    CHECK(op_match.backends.front() == "HTP0");
+    CHECK(!llama_backend_policy_match_op_for_profile(
+            "warm", "other", "other-1", GGML_OP_ADD, 1, true, op_match));
+    CHECK(!llama_backend_policy_match_op_for_profile(
+            "warm", "ffn_rms_norm", "ffn_rms_norm-1",
+            GGML_OP_RMS_NORM, 1, true, op_match));
+    CHECK(!llama_backend_policy_match_op_for_profile(
+            "unknown", "", "", GGML_OP_RMS_NORM, 1, true, op_match));
+
+    const std::string active_before = llama_backend_policy_active_profile();
+    llama_backend_policy_runtime_route_selection selection;
+
+    // The globally closest hot profile is not a direct transition from cool,
+    // so the selector advances only one edge to warm.
+    CHECK(llama_backend_policy_select_runtime_route_profile(
+            "cool", true, 10, 4, 3000, 3000, 3000000, selection));
+    CHECK(selection.enabled);
+    CHECK(selection.matched);
+    CHECK(selection.profile == "warm");
+
+    CHECK(llama_backend_policy_select_runtime_route_profile(
+            "warm", true, 10, 4, 3000, 3000, 3000000, selection));
+    CHECK(selection.profile == "hot");
+    CHECK(std::fabs(selection.distance) < 1.0e-12);
+
+    // Recovery follows the direct transition graph instead of attempting an
+    // illegal hot -> cool reset in one step. warm=4000 is deliberately farther
+    // from the cool=1000 sample than hot=3000, proving selection targets the
+    // global optimum and takes its shortest-path hop rather than getting stuck
+    // in a local greedy minimum.
+    CHECK(llama_backend_policy_select_runtime_route_profile(
+            "hot", true, 10, 4, 1000, 1000, 1000000, selection));
+    CHECK(selection.profile == "warm");
+    CHECK(llama_backend_policy_select_runtime_route_profile(
+            "warm", true, 10, 4, 1000, 1000, 1000000, selection));
+    CHECK(selection.profile == "cool");
+
+    CHECK(llama_backend_policy_select_runtime_route_profile(
+            nullptr, true, 10, 4, 1000, 1000, 1000000, selection));
+    CHECK(selection.profile == "cool");
+
+    CHECK(!llama_backend_policy_select_runtime_route_profile(
+            "cool", true, 10, 4, -1, 1000, 1000000, selection));
+    CHECK(selection.enabled);
+    CHECK(!selection.matched);
+
+    CHECK(!llama_backend_policy_select_runtime_route_profile(
+            "cool", false, 10, 4, 1000, 1000, 1000000, selection));
+    CHECK(!selection.enabled);
+
+    // Candidate selection is intentionally stateless: it must not reuse the
+    // legacy pending/active FFN profile state.
+    CHECK(std::string(llama_backend_policy_active_profile()) == active_before);
+
+    llama_backend_policy_clear();
+    return true;
+}
+
+bool test_disabled_runtime_routes_are_inert(const char * policy_path) {
+    llama_backend_policy_clear();
+    CHECK(llama_backend_policy_load(policy_path, false, false));
+
+    llama_backend_policy_runtime_routes routes;
+    CHECK(!llama_backend_policy_resolve_runtime_routes(true, routes));
+    CHECK(!routes.enabled);
+
+    std::vector<std::string> profiles;
+    CHECK(!llama_backend_policy_list_runtime_route_profiles(true, profiles));
+    CHECK(profiles.empty());
+
+    llama_backend_policy_clear();
+    return true;
+}
+
+bool test_fixed_runtime_routes_do_not_clock_select(const char * policy_path) {
+    llama_backend_policy_clear();
+    CHECK(llama_backend_policy_load(policy_path, false, false));
+
+    llama_backend_policy_runtime_routes routes;
+    CHECK(llama_backend_policy_resolve_runtime_routes(true, routes));
+    CHECK(routes.enabled);
+    CHECK(routes.mode == "fixed");
+    CHECK(routes.initial_profile == "only");
+
+    llama_backend_policy_runtime_route_selection selection;
+    CHECK(!llama_backend_policy_select_runtime_route_profile(
+            "only", true, 10, 4, 1000, 1000, 1000000, selection));
+    CHECK(!selection.enabled);
+    CHECK(!selection.matched);
+
+    llama_backend_policy_clear();
+    return true;
+}
+
+bool test_invalid_runtime_routes_are_transactional(
+        const char * valid_policy_path,
+        const std::vector<const char *> & invalid_policy_paths) {
+    llama_backend_policy_clear();
+    CHECK(llama_backend_policy_load(valid_policy_path, false, true));
+
+    for (const char * invalid_policy_path : invalid_policy_paths) {
+        CHECK(!llama_backend_policy_load(invalid_policy_path, false, true));
+
+        llama_backend_policy_runtime_routes routes;
+        CHECK(llama_backend_policy_resolve_runtime_routes(true, routes));
+        CHECK(routes.initial_profile == "cool");
+        CHECK(routes.profiles.size() == 3);
+    }
+
+    llama_backend_policy_clear();
+    return true;
+}
+
+bool test_compact_unified_ffn_routes(const char * policy_path) {
+    llama_backend_policy_clear();
+    CHECK(llama_backend_policy_load(policy_path, false, true));
+
+    llama_backend_policy_runtime_routes routes;
+    CHECK(llama_backend_policy_resolve_runtime_routes(true, routes));
+    CHECK(routes.initial_profile == "cool");
+    CHECK(routes.profiles == std::vector<std::string>({ "cool", "hot" }));
+    CHECK(routes.candidate_kinds ==
+            std::vector<std::string>({ "weightless_stateless", "weighted_norm", "ffn_block" }));
+
+    std::vector<std::string> next;
+    CHECK(llama_backend_policy_list_runtime_route_next_profiles("cool", true, next));
+    CHECK(next == std::vector<std::string>({ "cool", "hot" }));
+    CHECK(llama_backend_policy_list_runtime_route_next_profiles("hot", true, next));
+    CHECK(next == std::vector<std::string>({ "hot", "cool" }));
+
+    llama_backend_policy_ffn_parallel cool;
+    llama_backend_policy_ffn_parallel hot;
+    CHECK(llama_backend_policy_match_ffn_parallel_for_profile("cool", 0, true, cool));
+    CHECK(llama_backend_policy_match_ffn_parallel_for_profile("hot", 0, true, hot));
+    CHECK(cool.splits.size() == 2 && hot.splits.size() == 2);
+    CHECK(cool.splits[0].id == "npu" && cool.splits[0].start == 0 && cool.splits[0].size == 64);
+    CHECK(cool.splits[1].id == "gpu" && cool.splits[1].start == 64 && cool.splits[1].size == 128);
+    CHECK(hot.splits[0].id == "npu" && hot.splits[0].start == 0 && hot.splits[0].size == 128);
+    CHECK(hot.splits[1].id == "gpu" && hot.splits[1].start == 128 && hot.splits[1].size == 64);
+    CHECK(cool.reduce_threads == 2 && hot.reduce_threads == 2);
+
+    llama_backend_policy_match match;
+    CHECK(llama_backend_policy_match_op_for_profile(
+            "cool", "ffn_rms_norm", "ffn_rms_norm-0",
+            GGML_OP_RMS_NORM, 0, true, match));
+    CHECK(match.backends.front() == "OpenCL");
+    CHECK(llama_backend_policy_match_op_for_profile(
+            "hot", "ffn_rms_norm", "ffn_rms_norm-0",
+            GGML_OP_RMS_NORM, 0, true, match));
+    CHECK(match.backends.front() == "HTP0");
+    CHECK(llama_backend_policy_match_op_for_profile(
+            "hot", "ffn_norm", "ffn_norm-0",
+            GGML_OP_MUL, 0, true, match));
+    CHECK(match.backends.front() == "HTP0-REPACK");
+    CHECK(llama_backend_policy_match_op_for_profile(
+            "cool", "attn_norm", "attn_norm-0",
+            GGML_OP_MUL, 0, true, match));
+    CHECK(match.backends.front() == "CPU");
+    CHECK(llama_backend_policy_match_op_for_profile(
+            "hot", "attn_norm", "attn_norm-0",
+            GGML_OP_MUL, 0, true, match));
+    CHECK(match.backends.front() == "HTP0-REPACK");
+    CHECK(llama_backend_policy_match_op_for_profile(
+            "cool", "ffn_inp", "ffn_inp-0",
+            GGML_OP_ADD, 0, true, match));
+    CHECK(match.backends.front() == "CPU");
+    CHECK(llama_backend_policy_match_op_for_profile(
+            "hot", "ffn_inp", "ffn_inp-0",
+            GGML_OP_ADD, 0, true, match));
+    CHECK(match.backends.front() == "HTP0");
+    CHECK(!llama_backend_policy_match_op_for_profile(
+            "hot", "unrelated_mul", "unrelated_mul-0",
+            GGML_OP_MUL, 0, true, match));
+
+    CHECK(llama_backend_policy_match_residency("blk.0.ffn_norm.weight", match));
+    CHECK(match.backends == std::vector<std::string>({ "CPU", "OpenCL", "HTP0-REPACK" }));
+    CHECK(llama_backend_policy_match_residency("blk.0.attn_norm.weight", match));
+    CHECK(match.backends == std::vector<std::string>({ "CPU", "OpenCL", "HTP0-REPACK" }));
+
+    llama_backend_policy_ffn_residency_plan plan;
+    CHECK(llama_backend_policy_build_ffn_residency_plan(0, plan));
+    CHECK(!plan.keep_full_source);
+
+    std::vector<llama_backend_policy_ffn_parallel> load_policies;
+    CHECK(llama_backend_policy_list_ffn_parallel_load_policies(0, load_policies));
+    for (const auto & policy : load_policies) {
+        int64_t total = 0;
+        for (const auto & split : policy.splits) {
+            CHECK(split.start == total);
+            total += split.size;
+        }
+        // The authored-but-unlisted profile below has a 256-wide cover. It
+        // must not participate in the layer-route residency union.
+        CHECK(total == 192);
+    }
+
+    const uint64_t cool_id = llama_backend_policy_runtime_route_plan_id("cool");
+    const uint64_t hot_id = llama_backend_policy_runtime_route_plan_id("hot");
+    CHECK(cool_id != 0 && hot_id != 0 && cool_id != hot_id);
+
+    // The layer plan is the sole FFN profile authority. An old launcher may
+    // still export FFN_CLOCK_SWITCH=1, but it must not reactivate the legacy
+    // query-boundary graph rebuild path.
+    CHECK(!llama_backend_policy_ffn_clock_switch_enabled());
+    const auto legacy = llama_backend_policy_select_ffn_clock_profile(
+            8, 8, 1000, 1000, 1000000);
+    CHECK(!legacy.enabled && !legacy.matched);
+    CHECK(!llama_backend_policy_update_runtime_profile(true));
+
+    llama_backend_policy_clear();
+    return true;
+}
+
 } // namespace
 
 int main() {
@@ -545,6 +800,385 @@ int main() {
 }
 )JSON";
 
+    static const char * runtime_routes_policy = R"JSON(
+{
+  "enabled": true,
+  "profiles": {
+    "cool": {
+      "clock_point": {
+        "prime": { "index": 0, "khz": 1000 },
+        "gold":  { "index": 0, "khz": 1000 },
+        "gpu":   { "index": 0, "hz": 1000000 }
+      },
+      "applicability": {
+        "input_tokens": [8, 16],
+        "ubatch_tokens": [4, 8]
+      },
+      "ops": {
+        "enabled": true,
+        "rules": [
+          { "op": "RMS_NORM", "phase": "prefill", "backend": "CPU" }
+        ]
+      }
+    },
+    "warm": {
+      "clock_point": {
+        "prime": { "index": 1, "khz": 4000 },
+        "gold":  { "index": 1, "khz": 4000 },
+        "gpu":   { "index": 1, "hz": 4000000 }
+      },
+      "applicability": {
+        "input_tokens": [8, 16],
+        "ubatch_tokens": [4, 8]
+      },
+      "ops": {
+        "enabled": true,
+        "rules": [
+          { "name": "attn_rms_norm", "op": "RMS_NORM", "phase": "prefill", "backend": "HTP0" }
+        ]
+      }
+    },
+    "hot": {
+      "clock_point": {
+        "prime": { "index": 2, "khz": 3000 },
+        "gold":  { "index": 2, "khz": 3000 },
+        "gpu":   { "index": 2, "hz": 3000000 }
+      },
+      "applicability": {
+        "input_tokens": [8, 16],
+        "ubatch_tokens": [4, 8]
+      },
+      "ops": {
+        "enabled": true,
+        "rules": [
+          { "op": "RMS_NORM", "phase": "prefill", "backend": "OpenCL" }
+        ]
+      }
+    }
+  },
+  "runtime_routes": {
+    "enabled": true,
+    "mode": "clock",
+    "phase": "prefill",
+    "initial_profile": "cool",
+    "profiles": ["cool", "warm", "hot"],
+    "transitions": {
+      "cool": ["warm"],
+      "warm": ["cool", "hot"],
+      "hot": ["warm"]
+    },
+    "candidate_kinds": ["weightless_stateless"],
+    "boundary": {
+      "node": "l_out",
+      "backend": "CPU",
+      "granularity": "layer"
+    },
+    "output_mode": "canonical",
+    "min_dwell_layers": 2,
+    "strict": true
+  }
+}
+)JSON";
+
+    static const char * disabled_runtime_routes_policy = R"JSON(
+{
+  "enabled": true,
+  "runtime_routes": {
+    "enabled": false,
+    "profiles": "this disabled section is intentionally incomplete"
+  }
+}
+)JSON";
+
+    static const char * fixed_runtime_routes_policy = R"JSON(
+{
+  "enabled": true,
+  "profiles": {
+    "only": {
+      "clock_point": {
+        "prime": { "index": 0, "khz": 1000 },
+        "gold":  { "index": 0, "khz": 1000 },
+        "gpu":   { "index": 0, "hz": 1000000 }
+      },
+      "applicability": {
+        "input_tokens": [8, 16],
+        "ubatch_tokens": [4, 8]
+      }
+    }
+  },
+  "runtime_routes": {
+    "enabled": true,
+    "initial_profile": "only",
+    "profiles": ["only"],
+    "transitions": {}
+  }
+}
+)JSON";
+
+    static const char * unknown_runtime_route_profile_policy = R"JSON(
+{
+  "enabled": true,
+  "profiles": {
+    "known": {}
+  },
+  "runtime_routes": {
+    "enabled": true,
+    "initial_profile": "known",
+    "profiles": ["known", "missing"],
+    "transitions": {
+      "known": ["missing"]
+    }
+  }
+}
+)JSON";
+
+    static const char * unreachable_runtime_route_profile_policy = R"JSON(
+{
+  "enabled": true,
+  "profiles": {
+    "initial": {},
+    "reachable": {},
+    "orphan": {}
+  },
+  "runtime_routes": {
+    "enabled": true,
+    "initial_profile": "initial",
+    "profiles": ["initial", "reachable", "orphan"],
+    "transitions": {
+      "initial": ["reachable"]
+    }
+  }
+}
+)JSON";
+
+    static const char * unsupported_runtime_route_kind_policy = R"JSON(
+{
+  "enabled": true,
+  "profiles": {
+    "only": {}
+  },
+  "runtime_routes": {
+    "enabled": true,
+    "initial_profile": "only",
+    "profiles": ["only"],
+    "transitions": {},
+    "candidate_kinds": ["resident_weighted"]
+  }
+}
+)JSON";
+
+    static const char * sticky_runtime_route_policy = R"JSON(
+{
+  "enabled": true,
+  "profiles": {
+    "cool": {
+      "clock_point": {
+        "prime": { "index": 0, "khz": 1000 },
+        "gold":  { "index": 0, "khz": 1000 },
+        "gpu":   { "index": 0, "hz": 1000000 }
+      },
+      "applicability": { "input_tokens": [8, 16] }
+    },
+    "hot": {
+      "clock_point": {
+        "prime": { "index": 1, "khz": 2000 },
+        "gold":  { "index": 1, "khz": 2000 },
+        "gpu":   { "index": 1, "hz": 2000000 }
+      },
+      "applicability": { "input_tokens": [8, 16] }
+    }
+  },
+  "runtime_routes": {
+    "enabled": true,
+    "mode": "clock",
+    "phase": "prefill",
+    "initial_profile": "cool",
+    "profiles": ["cool", "hot"],
+    "transitions": { "cool": ["hot"], "hot": [] }
+  }
+}
+)JSON";
+
+    static const char * decode_clock_runtime_route_policy = R"JSON(
+{
+  "enabled": true,
+  "profiles": {
+    "only": {
+      "clock_point": {
+        "prime": { "index": 0, "khz": 1000 },
+        "gold":  { "index": 0, "khz": 1000 },
+        "gpu":   { "index": 0, "hz": 1000000 }
+      },
+      "applicability": { "input_tokens": [8, 16] }
+    }
+  },
+  "runtime_routes": {
+    "enabled": true,
+    "mode": "clock",
+    "phase": "decode",
+    "initial_profile": "only",
+    "profiles": ["only"],
+    "transitions": {}
+  }
+}
+)JSON";
+
+    static const char * ambiguous_runtime_route_policy = R"JSON(
+{
+  "enabled": true,
+  "profiles": {
+    "a": {
+      "clock_point": {
+        "prime": { "index": 0, "khz": 1000 },
+        "gold":  { "index": 0, "khz": 1000 },
+        "gpu":   { "index": 0, "hz": 1000000 }
+      },
+      "applicability": { "input_tokens": [8, 16] }
+    },
+    "b": {
+      "clock_point": {
+        "prime": { "index": 1, "khz": 1000 },
+        "gold":  { "index": 1, "khz": 1000 },
+        "gpu":   { "index": 1, "hz": 1000000 }
+      },
+      "applicability": { "input_tokens": [12, 20] }
+    }
+  },
+  "runtime_routes": {
+    "enabled": true,
+    "mode": "clock",
+    "phase": "prefill",
+    "initial_profile": "a",
+    "profiles": ["a", "b"],
+    "transitions": { "a": ["b"], "b": ["a"] }
+  }
+}
+)JSON";
+
+    static const char * non_layer_boundary_clock_route_policy = R"JSON(
+{
+  "enabled": true,
+  "profiles": {
+    "cool": {
+      "clock_point": {
+        "prime": { "index": 0, "khz": 1000 },
+        "gold":  { "index": 0, "khz": 1000 },
+        "gpu":   { "index": 0, "hz": 1000000 }
+      },
+      "applicability": { "input_tokens": [8, 16] }
+    }
+  },
+  "runtime_routes": {
+    "enabled": true,
+    "mode": "clock",
+    "phase": "prefill",
+    "initial_profile": "cool",
+    "profiles": ["cool"],
+    "transitions": {},
+    "boundary": { "node": "ffn_out", "granularity": "layer" }
+  }
+}
+)JSON";
+
+    static const char * compact_unified_ffn_route_policy = R"JSON(
+{
+  "enabled": true,
+  "ffn_clock_switch": { "enabled": false },
+  "ffn_parallel": {
+    "enabled": true,
+    "phase": "all",
+    "layer_range": [0, 0],
+    "align": 64,
+    "reduce_backend": "CPU",
+    "reduce_threads": 2,
+    "split_layout": [
+      { "id": "npu", "backend": "HTP0-REPACK" },
+      { "id": "gpu", "backend": "OpenCL" }
+    ],
+    "split_sizes": { "npu": 64, "gpu": 128 }
+  },
+  "profile_defaults": {
+    "applicability": {
+      "input_tokens": [8, 8],
+      "ubatch_tokens": [8, 8]
+    },
+    "ffn_parallel": {
+      "enabled": true,
+      "phase": "all",
+      "layer_range": [0, 0],
+      "align": 64,
+      "reduce_backend": "CPU",
+      "reduce_threads": 2,
+      "split_layout": [
+        { "id": "npu", "backend": "HTP0-REPACK" },
+        { "id": "gpu", "backend": "OpenCL" }
+      ]
+    },
+    "ops": {
+      "enabled": true,
+      "rules": [
+        { "name": "attn_rms_norm", "op": "RMS_NORM", "phase": "prefill", "backend": "HTP0" },
+        { "name": "attn_norm", "op": "MUL", "phase": "prefill", "backend": "HTP0-REPACK" },
+        { "name": "ffn_rms_norm", "op": "RMS_NORM", "phase": "prefill", "backend": "HTP0" },
+        { "name": "ffn_norm", "op": "MUL", "phase": "prefill", "backend": "HTP0-REPACK" },
+        { "name": "ffn_inp", "op": "ADD", "phase": "prefill", "backend": "HTP0" }
+      ]
+    }
+  },
+  "profiles": {
+    "cool": {
+      "clock_point": {
+        "prime": { "index": 0, "khz": 1000 },
+        "gold":  { "index": 0, "khz": 1000 },
+        "gpu":   { "index": 0, "hz": 1000000 }
+      },
+      "ffn_parallel": { "split_sizes": { "npu": 64, "gpu": 128 } },
+      "ops": {
+        "rules": [
+          { "name": "attn_rms_norm", "op": "RMS_NORM", "phase": "prefill", "backend": "CPU" },
+          { "name": "attn_norm", "op": "MUL", "phase": "prefill", "backend": "CPU" },
+          { "name": "ffn_rms_norm", "op": "RMS_NORM", "phase": "prefill", "backend": "OpenCL" },
+          { "name": "ffn_norm", "op": "MUL", "phase": "prefill", "backend": "HTP0-REPACK" },
+          { "name": "ffn_inp", "op": "ADD", "phase": "prefill", "backend": "CPU" }
+        ]
+      }
+    },
+    "hot": {
+      "clock_point": {
+        "prime": { "index": 1, "khz": 2000 },
+        "gold":  { "index": 1, "khz": 2000 },
+        "gpu":   { "index": 1, "hz": 2000000 }
+      },
+      "ffn_parallel": { "split_sizes": { "npu": 128, "gpu": 64 } }
+    },
+    "unused": {
+      "ffn_parallel": { "split_sizes": { "npu": 128, "gpu": 128 } }
+    }
+  },
+  "runtime_routes": {
+    "enabled": true,
+    "mode": "clock",
+    "phase": "prefill",
+    "initial_profile": "cool",
+    "profiles": ["cool", "hot"],
+    "transitions": "complete",
+    "candidate_kinds": ["weightless_stateless", "weighted_norm", "ffn_block"],
+    "boundary": { "node": "l_out", "backend": "auto", "granularity": "layer" },
+    "output_mode": "canonical",
+    "strict": true
+  },
+  "residency": {
+    "enabled": true,
+    "rules": [
+      {
+        "pattern": "^blk\\.[0-9]+\\.(attn|ffn)_norm\\.weight$",
+        "copies": ["CPU", "OpenCL", "HTP0-REPACK"]
+      }
+    ]
+  }
+}
+)JSON";
+
     try {
         scoped_environment clock_switch("LLAMA_BACKEND_POLICY_FFN_CLOCK_SWITCH", "1");
         scoped_environment ffn_parallel("LLAMA_FFN_PARALLEL", "1");
@@ -553,6 +1187,30 @@ int main() {
         temporary_policy_file union_file("test-backend-policy-clock-union.json", union_policy);
         temporary_policy_file profile_only_file(
                 "test-backend-policy-clock-profile-only.json", profile_only_policy);
+        temporary_policy_file runtime_routes_file(
+                "test-backend-policy-runtime-routes-valid.json", runtime_routes_policy);
+        temporary_policy_file disabled_runtime_routes_file(
+                "test-backend-policy-runtime-routes-disabled.json", disabled_runtime_routes_policy);
+        temporary_policy_file fixed_runtime_routes_file(
+                "test-backend-policy-runtime-routes-fixed.json", fixed_runtime_routes_policy);
+        temporary_policy_file unknown_runtime_route_profile_file(
+                "test-backend-policy-runtime-routes-unknown-profile.json", unknown_runtime_route_profile_policy);
+        temporary_policy_file unreachable_runtime_route_profile_file(
+                "test-backend-policy-runtime-routes-unreachable.json", unreachable_runtime_route_profile_policy);
+        temporary_policy_file unsupported_runtime_route_kind_file(
+                "test-backend-policy-runtime-routes-kind.json", unsupported_runtime_route_kind_policy);
+        temporary_policy_file sticky_runtime_route_file(
+                "test-backend-policy-runtime-routes-sticky.json", sticky_runtime_route_policy);
+        temporary_policy_file decode_clock_runtime_route_file(
+                "test-backend-policy-runtime-routes-decode-clock.json", decode_clock_runtime_route_policy);
+        temporary_policy_file ambiguous_runtime_route_file(
+                "test-backend-policy-runtime-routes-ambiguous.json", ambiguous_runtime_route_policy);
+        temporary_policy_file non_layer_boundary_clock_route_file(
+                "test-backend-policy-runtime-routes-non-layer-boundary.json",
+                non_layer_boundary_clock_route_policy);
+        temporary_policy_file compact_unified_ffn_route_file(
+                "test-backend-policy-runtime-routes-compact-ffn.json",
+                compact_unified_ffn_route_policy);
 
         if (!test_clock_profile_selection(valid_file.path())) {
             llama_backend_policy_clear();
@@ -567,6 +1225,36 @@ int main() {
             return 1;
         }
         if (!test_profile_only_residency_keeps_full_source(profile_only_file.path())) {
+            llama_backend_policy_clear();
+            return 1;
+        }
+        if (!test_runtime_route_catalog(runtime_routes_file.path())) {
+            llama_backend_policy_clear();
+            return 1;
+        }
+        if (!test_disabled_runtime_routes_are_inert(disabled_runtime_routes_file.path())) {
+            llama_backend_policy_clear();
+            return 1;
+        }
+        if (!test_fixed_runtime_routes_do_not_clock_select(fixed_runtime_routes_file.path())) {
+            llama_backend_policy_clear();
+            return 1;
+        }
+        if (!test_invalid_runtime_routes_are_transactional(
+                runtime_routes_file.path(),
+                {
+                    unknown_runtime_route_profile_file.path(),
+                    unreachable_runtime_route_profile_file.path(),
+                    unsupported_runtime_route_kind_file.path(),
+                    sticky_runtime_route_file.path(),
+                    decode_clock_runtime_route_file.path(),
+                    ambiguous_runtime_route_file.path(),
+                    non_layer_boundary_clock_route_file.path(),
+                })) {
+            llama_backend_policy_clear();
+            return 1;
+        }
+        if (!test_compact_unified_ffn_routes(compact_unified_ffn_route_file.path())) {
             llama_backend_policy_clear();
             return 1;
         }

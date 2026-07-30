@@ -112,6 +112,24 @@ static llama_module_bench_type common_arg_parse_module_bench_type(const std::str
     if (v == "l_out") {
         return LLAMA_MODULE_BENCH_L_OUT;
     }
+    if (v == "attn_rms_norm") {
+        return LLAMA_MODULE_BENCH_ATTN_RMS_NORM;
+    }
+    if (v == "attn_norm_mul") {
+        return LLAMA_MODULE_BENCH_ATTN_NORM_MUL;
+    }
+    if (v == "ffn_rms_norm") {
+        return LLAMA_MODULE_BENCH_FFN_RMS_NORM;
+    }
+    if (v == "ffn_norm_mul" || v == "weighted_mul") {
+        return LLAMA_MODULE_BENCH_FFN_NORM_MUL;
+    }
+    if (v == "ffn_parallel_sum") {
+        return LLAMA_MODULE_BENCH_FFN_PARALLEL_SUM;
+    }
+    if (v == "ffn_out") {
+        return LLAMA_MODULE_BENCH_FFN_OUT;
+    }
     throw std::runtime_error(string_format("unknown --module-bench value '%s'", value.c_str()));
 }
 
@@ -1283,8 +1301,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_BACKEND_POLICY_OPS"));
     add_opt(common_arg(
-        {"--module-bench"}, "off|attn_norm|attn_projection|attn_score|attn_out_proj|input_get_rows|ffn_inp|ffn_norm|ffn_core|l_out",
-        "enable experimental module-only micro-benchmark graph (default: off)",
+        {"--module-bench"}, "off|attn_norm|attn_rms_norm|attn_norm_mul|attn_projection|attn_score|attn_out_proj|input_get_rows|ffn_inp|ffn_norm|ffn_rms_norm|ffn_norm_mul|ffn_core|ffn_parallel_sum|ffn_out|l_out",
+        "enable a semantic-node/module micro-benchmark graph (default: off)",
         [](common_params & params, const std::string & value) {
             params.module_bench_type = common_arg_parse_module_bench_type(value);
         }
@@ -1319,7 +1337,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_MODULE_BENCH_LAYER_RANGE"));
     add_opt(common_arg(
         {"--module-bench-trace"}, "FNAME",
-        "CSV path for module-bench synchronized wall-time measurements",
+        "CSV path for synchronized wall time plus semantic role, raw node name, ggml op, shape, and backend",
         [](common_params & params, const std::string & value) {
             params.module_bench_trace_path = value;
         }
