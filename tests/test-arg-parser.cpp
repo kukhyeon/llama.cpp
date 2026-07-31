@@ -147,6 +147,36 @@ int main(void) {
     argv = {"binary_name", "-m", "model.gguf", "--hardware-stats-core", "-2"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), hardware_stats_params, LLAMA_EXAMPLE_COMPLETION));
 
+    common_params query_period_default_params;
+    assert(query_period_default_params.query_interval == 0);
+
+    common_params query_period_positive_params;
+    argv = {"binary_name", "-m", "model.gguf", "--query-period-ms", "60000"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), query_period_positive_params, LLAMA_EXAMPLE_COMPLETION));
+    assert(query_period_positive_params.query_interval == 60000);
+
+    common_params query_period_zero_params;
+    argv = {"binary_name", "-m", "model.gguf", "--query-period-ms", "0"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), query_period_zero_params, LLAMA_EXAMPLE_COMPLETION));
+    assert(query_period_zero_params.query_interval == 0);
+
+    common_params query_period_negative_params;
+    argv = {"binary_name", "-m", "model.gguf", "--query-period-ms", "-1"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), query_period_negative_params, LLAMA_EXAMPLE_COMPLETION));
+
+    common_params query_period_non_completion_params;
+    argv = {"binary_name", "--query-period-ms", "60000"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), query_period_non_completion_params, LLAMA_EXAMPLE_COMMON));
+
+    common_params max_query_unlimited_params;
+    argv = {"binary_name", "-m", "model.gguf", "--max-query-number", "-1"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), max_query_unlimited_params, LLAMA_EXAMPLE_COMPLETION));
+    assert(max_query_unlimited_params.max_query_number == -1);
+
+    common_params max_query_invalid_params;
+    argv = {"binary_name", "-m", "model.gguf", "--max-query-number", "-2"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), max_query_invalid_params, LLAMA_EXAMPLE_COMPLETION));
+
     // multi-value args (CSV)
     argv = {"binary_name", "--lora", "file1.gguf,\"file2,2.gguf\",\"file3\"\"3\"\".gguf\",file4\".gguf"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));

@@ -94,6 +94,7 @@ add_library(${TARGET}
     peg-parser.h
     preset.cpp
     preset.h
+    query-pacing.h
     regex-partial.cpp
     reasoning-budget.cpp
     reasoning-budget.h
