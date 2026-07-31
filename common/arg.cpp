@@ -1156,7 +1156,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--max-query-number"}, "N",
         "maximum number of ignite queries to process (default: unlimited)",
         [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument("error: --max-query-number must be -1 or non-negative");
+            }
             params.max_query_number = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
+        {"--query-period-ms"}, "N",
+        "fixed interval between JSON query start times in milliseconds (0 = disabled; aborts if query work overruns the next start deadline)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: --query-period-ms must be non-negative");
+            }
+            params.query_interval = value;
         }
     ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
     add_opt(common_arg(

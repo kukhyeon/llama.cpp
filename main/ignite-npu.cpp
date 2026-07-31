@@ -2,6 +2,7 @@
 #include "common.h"
 #include "console.h"
 #include "log.h"
+#include "query-pacing.h"
 #include "sampling.h"
 #include "llama.h"
 #include "chat.h"
@@ -17,7 +18,9 @@
 #include <cstdint>
 #include <time.h>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -1147,7 +1150,17 @@ int main(int argc, char ** argv) {
         // }
     }
     bool custom_max_query = params.max_query_number == -1 ? false : true;
-    size_t max_query_num = custom_max_query ? (size_t) params.max_query_number : json_questions.size();
+    size_t max_query_num = custom_max_query ?
+        std::min((size_t) params.max_query_number, json_questions.size()) :
+        json_questions.size();
+    if (custom_max_query && (size_t) params.max_query_number > json_questions.size()) {
+        LOG_WRN(
+                "requested %d queries, but %zu JSON questions are available; "
+                "limiting the run to %zu queries\n",
+                params.max_query_number,
+                json_questions.size(),
+                max_query_num);
+    }
     // JSON questions load done
 //------------------------------------------------
 
@@ -1171,6 +1184,86 @@ int main(int argc, char ** argv) {
     // timer variables
     std::chrono::steady_clock::time_point inference_start_time;
     bool inference_started = false;
+
+    struct query_timing_sample {
+        size_t query_id = 0;
+        std::chrono::steady_clock::time_point scheduled_start;
+        std::chrono::steady_clock::time_point actual_start;
+        std::chrono::steady_clock::time_point inference_end;
+        std::chrono::steady_clock::time_point postprocess_end;
+        bool valid = false;
+    };
+
+    struct query_timing_record {
+        query_timing_sample sample;
+        std::chrono::steady_clock::duration cooling;
+        std::chrono::steady_clock::duration pacing_wait;
+        std::chrono::steady_clock::duration overrun;
+        bool deadline_miss = false;
+        bool next_query_scheduled = false;
+        const char * status = "";
+    };
+
+    const bool query_pacing_enabled = ig->query_interval > 0 && !json_questions.empty();
+    const std::chrono::milliseconds query_period(std::max(ig->query_interval, 0));
+    const std::chrono::milliseconds query_wake_lateness_tolerance(10);
+    std::optional<std::ofstream> query_timing_file;
+    std::vector<query_timing_record> query_timing_records;
+    std::chrono::steady_clock::time_point query_schedule_epoch;
+    query_timing_sample query_timing;
+    bool query_schedule_started = false;
+    int query_pacing_exit_status = 0;
+
+    if (query_pacing_enabled) {
+        const std::string output_path_query_timing = params.output_dir + "/query_timing.csv";
+        query_timing_records.reserve(max_query_num);
+        query_timing_file.emplace(output_path_query_timing, std::ios::app);
+        if (query_timing_file->is_open()) {
+            if (query_timing_file->tellp() == std::streampos(0)) {
+                // cooling_ms spans device completion to the next query start;
+                // pacing_wait_ms is the subset after stats/trace processing.
+                *query_timing_file
+                    << "query_id,period_ms,scheduled_start_ms,actual_start_ms,"
+                    << "inference_end_ms,postprocess_end_ms,service_ms,postprocess_ms,"
+                    << "cooling_ms,pacing_wait_ms,start_lateness_ms,overrun_ms,"
+                    << "deadline_miss,next_query_scheduled,status\n";
+            }
+        } else {
+            LOG_WRN("query_pacing: failed to open timing log %s\n", output_path_query_timing.c_str());
+        }
+    }
+
+    auto query_duration_ms = [](std::chrono::steady_clock::duration duration) {
+        return std::chrono::duration<double, std::milli>(duration).count();
+    };
+
+    auto queue_query_timing = [&](const query_timing_sample & sample,
+                                  std::chrono::steady_clock::duration cooling,
+                                  std::chrono::steady_clock::duration pacing_wait,
+                                  std::chrono::steady_clock::duration overrun,
+                                  bool deadline_miss,
+                                  bool next_query_scheduled,
+                                  const char * status) {
+        if (!sample.valid || !query_timing_file || !query_timing_file->is_open()) {
+            return;
+        }
+        query_timing_records.push_back({
+                sample,
+                cooling,
+                pacing_wait,
+                overrun,
+                deadline_miss,
+                next_query_scheduled,
+                status});
+    };
+
+    if (query_pacing_enabled) {
+        LOG_INF(
+                "query_pacing: fixed JSON query start period=%lld ms; "
+                "the run stops on work overrun or wake lateness above %lld ms\n",
+                (long long) query_period.count(),
+                (long long) query_wake_lateness_tolerance.count());
+    }
     // prefill/decode detector variables
     bool generation_started = false;
     bool prefill_active = false;
@@ -1826,6 +1919,12 @@ int main(int argc, char ** argv) {
 // -------------------------------
                 // Print inference time for previous question
                 if (inference_started) {
+                    // Pacing must observe device completion rather than only the
+                    // host-side enqueue boundary. Keep this synchronization out
+                    // of the default path because it is intentionally opt-in.
+                    if (query_pacing_enabled) {
+                        llama_synchronize(ctx);
+                    }
                     auto inference_end_time = std::chrono::steady_clock::now();
                     auto inference_duration = std::chrono::duration_cast<std::chrono::milliseconds>(inference_end_time - inference_start_time).count();
                     // LOG_INF("Inference time for previous question: %lld ms\n", inference_duration);
@@ -1842,6 +1941,50 @@ int main(int argc, char ** argv) {
                     //check_hardware(device_name);
                     // common_sampler_free(smpl);
                     inference_started = false;
+
+                    if (query_pacing_enabled && query_timing.valid) {
+                        query_timing.inference_end = inference_end_time;
+                        query_timing.postprocess_end = std::chrono::steady_clock::now();
+
+                        const bool has_next_query = current_question_index < max_query_num;
+                        const auto next_start = common_query_pacing_decide(
+                                query_schedule_epoch,
+                                current_question_index,
+                                query_period,
+                                query_timing.postprocess_end);
+
+                        if (next_start.deadline_miss) {
+                            queue_query_timing(
+                                    query_timing,
+                                    std::chrono::steady_clock::duration::zero(),
+                                    std::chrono::steady_clock::duration::zero(),
+                                    next_start.lateness,
+                                    true,
+                                    false,
+                                    "deadline_miss");
+                            LOG_ERR(
+                                    "query_pacing: query %zu missed the next %lld ms "
+                                    "start deadline by %.3f ms; stopping before another query\n",
+                                    current_question_index,
+                                    (long long) query_period.count(),
+                                    query_duration_ms(next_start.lateness));
+                            query_timing.valid = false;
+                            query_pacing_exit_status = 2;
+                            break;
+                        }
+
+                        if (!has_next_query) {
+                            queue_query_timing(
+                                    query_timing,
+                                    std::chrono::steady_clock::duration::zero(),
+                                    std::chrono::steady_clock::duration::zero(),
+                                    std::chrono::steady_clock::duration::zero(),
+                                    false,
+                                    false,
+                                    "final");
+                            query_timing.valid = false;
+                        }
+                    }
                 }
 // -------------------------------
                 LOG_DBG("waiting for user input\n");
@@ -1880,7 +2023,70 @@ int main(int argc, char ** argv) {
                     // 2. json-query mode
                     // Use next question from JSON file
                     // TODO: apply seamless think mode only Qwen3.
+                    std::chrono::steady_clock::time_point query_actual_start;
+                    std::chrono::steady_clock::time_point query_scheduled_start;
+                    if (query_pacing_enabled) {
+                        const auto now = std::chrono::steady_clock::now();
+                        if (!query_schedule_started) {
+                            query_schedule_epoch = now;
+                            query_schedule_started = true;
+                            query_actual_start = now;
+                            query_scheduled_start = now;
+                        } else {
+                            const auto start_decision = common_query_pacing_decide(
+                                    query_schedule_epoch,
+                                    current_question_index,
+                                    query_period,
+                                    now);
+                            if (start_decision.wait > std::chrono::steady_clock::duration::zero()) {
+                                std::this_thread::sleep_until(start_decision.scheduled_start);
+                            }
+                            query_scheduled_start = start_decision.scheduled_start;
+
+                            const auto pacing_wake_time = std::chrono::steady_clock::now();
+                            const auto wake_lateness = pacing_wake_time > query_scheduled_start ?
+                                pacing_wake_time - query_scheduled_start :
+                                std::chrono::steady_clock::duration::zero();
+                            if (wake_lateness > query_wake_lateness_tolerance) {
+                                queue_query_timing(
+                                        query_timing,
+                                        pacing_wake_time - query_timing.inference_end,
+                                        pacing_wake_time - query_timing.postprocess_end,
+                                        wake_lateness,
+                                        true,
+                                        false,
+                                        "wake_deadline_miss");
+                                LOG_ERR(
+                                        "query_pacing: start of query %zu was %.3f ms late "
+                                        "(tolerance=%lld ms); stopping\n",
+                                        current_question_index + 1,
+                                        query_duration_ms(wake_lateness),
+                                        (long long) query_wake_lateness_tolerance.count());
+                                query_timing.valid = false;
+                                query_pacing_exit_status = 2;
+                                break;
+                            }
+
+                            queue_query_timing(
+                                    query_timing,
+                                    pacing_wake_time - query_timing.inference_end,
+                                    pacing_wake_time - query_timing.postprocess_end,
+                                    std::chrono::steady_clock::duration::zero(),
+                                    false,
+                                    true,
+                                    "paced");
+                            query_timing.valid = false;
+                            query_actual_start = pacing_wake_time;
+                        }
+                    }
+
                     current_question_index += 1;
+                    if (query_pacing_enabled) {
+                        query_timing.query_id = current_question_index;
+                        query_timing.scheduled_start = query_scheduled_start;
+                        query_timing.actual_start = query_actual_start;
+                        query_timing.valid = true;
+                    }
                     buffer = "/no_think "; // see `general.architecture`
                     auto tmp = json_questions[current_question_index-1]; // only json requires -1
                     buffer += tmp;
@@ -2078,10 +2284,39 @@ int main(int argc, char ** argv) {
         ggml_backend_sched_trace_flush();
     }
 
+    // Keep query-period logging out of the active schedule: rows are buffered
+    // in memory and written only after the final query (or a deadline miss).
+    if (query_timing_file && query_timing_file->is_open()) {
+        *query_timing_file << std::fixed << std::setprecision(3);
+        for (const auto & record : query_timing_records) {
+            const auto & sample = record.sample;
+            const auto start_lateness = sample.actual_start > sample.scheduled_start ?
+                sample.actual_start - sample.scheduled_start :
+                std::chrono::steady_clock::duration::zero();
+            *query_timing_file
+                << sample.query_id << ","
+                << query_period.count() << ","
+                << query_duration_ms(sample.scheduled_start - query_schedule_epoch) << ","
+                << query_duration_ms(sample.actual_start - query_schedule_epoch) << ","
+                << query_duration_ms(sample.inference_end - query_schedule_epoch) << ","
+                << query_duration_ms(sample.postprocess_end - query_schedule_epoch) << ","
+                << query_duration_ms(sample.inference_end - sample.actual_start) << ","
+                << query_duration_ms(sample.postprocess_end - sample.inference_end) << ","
+                << query_duration_ms(record.cooling) << ","
+                << query_duration_ms(record.pacing_wait) << ","
+                << query_duration_ms(start_lateness) << ","
+                << query_duration_ms(record.overrun) << ","
+                << (record.deadline_miss ? 1 : 0) << ","
+                << (record.next_query_scheduled ? 1 : 0) << ","
+                << record.status << "\n";
+        }
+        query_timing_file->flush();
+    }
+
     llama_backend_free();
 
     ggml_threadpool_free_fn(threadpool);
     ggml_threadpool_free_fn(threadpool_batch);
 
-    return 0;
+    return query_pacing_exit_status;
 }
