@@ -659,6 +659,11 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         }
     }
 
+    if (params.attn_qkv_parallel && params.attn_qkv_shards) {
+        throw std::invalid_argument(
+                "error: --attn-qkv-parallel and --attn-qkv-shards are mutually exclusive\n");
+    }
+
     postprocess_cpu_params(params.cpuparams,       nullptr);
     postprocess_cpu_params(params.cpuparams_batch, &params.cpuparams);
 
@@ -1173,6 +1178,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
     add_opt(common_arg(
+        {"--query-prewake-us"}, "N",
+        "wake the prefill CPU thread pool N microseconds before a paced query starts (0 = disabled; default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: --query-prewake-us must be non-negative");
+            }
+            params.query_prewake_us = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
         {"--device-name", "--dvfs-device"}, "NAME",
         "DVFS target device name",
         [](common_params & params, const std::string & value) {
@@ -1362,6 +1377,36 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.module_bench_backend = value;
         }
     ).set_examples({LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_MODULE_BENCH_BACKEND"));
+    add_opt(common_arg(
+        {"--attn-qkv-parallel"}, "on|off",
+        "run independent prefill Q/K/V projection branches concurrently (default: off; backend placement comes from --backend-policy)",
+        [](common_params & params, const std::string & value) {
+            const std::string normalized = common_arg_lower(value);
+            if (is_truthy(normalized)) {
+                params.attn_qkv_parallel = true;
+            } else if (is_falsey(normalized)) {
+                params.attn_qkv_parallel = false;
+            } else {
+                throw std::invalid_argument(
+                    string_format("error: unknown value for --attn-qkv-parallel: '%s'\n", value.c_str()));
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_ATTN_QKV_PARALLEL"));
+    add_opt(common_arg(
+        {"--attn-qkv-shards"}, "on|off",
+        "shard each prefill Q/K/V projection across policy backends (default: off; mutually exclusive with --attn-qkv-parallel)",
+        [](common_params & params, const std::string & value) {
+            const std::string normalized = common_arg_lower(value);
+            if (is_truthy(normalized)) {
+                params.attn_qkv_shards = true;
+            } else if (is_falsey(normalized)) {
+                params.attn_qkv_shards = false;
+            } else {
+                throw std::invalid_argument(
+                    string_format("error: unknown value for --attn-qkv-shards: '%s'\n", value.c_str()));
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_ATTN_QKV_SHARDS"));
     add_opt(common_arg(
         {"--strict"}, "on|off",
         "enable ignite strict generation limit",

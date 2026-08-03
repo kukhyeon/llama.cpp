@@ -38,6 +38,8 @@ struct llama_cparams {
     bool no_perf;
     bool warmup;
     bool op_offload;
+    bool attn_qkv_parallel;
+    bool attn_qkv_shards;
     bool kv_unified;
     bool pipeline_parallel;
 

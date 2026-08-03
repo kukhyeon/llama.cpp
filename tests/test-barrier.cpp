@@ -122,7 +122,16 @@ static void test_active(int n_threads, int n_rounds) {
     // In this test we keep changing the number of threads every 4th iteration
     // to test for race conditions in that path
 
+    // Let secondary workers reach their condition-variable wait, then ensure a
+    // pre-wake never publishes stale graph work or prevents the next compute.
+    ggml_threadpool_prewake(NULL);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    ggml_threadpool_prewake(threadpool);
+
     for (int i=0; i < n_rounds; i++) {
+        if ((i % 7) == 0) {
+            ggml_threadpool_prewake(threadpool);
+        }
         struct ggml_cplan cplan = ggml_graph_plan(gf, (i % 4) == 0 ? 1 : n_threads, threadpool);
 
         std::vector<uint8_t> work_data(cplan.work_size);

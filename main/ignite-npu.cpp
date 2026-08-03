@@ -673,6 +673,14 @@ int main(int argc, char ** argv) {
     auto * reg = ggml_backend_dev_backend_reg(cpu_dev);
     auto * ggml_threadpool_new_fn = (decltype(ggml_threadpool_new) *) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_new");
     auto * ggml_threadpool_free_fn = (decltype(ggml_threadpool_free) *) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_free");
+    decltype(ggml_threadpool_prewake) * ggml_threadpool_prewake_fn = nullptr;
+    if (params.query_prewake_us > 0) {
+        ggml_threadpool_prewake_fn = (decltype(ggml_threadpool_prewake) *)
+            ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_prewake");
+        if (ggml_threadpool_prewake_fn == nullptr) {
+            LOG_WRN("%s: CPU backend does not provide thread-pool pre-wake; continuing without it\n", __func__);
+        }
+    }
 
     struct ggml_threadpool_params tpp_batch =
             ggml_threadpool_params_from_cpu_params(params.cpuparams_batch);
@@ -700,6 +708,18 @@ int main(int argc, char ** argv) {
     if (!threadpool) {
         LOG_ERR("%s: threadpool create failed : n_threads %d\n", __func__, tpp.n_threads);
         return 1;
+    }
+
+    struct ggml_threadpool * prefill_threadpool = threadpool_batch != nullptr ? threadpool_batch : threadpool;
+    const uint32_t prefill_threadpool_poll = threadpool_batch != nullptr ? tpp_batch.poll : tpp.poll;
+    const int prefill_threadpool_threads = threadpool_batch != nullptr ? tpp_batch.n_threads : tpp.n_threads;
+    if (params.query_prewake_us > 0 &&
+            (prefill_threadpool_poll == 0 || prefill_threadpool_threads <= 1)) {
+        LOG_WRN(
+                "%s: query pre-wake requires a prefill CPU pool with polling enabled "
+                "and more than one thread; continuing without it (poll=%u, threads=%d)\n",
+                __func__, prefill_threadpool_poll, prefill_threadpool_threads);
+        ggml_threadpool_prewake_fn = nullptr;
     }
 
     llama_attach_threadpool(ctx, threadpool, threadpool_batch);
@@ -1191,6 +1211,8 @@ int main(int argc, char ** argv) {
         std::chrono::steady_clock::time_point actual_start;
         std::chrono::steady_clock::time_point inference_end;
         std::chrono::steady_clock::time_point postprocess_end;
+        std::chrono::steady_clock::duration prewake_actual_lead = std::chrono::steady_clock::duration::zero();
+        bool prewake_issued = false;
         bool valid = false;
     };
 
@@ -1206,6 +1228,10 @@ int main(int argc, char ** argv) {
 
     const bool query_pacing_enabled = ig->query_interval > 0 && !json_questions.empty();
     const std::chrono::milliseconds query_period(std::max(ig->query_interval, 0));
+    const std::chrono::microseconds query_prewake_lead(std::max(params.query_prewake_us, 0));
+    const bool query_prewake_enabled = query_pacing_enabled &&
+        query_prewake_lead > std::chrono::microseconds::zero() &&
+        ggml_threadpool_prewake_fn != nullptr;
     const std::chrono::milliseconds query_wake_lateness_tolerance(10);
     std::optional<std::ofstream> query_timing_file;
     std::vector<query_timing_record> query_timing_records;
@@ -1226,7 +1252,13 @@ int main(int argc, char ** argv) {
                     << "query_id,period_ms,scheduled_start_ms,actual_start_ms,"
                     << "inference_end_ms,postprocess_end_ms,service_ms,postprocess_ms,"
                     << "cooling_ms,pacing_wait_ms,start_lateness_ms,overrun_ms,"
-                    << "deadline_miss,next_query_scheduled,status\n";
+                    << "deadline_miss,next_query_scheduled";
+                if (query_prewake_enabled) {
+                    // These fields describe the pre-wake for this row's own start.
+                    *query_timing_file
+                        << ",prewake_issued,prewake_requested_us,prewake_actual_lead_us";
+                }
+                *query_timing_file << ",status\n";
             }
         } else {
             LOG_WRN("query_pacing: failed to open timing log %s\n", output_path_query_timing.c_str());
@@ -1235,6 +1267,10 @@ int main(int argc, char ** argv) {
 
     auto query_duration_ms = [](std::chrono::steady_clock::duration duration) {
         return std::chrono::duration<double, std::milli>(duration).count();
+    };
+
+    auto query_duration_us = [](std::chrono::steady_clock::duration duration) {
+        return std::chrono::duration<double, std::micro>(duration).count();
     };
 
     auto queue_query_timing = [&](const query_timing_sample & sample,
@@ -1263,6 +1299,15 @@ int main(int argc, char ** argv) {
                 "the run stops on work overrun or wake lateness above %lld ms\n",
                 (long long) query_period.count(),
                 (long long) query_wake_lateness_tolerance.count());
+    }
+    if (params.query_prewake_us > 0) {
+        if (query_prewake_enabled) {
+            LOG_INF(
+                    "query_pacing: prefill CPU thread-pool pre-wake enabled at %lld us before each paced query\n",
+                    (long long) query_prewake_lead.count());
+        } else if (!query_pacing_enabled) {
+            LOG_WRN("query_pacing: query pre-wake requested without an active query period; ignoring it\n");
+        }
     }
     // prefill/decode detector variables
     bool generation_started = false;
@@ -2025,6 +2070,9 @@ int main(int argc, char ** argv) {
                     // TODO: apply seamless think mode only Qwen3.
                     std::chrono::steady_clock::time_point query_actual_start;
                     std::chrono::steady_clock::time_point query_scheduled_start;
+                    std::chrono::steady_clock::duration query_actual_prewake_lead =
+                        std::chrono::steady_clock::duration::zero();
+                    bool query_prewake_issued = false;
                     if (query_pacing_enabled) {
                         const auto now = std::chrono::steady_clock::now();
                         if (!query_schedule_started) {
@@ -2039,7 +2087,27 @@ int main(int argc, char ** argv) {
                                     query_period,
                                     now);
                             if (start_decision.wait > std::chrono::steady_clock::duration::zero()) {
-                                std::this_thread::sleep_until(start_decision.scheduled_start);
+                                if (query_prewake_enabled) {
+                                    const auto prewake_time = start_decision.scheduled_start - query_prewake_lead;
+                                    if (now < prewake_time) {
+                                        std::this_thread::sleep_until(prewake_time);
+                                    }
+
+                                    // This only wakes the active prefill CPU pool's secondary
+                                    // workers into their existing finite polling window. It
+                                    // does not enqueue a graph or modify model state.
+                                    ggml_threadpool_prewake_fn(prefill_threadpool);
+                                    query_prewake_issued = true;
+                                    const auto prewake_end = std::chrono::steady_clock::now();
+                                    if (prewake_end < start_decision.scheduled_start) {
+                                        query_actual_prewake_lead =
+                                            start_decision.scheduled_start - prewake_end;
+                                    }
+                                    std::this_thread::sleep_until(start_decision.scheduled_start);
+                                } else {
+                                    // Preserve the original single-sleep path when pre-wake is off.
+                                    std::this_thread::sleep_until(start_decision.scheduled_start);
+                                }
                             }
                             query_scheduled_start = start_decision.scheduled_start;
 
@@ -2085,6 +2153,8 @@ int main(int argc, char ** argv) {
                         query_timing.query_id = current_question_index;
                         query_timing.scheduled_start = query_scheduled_start;
                         query_timing.actual_start = query_actual_start;
+                        query_timing.prewake_actual_lead = query_actual_prewake_lead;
+                        query_timing.prewake_issued = query_prewake_issued;
                         query_timing.valid = true;
                     }
                     buffer = "/no_think "; // see `general.architecture`
@@ -2307,8 +2377,14 @@ int main(int argc, char ** argv) {
                 << query_duration_ms(start_lateness) << ","
                 << query_duration_ms(record.overrun) << ","
                 << (record.deadline_miss ? 1 : 0) << ","
-                << (record.next_query_scheduled ? 1 : 0) << ","
-                << record.status << "\n";
+                << (record.next_query_scheduled ? 1 : 0);
+            if (query_prewake_enabled) {
+                *query_timing_file
+                    << "," << (sample.prewake_issued ? 1 : 0)
+                    << "," << params.query_prewake_us
+                    << "," << query_duration_us(sample.prewake_actual_lead);
+            }
+            *query_timing_file << "," << record.status << "\n";
         }
         query_timing_file->flush();
     }

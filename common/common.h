@@ -509,6 +509,14 @@ struct common_params {
     std::string module_bench_trace_path = "output/module_trace.csv";
     std::string module_bench_backend = "";
 
+    // Independent from FFN partition parallelism. The backend policy still
+    // owns Q/K/V weight placement; this flag only enables prefill fork-join execution.
+    bool attn_qkv_parallel = false;
+
+    // Output-channel sharding of each Q/K/V projection. This is mutually
+    // exclusive with whole-projection attn_qkv_parallel execution.
+    bool attn_qkv_shards = false;
+
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale
 
@@ -725,6 +733,7 @@ struct common_params {
     int token_pause = 0; // ms
     int layer_pause = 0; // ms
     int query_interval = 0; // ms
+    int query_prewake_us = 0; // CPU thread-pool pre-wake lead; 0 disables
     bool backend_compute_profile = false;
     bool backend_op_breakdown = false;
     bool prefill_phase = true;

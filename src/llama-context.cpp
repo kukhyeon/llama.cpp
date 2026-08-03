@@ -311,6 +311,8 @@ llama_context::llama_context(
     cparams.module_bench_profile     = params.module_bench_profile ? params.module_bench_profile : "";
     cparams.module_bench_trace_path  = params.module_bench_trace_path ? params.module_bench_trace_path : "";
     cparams.module_bench_backend     = params.module_bench_backend ? params.module_bench_backend : "";
+    cparams.attn_qkv_parallel        = params.attn_qkv_parallel;
+    cparams.attn_qkv_shards          = params.attn_qkv_shards;
 
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
     cparams.rope_freq_base   = params.rope_freq_base  == 0.0f ? hparams.rope_freq_base_train  : params.rope_freq_base;
@@ -462,6 +464,8 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: causal_attn   = %d\n",   __func__, cparams.causal_attn);
     LLAMA_LOG_INFO("%s: flash_attn    = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
     LLAMA_LOG_INFO("%s: kv_unified    = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
+    LLAMA_LOG_INFO("%s: attn_qkv_parallel = %s\n", __func__, cparams.attn_qkv_parallel ? "true" : "false");
+    LLAMA_LOG_INFO("%s: attn_qkv_shards   = %s\n", __func__, cparams.attn_qkv_shards ? "true" : "false");
     LLAMA_LOG_INFO("%s: freq_base     = %.1f\n", __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale    = %g\n",   __func__, cparams.rope_freq_scale);
 
@@ -3253,6 +3257,15 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         }
     }
 
+    if (cparams.attn_qkv_shards && n_tokens > 1) {
+        // Three lanes x Q/K/V region matmuls, six concat nodes, and room for
+        // optional scale/bias/clamp plus canonical reshapes.  Keep this
+        // separate from the ordinary three-projection reserve so enabling the
+        // experiment cannot exhaust graph metadata on all-layer prefill.
+        constexpr uint64_t nodes_per_qkv_sharded_layer = 24;
+        res += (uint64_t) model.hparams.n_layer * nodes_per_qkv_sharded_layer;
+    }
+
     if (runtime_routes_configured) {
         // A canonical node needs at most one clone per alternate concrete
         // backend, even when several profiles select that same backend. This
@@ -4612,6 +4625,8 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.attn_qkv_parallel           =*/ false,
+        /*.attn_qkv_shards             =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
     };
@@ -4634,6 +4649,19 @@ llama_context * llama_init_from_model(
 
     if (params.n_ctx == 0 && model->hparams.n_ctx_train == 0) {
         LLAMA_LOG_ERROR("%s: n_ctx and model->hparams.n_ctx_train cannot both be zero\n", __func__);
+        return nullptr;
+    }
+
+    if (params.attn_qkv_parallel && params.attn_qkv_shards) {
+        LLAMA_LOG_ERROR("%s: attn_qkv_parallel and attn_qkv_shards are mutually exclusive\n", __func__);
+        return nullptr;
+    }
+    if (params.attn_qkv_shards &&
+            (!llama_backend_policy_attn_qkv_shards_enabled() ||
+             !llama_backend_policy_residency_enabled())) {
+        LLAMA_LOG_ERROR(
+                "%s: attn_qkv_shards requires an enabled attn_qkv_shards policy and residency copies\n",
+                __func__);
         return nullptr;
     }
 

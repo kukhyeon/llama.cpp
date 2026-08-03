@@ -1502,6 +1502,9 @@ struct ggml_backend_sched_trace_row {
     int64_t compute_wall_us = 0;
     bool is_ffn_group = false;
     char ffn_branch[GGML_MAX_NAME] = {};
+    bool is_parallel_group = false;
+    char parallel_kind[GGML_MAX_NAME] = {};
+    char parallel_branch[GGML_MAX_NAME] = {};
     int group_id = -1;
     int64_t group_wall_us = 0;
     int64_t group_copy_us = 0;
@@ -1531,7 +1534,7 @@ static ggml_backend_sched_trace_state g_sched_trace;
 static constexpr size_t GGML_SCHED_TRACE_ROW_RESERVE = 32768;
 
 struct ggml_backend_sched_ffn_worker_trace_row {
-    int schema_version = 1;
+    int schema_version = 2;
     int64_t trace_session_id = -1;
     int64_t group_seq = -1;
     int64_t job_id = -1;
@@ -1551,6 +1554,8 @@ struct ggml_backend_sched_ffn_worker_trace_row {
     char ffn_branch[GGML_MAX_NAME] = {};
     char first_node[GGML_MAX_NAME] = {};
     char last_node[GGML_MAX_NAME] = {};
+    char parallel_group_kind[GGML_MAX_NAME] = {};
+    char parallel_branch[GGML_MAX_NAME] = {};
     enum ggml_status status = GGML_STATUS_SUCCESS;
 
     int64_t group_begin_us = -1;
@@ -1774,7 +1779,7 @@ static FILE * ggml_sched_trace_file(void) {
                 "copy_in_us,wait_before_copy_us,"
                 "compute_submit_us,compute_wall_us,"
                 "is_ffn_group,ffn_branch,group_id,group_wall_us,group_copy_us,"
-                "timing_mode\n");
+                "timing_mode,is_parallel_group,parallel_group_kind,parallel_branch\n");
     }
 
     return g_sched_trace.file;
@@ -1840,7 +1845,8 @@ static constexpr char GGML_FFN_WORKER_TRACE_CSV_HEADER[] =
         "start_offset_us,finish_offset_us,group_start_skew_us,"
         "group_tail_after_last_backend_us,group_tail_after_last_publish_us,"
         "group_compute_wall_us,group_wall_us,"
-        "is_longest_duration,is_last_backend_finisher,is_last_completion_publisher\n";
+        "is_longest_duration,is_last_backend_finisher,is_last_completion_publisher,"
+        "parallel_group_kind,parallel_branch\n";
 
 static FILE * ggml_ffn_worker_trace_file(void) {
     ggml_ffn_worker_trace_init();
@@ -2020,8 +2026,12 @@ static void ggml_ffn_worker_trace_flush_rows(void) {
         };
         for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
             ggml_ffn_worker_trace_optional_i64(f, values[i]);
-            fputc(i + 1 == sizeof(values) / sizeof(values[0]) ? '\n' : ',', f);
+            fputc(',', f);
         }
+        ggml_sched_trace_csv_cell(f, row.parallel_group_kind);
+        fputc(',', f);
+        ggml_sched_trace_csv_cell(f, row.parallel_branch);
+        fputc('\n', f);
     }
 
     if (fflush(f) != 0 && !g_ffn_worker_trace.warned_open) {
@@ -2079,6 +2089,10 @@ static void ggml_sched_trace_flush_rows(void) {
                 (long long) row.group_wall_us,
                 (long long) row.group_copy_us);
         ggml_sched_trace_csv_cell(f, row.timing_mode);
+        fprintf(f, ",%d,", row.is_parallel_group ? 1 : 0);
+        ggml_sched_trace_csv_cell(f, row.parallel_kind);
+        fputc(',', f);
+        ggml_sched_trace_csv_cell(f, row.parallel_branch);
         fputc('\n', f);
     }
 
@@ -3210,6 +3224,143 @@ static bool ggml_backend_sched_parse_ffn_parallel_branch_node(
     return false;
 }
 
+static bool ggml_backend_sched_parse_attn_qkv_branch_name(
+        const char * name,
+        std::string * branch,
+        int * layer) {
+    static constexpr char prefix[] = "attn_qkv.";
+    if (name == nullptr || strncmp(name, prefix, sizeof(prefix) - 1) != 0) {
+        return false;
+    }
+
+    const char * branch_start = name + sizeof(prefix) - 1;
+    const char * stage_start = strchr(branch_start, '.');
+    const char * layer_start = strrchr(branch_start, '-');
+    if (stage_start == nullptr || stage_start == branch_start ||
+            layer_start == nullptr || layer_start <= stage_start + 1 || layer_start[1] == '\0') {
+        return false;
+    }
+
+    const std::string parsed_branch(branch_start, stage_start - branch_start);
+    if (parsed_branch != "q" && parsed_branch != "k" && parsed_branch != "v") {
+        return false;
+    }
+
+    char * end = nullptr;
+    const long parsed_layer = strtol(layer_start + 1, &end, 10);
+    if (end == layer_start + 1 || *end != '\0') {
+        return false;
+    }
+
+    if (branch != nullptr) {
+        *branch = parsed_branch;
+    }
+    if (layer != nullptr) {
+        *layer = (int) parsed_layer;
+    }
+    return true;
+}
+
+static bool ggml_backend_sched_parse_attn_qkv_shard_branch_name(
+        const char * name,
+        std::string * branch,
+        int * layer) {
+    static constexpr char prefix[] = "attn_qkv_shard.";
+    if (name == nullptr || strncmp(name, prefix, sizeof(prefix) - 1) != 0) {
+        return false;
+    }
+
+    const char * lane_start = name + sizeof(prefix) - 1;
+    const char * projection_start = strchr(lane_start, '.');
+    const char * stage_start = projection_start != nullptr
+        ? strchr(projection_start + 1, '.')
+        : nullptr;
+    const char * layer_start = stage_start != nullptr
+        ? strrchr(stage_start + 1, '-')
+        : nullptr;
+    if (projection_start == nullptr || projection_start == lane_start ||
+            stage_start == nullptr || stage_start == projection_start + 1 ||
+            layer_start == nullptr || layer_start <= stage_start + 1 ||
+            layer_start[1] == '\0') {
+        return false;
+    }
+
+    const std::string parsed_projection(
+            projection_start + 1, stage_start - projection_start - 1);
+    if (parsed_projection != "q" && parsed_projection != "k" && parsed_projection != "v") {
+        return false;
+    }
+
+    char * end = nullptr;
+    const long parsed_layer = strtol(layer_start + 1, &end, 10);
+    if (end == layer_start + 1 || *end != '\0') {
+        return false;
+    }
+
+    if (branch != nullptr) {
+        branch->assign(lane_start, projection_start - lane_start);
+    }
+    if (layer != nullptr) {
+        *layer = (int) parsed_layer;
+    }
+    return true;
+}
+
+static bool ggml_backend_sched_parse_parallel_branch_name(
+        const char * name,
+        std::string * kind,
+        std::string * branch,
+        int * layer) {
+    if (ggml_backend_sched_parse_ffn_branch_name(name, branch, layer)) {
+        if (kind != nullptr) {
+            *kind = "ffn";
+        }
+        return true;
+    }
+    if (ggml_backend_sched_parse_attn_qkv_shard_branch_name(name, branch, layer)) {
+        if (kind != nullptr) {
+            *kind = "attn_qkv_shard";
+        }
+        return true;
+    }
+    if (ggml_backend_sched_parse_attn_qkv_branch_name(name, branch, layer)) {
+        if (kind != nullptr) {
+            *kind = "attn_qkv";
+        }
+        return true;
+    }
+    return false;
+}
+
+static bool ggml_backend_sched_parse_parallel_branch_node(
+        const struct ggml_tensor * node,
+        std::string * kind,
+        std::string * branch,
+        int * layer) {
+    if (ggml_backend_sched_parse_ffn_parallel_branch_node(node, branch, layer)) {
+        if (kind != nullptr) {
+            *kind = "ffn";
+        }
+        return true;
+    }
+    if (node != nullptr &&
+            ggml_backend_sched_parse_attn_qkv_shard_branch_name(
+                node->name, branch, layer)) {
+        if (kind != nullptr) {
+            *kind = "attn_qkv_shard";
+        }
+        return true;
+    }
+    if (node != nullptr &&
+            ggml_backend_sched_parse_attn_qkv_branch_name(node->name, branch, layer)) {
+        if (kind != nullptr) {
+            *kind = "attn_qkv";
+        }
+        return true;
+    }
+    return false;
+}
+
 static bool ggml_backend_sched_is_ffn_parallel_branch_node(const struct ggml_tensor * node) {
     return ggml_backend_sched_parse_ffn_parallel_branch_node(node, nullptr, nullptr);
 }
@@ -3961,35 +4112,42 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         int cur_backend_id = split->backend_id;
         int pending_checkpoint_index = -1;
         size_t next_checkpoint = 0;
-        bool cur_split_has_ffn_parallel_branch = false;
-        bool cur_split_needs_ffn_branch_isolation = false;
+        bool cur_split_has_parallel_branch = false;
+        bool cur_split_needs_parallel_branch_isolation = false;
+        std::string cur_parallel_kind;
+        std::string cur_parallel_branch;
+        int cur_parallel_layer = -1;
         bool cur_split_has_ffn_parallel_reduce = false;
         int cur_route_group = -1;
         int cur_route_variant = -1;
         bool cur_split_has_compute_node = false;
-        std::unordered_map<int, std::unordered_set<std::string>>
-            ffn_parallel_branches_by_layer;
+        std::unordered_map<std::string, std::unordered_set<std::string>>
+            parallel_branches_by_kind_layer;
         std::vector<bool> ffn_parallel_reduce_nodes(graph->n_nodes, false);
         for (int j = 0; j < graph->n_nodes; ++j) {
             const struct ggml_tensor * node = graph->nodes[j];
             ffn_parallel_reduce_nodes[j] = ggml_backend_sched_is_ffn_parallel_reduce_node(node);
+            std::string kind;
             std::string branch;
             int layer = -1;
-            if (!ggml_backend_sched_parse_ffn_branch_name(node->name, &branch, &layer)) {
+            if (!ggml_backend_sched_parse_parallel_branch_name(
+                    node != nullptr ? node->name : nullptr, &kind, &branch, &layer)) {
                 continue;
             }
 
-            ffn_parallel_branches_by_layer[layer].insert(std::move(branch));
+            parallel_branches_by_kind_layer[kind + ":" + std::to_string(layer)].insert(std::move(branch));
         }
-        auto ffn_layer_has_multiple_branches = [&](const struct ggml_tensor * node) {
+        auto parallel_group_has_multiple_branches = [&](const struct ggml_tensor * node) {
+            std::string kind;
             std::string branch;
             int layer = -1;
-            if (!ggml_backend_sched_parse_ffn_branch_name(node->name, &branch, &layer)) {
+            if (!ggml_backend_sched_parse_parallel_branch_name(
+                    node != nullptr ? node->name : nullptr, &kind, &branch, &layer)) {
                 return false;
             }
 
-            const auto it = ffn_parallel_branches_by_layer.find(layer);
-            return it != ffn_parallel_branches_by_layer.end() && it->second.size() >= 2;
+            const auto it = parallel_branches_by_kind_layer.find(kind + ":" + std::to_string(layer));
+            return it != parallel_branches_by_kind_layer.end() && it->second.size() >= 2;
         };
 
         // tensor_id_copy() is shared by the whole graph, but a route graph
@@ -4036,15 +4194,19 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             }
 
             const int node_backend_id = tensor_backend_id(node);
-            const bool node_is_ffn_parallel_branch = ggml_backend_sched_is_ffn_parallel_branch_node(node);
+            std::string node_parallel_kind;
+            std::string node_parallel_branch;
+            int node_parallel_layer = -1;
+            const bool node_is_parallel_branch = ggml_backend_sched_parse_parallel_branch_node(
+                    node, &node_parallel_kind, &node_parallel_branch, &node_parallel_layer);
             const bool node_is_ffn_parallel_reduce = ffn_parallel_reduce_nodes[i];
             const int node_route_group = route_candidate_mode
                 ? route_state->node_to_group[i] : -1;
             const int node_route_variant = route_candidate_mode
                 ? route_state->node_to_variant[i] : -1;
-            const bool node_needs_ffn_branch_isolation =
-                node_is_ffn_parallel_branch &&
-                (sched->debug >= 2 || ffn_layer_has_multiple_branches(node));
+            const bool node_needs_parallel_branch_isolation =
+                node_is_parallel_branch &&
+                (sched->debug >= 2 || parallel_group_has_multiple_branches(node));
 
             GGML_ASSERT(node_backend_id != -1); // all nodes should be assigned by now, this can happen if there is no CPU fallback
 
@@ -4059,17 +4221,31 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 need_new_split = true;
             }
             if (node_backend_id == cur_backend_id &&
-                    cur_split_has_ffn_parallel_branch != node_is_ffn_parallel_branch &&
-                    (cur_split_needs_ffn_branch_isolation ||
-                     (node_needs_ffn_branch_isolation && split->i_start < i))) {
-                // Keep FFN shard branch splits pure. If a branch is fused with
+                    cur_split_has_parallel_branch != node_is_parallel_branch &&
+                    (cur_split_needs_parallel_branch_isolation ||
+                     (node_needs_parallel_branch_isolation && split->i_start < i))) {
+                // Keep parallel branch splits pure. If a branch is fused with
                 // the surrounding layer prefix/suffix on the same backend, the
-                // scheduler cannot collect consecutive branch splits into one
-                // parallel FFN group in normal (non-debug) multi-shard runs.
+                // scheduler cannot collect consecutive branch splits into one group.
+                need_new_split = true;
+            }
+            if (node_backend_id == cur_backend_id && cur_split_has_parallel_branch &&
+                    node_is_parallel_branch &&
+                    (cur_parallel_kind == "attn_qkv" || node_parallel_kind == "attn_qkv" ||
+                     cur_parallel_kind == "attn_qkv_shard" ||
+                     node_parallel_kind == "attn_qkv_shard") &&
+                    (cur_parallel_kind != node_parallel_kind ||
+                     cur_parallel_branch != node_parallel_branch ||
+                     cur_parallel_layer != node_parallel_layer)) {
+                // Whole Q/K/V branches need one split per projection. Sharded
+                // QKV instead keeps all Q/K/V work for a lane together and
+                // starts a new split only when the lane changes. Execution
+                // safely chooses serial fallback for duplicate backend IDs.
+                // Keep the legacy same-backend FFN behavior unchanged.
                 need_new_split = true;
             }
             if (node_backend_id == cur_backend_id &&
-                    cur_split_has_ffn_parallel_branch &&
+                    cur_split_has_parallel_branch &&
                     node_is_ffn_parallel_reduce) {
                 // Keep each FFN shard branch split pure. When the reduce backend
                 // equals the backend of the last branch, the default scheduler
@@ -4163,18 +4339,24 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 split->checkpoint_index_after = -1;
                 split->is_ffn_parallel_reduce = false;
                 cur_backend_id = node_backend_id;
-                cur_split_has_ffn_parallel_branch = false;
-                cur_split_needs_ffn_branch_isolation = false;
+                cur_split_has_parallel_branch = false;
+                cur_split_needs_parallel_branch_isolation = false;
+                cur_parallel_kind.clear();
+                cur_parallel_branch.clear();
+                cur_parallel_layer = -1;
                 cur_split_has_ffn_parallel_reduce = false;
                 cur_route_group = -1;
                 cur_route_variant = -1;
                 cur_split_has_compute_node = false;
             }
 
-            if (node_is_ffn_parallel_branch) {
-                cur_split_has_ffn_parallel_branch = true;
-                cur_split_needs_ffn_branch_isolation =
-                    cur_split_needs_ffn_branch_isolation || node_needs_ffn_branch_isolation;
+            if (node_is_parallel_branch) {
+                cur_split_has_parallel_branch = true;
+                cur_split_needs_parallel_branch_isolation =
+                    cur_split_needs_parallel_branch_isolation || node_needs_parallel_branch_isolation;
+                cur_parallel_kind = node_parallel_kind;
+                cur_parallel_branch = node_parallel_branch;
+                cur_parallel_layer = node_parallel_layer;
             }
             if (node_is_ffn_parallel_reduce) {
                 cur_split_has_ffn_parallel_reduce = true;
@@ -4530,6 +4712,7 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 }
 
 struct ggml_backend_sched_ffn_branch_info {
+    std::string kind;
     std::string branch;
     int layer = -1;
 };
@@ -4537,7 +4720,8 @@ struct ggml_backend_sched_ffn_branch_info {
 static bool ggml_backend_sched_parse_ffn_branch_node(
         const struct ggml_tensor * node,
         ggml_backend_sched_ffn_branch_info * info) {
-    return ggml_backend_sched_parse_ffn_parallel_branch_node(node, &info->branch, &info->layer);
+    return ggml_backend_sched_parse_parallel_branch_node(
+            node, &info->kind, &info->branch, &info->layer);
 }
 
 static bool ggml_backend_sched_split_ffn_branch_info(
@@ -4552,7 +4736,8 @@ static bool ggml_backend_sched_split_ffn_branch_info(
             return false;
         }
 
-        if (found && (split_info.layer != node_info.layer || split_info.branch != node_info.branch)) {
+        if (found && (split_info.kind != node_info.kind ||
+                split_info.layer != node_info.layer || split_info.branch != node_info.branch)) {
             return false;
         }
 
@@ -4589,7 +4774,7 @@ static int ggml_backend_sched_collect_parallel_ffn_group(
         if (!ggml_backend_sched_split_ffn_branch_info(&splits[i], &cur)) {
             break;
         }
-        if (cur.layer != first.layer) {
+        if (cur.kind != first.kind || cur.layer != first.layer) {
             break;
         }
         const auto duplicate = std::find_if(infos->begin(), infos->end(), [&](const ggml_backend_sched_ffn_branch_info & prev) {
@@ -4599,6 +4784,36 @@ static int ggml_backend_sched_collect_parallel_ffn_group(
             break;
         }
         infos->push_back(std::move(cur));
+    }
+
+    if (first.kind == "attn_qkv") {
+        if (infos->size() != 3) {
+            infos->clear();
+            return 0;
+        }
+        bool have_q = false;
+        bool have_k = false;
+        bool have_v = false;
+        for (const auto & info : *infos) {
+            have_q = have_q || info.branch == "q";
+            have_k = have_k || info.branch == "k";
+            have_v = have_v || info.branch == "v";
+        }
+        if (!have_q || !have_k || !have_v) {
+            infos->clear();
+            return 0;
+        }
+        return 3;
+    }
+
+    if (first.kind == "attn_qkv_shard") {
+        // Duplicate lanes terminate the scan above, so exactly three entries
+        // here also means exactly three unique composite lane splits.
+        if (infos->size() != 3) {
+            infos->clear();
+            return 0;
+        }
+        return 3;
     }
 
     return infos->size() >= 2 || allow_single ? (int) infos->size() : 0;
@@ -4634,8 +4849,9 @@ static void ggml_backend_sched_trace_append_split(
         const ggml_backend_sched_trace_io_times & io_times,
         int64_t compute_submit_us,
         int64_t compute_wall_us,
-        bool is_ffn_group,
-        const char * ffn_branch,
+        bool is_parallel_group,
+        const char * parallel_kind,
+        const char * parallel_branch,
         int group_id,
         int64_t group_wall_us,
         int64_t group_copy_us,
@@ -4666,7 +4882,8 @@ static void ggml_backend_sched_trace_append_split(
     row.wait_us = io_times.wait_us;
     row.compute_submit_us = compute_submit_us;
     row.compute_wall_us = compute_wall_us;
-    row.is_ffn_group = is_ffn_group;
+    row.is_parallel_group = is_parallel_group;
+    row.is_ffn_group = is_parallel_group && parallel_kind != nullptr && strcmp(parallel_kind, "ffn") == 0;
     row.group_id = group_id;
     row.group_wall_us = group_wall_us;
     row.group_copy_us = group_copy_us;
@@ -4674,7 +4891,10 @@ static void ggml_backend_sched_trace_append_split(
     ggml_sched_trace_copy_string(row.backend, sizeof(row.backend), ggml_backend_name(sched->backends[split->backend_id]));
     ggml_sched_trace_copy_string(row.first_node, sizeof(row.first_node), first ? first->name : "");
     ggml_sched_trace_copy_string(row.last_node, sizeof(row.last_node), last ? last->name : "");
-    ggml_sched_trace_copy_string(row.ffn_branch, sizeof(row.ffn_branch), ffn_branch);
+    ggml_sched_trace_copy_string(
+            row.ffn_branch, sizeof(row.ffn_branch), row.is_ffn_group ? parallel_branch : "");
+    ggml_sched_trace_copy_string(row.parallel_kind, sizeof(row.parallel_kind), parallel_kind);
+    ggml_sched_trace_copy_string(row.parallel_branch, sizeof(row.parallel_branch), parallel_branch);
     ggml_sched_trace_copy_string(row.timing_mode, sizeof(row.timing_mode), timing_mode);
 }
 
@@ -4772,11 +4992,18 @@ static void ggml_backend_sched_ffn_worker_trace_append_group(
                 row.backend, sizeof(row.backend),
                 ggml_backend_name(sched->backends[split->backend_id]));
         ggml_sched_trace_copy_string(
-                row.ffn_branch, sizeof(row.ffn_branch), ffn_group_infos[i].branch.c_str());
+                row.ffn_branch, sizeof(row.ffn_branch),
+                ffn_group_infos[i].kind == "ffn" ? ffn_group_infos[i].branch.c_str() : "");
         ggml_sched_trace_copy_string(
                 row.first_node, sizeof(row.first_node), first ? first->name : "");
         ggml_sched_trace_copy_string(
                 row.last_node, sizeof(row.last_node), last ? last->name : "");
+        ggml_sched_trace_copy_string(
+                row.parallel_group_kind, sizeof(row.parallel_group_kind),
+                ffn_group_infos[i].kind.c_str());
+        ggml_sched_trace_copy_string(
+                row.parallel_branch, sizeof(row.parallel_branch),
+                ffn_group_infos[i].branch.c_str());
 
         const ggml_backend_sched_ffn_worker_timeline & timeline = row.timeline;
         row.group_copy_us = ggml_ffn_worker_trace_delta(copy_end_us, group_begin_us);
@@ -5635,8 +5862,9 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                                 timeline->collect_kind = GGML_SCHED_FFN_COLLECT_NONE;
                             }
                             GGML_LOG_ERROR(
-                                    "%s: failed to submit persistent FFN job for backend %s, layer %d\n",
+                                    "%s: failed to submit persistent %s job for backend %s, layer %d\n",
                                     __func__,
+                                    ffn_group_infos[i].kind.c_str(),
                                     ggml_backend_name(device_jobs[i].backend),
                                     ffn_group_infos[i].layer);
                             status[i] = GGML_STATUS_FAILED;
@@ -5679,14 +5907,14 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                             } catch (const std::exception & error) {
                                 status[i] = GGML_STATUS_FAILED;
                                 GGML_LOG_ERROR(
-                                        "%s: transient FFN worker backend %s threw an exception: %s\n",
+                                        "%s: transient parallel worker backend %s threw an exception: %s\n",
                                         __func__,
                                         ggml_backend_name(sched->backends[splits[split_id + i].backend_id]),
                                         error.what());
                             } catch (...) {
                                 status[i] = GGML_STATUS_FAILED;
                                 GGML_LOG_ERROR(
-                                        "%s: transient FFN worker backend %s threw an exception\n",
+                                        "%s: transient parallel worker backend %s threw an exception\n",
                                         __func__,
                                         ggml_backend_name(sched->backends[splits[split_id + i].backend_id]));
                             }
@@ -5716,14 +5944,14 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                 } catch (const std::exception & error) {
                     status[main_i] = GGML_STATUS_FAILED;
                     GGML_LOG_ERROR(
-                            "%s: caller FFN branch backend %s threw an exception: %s\n",
+                        "%s: caller parallel branch backend %s threw an exception: %s\n",
                             __func__,
                             ggml_backend_name(sched->backends[splits[split_id + main_i].backend_id]),
                             error.what());
                 } catch (...) {
                     status[main_i] = GGML_STATUS_FAILED;
                     GGML_LOG_ERROR(
-                            "%s: caller FFN branch backend %s threw an exception\n",
+                        "%s: caller parallel branch backend %s threw an exception\n",
                             __func__,
                             ggml_backend_name(sched->backends[splits[split_id + main_i].backend_id]));
                 }
@@ -5848,7 +6076,8 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
             overlap = std::min(100.0, std::max(0.0, overlap));
 
             GGML_LOG_DEBUG(
-                    "sched: parallel ffn group layer %d splits %s: %s, compute_wall %.3f ms, group_wall %.3f ms, copy %.3f ms, speedup %.2fx, overlap %.1f%%, balance %.1f%%\n",
+                    "sched: parallel %s group layer %d splits %s: %s, compute_wall %.3f ms, group_wall %.3f ms, copy %.3f ms, speedup %.2fx, overlap %.1f%%, balance %.1f%%\n",
+                    ffn_group_infos[0].kind.c_str(),
                     ffn_group_infos[0].layer,
                     split_list.c_str(),
                     branch_list.c_str(),
@@ -5870,6 +6099,7 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                             dt_us[i],
                             dt_us[i],
                             true,
+                            ffn_group_infos[i].kind.c_str(),
                             ffn_group_infos[i].branch.c_str(),
                             split_id,
                             group_wall_us,
@@ -5931,6 +6161,7 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                         split_is_cpu ? dt_us : -1,
                         false,
                         "",
+                        "",
                         -1,
                         -1,
                         io_times.copy_us,
@@ -5952,6 +6183,7 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                         -1,
                         -1,
                         false,
+                        "",
                         "",
                         -1,
                         -1,
