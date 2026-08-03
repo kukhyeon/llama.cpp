@@ -168,6 +168,81 @@ int main(void) {
     argv = {"binary_name", "--query-period-ms", "60000"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), query_period_non_completion_params, LLAMA_EXAMPLE_COMMON));
 
+    common_params query_prewake_default_params;
+    assert(query_prewake_default_params.query_prewake_us == 0);
+
+    common_params query_prewake_positive_params;
+    argv = {"binary_name", "-m", "model.gguf", "--query-prewake-us", "500"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), query_prewake_positive_params, LLAMA_EXAMPLE_COMPLETION));
+    assert(query_prewake_positive_params.query_prewake_us == 500);
+
+    common_params query_prewake_zero_params;
+    argv = {"binary_name", "-m", "model.gguf", "--query-prewake-us", "0"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), query_prewake_zero_params, LLAMA_EXAMPLE_COMPLETION));
+    assert(query_prewake_zero_params.query_prewake_us == 0);
+
+    common_params query_prewake_negative_params;
+    argv = {"binary_name", "-m", "model.gguf", "--query-prewake-us", "-1"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), query_prewake_negative_params, LLAMA_EXAMPLE_COMPLETION));
+
+    common_params query_prewake_non_completion_params;
+    argv = {"binary_name", "--query-prewake-us", "500"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), query_prewake_non_completion_params, LLAMA_EXAMPLE_COMMON));
+
+    common_params attn_qkv_default_params;
+    assert(attn_qkv_default_params.attn_qkv_parallel == false);
+
+    common_params attn_qkv_on_params;
+    argv = {"binary_name", "-m", "model.gguf", "--attn-qkv-parallel", "on"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), attn_qkv_on_params, LLAMA_EXAMPLE_COMPLETION));
+    assert(attn_qkv_on_params.attn_qkv_parallel == true);
+
+    common_params attn_qkv_off_params;
+    argv = {"binary_name", "-m", "model.gguf", "--attn-qkv-parallel", "off"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), attn_qkv_off_params, LLAMA_EXAMPLE_COMPLETION));
+    assert(attn_qkv_off_params.attn_qkv_parallel == false);
+
+    common_params attn_qkv_invalid_params;
+    argv = {"binary_name", "-m", "model.gguf", "--attn-qkv-parallel", "invalid"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), attn_qkv_invalid_params, LLAMA_EXAMPLE_COMPLETION));
+
+    common_params attn_qkv_shards_default_params;
+    assert(attn_qkv_shards_default_params.attn_qkv_shards == false);
+    const llama_context_params attn_qkv_api_default_params = llama_context_default_params();
+    assert(attn_qkv_api_default_params.attn_qkv_shards == false);
+
+    common_params attn_qkv_shards_on_params;
+    argv = {"binary_name", "-m", "model.gguf", "--attn-qkv-shards", "on"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), attn_qkv_shards_on_params, LLAMA_EXAMPLE_COMPLETION));
+    assert(attn_qkv_shards_on_params.attn_qkv_shards == true);
+
+    common_params attn_qkv_shards_off_params;
+    argv = {"binary_name", "-m", "model.gguf", "--attn-qkv-shards", "off"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), attn_qkv_shards_off_params, LLAMA_EXAMPLE_COMPLETION));
+    assert(attn_qkv_shards_off_params.attn_qkv_shards == false);
+
+    common_params attn_qkv_shards_invalid_params;
+    argv = {"binary_name", "-m", "model.gguf", "--attn-qkv-shards", "invalid"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), attn_qkv_shards_invalid_params, LLAMA_EXAMPLE_COMPLETION));
+
+    common_params attn_qkv_modes_conflict_params;
+    argv = {
+        "binary_name", "-m", "model.gguf",
+        "--attn-qkv-parallel", "on",
+        "--attn-qkv-shards", "on",
+    };
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), attn_qkv_modes_conflict_params, LLAMA_EXAMPLE_COMPLETION));
+
+    common_params attn_qkv_modes_non_conflict_params;
+    argv = {
+        "binary_name", "-m", "model.gguf",
+        "--attn-qkv-parallel", "off",
+        "--attn-qkv-shards", "on",
+    };
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), attn_qkv_modes_non_conflict_params, LLAMA_EXAMPLE_COMPLETION));
+    assert(attn_qkv_modes_non_conflict_params.attn_qkv_parallel == false);
+    assert(attn_qkv_modes_non_conflict_params.attn_qkv_shards == true);
+
     common_params max_query_unlimited_params;
     argv = {"binary_name", "-m", "model.gguf", "--max-query-number", "-1"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), max_query_unlimited_params, LLAMA_EXAMPLE_COMPLETION));
@@ -202,6 +277,20 @@ int main(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.model.path == "blah.gguf");
     assert(params.cpuparams.n_threads == 1010);
+
+    setenv("LLAMA_ARG_ATTN_QKV_SHARDS", "on", true);
+    common_params attn_qkv_shards_env_params;
+    argv = {"binary_name"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), attn_qkv_shards_env_params, LLAMA_EXAMPLE_COMPLETION));
+    assert(attn_qkv_shards_env_params.attn_qkv_shards == true);
+    unsetenv("LLAMA_ARG_ATTN_QKV_SHARDS");
+
+    setenv("LLAMA_ARG_ATTN_QKV_PARALLEL", "on", true);
+    setenv("LLAMA_ARG_ATTN_QKV_SHARDS", "on", true);
+    common_params attn_qkv_modes_env_conflict_params;
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), attn_qkv_modes_env_conflict_params, LLAMA_EXAMPLE_COMPLETION));
+    unsetenv("LLAMA_ARG_ATTN_QKV_PARALLEL");
+    unsetenv("LLAMA_ARG_ATTN_QKV_SHARDS");
 
     printf("test-arg-parser: test negated environment variables\n\n");
 

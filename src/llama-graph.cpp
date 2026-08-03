@@ -16,6 +16,7 @@
 #include <cassert>
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <numeric>
 #include <sstream>
@@ -1122,11 +1123,38 @@ llm_graph_qkv llm_graph_context::build_qkv(
                   int64_t   n_embd_head,
                   int64_t   n_head,
                   int64_t   n_head_kv,
-                      int   il) const {
+                      int   il,
+                     bool   parallel_projection_names) const {
     const int64_t n_embd_q  = n_embd_head * n_head;
     const int64_t n_embd_kv = n_embd_head * n_head_kv;
 
     ggml_tensor * Qcur, * Kcur, * Vcur;
+
+    const bool mark_parallel_projections = parallel_projection_names && layer.wqkv == nullptr;
+    auto mark_projection_internals = [&](ggml_tensor * root, const char * branch) {
+        if (!mark_parallel_projections) {
+            return;
+        }
+
+        int internal_index = 0;
+        std::unordered_set<ggml_tensor *> visited;
+        auto visit = [&](auto && self, ggml_tensor * node) -> void {
+            if (node == nullptr || node == root || node == cur || node->op == GGML_OP_NONE ||
+                    !visited.insert(node).second) {
+                return;
+            }
+            for (int i = 0; i < GGML_MAX_SRC; ++i) {
+                self(self, node->src[i]);
+            }
+
+            char name[GGML_MAX_NAME];
+            snprintf(name, sizeof(name), "attn_qkv.%s.internal%d", branch, internal_index++);
+            cb(node, name, il);
+        };
+        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+            visit(visit, root->src[i]);
+        }
+    };
 
     if (layer.wqkv) {
         // fused QKV path
@@ -1151,45 +1179,253 @@ llm_graph_qkv llm_graph_context::build_qkv(
     } else {
         // separate Q/K/V path
         Qcur = build_lora_mm(layer.wq, cur, layer.wq_s);
-        cb(Qcur, "Qcur", il);
+        mark_projection_internals(Qcur, "q");
+        cb(Qcur, mark_parallel_projections ? "attn_qkv.q.proj" : "Qcur", il);
         if (layer.wq_b) {
             Qcur = ggml_add(ctx0, Qcur, layer.wq_b);
-            cb(Qcur, "Qcur", il);
+            cb(Qcur, mark_parallel_projections ? "attn_qkv.q.bias" : "Qcur", il);
         }
         if (hparams.f_clamp_kqv > 0.0f) {
             Qcur = ggml_clamp(ctx0, Qcur, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
-            cb(Qcur, "Qcur_clamped", il);
+            cb(Qcur, mark_parallel_projections ? "attn_qkv.q.clamp" : "Qcur_clamped", il);
         }
         Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
-        cb(Kcur, "Kcur", il);
+        mark_projection_internals(Kcur, "k");
+        cb(Kcur, mark_parallel_projections ? "attn_qkv.k.proj" : "Kcur", il);
         if (layer.wk_b) {
             Kcur = ggml_add(ctx0, Kcur, layer.wk_b);
-            cb(Kcur, "Kcur", il);
+            cb(Kcur, mark_parallel_projections ? "attn_qkv.k.bias" : "Kcur", il);
         }
         if (hparams.f_clamp_kqv > 0.0f) {
             Kcur = ggml_clamp(ctx0, Kcur, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
-            cb(Kcur, "Kcur_clamped", il);
+            cb(Kcur, mark_parallel_projections ? "attn_qkv.k.clamp" : "Kcur_clamped", il);
         }
         Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
-        cb(Vcur, "Vcur", il);
+        mark_projection_internals(Vcur, "v");
+        cb(Vcur, mark_parallel_projections ? "attn_qkv.v.proj" : "Vcur", il);
         if (layer.wv_b) {
             Vcur = ggml_add(ctx0, Vcur, layer.wv_b);
-            cb(Vcur, "Vcur", il);
+            cb(Vcur, mark_parallel_projections ? "attn_qkv.v.bias" : "Vcur", il);
         }
         if (hparams.f_clamp_kqv > 0.0f) {
             Vcur = ggml_clamp(ctx0, Vcur, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
-            cb(Vcur, "Vcur_clamped", il);
+            cb(Vcur, mark_parallel_projections ? "attn_qkv.v.clamp" : "Vcur_clamped", il);
         }
         Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens);
         Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
         Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
     }
 
-    cb(Qcur, "Qcur", il);
-    cb(Kcur, "Kcur", il);
-    cb(Vcur, "Vcur", il);
+    cb(Qcur, mark_parallel_projections ? "attn_qkv.q.reshape" : "Qcur", il);
+    cb(Kcur, mark_parallel_projections ? "attn_qkv.k.reshape" : "Kcur", il);
+    cb(Vcur, mark_parallel_projections ? "attn_qkv.v.reshape" : "Vcur", il);
 
     return { Qcur, Kcur, Vcur };
+}
+
+bool llm_graph_context::build_qkv_shards(
+        const llama_layer & layer,
+              ggml_tensor * cur,
+                  int64_t   n_embd_head,
+                  int64_t   n_head,
+                  int64_t   n_head_kv,
+                      int   il,
+            llm_graph_qkv & out) const {
+    out = {};
+
+    llama_backend_policy_attn_qkv_shards policy;
+    const bool is_prefill = n_tokens > 1;
+    if (!llama_backend_policy_match_attn_qkv_shards(il, is_prefill, policy)) {
+        return false;
+    }
+
+    const int64_t n_embd_q  = n_embd_head * n_head;
+    const int64_t n_embd_kv = n_embd_head * n_head_kv;
+    const bool eligible =
+        model != nullptr &&
+        layer.wqkv == nullptr &&
+        layer.wq != nullptr && layer.wk != nullptr && layer.wv != nullptr &&
+        (loras == nullptr || loras->empty()) &&
+        policy.head_dim == n_embd_head &&
+        layer.wq->ne[0] == cur->ne[0] && layer.wq->ne[1] == n_embd_q &&
+        layer.wk->ne[0] == cur->ne[0] && layer.wk->ne[1] == n_embd_kv &&
+        layer.wv->ne[0] == cur->ne[0] && layer.wv->ne[1] == n_embd_kv;
+    if (!eligible) {
+        LLAMA_LOG_WARN(
+                "backend_policy: attn_qkv_shards layer %d is not eligible "
+                "(separate Q/K/V, no LoRA, matching head/output dimensions required); falling back\n",
+                il);
+        return false;
+    }
+
+    struct qkv_lane {
+        llama_backend_policy_attn_qkv_shard split;
+        ggml_tensor * wq = nullptr;
+        ggml_tensor * wk = nullptr;
+        ggml_tensor * wv = nullptr;
+        ggml_tensor * q = nullptr;
+        ggml_tensor * k = nullptr;
+        ggml_tensor * v = nullptr;
+    };
+
+    std::vector<qkv_lane> lanes;
+    lanes.reserve(policy.splits.size());
+    for (const auto & split : policy.splits) {
+        qkv_lane lane;
+        lane.split = split;
+        const std::vector<std::string> backend = { split.backend };
+        lane.wq = model->get_backend_policy_residency_tensor(layer.wq, backend);
+        lane.wk = model->get_backend_policy_residency_tensor(layer.wk, backend);
+        lane.wv = model->get_backend_policy_residency_tensor(layer.wv, backend);
+        if (lane.wq == nullptr || lane.wk == nullptr || lane.wv == nullptr) {
+            LLAMA_LOG_WARN(
+                    "backend_policy: attn_qkv_shards layer %d lane %s is missing resident Q/K/V "
+                    "weights for %s; falling back\n",
+                    il, split.id.c_str(), split.backend.c_str());
+            return false;
+        }
+        LLAMA_LOG_DEBUG(
+                "backend_policy: attn_qkv_shards layer %d lane %s backend %s "
+                "q=%" PRId64 "+%" PRId64 " k=%" PRId64 "+%" PRId64
+                " v=%" PRId64 "+%" PRId64 "\n",
+                il, split.id.c_str(), split.backend.c_str(),
+                split.q_start, split.q_size,
+                split.k_start, split.k_size,
+                split.v_start, split.v_size);
+        lanes.push_back(std::move(lane));
+    }
+
+    auto validate_projection = [&](char projection, int64_t expected) {
+        int64_t covered = 0;
+        for (const auto & lane : lanes) {
+            int64_t start = 0;
+            int64_t size = 0;
+            switch (projection) {
+                case 'q': start = lane.split.q_start; size = lane.split.q_size; break;
+                case 'k': start = lane.split.k_start; size = lane.split.k_size; break;
+                case 'v': start = lane.split.v_start; size = lane.split.v_size; break;
+                default: GGML_ABORT("invalid QKV projection selector");
+            }
+            if (start != covered || size <= 0 || start % n_embd_head != 0 || size % n_embd_head != 0) {
+                return false;
+            }
+            covered += size;
+        }
+        return covered == expected;
+    };
+
+    if (lanes.size() != 3 ||
+            !validate_projection('q', n_embd_q) ||
+            !validate_projection('k', n_embd_kv) ||
+            !validate_projection('v', n_embd_kv)) {
+        LLAMA_LOG_WARN(
+                "backend_policy: attn_qkv_shards layer %d does not exactly cover Q=%" PRId64
+                ", K/V=%" PRId64 " on head boundaries; falling back\n",
+                il, n_embd_q, n_embd_kv);
+        return false;
+    }
+
+    auto make_shard = [&](qkv_lane & lane, char projection) {
+        ggml_tensor * weight = nullptr;
+        int64_t start = 0;
+        int64_t size = 0;
+        switch (projection) {
+            case 'q': weight = lane.wq; start = lane.split.q_start; size = lane.split.q_size; break;
+            case 'k': weight = lane.wk; start = lane.split.k_start; size = lane.split.k_size; break;
+            case 'v': weight = lane.wv; start = lane.split.v_start; size = lane.split.v_size; break;
+            default: GGML_ABORT("invalid QKV projection selector");
+        }
+
+        ggml_tensor * shard = ggml_mul_mat_src0_region(
+                ctx0, weight, cur,
+                0, weight->ne[0], start, size);
+        const std::string name = std::string("attn_qkv_shard.") + lane.split.id + "." +
+            projection + ".proj";
+        cb_route(shard, name.c_str(), il, lane.split.backend.c_str());
+        return shard;
+    };
+
+    // Emit all three projection shards for one backend before moving to the
+    // next lane.  The scheduler therefore sees exactly three pure composite
+    // branch splits instead of nine competing calls into three contexts.
+    std::unordered_set<ggml_backend_t> lane_backends;
+    for (auto & lane : lanes) {
+        lane.q = make_shard(lane, 'q');
+        ggml_backend_t lane_backend = sched != nullptr
+            ? ggml_backend_sched_get_tensor_backend(sched, lane.q)
+            : nullptr;
+        if (lane_backend == nullptr || !lane_backends.insert(lane_backend).second) {
+            GGML_ABORT(
+                    "backend_policy: attn_qkv_shards layer %d lane %s did not resolve to a unique backend",
+                    il, lane.split.id.c_str());
+        }
+        lane.k = make_shard(lane, 'k');
+        lane.v = make_shard(lane, 'v');
+        ggml_build_forward_expand(gf, lane.q);
+        ggml_build_forward_expand(gf, lane.k);
+        ggml_build_forward_expand(gf, lane.v);
+    }
+
+    auto assemble = [&](char projection) {
+        std::vector<std::pair<int64_t, ggml_tensor *>> parts;
+        parts.reserve(lanes.size());
+        for (const auto & lane : lanes) {
+            switch (projection) {
+                case 'q': parts.emplace_back(lane.split.q_start, lane.q); break;
+                case 'k': parts.emplace_back(lane.split.k_start, lane.k); break;
+                case 'v': parts.emplace_back(lane.split.v_start, lane.v); break;
+                default: GGML_ABORT("invalid QKV projection selector");
+            }
+        }
+        std::sort(parts.begin(), parts.end(), [](const auto & lhs, const auto & rhs) {
+            return lhs.first < rhs.first;
+        });
+
+        // Right-associated concatenation keeps every branch node before the
+        // canonical join even if this helper is later used without the eager
+        // branch expansion above.
+        ggml_tensor * result = parts.back().second;
+        for (size_t i = parts.size() - 1; i > 0; --i) {
+            result = ggml_concat(ctx0, parts[i - 1].second, result, 0);
+            const std::string name = std::string("attn_qkv_join.") + projection +
+                ".concat" + std::to_string(i - 1);
+            cb_route(result, name.c_str(), il, policy.assemble_backend.c_str());
+        }
+        return result;
+    };
+
+    ggml_tensor * Qcur = assemble('q');
+    ggml_tensor * Kcur = assemble('k');
+    ggml_tensor * Vcur = assemble('v');
+
+    // Preserve the ordinary projection's post-matmul ordering exactly:
+    // optional scale, bias, clamp, then canonical reshape.
+    auto finish_projection = [&](ggml_tensor * value, ggml_tensor * scale, ggml_tensor * bias,
+                                 char projection, int64_t heads) {
+        const std::string prefix = std::string("attn_qkv_join.") + projection;
+        if (scale != nullptr) {
+            value = ggml_mul(ctx0, value, scale);
+            cb_route(value, (prefix + ".scale").c_str(), il, policy.assemble_backend.c_str());
+        }
+        if (bias != nullptr) {
+            value = ggml_add(ctx0, value, bias);
+            cb_route(value, (prefix + ".bias").c_str(), il, policy.assemble_backend.c_str());
+        }
+        if (hparams.f_clamp_kqv > 0.0f) {
+            value = ggml_clamp(ctx0, value, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
+            cb_route(value, (prefix + ".clamp").c_str(), il, policy.assemble_backend.c_str());
+        }
+        value = ggml_reshape_3d(ctx0, value, n_embd_head, heads, n_tokens);
+        cb(value, (prefix + ".reshape").c_str(), il, policy.assemble_backend.c_str());
+        return value;
+    };
+
+    Qcur = finish_projection(Qcur, layer.wq_s, layer.wq_b, 'q', n_head);
+    Kcur = finish_projection(Kcur, layer.wk_s, layer.wk_b, 'k', n_head_kv);
+    Vcur = finish_projection(Vcur, layer.wv_s, layer.wv_b, 'v', n_head_kv);
+
+    out = { Qcur, Kcur, Vcur };
+    return true;
 }
 
 

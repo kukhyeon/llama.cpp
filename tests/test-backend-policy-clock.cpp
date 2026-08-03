@@ -227,6 +227,90 @@ bool test_failed_load_is_transactional(const char * invalid_policy_path) {
     return true;
 }
 
+bool test_attn_qkv_shards_policy() {
+    static constexpr char valid_policy[] = R"JSON(
+{
+  "version": 1,
+  "enabled": true,
+  "attn_qkv_shards": {
+    "enabled": true,
+    "phase": "prefill",
+    "layer_range": [2, 4],
+    "head_dim": 128,
+    "assemble_backend": "OpenCL",
+    "split_layout": [
+      { "id": "npu", "backend": "HTP0-REPACK" },
+      { "id": "gpu", "backend": "OpenCL", "align": 64 },
+      { "id": "cpu", "backend": "CPU", "align": 64 }
+    ],
+    "split_sizes": {
+      "q": { "npu": 512, "gpu": 256, "cpu": 256 },
+      "k": { "npu": 256, "gpu": 128, "cpu": 128 },
+      "v": { "npu": 256, "gpu": 128, "cpu": 128 }
+    }
+  }
+}
+)JSON";
+
+    // The HTP lane is implicitly at least 256-wide, even without an explicit
+    // layout align. A 128-wide HTP shard must therefore fail transactionally.
+    static constexpr char invalid_policy[] = R"JSON(
+{
+  "version": 1,
+  "enabled": true,
+  "attn_qkv_shards": {
+    "enabled": true,
+    "split_layout": [
+      { "id": "npu", "backend": "HTP0-REPACK" },
+      { "id": "gpu", "backend": "OpenCL" },
+      { "id": "cpu", "backend": "CPU" }
+    ],
+    "split_sizes": {
+      "q": { "npu": 128, "gpu": 128, "cpu": 128 },
+      "k": { "npu": 128, "gpu": 128, "cpu": 128 },
+      "v": { "npu": 128, "gpu": 128, "cpu": 128 }
+    }
+  }
+}
+)JSON";
+
+    temporary_policy_file valid_file("test-backend-policy-attn-qkv-valid.json", valid_policy);
+    temporary_policy_file invalid_file("test-backend-policy-attn-qkv-invalid.json", invalid_policy);
+
+    llama_backend_policy_clear();
+    CHECK(!llama_backend_policy_attn_qkv_shards_enabled());
+    CHECK(llama_backend_policy_load(valid_file.path(), false, false));
+    CHECK(llama_backend_policy_attn_qkv_shards_enabled());
+
+    llama_backend_policy_attn_qkv_shards policy;
+    CHECK(!llama_backend_policy_match_attn_qkv_shards(1, true, policy));
+    CHECK(!llama_backend_policy_match_attn_qkv_shards(2, false, policy));
+    CHECK(llama_backend_policy_match_attn_qkv_shards(2, true, policy));
+    CHECK(policy.enabled);
+    CHECK(policy.phase == "prefill");
+    CHECK(policy.layer_start == 2);
+    CHECK(policy.layer_end == 4);
+    CHECK(policy.head_dim == 128);
+    CHECK(policy.assemble_backend == "OpenCL");
+    CHECK(policy.splits.size() == 3);
+    CHECK(policy.splits[0].id == "npu");
+    CHECK(policy.splits[0].backend == "HTP0-REPACK");
+    CHECK(policy.splits[0].q_start == 0 && policy.splits[0].q_size == 512);
+    CHECK(policy.splits[1].q_start == 512 && policy.splits[1].q_size == 256);
+    CHECK(policy.splits[2].q_start == 768 && policy.splits[2].q_size == 256);
+    CHECK(policy.splits[1].k_start == 256 && policy.splits[1].k_size == 128);
+    CHECK(policy.splits[2].v_start == 384 && policy.splits[2].v_size == 128);
+
+    CHECK(!llama_backend_policy_load(invalid_file.path(), false, false));
+    CHECK(llama_backend_policy_attn_qkv_shards_enabled());
+    CHECK(llama_backend_policy_match_attn_qkv_shards(3, true, policy));
+    CHECK(policy.splits[0].q_size == 512);
+
+    llama_backend_policy_clear();
+    CHECK(!llama_backend_policy_attn_qkv_shards_enabled());
+    return true;
+}
+
 bool test_cover_residency_plan(const char * union_policy_path) {
     llama_backend_policy_clear();
     CHECK(llama_backend_policy_load(union_policy_path, false, false));
@@ -1217,6 +1301,10 @@ int main() {
             return 1;
         }
         if (!test_failed_load_is_transactional(invalid_file.path())) {
+            llama_backend_policy_clear();
+            return 1;
+        }
+        if (!test_attn_qkv_shards_policy()) {
             llama_backend_policy_clear();
             return 1;
         }

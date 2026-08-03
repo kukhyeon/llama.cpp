@@ -35,6 +35,28 @@ struct llama_backend_policy_ffn_parallel {
     std::string source;
 };
 
+struct llama_backend_policy_attn_qkv_shard {
+    std::string id;
+    std::string backend;
+    int64_t q_start = 0;
+    int64_t q_size = 0;
+    int64_t k_start = 0;
+    int64_t k_size = 0;
+    int64_t v_start = 0;
+    int64_t v_size = 0;
+};
+
+struct llama_backend_policy_attn_qkv_shards {
+    bool enabled = false;
+    std::string phase = "prefill";
+    int layer_start = -2;
+    int layer_end = -2;
+    int64_t head_dim = 128;
+    std::string assemble_backend = "CPU";
+    std::vector<llama_backend_policy_attn_qkv_shard> splits;
+    std::string source;
+};
+
 // Model-load residency for every FFN policy that can become active at runtime.
 // Each entry is one connected union cover for a backend. Overlapping or
 // touching profile intervals are merged, while genuinely disjoint intervals
@@ -84,6 +106,7 @@ bool llama_backend_policy_weights_enabled();
 bool llama_backend_policy_ops_enabled();
 bool llama_backend_policy_residency_enabled();
 bool llama_backend_policy_ffn_parallel_enabled();
+bool llama_backend_policy_attn_qkv_shards_enabled();
 int  llama_backend_policy_ffn_parallel_reduce_threads();
 
 // Update the process-global runtime profile from the current execution phase
@@ -169,6 +192,13 @@ bool llama_backend_policy_match_ffn_parallel(
         int il,
         bool is_prefill,
         llama_backend_policy_ffn_parallel & out);
+
+// Resolve the root-level attention Q/K/V output-shard policy for one layer and
+// phase. Profiles intentionally do not override this policy.
+bool llama_backend_policy_match_attn_qkv_shards(
+        int il,
+        bool is_prefill,
+        llama_backend_policy_attn_qkv_shards & out);
 
 // Resolve one prepared profile without mutating the legacy process-global
 // active profile. Layer-boundary plans use this while constructing all FFN

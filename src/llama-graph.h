@@ -669,6 +669,8 @@ struct llm_graph_params {
             cparams.module_bench_layer_start == other.cparams.module_bench_layer_start &&
             cparams.module_bench_layer_end   == other.cparams.module_bench_layer_end &&
             cparams.module_bench_backend     == other.cparams.module_bench_backend &&
+            cparams.attn_qkv_parallel        == other.cparams.attn_qkv_parallel &&
+            cparams.attn_qkv_shards          == other.cparams.attn_qkv_shards &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             model == other.model &&
@@ -863,7 +865,22 @@ struct llm_graph_context {
                   int64_t   n_embd_head,
                   int64_t   n_head,
                   int64_t   n_head_kv,
-                      int   il) const;
+                      int   il,
+                     bool   parallel_projection_names = false) const;
+
+    // Split each separate Q/K/V projection along its output/head axis across
+    // three policy lanes.  The lanes are emitted backend-major so one backend
+    // executes its Q, K, and V shards serially while the three backends run in
+    // parallel.  The returned tensors are canonical full Q/K/V values; RoPE
+    // and every KV-cache operation remain outside this helper.
+    bool build_qkv_shards(
+        const llama_layer & layer,
+              ggml_tensor * cur,
+                  int64_t   n_embd_head,
+                  int64_t   n_head,
+                  int64_t   n_head_kv,
+                      int   il,
+            llm_graph_qkv & out) const;
 
     ggml_tensor * build_ffn(
              ggml_tensor * cur,

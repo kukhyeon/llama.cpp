@@ -178,8 +178,28 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                         cb(inp, "module_attn_projection_inp", il);
 
                         ggml_tensor * rope_factors = model.get_rope_factors(cparams, il);
-                        auto [Qcur, Kcur, Vcur] = build_qkv(model.layers[il], inp,
-                                n_embd_head, n_head, n_head_kv, il);
+                        llm_graph_qkv qkv;
+                        const bool sharded_qkv =
+                            cparams.attn_qkv_shards && n_tokens > 1 &&
+                            build_qkv_shards(model.layers[il], inp,
+                                    n_embd_head, n_head, n_head_kv, il, qkv);
+                        const bool parallel_qkv =
+                            !sharded_qkv && cparams.attn_qkv_parallel &&
+                            n_tokens > 1 && model.layers[il].wqkv == nullptr;
+                        if (!sharded_qkv) {
+                            qkv = build_qkv(model.layers[il], inp,
+                                    n_embd_head, n_head, n_head_kv, il, parallel_qkv);
+                        }
+                        auto [Qcur, Kcur, Vcur] = qkv;
+
+                        // Materialize the three independent projection branches
+                        // before adding RoPE or KV-cache side effects. The scheduler
+                        // may fork-join only this prefix when the opt-in is enabled.
+                        if (parallel_qkv || sharded_qkv) {
+                            ggml_build_forward_expand(gf, Qcur);
+                            ggml_build_forward_expand(gf, Vcur);
+                            ggml_build_forward_expand(gf, Kcur);
+                        }
 
                         Qcur = ggml_rope_ext(
                                 ctx0, Qcur, inp_pos, rope_factors,
@@ -193,7 +213,9 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
 
                         cb(Qcur, "Qcur", il);
                         cb(Kcur, "Kcur", il);
-                        cb(Vcur, "Vcur", il);
+                        if (!parallel_qkv && !sharded_qkv) {
+                            cb(Vcur, "Vcur", il);
+                        }
 
                         ggml_build_forward_expand(gf, Qcur);
                         ggml_build_forward_expand(gf, Vcur);
@@ -524,8 +546,27 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
             ggml_tensor * rope_factors = model.get_rope_factors(cparams, il);
 
             // compute Q and K and RoPE them
-            auto [Qcur, Kcur, Vcur] = build_qkv(model.layers[il], cur,
-                    n_embd_head, n_head, n_head_kv, il);
+            llm_graph_qkv qkv;
+            const bool sharded_qkv =
+                cparams.attn_qkv_shards && n_tokens > 1 &&
+                build_qkv_shards(model.layers[il], cur,
+                        n_embd_head, n_head, n_head_kv, il, qkv);
+            const bool parallel_qkv =
+                !sharded_qkv && cparams.attn_qkv_parallel &&
+                n_tokens > 1 && model.layers[il].wqkv == nullptr;
+            if (!sharded_qkv) {
+                qkv = build_qkv(model.layers[il], cur,
+                        n_embd_head, n_head, n_head_kv, il, parallel_qkv);
+            }
+            auto [Qcur, Kcur, Vcur] = qkv;
+
+            // Keep RoPE and all KV-cache reads/writes after a projection-only
+            // fork-join. OFF preserves the original graph construction order.
+            if (parallel_qkv || sharded_qkv) {
+                ggml_build_forward_expand(gf, Qcur);
+                ggml_build_forward_expand(gf, Vcur);
+                ggml_build_forward_expand(gf, Kcur);
+            }
 
             Qcur = ggml_rope_ext(
                     ctx0, Qcur, inp_pos, rope_factors,
@@ -541,7 +582,9 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
 
             cb(Qcur, "Qcur", il);
             cb(Kcur, "Kcur", il);
-            cb(Vcur, "Vcur", il);
+            if (!parallel_qkv && !sharded_qkv) {
+                cb(Vcur, "Vcur", il);
+            }
 
             if (hparams.use_kq_norm) {
                 // Llama4TextL2Norm

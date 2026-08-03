@@ -103,6 +103,7 @@ struct policy_state {
     std::vector<policy_rule> residency_rules;
 
     ffn_parallel_policy ffn_parallel;
+    llama_backend_policy_attn_qkv_shards attn_qkv_shards;
 
     bool ffn_clock_switch_enabled = false;
     std::string pending_clock_profile;
@@ -723,6 +724,168 @@ llama_backend_policy_ffn_parallel materialize_ffn_policy(const ffn_parallel_poli
         out.splits = std::move(env_splits);
         out.source = "LLAMA_FFN_PARALLEL_SPLITS";
     }
+
+    return out;
+}
+
+bool attn_qkv_shard_id_is_safe(const std::string & id) {
+    return !id.empty() && std::all_of(id.begin(), id.end(), [](unsigned char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+               (c >= '0' && c <= '9') || c == '_' || c == '-';
+    });
+}
+
+bool attn_qkv_shard_backend_needs_htp_alignment(const std::string & backend) {
+    const std::string normalized = lower(backend);
+    return normalized.find("htp") != std::string::npos ||
+           normalized.find("hexagon") != std::string::npos;
+}
+
+llama_backend_policy_attn_qkv_shards parse_attn_qkv_shards(
+        const json & root,
+        const std::string & source) {
+    if (!root.is_object()) {
+        throw std::runtime_error(source + " must be an object");
+    }
+
+    llama_backend_policy_attn_qkv_shards out;
+    out.enabled = root.value("enabled", false);
+    out.phase = root.value("phase", std::string("prefill"));
+    out.assemble_backend = root.value("assemble_backend", std::string("CPU"));
+    out.source = source;
+
+    if (!str_eq_ci(out.phase, "all") && !str_eq_ci(out.phase, "prefill") &&
+            !str_eq_ci(out.phase, "decode")) {
+        throw std::runtime_error(source + ".phase must be all, prefill, or decode");
+    }
+    if (out.assemble_backend.empty()) {
+        throw std::runtime_error(source + ".assemble_backend must be a non-empty string");
+    }
+    if (root.contains("head_dim")) {
+        if (!root["head_dim"].is_number_integer()) {
+            throw std::runtime_error(source + ".head_dim must be a positive integer");
+        }
+        out.head_dim = root["head_dim"].get<int64_t>();
+    }
+    if (out.head_dim <= 0) {
+        throw std::runtime_error(source + ".head_dim must be a positive integer");
+    }
+    parse_layer_range(root, source, out.layer_start, out.layer_end);
+
+    if (!root.contains("split_layout") || !root["split_layout"].is_array() ||
+            root["split_layout"].size() != 3) {
+        throw std::runtime_error(source + ".split_layout must contain exactly 3 entries");
+    }
+    if (!root.contains("split_sizes") || !root["split_sizes"].is_object()) {
+        throw std::runtime_error(source + ".split_sizes must be an object");
+    }
+
+    struct layout_entry {
+        std::string id;
+        std::string backend;
+        int64_t lane_align = 1;
+    };
+    std::vector<layout_entry> layout;
+    layout.reserve(3);
+    std::unordered_set<std::string> split_ids;
+    std::unordered_set<std::string> split_backends;
+
+    for (size_t i = 0; i < root["split_layout"].size(); ++i) {
+        const auto & item = root["split_layout"][i];
+        const std::string item_source =
+            source + ".split_layout[" + std::to_string(i) + "]";
+        if (!item.is_object()) {
+            throw std::runtime_error(item_source + " must be an object");
+        }
+
+        layout_entry entry;
+        entry.id = item.value("id", std::string());
+        entry.backend = item.value("backend", std::string());
+        if (!attn_qkv_shard_id_is_safe(entry.id)) {
+            throw std::runtime_error(
+                    item_source + ".id must contain only ASCII letters, digits, '_' or '-'");
+        }
+        if (entry.backend.empty()) {
+            throw std::runtime_error(item_source + ".backend must be a non-empty string");
+        }
+        if (!split_ids.insert(lower(entry.id)).second) {
+            throw std::runtime_error(source + ".split_layout ids must be unique ignoring case");
+        }
+        if (!split_backends.insert(lower(entry.backend)).second) {
+            throw std::runtime_error(source + ".split_layout backends must be unique ignoring case");
+        }
+
+        if (item.contains("align")) {
+            if (!item["align"].is_number_integer()) {
+                throw std::runtime_error(item_source + ".align must be a positive integer");
+            }
+            entry.lane_align = item["align"].get<int64_t>();
+            if (entry.lane_align <= 0) {
+                throw std::runtime_error(item_source + ".align must be a positive integer");
+            }
+        }
+        if (attn_qkv_shard_backend_needs_htp_alignment(entry.backend)) {
+            entry.lane_align = std::max<int64_t>(entry.lane_align, 256);
+        }
+
+        llama_backend_policy_attn_qkv_shard split;
+        split.id = entry.id;
+        split.backend = entry.backend;
+        out.splits.push_back(std::move(split));
+        layout.push_back(std::move(entry));
+    }
+
+    const auto & split_sizes = root["split_sizes"];
+    if (split_sizes.size() != 3 || !split_sizes.contains("q") ||
+            !split_sizes.contains("k") || !split_sizes.contains("v")) {
+        throw std::runtime_error(source + ".split_sizes must contain exactly q, k, and v");
+    }
+
+    auto populate_projection = [&](const char * projection, auto start_member, auto size_member) {
+        const auto & sizes = split_sizes[projection];
+        const std::string projection_source = source + ".split_sizes." + projection;
+        if (!sizes.is_object() || sizes.size() != layout.size()) {
+            throw std::runtime_error(
+                    projection_source + " must contain exactly the split_layout ids");
+        }
+
+        int64_t start = 0;
+        for (size_t i = 0; i < layout.size(); ++i) {
+            const auto & entry = layout[i];
+            if (!sizes.contains(entry.id) || !sizes[entry.id].is_number_integer()) {
+                throw std::runtime_error(
+                        projection_source + "." + entry.id + " must be a positive integer");
+            }
+            const int64_t size = sizes[entry.id].get<int64_t>();
+            if (size <= 0 || start > std::numeric_limits<int64_t>::max() - size) {
+                throw std::runtime_error(
+                        projection_source + "." + entry.id +
+                        " must be a positive non-overflowing integer");
+            }
+            if ((start % out.head_dim) != 0 || (size % out.head_dim) != 0 ||
+                    (start % entry.lane_align) != 0 || (size % entry.lane_align) != 0) {
+                throw std::runtime_error(
+                        projection_source + "." + entry.id +
+                        " start/size must be divisible by head_dim=" +
+                        std::to_string(out.head_dim) + " and lane align=" +
+                        std::to_string(entry.lane_align));
+            }
+
+            out.splits[i].*start_member = start;
+            out.splits[i].*size_member = size;
+            start += size;
+        }
+    };
+
+    populate_projection(
+            "q", &llama_backend_policy_attn_qkv_shard::q_start,
+            &llama_backend_policy_attn_qkv_shard::q_size);
+    populate_projection(
+            "k", &llama_backend_policy_attn_qkv_shard::k_start,
+            &llama_backend_policy_attn_qkv_shard::k_size);
+    populate_projection(
+            "v", &llama_backend_policy_attn_qkv_shard::v_start,
+            &llama_backend_policy_attn_qkv_shard::v_size);
 
     return out;
 }
@@ -1518,6 +1681,12 @@ bool llama_backend_policy_load(const char * path, bool enable_weights, bool enab
             next.ffn_parallel.enabled = next.enabled && next.ffn_parallel.enabled;
         }
 
+        if (root.contains("attn_qkv_shards")) {
+            next.attn_qkv_shards =
+                parse_attn_qkv_shards(root["attn_qkv_shards"], "attn_qkv_shards");
+            next.attn_qkv_shards.enabled = next.enabled && next.attn_qkv_shards.enabled;
+        }
+
         if (root.contains("ffn_clock_switch")) {
             if (!root["ffn_clock_switch"].is_object()) {
                 throw std::runtime_error("ffn_clock_switch must be an object");
@@ -1639,12 +1808,13 @@ bool llama_backend_policy_load(const char * path, bool enable_weights, bool enab
 
         g_policy = std::move(next);
 
-        LLAMA_LOG_INFO("backend_policy: loaded '%s' (weights=%s, weight_rules=%zu, ops=%s, op_rules=%zu, residency=%s, residency_rules=%zu, ffn_parallel=%s, ffn_clock_switch=%s, profiles=%zu)\n",
+        LLAMA_LOG_INFO("backend_policy: loaded '%s' (weights=%s, weight_rules=%zu, ops=%s, op_rules=%zu, residency=%s, residency_rules=%zu, ffn_parallel=%s, attn_qkv_shards=%s, ffn_clock_switch=%s, profiles=%zu)\n",
                 g_policy.path.c_str(),
                 g_policy.weights_enabled ? "on" : "off", g_policy.weight_rules.size(),
                 g_policy.ops_enabled ? "on" : "off", g_policy.op_rules.size(),
                 g_policy.residency_enabled ? "on" : "off", g_policy.residency_rules.size(),
                 g_policy.ffn_parallel.enabled ? "on" : "off",
+                g_policy.attn_qkv_shards.enabled ? "on" : "off",
                 g_policy.ffn_clock_switch_enabled ? "on" : "off",
                 g_policy.profiles.size());
         if (g_policy.runtime_routes.enabled) {
@@ -1697,6 +1867,11 @@ bool llama_backend_policy_ffn_parallel_enabled() {
     std::lock_guard<std::mutex> lock(g_policy_mutex);
     llama_backend_policy_ffn_parallel policy;
     return g_policy.loaded && effective_ffn_policy(policy);
+}
+
+bool llama_backend_policy_attn_qkv_shards_enabled() {
+    std::lock_guard<std::mutex> lock(g_policy_mutex);
+    return g_policy.loaded && g_policy.attn_qkv_shards.enabled;
 }
 
 int llama_backend_policy_ffn_parallel_reduce_threads() {
@@ -2208,6 +2383,30 @@ bool llama_backend_policy_match_ffn_parallel(
         }
     }
 
+    return true;
+}
+
+bool llama_backend_policy_match_attn_qkv_shards(
+        int il,
+        bool is_prefill,
+        llama_backend_policy_attn_qkv_shards & out) {
+    std::lock_guard<std::mutex> lock(g_policy_mutex);
+    out = {};
+
+    if (!g_policy.loaded || !g_policy.attn_qkv_shards.enabled) {
+        return false;
+    }
+
+    const auto & policy = g_policy.attn_qkv_shards;
+    if (!phase_matches(policy.phase, is_prefill)) {
+        return false;
+    }
+    if (policy.layer_start != -2 &&
+            (il < policy.layer_start || (policy.layer_end != -2 && il > policy.layer_end))) {
+        return false;
+    }
+
+    out = policy;
     return true;
 }
 

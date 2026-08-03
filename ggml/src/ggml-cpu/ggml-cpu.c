@@ -473,6 +473,7 @@ struct ggml_threadpool {
 
     // synchronization primitives
     atomic_int n_graph;       // updated when there is work to be done (i.e each graph) holds graph and active thread counts.
+    atomic_uint prewake_generation; // wakes idle workers without publishing a graph
     atomic_int GGML_CACHE_ALIGN n_barrier;
     atomic_int GGML_CACHE_ALIGN n_barrier_passed;
     atomic_int GGML_CACHE_ALIGN current_chunk; // currently processing chunk during Mat_Mul, shared between all the threads.
@@ -495,6 +496,7 @@ struct ggml_compute_state {
 #ifndef GGML_USE_OPENMP
     ggml_thread_t thrd;
     int  last_graph;
+    unsigned last_prewake_generation;
     bool pending;
 #endif
     bool cpumask[GGML_MAX_N_THREADS];
@@ -2770,6 +2772,24 @@ void ggml_threadpool_resume(struct ggml_threadpool * threadpool) {
 #endif
 }
 
+void ggml_threadpool_prewake(struct ggml_threadpool * threadpool) {
+    if (threadpool == NULL) {
+        return;
+    }
+
+#ifndef GGML_USE_OPENMP
+    ggml_mutex_lock(&threadpool->mutex);
+    if (!threadpool->stop && !threadpool->pause &&
+            threadpool->n_threads > 1 && threadpool->poll > 0) {
+        atomic_fetch_add_explicit(&threadpool->prewake_generation, 1, memory_order_release);
+        ggml_cond_broadcast(&threadpool->cond);
+    }
+    ggml_mutex_unlock(&threadpool->mutex);
+#else
+    UNUSED(threadpool);
+#endif
+}
+
 struct ggml_cplan ggml_graph_plan(
           const struct ggml_cgraph * cgraph,
                                int   n_threads,
@@ -3090,6 +3110,19 @@ static inline bool ggml_graph_compute_thread_ready(struct ggml_compute_state * s
     return false;
 }
 
+// Each worker consumes a pre-wake generation independently. Keeping this
+// separate from n_graph prevents a pre-wake from executing a stale graph.
+static inline bool ggml_graph_compute_consume_prewake(struct ggml_compute_state * state) {
+    const unsigned generation = atomic_load_explicit(
+            &state->threadpool->prewake_generation, memory_order_acquire);
+    if (generation == state->last_prewake_generation) {
+        return false;
+    }
+
+    state->last_prewake_generation = generation;
+    return true;
+}
+
 // sync thread state after polling
 static inline void ggml_graph_compute_thread_sync(struct ggml_compute_state * state) {
     // TSAN doesn't support standalone fence yet, we use a dummy read-modify-write instead
@@ -3126,6 +3159,11 @@ static inline bool ggml_graph_compute_check_for_work(struct ggml_compute_state *
 
     ggml_mutex_lock_shared(&threadpool->mutex);
     while (!ggml_graph_compute_thread_ready(state)) {
+        // Break out without setting pending. The outer worker loop will call
+        // this function again and perform a fresh polling window.
+        if (ggml_graph_compute_consume_prewake(state)) {
+            break;
+        }
         // No new work. Wait for the signal.
         GGML_PRINT_DEBUG("thread #%d waiting for work (sleeping)\n", state->ith);
         ggml_cond_wait(&threadpool->cond, &threadpool->mutex);
@@ -3218,6 +3256,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->cgraph           = cgraph;
         threadpool->cplan            = cplan;
         threadpool->n_graph          = 0;
+        threadpool->prewake_generation = 0;
         threadpool->n_barrier        = 0;
         threadpool->n_barrier_passed = 0;
         threadpool->current_chunk    = 0;
