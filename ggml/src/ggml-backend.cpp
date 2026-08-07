@@ -786,6 +786,7 @@ struct ggml_backend_sched_split {
     int i_end;
     int checkpoint_index_after;
     bool is_ffn_parallel_reduce;
+    bool contains_transformer_layer;
     struct ggml_tensor * inputs[GGML_SCHED_MAX_SPLIT_INPUTS];
     int n_inputs;
     // graph view of this split
@@ -944,8 +945,10 @@ struct ggml_backend_sched {
     int ffn_device_worker_cpu;
     int ffn_gpu_worker_cpu;
     int ffn_npu_worker_cpu;
-    uint32_t ffn_cpu_prewake_hold_us;
-    ggml_backend_cpu_prewake_hold_t ffn_cpu_prewake_hold_fns[GGML_SCHED_MAX_BACKENDS];
+    uint32_t cpu_graph_prewake_hold_us;
+    uint32_t cpu_graph_prewake_idle_us;
+    int64_t cpu_graph_last_end_us[GGML_SCHED_MAX_BACKENDS];
+    ggml_backend_cpu_prewake_hold_t cpu_graph_prewake_hold_fns[GGML_SCHED_MAX_BACKENDS];
 
     // Non-trivial worker state is owned separately because this scheduler is
     // allocated with calloc/free.
@@ -1385,24 +1388,52 @@ static int ggml_backend_sched_ffn_worker_cpu(const char * env_name, int fallback
     return (int) cpu;
 }
 
-static uint32_t ggml_backend_sched_ffn_cpu_prewake_hold_us() {
-    static constexpr unsigned long MAX_HOLD_US = 1000000UL;
-    const char * env_name = "GGML_FFN_CPU_PREWAKE_HOLD_US";
-    const char * value = getenv(env_name);
+static uint32_t ggml_backend_sched_cpu_graph_prewake_us(
+        const char * env_name,
+        const char * legacy_env_name,
+        uint32_t default_value,
+        unsigned long max_value) {
+    const char * selected_env_name = env_name;
+    const char * value = getenv(selected_env_name);
+    if ((value == nullptr || value[0] == '\0') && legacy_env_name != nullptr) {
+        selected_env_name = legacy_env_name;
+        value = getenv(selected_env_name);
+        if (value != nullptr && value[0] != '\0') {
+            GGML_LOG_WARN(
+                    "%s: %s is deprecated; use %s instead\n",
+                    __func__, legacy_env_name, env_name);
+        }
+    }
     if (value == nullptr || value[0] == '\0') {
-        return 0;
+        return default_value;
     }
 
     errno = 0;
     char * end = nullptr;
-    const unsigned long hold_us = strtoul(value, &end, 10);
-    if (errno != 0 || end == value || *end != '\0' || value[0] == '-' || hold_us > MAX_HOLD_US) {
+    const unsigned long parsed = strtoul(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || value[0] == '-' || parsed > max_value) {
         GGML_LOG_WARN(
-                "%s: invalid %s='%s'; expected 0..%lu, disabling layer pre-wake\n",
-                __func__, env_name, value, MAX_HOLD_US);
+                "%s: invalid %s='%s'; expected 0..%lu\n",
+                __func__, selected_env_name, value, max_value);
         return 0;
     }
-    return (uint32_t) hold_us;
+    return (uint32_t) parsed;
+}
+
+static uint32_t ggml_backend_sched_cpu_graph_prewake_hold_us() {
+    return ggml_backend_sched_cpu_graph_prewake_us(
+            "GGML_CPU_GRAPH_PREWAKE_HOLD_US",
+            "GGML_FFN_CPU_PREWAKE_HOLD_US",
+            0,
+            1000000UL);
+}
+
+static uint32_t ggml_backend_sched_cpu_graph_prewake_idle_us() {
+    return ggml_backend_sched_cpu_graph_prewake_us(
+            "GGML_CPU_GRAPH_PREWAKE_IDLE_US",
+            "GGML_FFN_CPU_PREWAKE_IDLE_US",
+            100000,
+            60000000UL);
 }
 
 struct ggml_backend_sched_ffn_device_job {
@@ -1533,6 +1564,8 @@ struct ggml_backend_sched_trace_row {
     int64_t group_wall_us = 0;
     int64_t group_copy_us = 0;
     char timing_mode[32] = {};
+    int64_t cpu_idle_before_us = -1;
+    bool cpu_prewake_requested = false;
 };
 
 struct ggml_backend_sched_trace_state {
@@ -1864,6 +1897,17 @@ static bool ggml_sched_trace_phase_enabled(void) {
     return ggml_sched_trace_current_phase_selected();
 }
 
+static constexpr char GGML_SCHED_TRACE_CSV_HEADER[] =
+        "query_id,phase,graph_id,token_index,n_past,n_tokens,"
+        "split_id,backend,layer,"
+        "node_start,node_end,node_count,"
+        "first_node,last_node,op_first,op_last,"
+        "copy_in_us,wait_before_copy_us,"
+        "compute_submit_us,compute_wall_us,"
+        "is_ffn_group,ffn_branch,group_id,group_wall_us,group_copy_us,"
+        "timing_mode,is_parallel_group,parallel_group_kind,parallel_branch,"
+        "cpu_idle_before_us,cpu_prewake_requested\n";
+
 static FILE * ggml_sched_trace_file(void) {
     ggml_sched_trace_init();
     if (!g_sched_trace.enabled) {
@@ -1874,7 +1918,7 @@ static FILE * ggml_sched_trace_file(void) {
         return g_sched_trace.file;
     }
 
-    g_sched_trace.file = fopen(g_sched_trace.path.c_str(), "a");
+    g_sched_trace.file = fopen(g_sched_trace.path.c_str(), "a+");
     if (g_sched_trace.file == nullptr) {
         if (!g_sched_trace.warned_open) {
             GGML_LOG_WARN("%s: failed to open scheduler trace CSV '%s'\n", __func__, g_sched_trace.path.c_str());
@@ -1886,15 +1930,22 @@ static FILE * ggml_sched_trace_file(void) {
     fseek(g_sched_trace.file, 0, SEEK_END);
     const long pos = ftell(g_sched_trace.file);
     if (pos == 0) {
-        fprintf(g_sched_trace.file,
-                "query_id,phase,graph_id,token_index,n_past,n_tokens,"
-                "split_id,backend,layer,"
-                "node_start,node_end,node_count,"
-                "first_node,last_node,op_first,op_last,"
-                "copy_in_us,wait_before_copy_us,"
-                "compute_submit_us,compute_wall_us,"
-                "is_ffn_group,ffn_branch,group_id,group_wall_us,group_copy_us,"
-                "timing_mode,is_parallel_group,parallel_group_kind,parallel_branch\n");
+        fputs(GGML_SCHED_TRACE_CSV_HEADER, g_sched_trace.file);
+    } else {
+        rewind(g_sched_trace.file);
+        char existing_header[2048] = {};
+        if (fgets(existing_header, sizeof(existing_header), g_sched_trace.file) == nullptr ||
+                strcmp(existing_header, GGML_SCHED_TRACE_CSV_HEADER) != 0) {
+            GGML_LOG_ERROR(
+                    "%s: scheduler trace CSV schema mismatch for '%s'; refusing to append\n",
+                    __func__, g_sched_trace.path.c_str());
+            fclose(g_sched_trace.file);
+            g_sched_trace.file = nullptr;
+            g_sched_trace.warned_open = true;
+            g_sched_trace.enabled = false;
+            return nullptr;
+        }
+        fseek(g_sched_trace.file, 0, SEEK_END);
     }
 
     return g_sched_trace.file;
@@ -2208,7 +2259,9 @@ static void ggml_sched_trace_flush_rows(void) {
         ggml_sched_trace_csv_cell(f, row.parallel_kind);
         fputc(',', f);
         ggml_sched_trace_csv_cell(f, row.parallel_branch);
-        fputc('\n', f);
+        fprintf(f, ",%lld,%d\n",
+                (long long) row.cpu_idle_before_us,
+                row.cpu_prewake_requested ? 1 : 0);
     }
 
     fflush(f);
@@ -4933,6 +4986,16 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     for (int i = 0; i < sched->n_splits; i++) {
         struct ggml_backend_sched_split * split = &sched->splits[i];
         split->graph = ggml_graph_view(graph, split->i_start, split->i_end);
+        split->contains_transformer_layer = false;
+        if (sched->cpu_graph_prewake_hold_us > 0) {
+            for (int node_id = 0; node_id < split->graph.n_nodes; ++node_id) {
+                const struct ggml_tensor * node = split->graph.nodes[node_id];
+                if (ggml_sched_profile_extract_layer_id(node != nullptr ? node->name : nullptr) >= 0) {
+                    split->contains_transformer_layer = true;
+                    break;
+                }
+            }
+        }
 
         // Optimize this split of the graph. This needs to happen before we make graph_copy,
         // so they are in sync.
@@ -5245,7 +5308,9 @@ static void ggml_backend_sched_trace_append_split(
         int group_id,
         int64_t group_wall_us,
         int64_t group_copy_us,
-        const char * timing_mode) {
+        const char * timing_mode,
+        int64_t cpu_idle_before_us,
+        bool cpu_prewake_requested) {
     GGML_ASSERT(sched != nullptr);
     GGML_ASSERT(split != nullptr);
 
@@ -5277,6 +5342,8 @@ static void ggml_backend_sched_trace_append_split(
     row.group_id = group_id;
     row.group_wall_us = group_wall_us;
     row.group_copy_us = group_copy_us;
+    row.cpu_idle_before_us = cpu_idle_before_us;
+    row.cpu_prewake_requested = cpu_prewake_requested;
 
     ggml_sched_trace_copy_string(row.backend, sizeof(row.backend), ggml_backend_name(sched->backends[split->backend_id]));
     ggml_sched_trace_copy_string(row.first_node, sizeof(row.first_node), first ? first->name : "");
@@ -5675,7 +5742,95 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
         }
     };
 
-    auto copy_split_inputs = [&](struct ggml_backend_sched_split * split, ggml_backend_sched_trace_io_times * trace_io_times) {
+    auto cpu_graph_prewake_supported = [&](const struct ggml_backend_sched_split * split) {
+        if (!(sched->cpu_graph_prewake_hold_us > 0 &&
+            sched->cpu_graph_prewake_idle_us > 0 &&
+            sched->cpu_graph_prewake_hold_fns[split->backend_id] != nullptr)) {
+            return false;
+        }
+
+        // Exclude setup/output graphs such as the layer-less embedding split.
+        // Otherwise that small graph consumes the post-query-idle wake request
+        // before the first routed transformer-layer CPU graph is reached.
+        return split->contains_transformer_layer;
+    };
+
+    // The idle episode is defined by completed transformer-layer CPU graphs,
+    // not by a particular node name or route kind. This makes the first CPU
+    // graph after a long gap eligible even when ffn_inp moves to another
+    // backend and the CPU first appears as a parallel branch.
+    auto arm_cpu_graph_prewake_if_idle = [&](
+            struct ggml_backend_sched_split * split,
+            int64_t * idle_before_us) {
+        if (idle_before_us != nullptr) {
+            *idle_before_us = -1;
+        }
+        if (!cpu_graph_prewake_supported(split)) {
+            return false;
+        }
+
+        const int64_t now_us = ggml_time_us();
+        const int64_t last_end_us = sched->cpu_graph_last_end_us[split->backend_id];
+        if (idle_before_us != nullptr && last_end_us > 0 && now_us > last_end_us) {
+            *idle_before_us = now_us - last_end_us;
+        }
+        if (last_end_us > 0 &&
+                (now_us <= last_end_us ||
+                 now_us - last_end_us < (int64_t) sched->cpu_graph_prewake_idle_us)) {
+            return false;
+        }
+
+        return sched->cpu_graph_prewake_hold_fns[split->backend_id](
+                sched->backends[split->backend_id],
+                sched->cpu_graph_prewake_hold_us);
+    };
+
+    auto note_cpu_graph_completed = [&](
+            const struct ggml_backend_sched_split * split,
+            int64_t completed_us) {
+        if (cpu_graph_prewake_supported(split)) {
+            sched->cpu_graph_last_end_us[split->backend_id] = completed_us;
+        }
+    };
+
+    auto copy_split_inputs = [&](
+            struct ggml_backend_sched_split * split,
+            ggml_backend_sched_trace_io_times * trace_io_times,
+            int64_t * cpu_idle_before_us,
+            bool * cpu_prewake_requested) {
+        if (cpu_idle_before_us != nullptr) {
+            *cpu_idle_before_us = -1;
+        }
+        if (cpu_prewake_requested != nullptr) {
+            *cpu_prewake_requested = false;
+        }
+        const bool cpu_prewake_enabled = sched->cpu_graph_prewake_hold_us > 0;
+        int64_t last_prewake_request_us = -1;
+        auto request_cpu_prewake = [&]() {
+            if (!cpu_prewake_enabled) {
+                return;
+            }
+            if (last_prewake_request_us >= 0) {
+                const int64_t now_us = ggml_time_us();
+                const int64_t refresh_after_us =
+                    std::max<int64_t>(1, sched->cpu_graph_prewake_hold_us / 2);
+                if (now_us - last_prewake_request_us < refresh_after_us) {
+                    return;
+                }
+            }
+
+            int64_t idle_us = -1;
+            const bool requested = arm_cpu_graph_prewake_if_idle(split, &idle_us);
+            if (cpu_idle_before_us != nullptr) {
+                *cpu_idle_before_us = idle_us;
+            }
+            if (cpu_prewake_requested != nullptr && requested) {
+                *cpu_prewake_requested = true;
+            }
+            if (requested) {
+                last_prewake_request_us = ggml_time_us();
+            }
+        };
         auto add_copy_us = [&](int64_t dt_us) {
             if (trace_io_times != nullptr) {
                 trace_io_times->copy_us += dt_us;
@@ -5711,6 +5866,9 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                     add_wait_us(t1_us - t0_us);
                 }
                 {
+                    if (input_id + 1 == split->n_inputs) {
+                        request_cpu_prewake();
+                    }
                     const int64_t t0_us = ggml_sched_profile_time_us();
                     ggml_backend_tensor_copy(input, input_cpy);
                     const int64_t t1_us = ggml_sched_profile_time_us();
@@ -5810,6 +5968,9 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                         add_copy_us(t1_us - t0_us);
                     };
 
+                    if (input_id + 1 == split->n_inputs) {
+                        request_cpu_prewake();
+                    }
                     int id = 0;
                     while (!ggml_bitset_get(used_ids.data(), id)) {
                         id++;
@@ -5838,6 +5999,9 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     bool async_ok = false;
                     if (split_backend->iface.cpy_tensor_async) {
+                        if (input_id + 1 == split->n_inputs) {
+                            request_cpu_prewake();
+                        }
                         const int64_t t0_us = ggml_sched_profile_time_us();
                         async_ok = split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy);
                         const int64_t t1_us = ggml_sched_profile_time_us();
@@ -5863,6 +6027,11 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                             add_wait_us(t1_us - t0_us);
                         }
                         {
+                            if (input_id + 1 == split->n_inputs) {
+                                // Refresh after a blocking fallback wait so the
+                                // bounded hold covers the actual copy/dispatch.
+                                request_cpu_prewake();
+                            }
                             const int64_t t0_us = ggml_sched_profile_time_us();
                             ggml_backend_tensor_copy(input, input_cpy);
                             const int64_t t1_us = ggml_sched_profile_time_us();
@@ -5873,6 +6042,9 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
             }
         }
 
+        // Covers input-less CPU graphs and refreshes requests when the final
+        // copy itself consumed a substantial part of the bounded hold.
+        request_cpu_prewake();
     };
 
     auto ffn_reduce_set_n_threads = [&](struct ggml_backend_sched_split * split) -> ggml_backend_set_n_threads_t {
@@ -5955,10 +6127,16 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
         }
         const int64_t t1_us = ggml_time_us();
         *dt_us = t1_us - t0_us;
+        if (ec == GGML_STATUS_SUCCESS) {
+            note_cpu_graph_completed(split, t1_us);
+        }
         return ec;
     };
 
-    auto compute_split_with_callback = [&](struct ggml_backend_sched_split * split) {
+    auto compute_split_with_callback = [&](
+            struct ggml_backend_sched_split * split,
+            int64_t * cpu_idle_before_us,
+            bool * cpu_prewake_requested) {
         ggml_backend_t split_backend = sched->backends[split->backend_id];
         const ggml_sched_profile_backend_kind split_bucket = ggml_sched_profile_backend_bucket(split_backend);
         ggml_backend_set_n_threads_t set_n_threads = ffn_reduce_set_n_threads(split);
@@ -5985,7 +6163,20 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
 
             struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1 + 1);
 
+            int64_t refreshed_idle_us = -1;
+            const bool refreshed = arm_cpu_graph_prewake_if_idle(
+                    split, &refreshed_idle_us);
+            if (refreshed) {
+                if (cpu_idle_before_us != nullptr) {
+                    *cpu_idle_before_us = refreshed_idle_us;
+                }
+                if (cpu_prewake_requested != nullptr) {
+                    *cpu_prewake_requested = true;
+                }
+            }
+
             const bool profile_enabled = ggml_sched_profile_enabled();
+            const bool prewake_tracking = cpu_graph_prewake_supported(split);
             const int64_t t0_us = profile_enabled ? ggml_time_us() : 0;
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -5994,9 +6185,13 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
 
             // TODO: pass backend to the callback, then the user can decide if they want to synchronize
             ggml_backend_synchronize(split_backend);
-            const int64_t t1_us = profile_enabled ? ggml_time_us() : 0;
+            const int64_t t1_us =
+                profile_enabled || prewake_tracking ? ggml_time_us() : 0;
 
-            prof_add(gv, split_bucket, t1_us - t0_us);
+            prof_add(gv, split_bucket, profile_enabled ? t1_us - t0_us : 0);
+            if (prewake_tracking) {
+                note_cpu_graph_completed(split, t1_us);
+            }
 
             if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
                 break;
@@ -6013,27 +6208,6 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
         if (split->n_inputs > 0 && sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], sched->backends[split_backend_id]);
         }
-    };
-
-    auto arm_cpu_prewake_hold = [&](struct ggml_backend_sched_split * split) {
-        if (sched->ffn_cpu_prewake_hold_us == 0) {
-            return false;
-        }
-        ggml_backend_cpu_prewake_hold_t prewake_hold =
-            sched->ffn_cpu_prewake_hold_fns[split->backend_id];
-        return prewake_hold != nullptr && prewake_hold(
-                sched->backends[split->backend_id],
-                sched->ffn_cpu_prewake_hold_us);
-    };
-
-    auto split_contains_ffn_input = [](const struct ggml_backend_sched_split * split) {
-        for (int node_id = 0; node_id < split->graph.n_nodes; ++node_id) {
-            const struct ggml_tensor * node = split->graph.nodes[node_id];
-            if (node != nullptr && strstr(node->name, "ffn_inp") != nullptr) {
-                return true;
-            }
-        }
-        return false;
     };
 
     auto route_selected_variant = [&](int group_index, bool * plan_miss) {
@@ -6209,33 +6383,37 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
             }
             const bool run_group_serially = !group_backends_unique || cpu_branch_count > 1;
 
-            // Arm only the CPU shard of a real parallel FFN group. The next
-            // graph published by this CPU backend is this group's CPU branch:
-            // copy_split_inputs only copies/synchronizes, while the other
-            // branch graphs run on their own device backends. This lets worker
-            // wake-up overlap the dependency/copy and device-dispatch window.
-            if (sched->ffn_cpu_prewake_hold_us > 0 &&
-                    !run_group_serially &&
-                    cpu_branch_count == 1 &&
-                    cpu_branch_index >= 0 &&
-                    !ffn_group_infos.empty() &&
-                    ffn_group_infos[0].kind == "ffn") {
-                arm_cpu_prewake_hold(&splits[split_id + cpu_branch_index]);
-            }
-
             const int64_t group_t0_us = ggml_time_us();
             const int64_t copy_t0_us = group_t0_us;
             GGML_ASSERT(ffn_group_size <= GGML_SCHED_MAX_BACKENDS);
             ggml_backend_sched_trace_io_times io_times[GGML_SCHED_MAX_BACKENDS];
+            int64_t cpu_idle_before_us[GGML_SCHED_MAX_BACKENDS];
+            bool cpu_prewake_requested[GGML_SCHED_MAX_BACKENDS] = {};
             for (int i = 0; i < ffn_group_size; ++i) {
+                cpu_idle_before_us[i] = -1;
                 ggml_backend_sched_trace_io_times * trace_io_times = nullptr;
                 if (trace_enabled) {
                     io_times[i] = {};
                     trace_io_times = &io_times[i];
                 }
-                copy_split_inputs(&splits[split_id + i], trace_io_times);
+                copy_split_inputs(
+                        &splits[split_id + i],
+                        trace_io_times,
+                        &cpu_idle_before_us[i],
+                        &cpu_prewake_requested[i]);
             }
             const int64_t copy_t1_us = ggml_time_us();
+
+            // The CPU branch is first requested after its final blocking wait
+            // and before its final copy. Refresh here after every branch copy
+            // so a slow sibling copy cannot consume the bounded hold.
+            if (!run_group_serially && cpu_branch_count == 1 && cpu_branch_index >= 0) {
+                cpu_prewake_requested[cpu_branch_index] =
+                    arm_cpu_graph_prewake_if_idle(
+                        &splits[split_id + cpu_branch_index],
+                        &cpu_idle_before_us[cpu_branch_index]) ||
+                    cpu_prewake_requested[cpu_branch_index];
+            }
 
             std::vector<int64_t> dt_us(ffn_group_size, 0);
             std::vector<enum ggml_status> status(ffn_group_size, GGML_STATUS_SUCCESS);
@@ -6270,6 +6448,11 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                 // multiple CPU branches sharing the CPU thread pool) therefore
                 // fall back to deterministic serial execution.
                 for (int i = 0; i < ffn_group_size; ++i) {
+                    cpu_prewake_requested[i] =
+                        arm_cpu_graph_prewake_if_idle(
+                                &splits[split_id + i],
+                                &cpu_idle_before_us[i]) ||
+                        cpu_prewake_requested[i];
                     ggml_backend_sched_ffn_worker_timeline * timeline =
                         group_timelines != nullptr ? &group_timelines[i] : nullptr;
                     if (timeline != nullptr) {
@@ -6392,6 +6575,13 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                     }
                 }
 
+                // Device workers may spend most of a short hold in submission
+                // setup. Refresh adjacent to the caller's actual CPU kickoff.
+                cpu_prewake_requested[main_i] =
+                    arm_cpu_graph_prewake_if_idle(
+                            &splits[split_id + main_i],
+                            &cpu_idle_before_us[main_i]) ||
+                    cpu_prewake_requested[main_i];
                 ggml_backend_sched_ffn_worker_timeline * main_timeline =
                     group_timelines != nullptr ? &group_timelines[main_i] : nullptr;
                 if (main_timeline != nullptr) {
@@ -6566,7 +6756,9 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                             split_id,
                             group_wall_us,
                             copy_us,
-                            group_timing_mode);
+                            group_timing_mode,
+                            cpu_idle_before_us[i],
+                            cpu_prewake_requested[i]);
                 }
             }
 
@@ -6591,15 +6783,13 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
             io_times = {};
         }
 
-        // Some runtime routes place ffn_inp on CPU before the parallel FFN
-        // branches. Arm before that first CPU graph as well, otherwise its ADD
-        // node would continue to absorb the layer/query wake-up latency.
-        if (sched->ffn_cpu_prewake_hold_us > 0 &&
-                split_bucket == GGML_SCHED_PROFILE_BACKEND_CPU &&
-                split_contains_ffn_input(split)) {
-            arm_cpu_prewake_hold(split);
-        }
-        copy_split_inputs(split, trace_enabled ? &io_times : nullptr);
+        int64_t cpu_idle_before_us = -1;
+        bool cpu_prewake_requested = false;
+        copy_split_inputs(
+                split,
+                trace_enabled ? &io_times : nullptr,
+                &cpu_idle_before_us,
+                &cpu_prewake_requested);
 
         if (!sched->callback_eval) {
             int64_t dt_us = 0;
@@ -6636,10 +6826,15 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                         -1,
                         -1,
                         io_times.copy_us,
-                        split_is_cpu ? "sync_wall" : "async_submit");
+                        split_is_cpu ? "sync_wall" : "async_submit",
+                        cpu_idle_before_us,
+                        cpu_prewake_requested);
             }
         } else {
-            enum ggml_status ec = compute_split_with_callback(split);
+            enum ggml_status ec = compute_split_with_callback(
+                    split,
+                    &cpu_idle_before_us,
+                    &cpu_prewake_requested);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
@@ -6659,7 +6854,9 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                         -1,
                         -1,
                         io_times.copy_us,
-                        "callback");
+                        "callback",
+                        cpu_idle_before_us,
+                        cpu_prewake_requested);
             }
         }
 
@@ -6728,7 +6925,16 @@ ggml_backend_sched_t ggml_backend_sched_new(
             "GGML_FFN_GPU_WORKER_CPU", sched->ffn_device_worker_cpu);
     sched->ffn_npu_worker_cpu = ggml_backend_sched_ffn_worker_cpu(
             "GGML_FFN_NPU_WORKER_CPU", sched->ffn_device_worker_cpu);
-    sched->ffn_cpu_prewake_hold_us = ggml_backend_sched_ffn_cpu_prewake_hold_us();
+    sched->cpu_graph_prewake_hold_us = ggml_backend_sched_cpu_graph_prewake_hold_us();
+    sched->cpu_graph_prewake_idle_us = sched->cpu_graph_prewake_hold_us > 0
+        ? ggml_backend_sched_cpu_graph_prewake_idle_us()
+        : 0;
+    if (sched->cpu_graph_prewake_hold_us > 0 && sched->cpu_graph_prewake_idle_us == 0) {
+        GGML_LOG_WARN(
+                "%s: CPU graph pre-wake hold requested without a positive idle threshold; disabling\n",
+                __func__);
+        sched->cpu_graph_prewake_hold_us = 0;
+    }
 
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
@@ -6753,22 +6959,22 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->splits = (ggml_backend_sched_split *) calloc(initial_splits_capacity, sizeof(sched->splits[0]));
     sched->splits_capacity = initial_splits_capacity;
 
-    int ffn_cpu_prewake_backend_count = 0;
+    int cpu_graph_prewake_backend_count = 0;
     for (int b = 0; b < n_backends; b++) {
         sched->backends[b] = backends[b];
         sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
         GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
 
-        if (sched->ffn_cpu_prewake_hold_us > 0) {
+        if (sched->cpu_graph_prewake_hold_us > 0) {
             ggml_backend_dev_t dev = ggml_backend_get_device(backends[b]);
             if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
                 ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
                 if (reg != nullptr) {
-                    sched->ffn_cpu_prewake_hold_fns[b] =
+                    sched->cpu_graph_prewake_hold_fns[b] =
                         (ggml_backend_cpu_prewake_hold_t) ggml_backend_reg_get_proc_address(
                                 reg, "ggml_backend_cpu_prewake_hold");
-                    ffn_cpu_prewake_backend_count +=
-                        sched->ffn_cpu_prewake_hold_fns[b] != nullptr ? 1 : 0;
+                    cpu_graph_prewake_backend_count +=
+                        sched->cpu_graph_prewake_hold_fns[b] != nullptr ? 1 : 0;
                 }
             }
         }
@@ -6780,16 +6986,20 @@ ggml_backend_sched_t ggml_backend_sched_new(
         }
     }
 
-    if (sched->ffn_cpu_prewake_hold_us > 0) {
-        if (ffn_cpu_prewake_backend_count == 0) {
+    if (sched->cpu_graph_prewake_hold_us > 0) {
+        if (cpu_graph_prewake_backend_count == 0) {
             GGML_LOG_WARN(
-                    "%s: FFN CPU layer pre-wake requested for %u us, but no compatible CPU backend was found; disabling\n",
-                    __func__, sched->ffn_cpu_prewake_hold_us);
-            sched->ffn_cpu_prewake_hold_us = 0;
+                    "%s: CPU graph idle pre-wake requested for %u us, but no compatible CPU backend was found; disabling\n",
+                    __func__, sched->cpu_graph_prewake_hold_us);
+            sched->cpu_graph_prewake_hold_us = 0;
+            sched->cpu_graph_prewake_idle_us = 0;
         } else {
             GGML_LOG_INFO(
-                    "%s: FFN CPU layer pre-wake enabled (hold %u us, compatible backends %d)\n",
-                    __func__, sched->ffn_cpu_prewake_hold_us, ffn_cpu_prewake_backend_count);
+                    "%s: CPU graph idle pre-wake enabled (hold %u us, idle threshold %u us, compatible backends %d)\n",
+                    __func__,
+                    sched->cpu_graph_prewake_hold_us,
+                    sched->cpu_graph_prewake_idle_us,
+                    cpu_graph_prewake_backend_count);
         }
     }
 

@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -28,6 +29,61 @@
 //
 // llama_context
 //
+
+static bool llama_env_bool_value(const char * value, bool * valid) {
+    if (valid != nullptr) {
+        *valid = true;
+    }
+    if (value == nullptr || value[0] == '\0' ||
+            strcmp(value, "0") == 0 || strcmp(value, "off") == 0 || strcmp(value, "OFF") == 0 ||
+            strcmp(value, "false") == 0 || strcmp(value, "FALSE") == 0 ||
+            strcmp(value, "no") == 0 || strcmp(value, "NO") == 0) {
+        return false;
+    }
+    if (strcmp(value, "1") == 0 || strcmp(value, "on") == 0 || strcmp(value, "ON") == 0 ||
+            strcmp(value, "true") == 0 || strcmp(value, "TRUE") == 0 ||
+            strcmp(value, "yes") == 0 || strcmp(value, "YES") == 0) {
+        return true;
+    }
+    if (valid != nullptr) {
+        *valid = false;
+    }
+    return false;
+}
+
+static bool llama_cpu_prefill_keep_awake_enabled() {
+    static const bool enabled = []() {
+        const char * canonical = getenv("GGML_CPU_PREFILL_KEEP_AWAKE");
+        const char * typo_alias = getenv("GGML_CPU_PREFILL_KEPP_AWAKE");
+        const char * selected = canonical != nullptr && canonical[0] != '\0'
+            ? canonical
+            : typo_alias;
+
+        if ((canonical == nullptr || canonical[0] == '\0') &&
+                typo_alias != nullptr && typo_alias[0] != '\0') {
+            LLAMA_LOG_WARN(
+                    "%s: GGML_CPU_PREFILL_KEPP_AWAKE is a typo-compatible alias; use GGML_CPU_PREFILL_KEEP_AWAKE\n",
+                    __func__);
+        } else if (canonical != nullptr && canonical[0] != '\0' &&
+                typo_alias != nullptr && typo_alias[0] != '\0' &&
+                strcmp(canonical, typo_alias) != 0) {
+            LLAMA_LOG_WARN(
+                    "%s: conflicting prefill keep-awake variables; using GGML_CPU_PREFILL_KEEP_AWAKE='%s'\n",
+                    __func__, canonical);
+        }
+
+        bool valid = true;
+        const bool parsed = llama_env_bool_value(selected, &valid);
+        if (!valid) {
+            LLAMA_LOG_WARN(
+                    "%s: invalid GGML_CPU_PREFILL_KEEP_AWAKE value '%s'; disabling\n",
+                    __func__, selected);
+            return false;
+        }
+        return parsed;
+    }();
+    return enabled;
+}
 
 static const char * llama_module_bench_type_name(llama_module_bench_type type) {
     switch (type) {
@@ -3468,12 +3524,51 @@ ggml_status llama_context::graph_compute(
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
+    using cpu_set_keep_awake_t = bool (*)(ggml_backend_t backend, bool enabled);
+    cpu_set_keep_awake_t cpu_set_keep_awake_fn = nullptr;
+
     if (backend_cpu != nullptr) {
         auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
         auto * set_threadpool_fn = (decltype(ggml_backend_cpu_set_threadpool) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
         if (set_threadpool_fn) {
             set_threadpool_fn(backend_cpu, tp);
         }
+        if (batched && llama_cpu_prefill_keep_awake_enabled()) {
+            cpu_set_keep_awake_fn = (cpu_set_keep_awake_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_keep_awake");
+        }
+    }
+
+    struct cpu_keep_awake_guard {
+        cpu_set_keep_awake_t fn = nullptr;
+        ggml_backend_t backend = nullptr;
+        bool active = false;
+
+        ~cpu_keep_awake_guard() {
+            if (active && !fn(backend, false)) {
+                LLAMA_LOG_WARN("failed to end CPU prefill keep-awake epoch\n");
+            }
+        }
+    } keep_awake_guard { cpu_set_keep_awake_fn, backend_cpu, false };
+
+    if (cpu_set_keep_awake_fn != nullptr) {
+        keep_awake_guard.active = cpu_set_keep_awake_fn(backend_cpu, true);
+        if (keep_awake_guard.active) {
+            static std::once_flag info_once;
+            std::call_once(info_once, []() {
+                LLAMA_LOG_INFO("CPU prefill keep-awake enabled for secondary workers\n");
+            });
+        } else {
+            static std::once_flag warning_once;
+            std::call_once(warning_once, []() {
+                LLAMA_LOG_WARN("CPU prefill keep-awake was requested but could not be activated\n");
+            });
+        }
+    } else if (batched && llama_cpu_prefill_keep_awake_enabled()) {
+        static std::once_flag warning_once;
+        std::call_once(warning_once, []() {
+            LLAMA_LOG_WARN("CPU prefill keep-awake is unavailable for this CPU backend\n");
+        });
     }
 
     // set the number of threads for all the backends

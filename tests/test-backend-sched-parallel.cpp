@@ -377,6 +377,8 @@ static bool read_trace(
     const int is_parallel_group_col = column_index(columns, "is_parallel_group");
     const int parallel_kind_col = column_index(columns, "parallel_group_kind");
     const int parallel_branch_col = column_index(columns, "parallel_branch");
+    const int cpu_idle_before_us_col = column_index(columns, "cpu_idle_before_us");
+    const int cpu_prewake_requested_col = column_index(columns, "cpu_prewake_requested");
     const int required_columns[] = {
         split_id_col,
         group_id_col,
@@ -387,6 +389,8 @@ static bool read_trace(
         is_parallel_group_col,
         parallel_kind_col,
         parallel_branch_col,
+        cpu_idle_before_us_col,
+        cpu_prewake_requested_col,
     };
     for (int column : required_columns) {
         if (!check(column >= 0, scenario, "scheduler trace is missing a required column")) {
