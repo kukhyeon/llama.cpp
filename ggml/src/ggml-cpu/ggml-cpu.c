@@ -480,6 +480,7 @@ struct ggml_threadpool {
     atomic_int prewake_hold_duration_us; // 0 cancels the current hold request
     atomic_int prewake_hold_target_graph; // graph serial that consumes the hold
     bool prewake_hold_enabled;           // guarded by mutex; false keeps the idle path atomic-free
+    atomic_bool keep_awake;              // keeps secondary workers runnable for a bounded epoch
     atomic_int GGML_CACHE_ALIGN n_barrier;
     atomic_int GGML_CACHE_ALIGN n_barrier_passed;
     atomic_int GGML_CACHE_ALIGN current_chunk; // currently processing chunk during Mat_Mul, shared between all the threads.
@@ -2843,6 +2844,34 @@ bool ggml_threadpool_prewake_hold(struct ggml_threadpool * threadpool, uint32_t 
 #endif
 }
 
+bool ggml_threadpool_set_keep_awake(struct ggml_threadpool * threadpool, bool enabled) {
+    if (threadpool == NULL) {
+        return false;
+    }
+
+#ifndef GGML_USE_OPENMP
+    bool changed = false;
+    ggml_mutex_lock(&threadpool->mutex);
+
+    if (!threadpool->stop && (!enabled || threadpool->n_threads > 1)) {
+        const bool previous = atomic_load_explicit(
+                &threadpool->keep_awake, memory_order_relaxed);
+        if (previous != enabled) {
+            atomic_store_explicit(
+                    &threadpool->keep_awake, enabled, memory_order_release);
+            ggml_cond_broadcast(&threadpool->cond);
+        }
+        changed = true;
+    }
+
+    ggml_mutex_unlock(&threadpool->mutex);
+    return changed;
+#else
+    UNUSED(enabled);
+    return false;
+#endif
+}
+
 struct ggml_cplan ggml_graph_plan(
           const struct ggml_cgraph * cgraph,
                                int   n_threads,
@@ -3273,6 +3302,20 @@ static inline bool ggml_graph_compute_poll_for_work(struct ggml_compute_state * 
     return state->pending;
 }
 
+static inline bool ggml_graph_compute_keep_awake_for_work(struct ggml_compute_state * state) {
+    struct ggml_threadpool * threadpool = state->threadpool;
+
+    while (atomic_load_explicit(&threadpool->keep_awake, memory_order_acquire) &&
+            !ggml_graph_compute_thread_ready(state)) {
+        ggml_thread_cpu_relax();
+    }
+
+    if (state->pending) {
+        ggml_graph_compute_thread_sync(state);
+    }
+    return state->pending;
+}
+
 static inline bool ggml_graph_compute_hold_for_work(
         struct ggml_compute_state * state,
         int generation,
@@ -3330,12 +3373,21 @@ static inline bool ggml_graph_compute_check_for_work(struct ggml_compute_state *
         state->skip_poll_once = false;
     }
 
+    if (atomic_load_explicit(&threadpool->keep_awake, memory_order_acquire)) {
+        return ggml_graph_compute_keep_awake_for_work(state);
+    }
+
     int hold_generation = 0;
     int hold_duration_us = 0;
     bool hold_requested = false;
+    bool keep_awake_requested = false;
 
     ggml_mutex_lock_shared(&threadpool->mutex);
     while (!ggml_graph_compute_thread_ready(state)) {
+        if (atomic_load_explicit(&threadpool->keep_awake, memory_order_acquire)) {
+            keep_awake_requested = true;
+            break;
+        }
         if (ggml_graph_compute_consume_prewake_hold(
                     state, &hold_generation, &hold_duration_us)) {
             hold_requested = true;
@@ -3351,6 +3403,10 @@ static inline bool ggml_graph_compute_check_for_work(struct ggml_compute_state *
         ggml_cond_wait(&threadpool->cond, &threadpool->mutex);
     }
     ggml_mutex_unlock_shared(&threadpool->mutex);
+
+    if (keep_awake_requested) {
+        return ggml_graph_compute_keep_awake_for_work(state);
+    }
 
     if (hold_requested) {
         return ggml_graph_compute_hold_for_work(
@@ -3371,14 +3427,24 @@ static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
 
     while (true) {
         // Check if we need to sleep
-        while (threadpool->pause) {
+        while (threadpool->pause && !threadpool->stop) {
             GGML_PRINT_DEBUG("thread #%d inside pause loop\n", state->ith);
             ggml_mutex_lock_shared(&threadpool->mutex);
-            if (threadpool->pause) {
+            if (threadpool->pause && !threadpool->stop &&
+                    !atomic_load_explicit(&threadpool->keep_awake, memory_order_acquire)) {
                 ggml_cond_wait(&threadpool->cond, &threadpool->mutex);
             }
             GGML_PRINT_DEBUG("thread #%d resuming after wait\n", state->ith);
             ggml_mutex_unlock_shared(&threadpool->mutex);
+
+            // A prefill epoch may be armed while this pool is paused because
+            // the CPU backend has just switched from the decode pool. Keep
+            // secondary workers runnable without changing the logical pause;
+            // graph kickoff still owns the actual resume transition.
+            while (threadpool->pause && !threadpool->stop &&
+                    atomic_load_explicit(&threadpool->keep_awake, memory_order_acquire)) {
+                ggml_thread_cpu_relax();
+            }
         }
 
         // This needs to be checked for after the cond_wait
@@ -3450,6 +3516,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->prewake_hold_duration_us = 0;
         threadpool->prewake_hold_target_graph = 0;
         threadpool->prewake_hold_enabled = false;
+        threadpool->keep_awake          = false;
         threadpool->n_barrier        = 0;
         threadpool->n_barrier_passed = 0;
         threadpool->current_chunk    = 0;

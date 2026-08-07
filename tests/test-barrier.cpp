@@ -18,6 +18,13 @@ static void require_prewake(bool condition, const char * message) {
     }
 }
 
+static void require_keep_awake(bool condition, const char * message) {
+    if (!condition) {
+        fprintf(stderr, "keep-awake test failed: %s\n", message);
+        abort();
+    }
+}
+
 static void test_barrier(int n_threads, int n_rounds) {
     struct ggml_init_params params = {
         /* .mem_size   = */ 1024*1024*1024,
@@ -173,6 +180,95 @@ static void test_active(int n_threads, int n_rounds) {
     ggml_free(ctx);
 }
 
+static void test_keep_awake(int n_threads) {
+    require_keep_awake(!ggml_threadpool_set_keep_awake(NULL, true),  "NULL enable must fail");
+    require_keep_awake(!ggml_threadpool_set_keep_awake(NULL, false), "NULL disable must fail");
+
+    struct ggml_init_params params = {
+        /* .mem_size   = */ 16*1024*1024,
+        /* .mem_buffer = */ NULL,
+        /* .no_alloc   = */ false,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    require_keep_awake(ctx != NULL, "context creation");
+
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    struct ggml_tensor * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 64);
+    struct ggml_tensor * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, 64, 128);
+    struct ggml_tensor * output = ggml_mul_mat(ctx, weight, input);
+    ggml_build_forward_expand(gf, output);
+
+    struct ggml_threadpool_params single_tpp = ggml_threadpool_params_default(1);
+    struct ggml_threadpool * single_pool = ggml_threadpool_new(&single_tpp);
+    require_keep_awake(single_pool != NULL, "single-thread pool creation");
+    require_keep_awake(
+            !ggml_threadpool_set_keep_awake(single_pool, true),
+            "single-thread enable must be rejected");
+    // The non-OpenMP implementation accepts disable as an idempotent no-op;
+    // OpenMP builds report the feature as unsupported for both values.
+    (void) ggml_threadpool_set_keep_awake(single_pool, false);
+    struct ggml_cplan single_plan = ggml_graph_plan(gf, 1, single_pool);
+    std::vector<uint8_t> single_work(single_plan.work_size);
+    single_plan.work_data = single_work.data();
+    require_keep_awake(
+            ggml_graph_compute(gf, &single_plan) == GGML_STATUS_SUCCESS,
+            "single-thread compute after rejected enable");
+    ggml_threadpool_free(single_pool);
+
+    if (n_threads <= 1) {
+        ggml_free(ctx);
+        return;
+    }
+
+    struct ggml_threadpool_params tpp = ggml_threadpool_params_default(n_threads);
+    struct ggml_threadpool * threadpool = ggml_threadpool_new(&tpp);
+    require_keep_awake(threadpool != NULL, "multi-thread pool creation");
+
+    const bool keep_awake_supported = ggml_threadpool_set_keep_awake(threadpool, true);
+    if (keep_awake_supported) {
+        require_keep_awake(
+                ggml_threadpool_set_keep_awake(threadpool, true),
+                "repeated enable must be idempotent");
+
+        struct ggml_cplan plan = ggml_graph_plan(gf, n_threads, threadpool);
+        std::vector<uint8_t> work(plan.work_size);
+        plan.work_data = work.data();
+
+        for (int i = 0; i < 20; ++i) {
+            require_keep_awake(
+                    ggml_graph_compute(gf, &plan) == GGML_STATUS_SUCCESS,
+                    "compute during active epoch");
+        }
+
+        ggml_threadpool_pause(threadpool);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        ggml_threadpool_resume(threadpool);
+        require_keep_awake(
+                ggml_graph_compute(gf, &plan) == GGML_STATUS_SUCCESS,
+                "compute after active pause/resume");
+
+        require_keep_awake(
+                ggml_threadpool_set_keep_awake(threadpool, false),
+                "disable must succeed");
+        require_keep_awake(
+                ggml_threadpool_set_keep_awake(threadpool, false),
+                "repeated disable must be idempotent");
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        require_keep_awake(
+                ggml_graph_compute(gf, &plan) == GGML_STATUS_SUCCESS,
+                "compute after workers return to sleep");
+
+        require_keep_awake(
+                ggml_threadpool_set_keep_awake(threadpool, true),
+                "reactivation before free");
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    // Freeing an active pool must publish stop and let spinning workers exit.
+    ggml_threadpool_free(threadpool);
+    ggml_free(ctx);
+}
+
 static void test_multi_graph(int n_threads, int n_rounds) {
     struct ggml_init_params params = {
         /* .mem_size   = */ 1024*1024*1024,
@@ -267,6 +363,8 @@ int main(int argc, char *argv[]) {
     test_barrier(n_threads, n_rounds);
 
     test_active(n_threads,  n_rounds * 100);
+
+    test_keep_awake(n_threads);
 
     test_multi_graph(n_threads,  n_rounds * 10);
 
