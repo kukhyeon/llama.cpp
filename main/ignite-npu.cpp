@@ -244,6 +244,10 @@ static bool should_write_ffn_worker_trace_csv() {
     return env_flag_enabled("GGML_FFN_WORKER_TRACE") || env_flag_enabled("FFN_WORKER_TRACE");
 }
 
+static bool should_write_node_wall_trace_csv() {
+    return env_flag_enabled("GGML_NODE_WALL_TRACE") || env_flag_enabled("NODE_WALL_TRACE");
+}
+
 // Appends per-op CSV headers for the optional op breakdown section.
 // Each ggml op contributes six columns:
 // prefill_cpu, decode_cpu, prefill_htp, decode_htp, prefill_gpu, decode_gpu.
@@ -603,10 +607,20 @@ int main(int argc, char ** argv) {
     const bool sched_trace = should_write_sched_trace_csv();
     const bool ffn_worker_trace = should_write_ffn_worker_trace_csv();
     const bool any_sched_trace = sched_trace || ffn_worker_trace;
+    const bool node_wall_trace = should_write_node_wall_trace_csv();
     ggml_backend_op_load_profile_set_enabled(csv_op_load);
     ggml_backend_op_load_profile_set_breakdown_enabled(csv_op_load_breakdown);
     ggml_backend_op_load_profile_set_ops_from_env(std::getenv("CSV_OP_LOAD_OPS"));
     ggml_backend_op_load_profile_set_patterns_from_env(std::getenv("CSV_OP_LOAD_PATTERNS"));
+    ggml_backend_node_wall_trace_set_enabled(node_wall_trace);
+    if (const char * path = std::getenv("NODE_WALL_TRACE_PATH")) {
+        ggml_backend_node_wall_trace_set_path(path);
+    } else if (const char * path = std::getenv("GGML_NODE_WALL_TRACE_PATH")) {
+        ggml_backend_node_wall_trace_set_path(path);
+    } else {
+        const std::string default_node_trace_path = params.output_dir + "/node_wall_trace.csv";
+        ggml_backend_node_wall_trace_set_path(default_node_trace_path.c_str());
+    }
     if (const char * path = std::getenv("SCHED_TRACE_PATH")) {
         ggml_backend_sched_trace_set_path(path);
     } else if (const char * path = std::getenv("GGML_SCHED_TRACE_PATH")) {
@@ -1770,6 +1784,12 @@ int main(int argc, char ** argv) {
                     LOG_DBG("\n\033[31mTokens consumed so far = %d / %d \033[0m\n", n_past, n_ctx);
                 }
                 if (module_bench_done(params, embd, n_consumed, embd_inp)) {
+                    if (node_wall_trace || csv_load) {
+                        // OpenCL node events are harvested by the backend's
+                        // existing synchronize path. Complete that work before
+                        // printing/flushing the per-query profiling buffers.
+                        llama_synchronize(ctx);
+                    }
                     if (output_path_infer != "/inference_stats.csv") {
                         llama_perf_context_print_custom(ctx, output_path_infer, start_sys_time, ig);
                     }
@@ -1778,6 +1798,9 @@ int main(int argc, char ** argv) {
                     }
                     if (any_sched_trace) {
                         ggml_backend_sched_trace_flush();
+                    }
+                    if (node_wall_trace) {
+                        ggml_backend_node_wall_trace_flush();
                     }
                     inference_started = false;
                     LOG_INF("module-bench complete; exiting after isolated module graph\n");
@@ -1967,7 +1990,7 @@ int main(int argc, char ** argv) {
                     // Pacing must observe device completion rather than only the
                     // host-side enqueue boundary. Keep this synchronization out
                     // of the default path because it is intentionally opt-in.
-                    if (query_pacing_enabled) {
+                    if (query_pacing_enabled || node_wall_trace || csv_load) {
                         llama_synchronize(ctx);
                     }
                     auto inference_end_time = std::chrono::steady_clock::now();
@@ -1982,6 +2005,9 @@ int main(int argc, char ** argv) {
                     }
                     if (any_sched_trace) {
                         ggml_backend_sched_trace_flush();
+                    }
+                    if (node_wall_trace) {
+                        ggml_backend_node_wall_trace_flush();
                     }
                     //check_hardware(device_name);
                     // common_sampler_free(smpl);
@@ -2183,6 +2209,10 @@ int main(int argc, char ** argv) {
                         ggml_backend_sched_trace_reset();
                         ggml_backend_sched_trace_set_query_id((int) current_question_index);
                     }
+                    if (node_wall_trace) {
+                        ggml_backend_node_wall_trace_reset();
+                        ggml_backend_node_wall_trace_set_query_id((int) current_question_index);
+                    }
                     if (csv_load) {
                         ggml_backend_op_load_profile_reset();
                     }
@@ -2324,6 +2354,12 @@ int main(int argc, char ** argv) {
         }
     }
 
+    if (node_wall_trace || csv_load) {
+        // Complete and harvest pending device events before clocks are reset
+        // or backend routing hooks are detached.
+        llama_synchronize(ctx);
+    }
+
     if (route_clock_producer_registered) {
         (void) llama_runtime_route_set_layer_producer(ctx, nullptr, nullptr);
         route_clock_producer_registered = false;
@@ -2352,6 +2388,9 @@ int main(int argc, char ** argv) {
     common_perf_print(ctx, smpl);
     if (any_sched_trace) {
         ggml_backend_sched_trace_flush();
+    }
+    if (node_wall_trace) {
+        ggml_backend_node_wall_trace_flush();
     }
 
     // Keep query-period logging out of the active schedule: rows are buffered

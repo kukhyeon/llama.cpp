@@ -7226,6 +7226,12 @@ struct ggml_cgraph * ggml_new_graph_custom(struct ggml_context * ctx, size_t siz
         /*.hash_table   =*/ { hash_size, hash_used, hash_keys_ptr },
         /*.order        =*/ GGML_CGRAPH_EVAL_ORDER_LEFT_TO_RIGHT,
         /*.uid          =*/ 0,
+        /*.trace_graph_id    =*/ -1,
+        /*.trace_query_id    =*/ -1,
+        /*.trace_phase       =*/ -1,
+        /*.trace_split_id    =*/ -1,
+        /*.trace_node_offset =*/ 0,
+        /*.trace_backend     =*/ NULL,
     };
 
     ggml_hash_set_reset(&cgraph->visited_hash_set);
@@ -7253,7 +7259,13 @@ struct ggml_cgraph ggml_graph_view(struct ggml_cgraph * cgraph0, int i0, int i1)
         /*.use_counts       =*/ cgraph0->use_counts,
         /*.visited_hash_set =*/ cgraph0->visited_hash_set,
         /*.order            =*/ cgraph0->order,
-        /*.uid              =*/ 0
+        /*.uid              =*/ 0,
+        /*.trace_graph_id    =*/ cgraph0->trace_graph_id,
+        /*.trace_query_id    =*/ cgraph0->trace_query_id,
+        /*.trace_phase       =*/ cgraph0->trace_phase,
+        /*.trace_split_id    =*/ cgraph0->trace_split_id,
+        /*.trace_node_offset =*/ cgraph0->trace_node_offset + i0,
+        /*.trace_backend     =*/ cgraph0->trace_backend,
     };
 
     return cgraph;
@@ -7267,6 +7279,12 @@ void ggml_graph_cpy(struct ggml_cgraph * src, struct ggml_cgraph * dst) {
     dst->n_leafs = src->n_leafs;
     dst->n_nodes = src->n_nodes;
     dst->order   = src->order;
+    dst->trace_graph_id    = src->trace_graph_id;
+    dst->trace_query_id    = src->trace_query_id;
+    dst->trace_phase       = src->trace_phase;
+    dst->trace_split_id    = src->trace_split_id;
+    dst->trace_node_offset = src->trace_node_offset;
+    dst->trace_backend     = src->trace_backend;
 
     for (int i = 0; i < src->n_leafs; ++i) {
         dst->leafs[i] = src->leafs[i];

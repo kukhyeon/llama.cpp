@@ -344,6 +344,15 @@ struct ggml_cgraph {
     // an optional identifier that can be utilized to recognize same graphs if two non-zero values match
     // a value of 0 means it is not set and should be ignored
     uint64_t uid;
+
+    // Scheduler invocation metadata for the opt-in backend node wall trace.
+    // These fields are ignored by every backend when tracing is disabled.
+    int64_t trace_graph_id;
+    int32_t trace_query_id;
+    int32_t trace_phase;
+    int32_t trace_split_id;
+    int32_t trace_node_offset;
+    const char * trace_backend;
 };
 
 // returns a slice of cgraph with nodes [i0, i1)

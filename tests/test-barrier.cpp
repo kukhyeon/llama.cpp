@@ -11,6 +11,13 @@
 
 #define MAX_NARGS 2
 
+static void require_prewake(bool condition, const char * message) {
+    if (!condition) {
+        fprintf(stderr, "prewake-hold test failed: %s\n", message);
+        abort();
+    }
+}
+
 static void test_barrier(int n_threads, int n_rounds) {
     struct ggml_init_params params = {
         /* .mem_size   = */ 1024*1024*1024,
@@ -125,12 +132,34 @@ static void test_active(int n_threads, int n_rounds) {
     // Let secondary workers reach their condition-variable wait, then ensure a
     // pre-wake never publishes stale graph work or prevents the next compute.
     ggml_threadpool_prewake(NULL);
+    require_prewake(!ggml_threadpool_prewake_hold(NULL, 500), "NULL threadpool must be rejected");
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
     ggml_threadpool_prewake(threadpool);
+    const bool prewake_hold_supported = n_threads > 1 &&
+        ggml_threadpool_prewake_hold(threadpool, 5000);
+    if (prewake_hold_supported) {
+        // Delay graph publication long enough to exercise the explicit hold,
+        // rather than relying only on the ordinary finite poll window.
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } else if (n_threads == 1) {
+        require_prewake(!ggml_threadpool_prewake_hold(threadpool, 500), "single-thread hold rejection");
+    }
 
     for (int i=0; i < n_rounds; i++) {
         if ((i % 7) == 0) {
             ggml_threadpool_prewake(threadpool);
+        }
+        if (prewake_hold_supported && i > 0 && (i % 11) == 0) {
+            require_prewake(ggml_threadpool_prewake_hold(threadpool, 500), "repeated hold arm");
+        }
+        if (prewake_hold_supported && i > 0 && (i % 17) == 0) {
+            require_prewake(ggml_threadpool_prewake_hold(threadpool, 0), "hold cancellation");
+        }
+        if (prewake_hold_supported && i == 1) {
+            // Let a short hold expire before publishing a graph. The graph
+            // must still execute normally and must not revive the stale hold.
+            require_prewake(ggml_threadpool_prewake_hold(threadpool, 100), "short hold arm");
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         struct ggml_cplan cplan = ggml_graph_plan(gf, (i % 4) == 0 ? 1 : n_threads, threadpool);
 

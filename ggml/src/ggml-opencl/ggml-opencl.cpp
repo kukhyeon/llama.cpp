@@ -30,6 +30,7 @@
 #include <charconv>
 #include <mutex>
 #include <algorithm>
+#include <utility>
 
 #undef MIN
 #undef MAX
@@ -325,6 +326,19 @@ struct ProfilingInfo {
     ggml_op op;
     bool op_load;
     bool op_load_recorded;
+
+    bool node_wall_trace;
+    bool node_wall_trace_recorded;
+    int trace_query_id;
+    int trace_phase;
+    int64_t trace_graph_id;
+    int trace_split_id;
+    int trace_node_index;
+    std::string trace_node_name;
+    std::string trace_op_type;
+    std::string trace_backend;
+    std::string trace_execution_kind;
+    std::string trace_fused_node_ids;
 };
 
 static void populateProfilingInfo(
@@ -336,7 +350,9 @@ static void populateProfilingInfo(
     info.evt         = evt;
     info.op          = tensor->op;
     info.op_load     = ggml_backend_op_load_profile_should_measure(tensor->op, tensor->name);
-    info.op_load_recorded = false;
+    info.op_load_recorded = !info.op_load;
+    info.node_wall_trace = false;
+    info.node_wall_trace_recorded = true;
 
     // 0 means not specified, e.g., 2D workgroup, or NULL for driver to choose
     info.local_size[0] = 0;
@@ -636,6 +652,42 @@ struct ggml_backend_opencl_context {
 
     std::vector<ProfilingInfo> profiling_info;
 
+    bool node_wall_trace_dispatch = false;
+    int trace_query_id = -1;
+    int trace_phase = -1;
+    int64_t trace_graph_id = -1;
+    int trace_split_id = -1;
+    int trace_node_index = -1;
+    std::string trace_node_name;
+    std::string trace_op_type;
+    std::string trace_backend;
+    std::string trace_execution_kind;
+    std::string trace_fused_node_ids;
+
+    void set_node_wall_trace_dispatch(
+            const ggml_cgraph * cgraph,
+            int local_node_index,
+            const ggml_tensor * node,
+            const char * op_type,
+            const char * execution_kind,
+            const std::string & fused_node_ids = {}) {
+        node_wall_trace_dispatch = cgraph->trace_graph_id >= 0 &&
+            ggml_backend_node_wall_trace_enabled();
+        if (!node_wall_trace_dispatch) {
+            return;
+        }
+        trace_query_id = cgraph->trace_query_id;
+        trace_phase = cgraph->trace_phase;
+        trace_graph_id = cgraph->trace_graph_id;
+        trace_split_id = cgraph->trace_split_id;
+        trace_node_index = cgraph->trace_node_offset + local_node_index;
+        trace_node_name = node ? node->name : "";
+        trace_op_type = op_type ? op_type : "";
+        trace_backend = cgraph->trace_backend ? cgraph->trace_backend : "OpenCL";
+        trace_execution_kind = execution_kind ? execution_kind : "opencl_kernel_device";
+        trace_fused_node_ids = fused_node_ids;
+    }
+
     void write_profiling_info() {
         FILE * fperf = fopen("cl_profiling.csv", "w");
         if (!fperf) {
@@ -716,29 +768,56 @@ struct ggml_backend_opencl_context {
     }
 
     void accumulate_op_load_profiling_info() {
-        if (!ggml_backend_op_load_profile_enabled()) {
+        const bool collect_op_load = ggml_backend_op_load_profile_enabled();
+        const bool collect_node_wall = ggml_backend_node_wall_trace_enabled();
+        if (!collect_op_load && !collect_node_wall) {
+#ifndef GGML_OPENCL_PROFILING
+            // Events can remain if a runtime trace is disabled after enqueue.
+            // They are complete here because this function is called only
+            // after synchronize (or clFinish during teardown).
+            for (ProfilingInfo & info : profiling_info) {
+                if (info.evt != nullptr) {
+                    CL_CHECK(clReleaseEvent(info.evt));
+                    info.evt = nullptr;
+                }
+            }
+            profiling_info.clear();
+#endif
             return;
         }
 
         const bool breakdown = ggml_backend_op_load_profile_breakdown_enabled();
 
+        struct node_wall_aggregate {
+            int query_id = -1;
+            int phase = -1;
+            int64_t graph_id = -1;
+            int split_id = -1;
+            int node_index = -1;
+            std::string node_name;
+            std::string op_type;
+            std::string backend;
+            std::string execution_kind;
+            std::string fused_node_ids;
+            int kernel_count = 0;
+            cl_ulong device_start_ns = 0;
+            cl_ulong device_end_ns = 0;
+            cl_ulong kernel_sum_ns = 0;
+        };
+        std::vector<node_wall_aggregate> aggregates;
+
         for (ProfilingInfo & info : profiling_info) {
-            if (!info.op_load || info.op_load_recorded) {
+            const bool need_op_load = info.op_load && !info.op_load_recorded;
+            const bool need_node_wall = info.node_wall_trace && !info.node_wall_trace_recorded;
+            if ((!need_op_load && !need_node_wall) || info.evt == nullptr) {
                 continue;
             }
 
             cl_ulong cmd_start;
             cl_ulong cmd_end;
 
-            const int64_t wait_t0_us = breakdown ? ggml_time_us() : 0;
-            CL_CHECK(clWaitForEvents(1, &info.evt));
-            if (breakdown) {
-                ggml_backend_op_load_profile_add_backend_timer_us(
-                        GGML_BACKEND_OP_LOAD_PROFILE_GPU,
-                        GGML_BACKEND_OP_LOAD_PROFILE_TIMER_PROFILE_WAIT,
-                        ggml_time_us() - wait_t0_us);
-            }
-
+            // The caller invokes this only after the backend's existing queue
+            // barrier has completed. Do not add an event wait per kernel here.
             const int64_t query_t0_us = breakdown ? ggml_time_us() : 0;
             const cl_int err_start = clGetEventProfilingInfo(
                 info.evt, CL_PROFILING_COMMAND_START, sizeof(cl_ulong), &cmd_start, NULL);
@@ -754,38 +833,93 @@ struct ggml_backend_opencl_context {
             if (err_start == CL_PROFILING_INFO_NOT_AVAILABLE || err_end == CL_PROFILING_INFO_NOT_AVAILABLE) {
                 static bool warned = false;
                 if (!warned) {
-                    GGML_LOG_WARN("ggml_opencl: CSV_OP_LOAD GPU timing unavailable; command queue was created without profiling\n");
+                    GGML_LOG_WARN("ggml_opencl: GPU node timing unavailable; command queue was created without profiling\n");
                     warned = true;
                 }
                 info.op_load_recorded = true;
-#ifndef GGML_OPENCL_PROFILING
-                CL_CHECK(clReleaseEvent(info.evt));
-                info.evt = nullptr;
-#endif
+                info.node_wall_trace_recorded = true;
                 continue;
             }
 
             CL_CHECK(err_start);
             CL_CHECK(err_end);
 
-            ggml_backend_op_load_profile_add_tensor_ms(
-                    GGML_BACKEND_OP_LOAD_PROFILE_GPU,
-                    info.op,
-                    info.op_name.c_str(),
-                    (cmd_end - cmd_start) / 1.e6);
+            if (need_op_load) {
+                ggml_backend_op_load_profile_add_tensor_ms(
+                        GGML_BACKEND_OP_LOAD_PROFILE_GPU,
+                        info.op,
+                        info.op_name.c_str(),
+                        (cmd_end - cmd_start) / 1.e6);
+                info.op_load_recorded = true;
+            }
 
-            info.op_load_recorded = true;
+            if (need_node_wall) {
+                // A logical node enqueues all of its kernels contiguously on
+                // this in-order queue. Aggregate adjacent events directly;
+                // avoid string-key construction and O(log N) map work in the
+                // synchronize path.
+                const bool same_dispatch = !aggregates.empty() &&
+                    aggregates.back().query_id == info.trace_query_id &&
+                    aggregates.back().phase == info.trace_phase &&
+                    aggregates.back().graph_id == info.trace_graph_id &&
+                    aggregates.back().split_id == info.trace_split_id &&
+                    aggregates.back().node_index == info.trace_node_index &&
+                    aggregates.back().fused_node_ids == info.trace_fused_node_ids;
+                if (!same_dispatch) {
+                    aggregates.emplace_back();
+                    node_wall_aggregate & aggregate = aggregates.back();
+                    aggregate.query_id = info.trace_query_id;
+                    aggregate.phase = info.trace_phase;
+                    aggregate.graph_id = info.trace_graph_id;
+                    aggregate.split_id = info.trace_split_id;
+                    aggregate.node_index = info.trace_node_index;
+                    aggregate.node_name = info.trace_node_name;
+                    aggregate.op_type = info.trace_op_type;
+                    aggregate.backend = info.trace_backend;
+                    aggregate.execution_kind = info.trace_execution_kind;
+                    aggregate.fused_node_ids = info.trace_fused_node_ids;
+                    aggregate.device_start_ns = cmd_start;
+                    aggregate.device_end_ns = cmd_end;
+                }
 
-#ifndef GGML_OPENCL_PROFILING
-            CL_CHECK(clReleaseEvent(info.evt));
-            info.evt = nullptr;
-#endif
+                node_wall_aggregate & aggregate = aggregates.back();
+                aggregate.device_start_ns = std::min(aggregate.device_start_ns, cmd_start);
+                aggregate.device_end_ns = std::max(aggregate.device_end_ns, cmd_end);
+                aggregate.kernel_sum_ns += cmd_end - cmd_start;
+                aggregate.kernel_count++;
+                info.node_wall_trace_recorded = true;
+            }
+        }
+
+        for (const node_wall_aggregate & aggregate : aggregates) {
+            ggml_backend_node_wall_trace_add(
+                    aggregate.query_id,
+                    (enum ggml_backend_sched_profile_phase) aggregate.phase,
+                    aggregate.graph_id,
+                    aggregate.split_id,
+                    aggregate.node_index,
+                    aggregate.node_name.c_str(),
+                    aggregate.op_type.c_str(),
+                    aggregate.backend.c_str(),
+                    aggregate.execution_kind.c_str(),
+                    aggregate.fused_node_ids.c_str(),
+                    aggregate.kernel_count,
+                    aggregate.device_start_ns,
+                    aggregate.device_end_ns,
+                    (aggregate.device_end_ns - aggregate.device_start_ns) / 1000.0,
+                    aggregate.kernel_sum_ns / 1000.0);
         }
 
 #ifndef GGML_OPENCL_PROFILING
+        for (ProfilingInfo & info : profiling_info) {
+            if (info.evt != nullptr && info.op_load_recorded && info.node_wall_trace_recorded) {
+                CL_CHECK(clReleaseEvent(info.evt));
+                info.evt = nullptr;
+            }
+        }
         profiling_info.erase(
                 std::remove_if(profiling_info.begin(), profiling_info.end(), [](const ProfilingInfo & info) {
-                    return info.op_load_recorded;
+                    return info.op_load_recorded && info.node_wall_trace_recorded;
                 }),
                 profiling_info.end());
 #endif
@@ -803,6 +937,7 @@ struct ggml_backend_opencl_context {
 
     void enqueue_ndrange_kernel(cl_kernel kernel, cl_uint work_dim, size_t *global_work_size, size_t *local_work_size, const ggml_tensor * tensor) {
         const bool op_load = ggml_backend_op_load_profile_should_measure(tensor->op, tensor->name);
+        const bool node_wall_trace = node_wall_trace_dispatch;
         const bool breakdown = ggml_backend_op_load_profile_breakdown_enabled();
         const int64_t enqueue_t0_us = breakdown ? ggml_time_us() : 0;
 #ifdef GGML_OPENCL_PROFILING
@@ -812,7 +947,7 @@ struct ggml_backend_opencl_context {
         profiling_info.emplace_back();
         populateProfilingInfo(profiling_info.back(), evt, kernel, work_dim, global_work_size, local_work_size, tensor);
 #else
-        if (op_load) {
+        if (op_load || node_wall_trace) {
             cl_event evt;
             CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, &evt));
 
@@ -823,6 +958,21 @@ struct ggml_backend_opencl_context {
             CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, NULL));
         }
 #endif
+        if (!profiling_info.empty() && node_wall_trace && profiling_info.back().evt != nullptr) {
+            ProfilingInfo & info = profiling_info.back();
+            info.node_wall_trace = true;
+            info.node_wall_trace_recorded = false;
+            info.trace_query_id = trace_query_id;
+            info.trace_phase = trace_phase;
+            info.trace_graph_id = trace_graph_id;
+            info.trace_split_id = trace_split_id;
+            info.trace_node_index = trace_node_index;
+            info.trace_node_name = trace_node_name;
+            info.trace_op_type = trace_op_type;
+            info.trace_backend = trace_backend;
+            info.trace_execution_kind = trace_execution_kind;
+            info.trace_fused_node_ids = trace_fused_node_ids;
+        }
         if (breakdown) {
             ggml_backend_op_load_profile_add_backend_timer_us(
                     GGML_BACKEND_OP_LOAD_PROFILE_GPU,
@@ -876,6 +1026,13 @@ struct ggml_backend_opencl_context {
     void free() {
         ref_count--;
         if (ref_count == 0) {
+            if (!profiling_info.empty()) {
+                // Normal collection happens after the backend's existing
+                // synchronize barrier. This is only a teardown fallback for
+                // callers that destroy a backend with pending trace events.
+                CL_CHECK(clFinish(queue));
+                accumulate_op_load_profiling_info();
+            }
 #ifdef GGML_OPENCL_PROFILING
             write_profiling_info();
             profiling_info.clear();
@@ -3573,7 +3730,8 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
 #ifdef GGML_OPENCL_PROFILING
     command_queue_props |= CL_QUEUE_PROFILING_ENABLE;
 #endif
-    if (ggml_backend_op_load_profile_enabled() || ggml_opencl_csv_op_load_env_enabled()) {
+    if (ggml_backend_op_load_profile_enabled() || ggml_opencl_csv_op_load_env_enabled() ||
+            ggml_backend_node_wall_trace_enabled()) {
         command_queue_props |= CL_QUEUE_PROFILING_ENABLE;
     }
     CL_CHECK((backend_ctx->queue = clCreateCommandQueue(context, device, command_queue_props, &err), err));
@@ -4102,11 +4260,24 @@ static bool ggml_backend_opencl_cpy_tensor_async(ggml_backend_t backend, const g
 
 static void ggml_backend_opencl_synchronize(ggml_backend_t backend) {
     auto * backend_ctx = static_cast<ggml_backend_opencl_context *>(backend->context);
+    const bool pending_profile_events = !backend_ctx->profiling_info.empty();
+    const bool breakdown = pending_profile_events &&
+        ggml_backend_op_load_profile_breakdown_enabled();
+    const int64_t wait_t0_us = breakdown ? ggml_time_us() : 0;
 
     cl_event evt;
     CL_CHECK(clEnqueueBarrierWithWaitList(backend_ctx->queue, 0, nullptr, &evt));
     CL_CHECK(clWaitForEvents(1, &evt));
     CL_CHECK(clReleaseEvent(evt));
+    if (breakdown) {
+        ggml_backend_op_load_profile_add_backend_timer_us(
+                GGML_BACKEND_OP_LOAD_PROFILE_GPU,
+                GGML_BACKEND_OP_LOAD_PROFILE_TIMER_PROFILE_WAIT,
+                ggml_time_us() - wait_t0_us);
+    }
+    if (pending_profile_events) {
+        backend_ctx->accumulate_op_load_profiling_info();
+    }
 }
 
 // Synchronizes the 'backend_ctx's device with others so that commands
@@ -4215,6 +4386,30 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
     const bool breakdown = ggml_backend_op_load_profile_breakdown_enabled();
     const int64_t graph_t0_us = breakdown ? ggml_time_us() : 0;
+    const bool node_wall_trace = cgraph->trace_graph_id >= 0 &&
+        ggml_backend_node_wall_trace_enabled();
+    backend_ctx->node_wall_trace_dispatch = false;
+    std::vector<int> metadata_trace_nodes;
+    if (node_wall_trace) {
+        metadata_trace_nodes.reserve(cgraph->n_nodes);
+    }
+    struct no_event_trace_row {
+        int node_index;
+        std::string op_type;
+        std::string fused_node_ids;
+    };
+    std::vector<no_event_trace_row> no_event_trace_rows;
+
+    auto fused_node_ids = [&](int first, int last) {
+        std::string ids;
+        for (int node_index = first; node_index <= last; ++node_index) {
+            if (!ids.empty()) {
+                ids += ";";
+            }
+            ids += std::to_string(cgraph->trace_node_offset + node_index);
+        }
+        return ids;
+    };
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -4232,16 +4427,35 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
         }
 
         if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
+            if (node_wall_trace) {
+                metadata_trace_nodes.push_back(i);
+            }
             continue;
         }
 
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            if (node_wall_trace) {
+                metadata_trace_nodes.push_back(i);
+            }
             continue;
         }
 
         if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
             const int64_t fused_t0_us = breakdown ? ggml_time_us() : 0;
+            size_t event_count_before = 0;
+            std::string trace_fused_ids;
+            if (node_wall_trace) {
+                event_count_before = backend_ctx->profiling_info.size();
+                trace_fused_ids = fused_node_ids(i, i + 2);
+                backend_ctx->set_node_wall_trace_dispatch(
+                        cgraph, i + 2, cgraph->nodes[i + 2],
+                        "FUSED_NORM_MUL_ADD", "opencl_fused_kernel_device",
+                        trace_fused_ids);
+            }
             ggml_opencl_op_norm_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+            if (node_wall_trace && backend_ctx->profiling_info.size() == event_count_before) {
+                no_event_trace_rows.push_back({ i + 2, "FUSED_NORM_MUL_ADD", std::move(trace_fused_ids) });
+            }
             if (breakdown) {
                 ggml_backend_op_load_profile_add_backend_timer_us(
                         GGML_BACKEND_OP_LOAD_PROFILE_GPU,
@@ -4253,7 +4467,20 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
         }
         if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_GROUP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
             const int64_t fused_t0_us = breakdown ? ggml_time_us() : 0;
+            size_t event_count_before = 0;
+            std::string trace_fused_ids;
+            if (node_wall_trace) {
+                event_count_before = backend_ctx->profiling_info.size();
+                trace_fused_ids = fused_node_ids(i, i + 2);
+                backend_ctx->set_node_wall_trace_dispatch(
+                        cgraph, i + 2, cgraph->nodes[i + 2],
+                        "FUSED_GROUP_NORM_MUL_ADD", "opencl_fused_kernel_device",
+                        trace_fused_ids);
+            }
             ggml_opencl_op_group_norm_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+            if (node_wall_trace && backend_ctx->profiling_info.size() == event_count_before) {
+                no_event_trace_rows.push_back({ i + 2, "FUSED_GROUP_NORM_MUL_ADD", std::move(trace_fused_ids) });
+            }
             if (breakdown) {
                 ggml_backend_op_load_profile_add_backend_timer_us(
                         GGML_BACKEND_OP_LOAD_PROFILE_GPU,
@@ -4265,7 +4492,20 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
         }
         if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
             const int64_t fused_t0_us = breakdown ? ggml_time_us() : 0;
+            size_t event_count_before = 0;
+            std::string trace_fused_ids;
+            if (node_wall_trace) {
+                event_count_before = backend_ctx->profiling_info.size();
+                trace_fused_ids = fused_node_ids(i, i + 1);
+                backend_ctx->set_node_wall_trace_dispatch(
+                        cgraph, i + 1, cgraph->nodes[i + 1],
+                        "FUSED_RMS_NORM_MUL", "opencl_fused_kernel_device",
+                        trace_fused_ids);
+            }
             ggml_opencl_op_rms_norm_fused(backend, node, cgraph->nodes[i+1]);
+            if (node_wall_trace && backend_ctx->profiling_info.size() == event_count_before) {
+                no_event_trace_rows.push_back({ i + 1, "FUSED_RMS_NORM_MUL", std::move(trace_fused_ids) });
+            }
             if (breakdown) {
                 ggml_backend_op_load_profile_add_backend_timer_us(
                         GGML_BACKEND_OP_LOAD_PROFILE_GPU,
@@ -4277,7 +4517,16 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
         }
 
         const int64_t dispatch_t0_us = breakdown ? ggml_time_us() : 0;
+        size_t event_count_before = 0;
+        if (node_wall_trace) {
+            event_count_before = backend_ctx->profiling_info.size();
+            backend_ctx->set_node_wall_trace_dispatch(
+                    cgraph, i, node, ggml_op_name(node->op), "opencl_kernel_device");
+        }
         bool ok = ggml_cl_compute_forward(backend, node);
+        if (node_wall_trace && backend_ctx->profiling_info.size() == event_count_before) {
+            no_event_trace_rows.push_back({ i, ggml_op_name(node->op), {} });
+        }
         if (breakdown) {
             ggml_backend_op_load_profile_add_backend_timer_us(
                     GGML_BACKEND_OP_LOAD_PROFILE_GPU,
@@ -4290,7 +4539,45 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
         GGML_ASSERT(ok);
     }
 
-    backend_ctx->accumulate_op_load_profiling_info();
+    backend_ctx->node_wall_trace_dispatch = false;
+    for (const int node_index : metadata_trace_nodes) {
+        const ggml_tensor * node = cgraph->nodes[node_index];
+        ggml_backend_node_wall_trace_add(
+                cgraph->trace_query_id,
+                (enum ggml_backend_sched_profile_phase) cgraph->trace_phase,
+                cgraph->trace_graph_id,
+                cgraph->trace_split_id,
+                cgraph->trace_node_offset + node_index,
+                node->name,
+                ggml_op_name(node->op),
+                cgraph->trace_backend ? cgraph->trace_backend : "OpenCL",
+                "metadata_noop",
+                "",
+                0,
+                0,
+                0,
+                0.0,
+                0.0);
+    }
+    for (const no_event_trace_row & row : no_event_trace_rows) {
+        const ggml_tensor * node = cgraph->nodes[row.node_index];
+        ggml_backend_node_wall_trace_add(
+                cgraph->trace_query_id,
+                (enum ggml_backend_sched_profile_phase) cgraph->trace_phase,
+                cgraph->trace_graph_id,
+                cgraph->trace_split_id,
+                cgraph->trace_node_offset + row.node_index,
+                node->name,
+                row.op_type.c_str(),
+                cgraph->trace_backend ? cgraph->trace_backend : "OpenCL",
+                "opencl_no_profile_event",
+                row.fused_node_ids.c_str(),
+                0,
+                0,
+                0,
+                0.0,
+                0.0);
+    }
 
     if (breakdown) {
         ggml_backend_op_load_profile_add_backend_timer_us(

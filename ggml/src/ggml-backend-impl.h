@@ -146,6 +146,15 @@ extern "C" {
         void * context;
     };
 
+    // CPU node trace fast path: ggml-cpu records only raw timestamps while
+    // workers are active, then submits the whole graph after its final
+    // barrier. This keeps CSV formatting and the global trace mutex out of
+    // the per-node compute loop.
+    GGML_API void ggml_backend_node_wall_trace_add_cpu_graph(
+            const struct ggml_cgraph * cgraph,
+            const int64_t * node_start_us,
+            const int64_t * node_end_us);
+
     struct ggml_backend_event {
         struct ggml_backend_device * device;
         void * context;

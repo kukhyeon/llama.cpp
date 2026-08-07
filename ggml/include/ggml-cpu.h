@@ -63,6 +63,9 @@ extern "C" {
     // Wake sleeping secondary workers so they enter their normal finite polling
     // window before the next graph is submitted. This does not enqueue work.
     GGML_BACKEND_API void                          ggml_threadpool_prewake       (struct ggml_threadpool * threadpool);
+    // Wake sleeping secondary workers and keep them polling for at most hold_us
+    // while waiting for the next graph. A value of 0 cancels an active hold.
+    GGML_BACKEND_API bool                          ggml_threadpool_prewake_hold  (struct ggml_threadpool * threadpool, uint32_t hold_us);
 
     // ggml_graph_plan() has to be called before ggml_graph_compute()
     // when plan.work_size > 0, caller must allocate memory for plan.work_data
@@ -136,6 +139,7 @@ extern "C" {
     GGML_BACKEND_API bool ggml_backend_is_cpu                (ggml_backend_t backend);
     GGML_BACKEND_API void ggml_backend_cpu_set_n_threads     (ggml_backend_t backend_cpu, int n_threads);
     GGML_BACKEND_API void ggml_backend_cpu_set_threadpool    (ggml_backend_t backend_cpu, ggml_threadpool_t threadpool);
+    GGML_BACKEND_API bool ggml_backend_cpu_prewake_hold      (ggml_backend_t backend_cpu, uint32_t hold_us);
     GGML_BACKEND_API void ggml_backend_cpu_set_abort_callback(ggml_backend_t backend_cpu, ggml_abort_callback abort_callback, void * abort_callback_data);
 
     GGML_BACKEND_API void ggml_backend_cpu_set_use_ref(ggml_backend_t backend_cpu, bool use_ref);
