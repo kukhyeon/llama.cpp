@@ -269,6 +269,13 @@ void ggml_backend_cpu_set_threadpool(ggml_backend_t backend_cpu, ggml_threadpool
     ctx->threadpool = threadpool;
 }
 
+bool ggml_backend_cpu_prewake_hold(ggml_backend_t backend_cpu, uint32_t hold_us) {
+    GGML_ASSERT(ggml_backend_is_cpu(backend_cpu));
+
+    struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *)backend_cpu->context;
+    return ggml_threadpool_prewake_hold(ctx->threadpool, hold_us);
+}
+
 void ggml_backend_cpu_set_abort_callback(ggml_backend_t backend_cpu, ggml_abort_callback abort_callback, void * abort_callback_data) {
     GGML_ASSERT(ggml_backend_is_cpu(backend_cpu));
 
@@ -680,6 +687,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
 #ifndef GGML_USE_OPENMP
     if (strcmp(name, "ggml_threadpool_prewake") == 0) {
         return (void *)ggml_threadpool_prewake;
+    }
+    if (strcmp(name, "ggml_backend_cpu_prewake_hold") == 0) {
+        return (void *)ggml_backend_cpu_prewake_hold;
     }
 #endif
     if (strcmp(name, "ggml_backend_cpu_set_threadpool") == 0) {

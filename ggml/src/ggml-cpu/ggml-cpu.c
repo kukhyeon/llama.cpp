@@ -470,10 +470,16 @@ struct ggml_threadpool {
 
     struct ggml_cgraph * cgraph;
     struct ggml_cplan  * cplan;
+    int64_t * node_wall_trace_start_us;
+    int64_t * node_wall_trace_end_us;
 
     // synchronization primitives
     atomic_int n_graph;       // updated when there is work to be done (i.e each graph) holds graph and active thread counts.
     atomic_uint prewake_generation; // wakes idle workers without publishing a graph
+    atomic_int prewake_hold_generation;  // publishes a bounded hold request
+    atomic_int prewake_hold_duration_us; // 0 cancels the current hold request
+    atomic_int prewake_hold_target_graph; // graph serial that consumes the hold
+    bool prewake_hold_enabled;           // guarded by mutex; false keeps the idle path atomic-free
     atomic_int GGML_CACHE_ALIGN n_barrier;
     atomic_int GGML_CACHE_ALIGN n_barrier_passed;
     atomic_int GGML_CACHE_ALIGN current_chunk; // currently processing chunk during Mat_Mul, shared between all the threads.
@@ -497,6 +503,8 @@ struct ggml_compute_state {
     ggml_thread_t thrd;
     int  last_graph;
     unsigned last_prewake_generation;
+    int last_prewake_hold_generation;
+    bool skip_poll_once;
     bool pending;
 #endif
     bool cpumask[GGML_MAX_N_THREADS];
@@ -2790,6 +2798,51 @@ void ggml_threadpool_prewake(struct ggml_threadpool * threadpool) {
 #endif
 }
 
+bool ggml_threadpool_prewake_hold(struct ggml_threadpool * threadpool, uint32_t hold_us) {
+    if (threadpool == NULL || hold_us > (uint32_t) INT_MAX) {
+        return false;
+    }
+
+#ifndef GGML_USE_OPENMP
+    bool armed = false;
+    ggml_mutex_lock(&threadpool->mutex);
+
+    if (hold_us == 0) {
+        if (threadpool->prewake_hold_enabled) {
+            // Publish a new zero-duration generation so workers that are
+            // already holding observe cancellation without waiting for timeout.
+            atomic_store_explicit(&threadpool->prewake_hold_duration_us, 0, memory_order_relaxed);
+            atomic_store_explicit(&threadpool->prewake_hold_target_graph, 0, memory_order_relaxed);
+            atomic_fetch_add_explicit(&threadpool->prewake_hold_generation, 1, memory_order_release);
+            ggml_cond_broadcast(&threadpool->cond);
+        }
+        armed = true;
+    } else if (!threadpool->stop && !threadpool->pause && threadpool->n_threads > 1) {
+        const int graph_serial =
+            atomic_load_explicit(&threadpool->n_graph, memory_order_relaxed) >>
+                GGML_THREADPOOL_N_THREADS_BITS;
+
+        // The scheduler arms immediately before the intended CPU graph. The
+        // target serial prevents a worker that first observes that graph from
+        // consuming this request as a stale hold after the graph completes.
+        threadpool->prewake_hold_enabled = true;
+        atomic_store_explicit(
+                &threadpool->prewake_hold_duration_us, (int) hold_us, memory_order_relaxed);
+        atomic_store_explicit(
+                &threadpool->prewake_hold_target_graph, graph_serial + 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&threadpool->prewake_hold_generation, 1, memory_order_release);
+        ggml_cond_broadcast(&threadpool->cond);
+        armed = true;
+    }
+
+    ggml_mutex_unlock(&threadpool->mutex);
+    return armed;
+#else
+    UNUSED(hold_us);
+    return false;
+#endif
+}
+
 struct ggml_cplan ggml_graph_plan(
           const struct ggml_cgraph * cgraph,
                                int   n_threads,
@@ -3022,6 +3075,12 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
     const struct ggml_cgraph * cgraph = tp->cgraph;
     const struct ggml_cplan  * cplan  = tp->cplan;
+    const bool node_wall_trace = cgraph->trace_graph_id >= 0 &&
+        tp->node_wall_trace_start_us != NULL && tp->node_wall_trace_end_us != NULL;
+    struct ggml_tensor * deferred_profile_node = NULL;
+    int deferred_profile_node_n = -1;
+    int64_t deferred_profile_t0_us = 0;
+    bool deferred_op_load = false;
 
     set_numa_thread_affinity(state->ith);
 
@@ -3053,7 +3112,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         }
 
         const bool profile_node = ggml_backend_op_load_profile_should_measure(node->op, node->name);
-        const int64_t profile_t0_us = profile_node && state->ith == 0 ? ggml_time_us() : 0;
+        const bool time_node = profile_node || node_wall_trace;
+        const int64_t profile_t0_us = time_node && state->ith == 0 ? ggml_time_us() : 0;
 
         ggml_compute_forward(&params, node);
 
@@ -3063,20 +3123,38 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             tp->ec    = GGML_STATUS_ABORTED;
         }
 
-        if (node_n + 1 < cgraph->n_nodes) {
-            ggml_barrier(state->threadpool);
-        } else if (profile_node) {
+        const bool is_final_graph_node = node_n + 1 == cgraph->n_nodes;
+        if (!is_final_graph_node) {
             ggml_barrier(state->threadpool);
         }
 
-        if (profile_node && state->ith == 0) {
-            ggml_backend_op_load_profile_add_tensor_us(
-                    GGML_BACKEND_OP_LOAD_PROFILE_CPU,
-                    node->op,
-                    node->name,
-                    ggml_time_us() - profile_t0_us);
+        if (time_node && state->ith == 0) {
+            if (is_final_graph_node) {
+                // Reuse the normal graph-final barrier below. Adding a second
+                // profiling-only barrier here measurably perturbs small splits.
+                deferred_profile_node = node;
+                deferred_profile_node_n = node_n;
+                deferred_profile_t0_us = profile_t0_us;
+                deferred_op_load = profile_node;
+            } else {
+                const int64_t profile_t1_us = ggml_time_us();
+                const double wall_us = (double) (profile_t1_us - profile_t0_us);
+                if (profile_node) {
+                    ggml_backend_op_load_profile_add_tensor_us(
+                            GGML_BACKEND_OP_LOAD_PROFILE_CPU,
+                            node->op,
+                            node->name,
+                            wall_us);
+                }
+                if (node_wall_trace) {
+                    tp->node_wall_trace_start_us[node_n] = profile_t0_us;
+                    tp->node_wall_trace_end_us[node_n] = profile_t1_us;
+                }
+            }
         }
     }
+
+    ggml_barrier(state->threadpool);
 
 #ifdef GGML_USE_OPENMP
     GGML_PRINT_DEBUG("thread #%d compute-done cplan %p\n", state->ith, (const void *)cplan);
@@ -3084,7 +3162,21 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-done cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
 
-    ggml_barrier(state->threadpool);
+    if (state->ith == 0 && deferred_profile_node != NULL) {
+        const int64_t profile_t1_us = ggml_time_us();
+        const double wall_us = (double) (profile_t1_us - deferred_profile_t0_us);
+        if (deferred_op_load) {
+            ggml_backend_op_load_profile_add_tensor_us(
+                    GGML_BACKEND_OP_LOAD_PROFILE_CPU,
+                    deferred_profile_node->op,
+                    deferred_profile_node->name,
+                    wall_us);
+        }
+        if (node_wall_trace) {
+            tp->node_wall_trace_start_us[deferred_profile_node_n] = deferred_profile_t0_us;
+            tp->node_wall_trace_end_us[deferred_profile_node_n] = profile_t1_us;
+        }
+    }
 
     return 0;
 }
@@ -3123,6 +3215,38 @@ static inline bool ggml_graph_compute_consume_prewake(struct ggml_compute_state 
     return true;
 }
 
+static inline bool ggml_graph_compute_consume_prewake_hold(
+        struct ggml_compute_state * state,
+        int * generation,
+        int * duration_us) {
+    struct ggml_threadpool * threadpool = state->threadpool;
+    if (!threadpool->prewake_hold_enabled) {
+        return false;
+    }
+    const int current_generation = atomic_load_explicit(
+            &threadpool->prewake_hold_generation, memory_order_acquire);
+    if (current_generation == state->last_prewake_hold_generation) {
+        return false;
+    }
+
+    state->last_prewake_hold_generation = current_generation;
+    const int current_duration_us = atomic_load_explicit(
+            &threadpool->prewake_hold_duration_us, memory_order_relaxed);
+    const int target_graph = atomic_load_explicit(
+            &threadpool->prewake_hold_target_graph, memory_order_relaxed);
+    const int current_graph =
+        atomic_load_explicit(&threadpool->n_graph, memory_order_relaxed) >>
+            GGML_THREADPOOL_N_THREADS_BITS;
+
+    if (current_duration_us <= 0 || target_graph <= current_graph) {
+        return false;
+    }
+
+    *generation = current_generation;
+    *duration_us = current_duration_us;
+    return true;
+}
+
 // sync thread state after polling
 static inline void ggml_graph_compute_thread_sync(struct ggml_compute_state * state) {
     // TSAN doesn't support standalone fence yet, we use a dummy read-modify-write instead
@@ -3149,16 +3273,74 @@ static inline bool ggml_graph_compute_poll_for_work(struct ggml_compute_state * 
     return state->pending;
 }
 
+static inline bool ggml_graph_compute_hold_for_work(
+        struct ggml_compute_state * state,
+        int generation,
+        int duration_us) {
+    struct ggml_threadpool * threadpool = state->threadpool;
+    int64_t deadline_us = ggml_time_us() + duration_us;
+    uint32_t relax_count = 0;
+
+    while (!ggml_graph_compute_thread_ready(state)) {
+        const int current_generation = atomic_load_explicit(
+                &threadpool->prewake_hold_generation, memory_order_acquire);
+        if (current_generation != generation) {
+            state->last_prewake_hold_generation = current_generation;
+            generation = current_generation;
+
+            duration_us = atomic_load_explicit(
+                    &threadpool->prewake_hold_duration_us, memory_order_relaxed);
+            const int target_graph = atomic_load_explicit(
+                    &threadpool->prewake_hold_target_graph, memory_order_relaxed);
+            const int current_graph =
+                atomic_load_explicit(&threadpool->n_graph, memory_order_relaxed) >>
+                    GGML_THREADPOOL_N_THREADS_BITS;
+            if (duration_us <= 0 || target_graph <= current_graph) {
+                break;
+            }
+            deadline_us = ggml_time_us() + duration_us;
+        }
+
+        ggml_thread_cpu_relax();
+        if ((++relax_count & 0xffU) == 0 && ggml_time_us() >= deadline_us) {
+            break;
+        }
+    }
+
+    if (state->pending) {
+        ggml_graph_compute_thread_sync(state);
+    } else {
+        // A timed-out/cancelled explicit hold is already the complete polling
+        // budget for this wake. Re-enter the condition wait without adding the
+        // normal poll window on the next outer-loop iteration.
+        state->skip_poll_once = true;
+    }
+    return state->pending;
+}
+
 static inline bool ggml_graph_compute_check_for_work(struct ggml_compute_state * state) {
     struct ggml_threadpool * threadpool = state->threadpool;
 
-    if (ggml_graph_compute_poll_for_work(state)) {
-        ggml_graph_compute_thread_sync(state);
-        return state->pending;
+    if (!state->skip_poll_once) {
+        if (ggml_graph_compute_poll_for_work(state)) {
+            ggml_graph_compute_thread_sync(state);
+            return state->pending;
+        }
+    } else {
+        state->skip_poll_once = false;
     }
+
+    int hold_generation = 0;
+    int hold_duration_us = 0;
+    bool hold_requested = false;
 
     ggml_mutex_lock_shared(&threadpool->mutex);
     while (!ggml_graph_compute_thread_ready(state)) {
+        if (ggml_graph_compute_consume_prewake_hold(
+                    state, &hold_generation, &hold_duration_us)) {
+            hold_requested = true;
+            break;
+        }
         // Break out without setting pending. The outer worker loop will call
         // this function again and perform a fresh polling window.
         if (ggml_graph_compute_consume_prewake(state)) {
@@ -3169,6 +3351,11 @@ static inline bool ggml_graph_compute_check_for_work(struct ggml_compute_state *
         ggml_cond_wait(&threadpool->cond, &threadpool->mutex);
     }
     ggml_mutex_unlock_shared(&threadpool->mutex);
+
+    if (hold_requested) {
+        return ggml_graph_compute_hold_for_work(
+                state, hold_generation, hold_duration_us);
+    }
 
     return state->pending;
 }
@@ -3255,8 +3442,14 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
     {
         threadpool->cgraph           = cgraph;
         threadpool->cplan            = cplan;
+        threadpool->node_wall_trace_start_us = NULL;
+        threadpool->node_wall_trace_end_us   = NULL;
         threadpool->n_graph          = 0;
         threadpool->prewake_generation = 0;
+        threadpool->prewake_hold_generation = 0;
+        threadpool->prewake_hold_duration_us = 0;
+        threadpool->prewake_hold_target_graph = 0;
+        threadpool->prewake_hold_enabled = false;
         threadpool->n_barrier        = 0;
         threadpool->n_barrier_passed = 0;
         threadpool->current_chunk    = 0;
@@ -3351,6 +3544,16 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
 
+    int64_t * node_wall_trace_samples = NULL;
+    if (cgraph->trace_graph_id >= 0 && cgraph->n_nodes > 0 &&
+            ggml_backend_node_wall_trace_enabled()) {
+        node_wall_trace_samples = (int64_t *) calloc((size_t) cgraph->n_nodes * 2, sizeof(int64_t));
+    }
+    threadpool->node_wall_trace_start_us = node_wall_trace_samples;
+    threadpool->node_wall_trace_end_us = node_wall_trace_samples != NULL
+        ? node_wall_trace_samples + cgraph->n_nodes
+        : NULL;
+
 #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {
         #pragma omp parallel num_threads(n_threads)
@@ -3392,6 +3595,16 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     clear_numa_thread_affinity();
 
     enum ggml_status ret = threadpool->ec;
+
+    if (node_wall_trace_samples != NULL) {
+        ggml_backend_node_wall_trace_add_cpu_graph(
+                cgraph,
+                threadpool->node_wall_trace_start_us,
+                threadpool->node_wall_trace_end_us);
+        free(node_wall_trace_samples);
+        threadpool->node_wall_trace_start_us = NULL;
+        threadpool->node_wall_trace_end_us = NULL;
+    }
 
     if (disposable_threadpool) {
         ggml_threadpool_free(threadpool);

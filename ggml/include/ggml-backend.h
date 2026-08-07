@@ -685,6 +685,35 @@ extern "C" {
     GGML_API const char * ggml_backend_op_load_profile_timer_name(enum ggml_backend_op_load_profile_timer timer);
     GGML_API struct ggml_backend_op_load_profile_data ggml_backend_op_load_profile_get(void);
 
+    // Default-off, per-node wall trace. Backend implementations record native
+    // timing without changing scheduler split boundaries. Rows are buffered and
+    // written only when flush is called by the application. Device timestamps
+    // use a backend-local clock domain and are zero when unavailable; interpret
+    // wall_us according to execution_kind rather than comparing absolute clocks
+    // across CPU, OpenCL, and HTP.
+    GGML_API void ggml_backend_node_wall_trace_set_enabled(bool enabled);
+    GGML_API bool ggml_backend_node_wall_trace_enabled(void);
+    GGML_API void ggml_backend_node_wall_trace_set_path(const char * path);
+    GGML_API void ggml_backend_node_wall_trace_reset(void);
+    GGML_API void ggml_backend_node_wall_trace_set_query_id(int query_id);
+    GGML_API void ggml_backend_node_wall_trace_flush(void);
+    GGML_API void ggml_backend_node_wall_trace_add(
+            int query_id,
+            enum ggml_backend_sched_profile_phase phase,
+            int64_t graph_id,
+            int split_id,
+            int node_index,
+            const char * node_name,
+            const char * op_type,
+            const char * backend,
+            const char * execution_kind,
+            const char * fused_node_ids,
+            int kernel_count,
+            uint64_t device_start_ns,
+            uint64_t device_end_ns,
+            double wall_us,
+            double kernel_sum_us);
+
     //
     // Meta backend
     //

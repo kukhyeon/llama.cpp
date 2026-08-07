@@ -895,6 +895,8 @@ struct ggml_backend_sched_route_candidate_state {
     }
 };
 
+using ggml_backend_cpu_prewake_hold_t = bool (*)(ggml_backend_t backend, uint32_t hold_us);
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
@@ -942,6 +944,8 @@ struct ggml_backend_sched {
     int ffn_device_worker_cpu;
     int ffn_gpu_worker_cpu;
     int ffn_npu_worker_cpu;
+    uint32_t ffn_cpu_prewake_hold_us;
+    ggml_backend_cpu_prewake_hold_t ffn_cpu_prewake_hold_fns[GGML_SCHED_MAX_BACKENDS];
 
     // Non-trivial worker state is owned separately because this scheduler is
     // allocated with calloc/free.
@@ -1381,6 +1385,26 @@ static int ggml_backend_sched_ffn_worker_cpu(const char * env_name, int fallback
     return (int) cpu;
 }
 
+static uint32_t ggml_backend_sched_ffn_cpu_prewake_hold_us() {
+    static constexpr unsigned long MAX_HOLD_US = 1000000UL;
+    const char * env_name = "GGML_FFN_CPU_PREWAKE_HOLD_US";
+    const char * value = getenv(env_name);
+    if (value == nullptr || value[0] == '\0') {
+        return 0;
+    }
+
+    errno = 0;
+    char * end = nullptr;
+    const unsigned long hold_us = strtoul(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || value[0] == '-' || hold_us > MAX_HOLD_US) {
+        GGML_LOG_WARN(
+                "%s: invalid %s='%s'; expected 0..%lu, disabling layer pre-wake\n",
+                __func__, env_name, value, MAX_HOLD_US);
+        return 0;
+    }
+    return (uint32_t) hold_us;
+}
+
 struct ggml_backend_sched_ffn_device_job {
     ggml_backend_t backend = nullptr;
     struct ggml_cgraph * graph = nullptr;
@@ -1533,6 +1557,42 @@ struct ggml_backend_sched_trace_state {
 static ggml_backend_sched_trace_state g_sched_trace;
 static constexpr size_t GGML_SCHED_TRACE_ROW_RESERVE = 32768;
 
+struct ggml_backend_node_wall_trace_row {
+    int query_id = -1;
+    enum ggml_backend_sched_profile_phase phase = GGML_BACKEND_SCHED_PROFILE_PREFILL;
+    int64_t graph_id = -1;
+    int split_id = -1;
+    int node_index = -1;
+    int layer = -1;
+    char node_name[GGML_MAX_NAME] = {};
+    char op_type[64] = {};
+    char backend[GGML_MAX_NAME] = {};
+    char execution_kind[64] = {};
+    char fused_node_ids[128] = {};
+    int kernel_count = 0;
+    uint64_t device_start_ns = 0;
+    uint64_t device_end_ns = 0;
+    double wall_us = 0.0;
+    double kernel_sum_us = 0.0;
+};
+
+struct ggml_backend_node_wall_trace_state {
+    std::atomic<bool> initialized { false };
+    std::atomic<bool> enabled { false };
+    bool trace_prefill = true;
+    bool trace_decode = true;
+    bool warned_open = false;
+    FILE * file = nullptr;
+    std::string path = "output/node_wall_trace.csv";
+    std::atomic<int64_t> graph_id { 0 };
+    std::atomic<int> query_id { -1 };
+    std::vector<ggml_backend_node_wall_trace_row> rows;
+    std::mutex mutex;
+};
+
+static ggml_backend_node_wall_trace_state g_node_wall_trace;
+static constexpr size_t GGML_NODE_WALL_TRACE_ROW_RESERVE = 8192;
+
 struct ggml_backend_sched_ffn_worker_trace_row {
     int schema_version = 2;
     int64_t trace_session_id = -1;
@@ -1645,6 +1705,61 @@ static bool ggml_sched_trace_str_eq_ci(const char * lhs, const char * rhs) {
     }
 
     return *lhs == '\0' && *rhs == '\0';
+}
+
+static void ggml_node_wall_trace_init(void) {
+    if (g_node_wall_trace.initialized.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_node_wall_trace.mutex);
+    if (g_node_wall_trace.initialized.load(std::memory_order_relaxed)) {
+        return;
+    }
+
+    g_node_wall_trace.enabled = ggml_sched_trace_env_enabled("NODE_WALL_TRACE") ||
+        ggml_sched_trace_env_enabled("GGML_NODE_WALL_TRACE");
+
+    const char * phase = getenv("NODE_WALL_TRACE_PHASE");
+    if (phase == nullptr || phase[0] == '\0') {
+        phase = getenv("GGML_NODE_WALL_TRACE_PHASE");
+    }
+    if (phase != nullptr && phase[0] != '\0') {
+        if (ggml_sched_trace_str_eq_ci(phase, "prefill")) {
+            g_node_wall_trace.trace_prefill = true;
+            g_node_wall_trace.trace_decode = false;
+        } else if (ggml_sched_trace_str_eq_ci(phase, "decode")) {
+            g_node_wall_trace.trace_prefill = false;
+            g_node_wall_trace.trace_decode = true;
+        } else if (!ggml_sched_trace_str_eq_ci(phase, "both") &&
+                   !ggml_sched_trace_str_eq_ci(phase, "all")) {
+            GGML_LOG_WARN(
+                    "%s: invalid node wall trace phase '%s'; expected prefill, decode, or both; tracing both phases\n",
+                    __func__, phase);
+        }
+    }
+
+    const char * path = getenv("NODE_WALL_TRACE_PATH");
+    if (path == nullptr || path[0] == '\0') {
+        path = getenv("GGML_NODE_WALL_TRACE_PATH");
+    }
+    if (path != nullptr && path[0] != '\0') {
+        g_node_wall_trace.path = path;
+    }
+
+    if (g_node_wall_trace.enabled) {
+        g_node_wall_trace.rows.reserve(GGML_NODE_WALL_TRACE_ROW_RESERVE);
+    }
+    g_node_wall_trace.initialized.store(true, std::memory_order_release);
+}
+
+static bool ggml_node_wall_trace_phase_enabled(void) {
+    ggml_node_wall_trace_init();
+    if (!g_node_wall_trace.enabled) {
+        return false;
+    }
+    return g_sched_profile_phase == GGML_BACKEND_SCHED_PROFILE_PREFILL
+        ? g_node_wall_trace.trace_prefill
+        : g_node_wall_trace.trace_decode;
 }
 
 static void ggml_sched_trace_init(void) {
@@ -2298,6 +2413,280 @@ static int ggml_sched_profile_extract_layer_id(const char * name) {
     return -1;
 }
 
+static bool ggml_node_wall_trace_phase_selected(enum ggml_backend_sched_profile_phase phase) {
+    return phase == GGML_BACKEND_SCHED_PROFILE_PREFILL
+        ? g_node_wall_trace.trace_prefill
+        : g_node_wall_trace.trace_decode;
+}
+
+static ggml_backend_node_wall_trace_row ggml_node_wall_trace_make_row(
+        int query_id,
+        enum ggml_backend_sched_profile_phase phase,
+        int64_t graph_id,
+        int split_id,
+        int node_index,
+        const char * node_name,
+        const char * op_type,
+        const char * backend,
+        const char * execution_kind,
+        const char * fused_node_ids,
+        int kernel_count,
+        uint64_t device_start_ns,
+        uint64_t device_end_ns,
+        double wall_us,
+        double kernel_sum_us) {
+    ggml_backend_node_wall_trace_row row;
+    row.query_id = query_id;
+    row.phase = phase;
+    row.graph_id = graph_id;
+    row.split_id = split_id;
+    row.node_index = node_index;
+    row.layer = ggml_sched_profile_extract_layer_id(node_name);
+    snprintf(row.node_name, sizeof(row.node_name), "%s", node_name ? node_name : "");
+    snprintf(row.op_type, sizeof(row.op_type), "%s", op_type ? op_type : "");
+    snprintf(row.backend, sizeof(row.backend), "%s", backend ? backend : "");
+    snprintf(row.execution_kind, sizeof(row.execution_kind), "%s", execution_kind ? execution_kind : "");
+    snprintf(row.fused_node_ids, sizeof(row.fused_node_ids), "%s", fused_node_ids ? fused_node_ids : "");
+    row.kernel_count = kernel_count;
+    row.device_start_ns = device_start_ns;
+    row.device_end_ns = device_end_ns;
+    row.wall_us = wall_us;
+    row.kernel_sum_us = kernel_sum_us;
+    return row;
+}
+
+static FILE * ggml_node_wall_trace_file_locked(void) {
+    if (!g_node_wall_trace.enabled) {
+        return nullptr;
+    }
+    if (g_node_wall_trace.file != nullptr) {
+        return g_node_wall_trace.file;
+    }
+
+    g_node_wall_trace.file = fopen(g_node_wall_trace.path.c_str(), "a");
+    if (g_node_wall_trace.file == nullptr) {
+        if (!g_node_wall_trace.warned_open) {
+            GGML_LOG_WARN("%s: failed to open node wall trace CSV '%s'\n",
+                    __func__, g_node_wall_trace.path.c_str());
+            g_node_wall_trace.warned_open = true;
+        }
+        return nullptr;
+    }
+
+    fseek(g_node_wall_trace.file, 0, SEEK_END);
+    if (ftell(g_node_wall_trace.file) == 0) {
+        fprintf(g_node_wall_trace.file,
+                "query_id,phase,graph_id,split_id,node_index,layer,"
+                "node_name,op_type,backend,execution_kind,fused_node_ids,kernel_count,"
+                "device_start_ns,device_end_ns,wall_us,kernel_sum_us\n");
+    }
+    return g_node_wall_trace.file;
+}
+
+static void ggml_node_wall_trace_flush_locked(void) {
+    if (g_node_wall_trace.rows.empty()) {
+        return;
+    }
+
+    FILE * f = ggml_node_wall_trace_file_locked();
+    if (f == nullptr) {
+        g_node_wall_trace.rows.clear();
+        return;
+    }
+
+    std::stable_sort(
+            g_node_wall_trace.rows.begin(),
+            g_node_wall_trace.rows.end(),
+            [](const ggml_backend_node_wall_trace_row & lhs,
+               const ggml_backend_node_wall_trace_row & rhs) {
+                if (lhs.query_id != rhs.query_id) return lhs.query_id < rhs.query_id;
+                if (lhs.phase != rhs.phase) return lhs.phase < rhs.phase;
+                if (lhs.graph_id != rhs.graph_id) return lhs.graph_id < rhs.graph_id;
+                if (lhs.split_id != rhs.split_id) return lhs.split_id < rhs.split_id;
+                return lhs.node_index < rhs.node_index;
+            });
+
+    for (const auto & row : g_node_wall_trace.rows) {
+        fprintf(f, "%d,%s,%lld,%d,%d,%d,",
+                row.query_id,
+                ggml_sched_profile_phase_name(row.phase),
+                (long long) row.graph_id,
+                row.split_id,
+                row.node_index,
+                row.layer);
+        ggml_sched_trace_csv_cell(f, row.node_name);
+        fputc(',', f);
+        ggml_sched_trace_csv_cell(f, row.op_type);
+        fputc(',', f);
+        ggml_sched_trace_csv_cell(f, row.backend);
+        fputc(',', f);
+        ggml_sched_trace_csv_cell(f, row.execution_kind);
+        fputc(',', f);
+        ggml_sched_trace_csv_cell(f, row.fused_node_ids);
+        fprintf(f, ",%d,%llu,%llu,%.3f,%.3f\n",
+                row.kernel_count,
+                (unsigned long long) row.device_start_ns,
+                (unsigned long long) row.device_end_ns,
+                row.wall_us,
+                row.kernel_sum_us);
+    }
+
+    if (fflush(f) != 0 && !g_node_wall_trace.warned_open) {
+        GGML_LOG_WARN("%s: failed to flush node wall trace CSV '%s'\n",
+                __func__, g_node_wall_trace.path.c_str());
+        g_node_wall_trace.warned_open = true;
+    }
+    g_node_wall_trace.rows.clear();
+}
+
+void ggml_backend_node_wall_trace_set_enabled(bool enabled) {
+    ggml_node_wall_trace_init();
+    std::lock_guard<std::mutex> lock(g_node_wall_trace.mutex);
+    if (!enabled && g_node_wall_trace.enabled) {
+        ggml_node_wall_trace_flush_locked();
+    }
+    g_node_wall_trace.enabled = enabled;
+    if (enabled && g_node_wall_trace.rows.capacity() < GGML_NODE_WALL_TRACE_ROW_RESERVE) {
+        g_node_wall_trace.rows.reserve(GGML_NODE_WALL_TRACE_ROW_RESERVE);
+    } else if (!enabled && g_node_wall_trace.file != nullptr) {
+        fclose(g_node_wall_trace.file);
+        g_node_wall_trace.file = nullptr;
+    }
+}
+
+bool ggml_backend_node_wall_trace_enabled(void) {
+    ggml_node_wall_trace_init();
+    return g_node_wall_trace.enabled;
+}
+
+void ggml_backend_node_wall_trace_set_path(const char * path) {
+    if (path == nullptr || path[0] == '\0') {
+        return;
+    }
+    ggml_node_wall_trace_init();
+    std::lock_guard<std::mutex> lock(g_node_wall_trace.mutex);
+    if (g_node_wall_trace.path == path) {
+        return;
+    }
+    ggml_node_wall_trace_flush_locked();
+    if (g_node_wall_trace.file != nullptr) {
+        fclose(g_node_wall_trace.file);
+        g_node_wall_trace.file = nullptr;
+    }
+    g_node_wall_trace.path = path;
+    g_node_wall_trace.warned_open = false;
+}
+
+void ggml_backend_node_wall_trace_reset(void) {
+    ggml_node_wall_trace_init();
+    std::lock_guard<std::mutex> lock(g_node_wall_trace.mutex);
+    if (!g_node_wall_trace.enabled) {
+        return;
+    }
+    ggml_node_wall_trace_flush_locked();
+    g_node_wall_trace.graph_id = 0;
+    g_node_wall_trace.query_id = -1;
+}
+
+void ggml_backend_node_wall_trace_set_query_id(int query_id) {
+    ggml_node_wall_trace_init();
+    if (!g_node_wall_trace.enabled) {
+        return;
+    }
+    g_node_wall_trace.query_id = query_id;
+}
+
+void ggml_backend_node_wall_trace_flush(void) {
+    ggml_node_wall_trace_init();
+    std::lock_guard<std::mutex> lock(g_node_wall_trace.mutex);
+    ggml_node_wall_trace_flush_locked();
+}
+
+void ggml_backend_node_wall_trace_add(
+        int query_id,
+        enum ggml_backend_sched_profile_phase phase,
+        int64_t graph_id,
+        int split_id,
+        int node_index,
+        const char * node_name,
+        const char * op_type,
+        const char * backend,
+        const char * execution_kind,
+        const char * fused_node_ids,
+        int kernel_count,
+        uint64_t device_start_ns,
+        uint64_t device_end_ns,
+        double wall_us,
+        double kernel_sum_us) {
+    if (!ggml_backend_node_wall_trace_enabled() || !ggml_node_wall_trace_phase_selected(phase)) {
+        return;
+    }
+
+    const ggml_backend_node_wall_trace_row row = ggml_node_wall_trace_make_row(
+            query_id, phase, graph_id, split_id, node_index,
+            node_name, op_type, backend, execution_kind, fused_node_ids,
+            kernel_count, device_start_ns, device_end_ns, wall_us, kernel_sum_us);
+
+    std::lock_guard<std::mutex> lock(g_node_wall_trace.mutex);
+    if (g_node_wall_trace.enabled.load(std::memory_order_relaxed)) {
+        g_node_wall_trace.rows.push_back(row);
+    }
+}
+
+void ggml_backend_node_wall_trace_add_cpu_graph(
+        const struct ggml_cgraph * cgraph,
+        const int64_t * node_start_us,
+        const int64_t * node_end_us) {
+    if (cgraph == nullptr || node_start_us == nullptr || node_end_us == nullptr ||
+            cgraph->trace_graph_id < 0 || !ggml_backend_node_wall_trace_enabled()) {
+        return;
+    }
+
+    const auto phase = (enum ggml_backend_sched_profile_phase) cgraph->trace_phase;
+    if (!ggml_node_wall_trace_phase_selected(phase)) {
+        return;
+    }
+
+    std::vector<ggml_backend_node_wall_trace_row> graph_rows;
+    graph_rows.reserve(cgraph->n_nodes);
+    for (int node_n = 0; node_n < cgraph->n_nodes; ++node_n) {
+        const ggml_tensor * node = cgraph->nodes[node_n];
+        const bool metadata_only = ggml_op_is_empty(node->op) ||
+            (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0;
+        const bool executed = !metadata_only && node_start_us[node_n] > 0 &&
+            node_end_us[node_n] >= node_start_us[node_n];
+        const double wall_us = executed
+            ? (double) (node_end_us[node_n] - node_start_us[node_n])
+            : 0.0;
+        const char * execution_kind = metadata_only
+            ? "metadata_noop"
+            : (executed ? "cpu_node_barrier_wall" : "cpu_node_not_executed");
+
+        graph_rows.push_back(ggml_node_wall_trace_make_row(
+                cgraph->trace_query_id,
+                phase,
+                cgraph->trace_graph_id,
+                cgraph->trace_split_id,
+                cgraph->trace_node_offset + node_n,
+                node->name,
+                ggml_op_name(node->op),
+                cgraph->trace_backend ? cgraph->trace_backend : "CPU",
+                execution_kind,
+                "",
+                executed ? 1 : 0,
+                executed ? (uint64_t) node_start_us[node_n] * 1000 : 0,
+                executed ? (uint64_t) node_end_us[node_n] * 1000 : 0,
+                wall_us,
+                wall_us));
+    }
+
+    std::lock_guard<std::mutex> lock(g_node_wall_trace.mutex);
+    if (g_node_wall_trace.enabled.load(std::memory_order_relaxed)) {
+        g_node_wall_trace.rows.insert(
+                g_node_wall_trace.rows.end(), graph_rows.begin(), graph_rows.end());
+    }
+}
+
 static void ggml_sched_profile_note_layers(const ggml_cgraph & graph, ggml_sched_profile_backend_kind bucket) {
     if (!ggml_sched_profile_enabled()) {
         return;
@@ -2407,7 +2796,8 @@ void ggml_backend_sched_profile_reset(void) {
 }
 
 void ggml_backend_sched_profile_set_phase(enum ggml_backend_sched_profile_phase phase) {
-    if (!ggml_sched_profile_enabled() && !ggml_sched_trace_enabled()) {
+    if (!ggml_sched_profile_enabled() && !ggml_sched_trace_enabled() &&
+            !ggml_backend_node_wall_trace_enabled()) {
         return;
     }
 
@@ -5202,6 +5592,39 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
 
     const bool trace_enabled = ggml_sched_trace_phase_enabled();
     const int64_t trace_graph_id = trace_enabled ? g_sched_trace.graph_id++ : -1;
+    const bool node_wall_trace_configured = ggml_backend_node_wall_trace_enabled();
+    const bool node_wall_trace_enabled = node_wall_trace_configured && ggml_node_wall_trace_phase_enabled();
+    int64_t node_wall_trace_graph_id = -1;
+    if (node_wall_trace_enabled) {
+        if (trace_graph_id >= 0) {
+            // Make scheduler_trace.csv and node_wall_trace.csv directly
+            // joinable whenever both traces select this graph.
+            node_wall_trace_graph_id = trace_graph_id;
+            const int64_t next_graph_id = trace_graph_id + 1;
+            int64_t current_graph_id = g_node_wall_trace.graph_id.load(std::memory_order_relaxed);
+            while (current_graph_id < next_graph_id &&
+                    !g_node_wall_trace.graph_id.compare_exchange_weak(
+                            current_graph_id, next_graph_id, std::memory_order_relaxed)) {
+            }
+        } else {
+            node_wall_trace_graph_id = g_node_wall_trace.graph_id.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (node_wall_trace_configured) {
+        for (int split_id = 0; split_id < sched->n_splits; ++split_id) {
+            struct ggml_backend_sched_split * split = &splits[split_id];
+            split->graph.trace_graph_id = node_wall_trace_enabled ? node_wall_trace_graph_id : -1;
+            split->graph.trace_query_id = node_wall_trace_enabled
+                ? g_node_wall_trace.query_id.load(std::memory_order_relaxed)
+                : -1;
+            split->graph.trace_phase = node_wall_trace_enabled ? (int32_t) g_sched_profile_phase : -1;
+            split->graph.trace_split_id = node_wall_trace_enabled ? split_id : -1;
+            split->graph.trace_node_offset = node_wall_trace_enabled ? split->i_start : 0;
+            split->graph.trace_backend = node_wall_trace_enabled
+                ? ggml_backend_name(sched->backends[split->backend_id])
+                : nullptr;
+        }
+    }
     const bool worker_trace_enabled = ggml_ffn_worker_trace_phase_enabled();
     const int64_t worker_trace_graph_id = worker_trace_enabled ? g_ffn_worker_trace.graph_id++ : -1;
 
@@ -5592,6 +6015,27 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
         }
     };
 
+    auto arm_cpu_prewake_hold = [&](struct ggml_backend_sched_split * split) {
+        if (sched->ffn_cpu_prewake_hold_us == 0) {
+            return false;
+        }
+        ggml_backend_cpu_prewake_hold_t prewake_hold =
+            sched->ffn_cpu_prewake_hold_fns[split->backend_id];
+        return prewake_hold != nullptr && prewake_hold(
+                sched->backends[split->backend_id],
+                sched->ffn_cpu_prewake_hold_us);
+    };
+
+    auto split_contains_ffn_input = [](const struct ggml_backend_sched_split * split) {
+        for (int node_id = 0; node_id < split->graph.n_nodes; ++node_id) {
+            const struct ggml_tensor * node = split->graph.nodes[node_id];
+            if (node != nullptr && strstr(node->name, "ffn_inp") != nullptr) {
+                return true;
+            }
+        }
+        return false;
+    };
+
     auto route_selected_variant = [&](int group_index, bool * plan_miss) {
         GGML_ASSERT(sched->route_candidates != nullptr);
         const auto & group = sched->route_candidates->groups[group_index];
@@ -5744,11 +6188,15 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
             std::vector<ggml_sched_profile_backend_kind> group_buckets(ffn_group_size);
             bool group_backends_unique = true;
             int cpu_branch_count = 0;
+            int cpu_branch_index = -1;
             for (int i = 0; i < ffn_group_size; ++i) {
                 struct ggml_backend_sched_split * group_split = &splits[split_id + i];
                 ggml_backend_t group_backend = sched->backends[group_split->backend_id];
                 group_buckets[i] = ggml_sched_profile_backend_bucket(group_backend);
-                cpu_branch_count += group_buckets[i] == GGML_SCHED_PROFILE_BACKEND_CPU ? 1 : 0;
+                if (group_buckets[i] == GGML_SCHED_PROFILE_BACKEND_CPU) {
+                    cpu_branch_count++;
+                    cpu_branch_index = i;
+                }
                 for (int j = 0; j < i; ++j) {
                     if (splits[split_id + j].backend_id == group_split->backend_id) {
                         group_backends_unique = false;
@@ -5760,6 +6208,20 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                 }
             }
             const bool run_group_serially = !group_backends_unique || cpu_branch_count > 1;
+
+            // Arm only the CPU shard of a real parallel FFN group. The next
+            // graph published by this CPU backend is this group's CPU branch:
+            // copy_split_inputs only copies/synchronizes, while the other
+            // branch graphs run on their own device backends. This lets worker
+            // wake-up overlap the dependency/copy and device-dispatch window.
+            if (sched->ffn_cpu_prewake_hold_us > 0 &&
+                    !run_group_serially &&
+                    cpu_branch_count == 1 &&
+                    cpu_branch_index >= 0 &&
+                    !ffn_group_infos.empty() &&
+                    ffn_group_infos[0].kind == "ffn") {
+                arm_cpu_prewake_hold(&splits[split_id + cpu_branch_index]);
+            }
 
             const int64_t group_t0_us = ggml_time_us();
             const int64_t copy_t0_us = group_t0_us;
@@ -6128,6 +6590,15 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
         if (trace_enabled) {
             io_times = {};
         }
+
+        // Some runtime routes place ffn_inp on CPU before the parallel FFN
+        // branches. Arm before that first CPU graph as well, otherwise its ADD
+        // node would continue to absorb the layer/query wake-up latency.
+        if (sched->ffn_cpu_prewake_hold_us > 0 &&
+                split_bucket == GGML_SCHED_PROFILE_BACKEND_CPU &&
+                split_contains_ffn_input(split)) {
+            arm_cpu_prewake_hold(split);
+        }
         copy_split_inputs(split, trace_enabled ? &io_times : nullptr);
 
         if (!sched->callback_eval) {
@@ -6257,6 +6728,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
             "GGML_FFN_GPU_WORKER_CPU", sched->ffn_device_worker_cpu);
     sched->ffn_npu_worker_cpu = ggml_backend_sched_ffn_worker_cpu(
             "GGML_FFN_NPU_WORKER_CPU", sched->ffn_device_worker_cpu);
+    sched->ffn_cpu_prewake_hold_us = ggml_backend_sched_ffn_cpu_prewake_hold_us();
 
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
@@ -6281,15 +6753,43 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->splits = (ggml_backend_sched_split *) calloc(initial_splits_capacity, sizeof(sched->splits[0]));
     sched->splits_capacity = initial_splits_capacity;
 
+    int ffn_cpu_prewake_backend_count = 0;
     for (int b = 0; b < n_backends; b++) {
         sched->backends[b] = backends[b];
         sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
         GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
 
+        if (sched->ffn_cpu_prewake_hold_us > 0) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backends[b]);
+            if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                if (reg != nullptr) {
+                    sched->ffn_cpu_prewake_hold_fns[b] =
+                        (ggml_backend_cpu_prewake_hold_t) ggml_backend_reg_get_proc_address(
+                                reg, "ggml_backend_cpu_prewake_hold");
+                    ffn_cpu_prewake_backend_count +=
+                        sched->ffn_cpu_prewake_hold_fns[b] != nullptr ? 1 : 0;
+                }
+            }
+        }
+
         if (sched->n_copies > 1) {
             for (int c = 0; c < sched->n_copies; c++) {
                 sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
             }
+        }
+    }
+
+    if (sched->ffn_cpu_prewake_hold_us > 0) {
+        if (ffn_cpu_prewake_backend_count == 0) {
+            GGML_LOG_WARN(
+                    "%s: FFN CPU layer pre-wake requested for %u us, but no compatible CPU backend was found; disabling\n",
+                    __func__, sched->ffn_cpu_prewake_hold_us);
+            sched->ffn_cpu_prewake_hold_us = 0;
+        } else {
+            GGML_LOG_INFO(
+                    "%s: FFN CPU layer pre-wake enabled (hold %u us, compatible backends %d)\n",
+                    __func__, sched->ffn_cpu_prewake_hold_us, ffn_cpu_prewake_backend_count);
         }
     }
 

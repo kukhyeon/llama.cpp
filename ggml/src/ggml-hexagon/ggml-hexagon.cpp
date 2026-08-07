@@ -179,7 +179,11 @@ struct ggml_hexagon_session {
     void allocate(int dev_id) noexcept(false);
     void release() noexcept(true);
 
-    void enqueue_op(htp_op_code opcode, const ggml_tensor *op);
+    void enqueue_op(
+            htp_op_code opcode,
+            const ggml_tensor * op,
+            const ggml_cgraph * graph,
+            int local_node_index);
     void flush(bool all = true);
 
     void flush_pending(bool all = false);
@@ -1551,10 +1555,20 @@ static ggml_backend_buffer_type_i ggml_backend_hexagon_repack_buffer_type_interf
 
 // Backend session implementation
 
+struct ggml_hexagon_node_wall_trace_meta {
+    int query_id = -1;
+    int phase = -1;
+    int64_t graph_id = -1;
+    int split_id = -1;
+    int node_index = -1;
+    std::string backend;
+};
+
 struct ggml_hexagon_opbatch {
     ggml_hexagon_session*            sess;
 
     std::vector<const ggml_tensor*>  ops;       // pointers to original ops
+    std::vector<ggml_hexagon_node_wall_trace_meta> trace_ops;
 
     std::vector<htp_buf_desc>        h_bufs;    // htp buffer descriptors
     std::vector<htp_tensor>          h_tens;    // htp tensor descriptors
@@ -1595,6 +1609,9 @@ struct ggml_hexagon_opbatch {
         b_vmem_max = max_vmem;
 
         ops.resize(n_ops_max);
+        if (ggml_backend_node_wall_trace_enabled()) {
+            trace_ops.resize(n_ops_max);
+        }
 
         h_bufs.resize(n_bufs_max);
         h_tens.resize(n_tens_max);
@@ -1737,7 +1754,10 @@ struct ggml_hexagon_opbatch {
     }
 
     // assumes that fit_op() was called first and returned true
-    void add_op(htp_op_code opcode, const struct ggml_tensor * t) {
+    void add_op(
+            htp_op_code opcode,
+            const struct ggml_tensor * t,
+            const ggml_hexagon_node_wall_trace_meta * trace_meta) {
         const bool breakdown = ggml_backend_op_load_profile_breakdown_enabled();
         const int64_t timer_t0_us = breakdown ? ggml_time_us() : 0;
 
@@ -1747,6 +1767,11 @@ struct ggml_hexagon_opbatch {
         GGML_ASSERT(n_ops <= n_ops_max);
 
         ops[n] = t;
+        if (!trace_ops.empty()) {
+            trace_ops[n] = trace_meta != nullptr
+                ? *trace_meta
+                : ggml_hexagon_node_wall_trace_meta {};
+        }
 
         htp_op_desc &o = h_ops[n];
         memcpy(&o.params, &t->op_params, sizeof(t->op_params));
@@ -1779,9 +1804,11 @@ struct ggml_hexagon_opqueue {
     size_t                      shm_blk_size;
 
     using opvec = std::vector<const ggml_tensor*>;
+    using tracevec = std::vector<ggml_hexagon_node_wall_trace_meta>;
 
     std::queue<unsigned int>    done;       // completed batch ids
     std::vector<opvec>          op_cache;   // per batch op cache
+    std::vector<tracevec>       trace_cache;
     std::vector<uint64_t>       start_usec; // per batch start time
 
     ggml_hexagon_opqueue(ggml_hexagon_session *sess, size_t batch_size, size_t depth) {
@@ -1797,6 +1824,9 @@ struct ggml_hexagon_opqueue {
         shm_buf = new ggml_hexagon_shared_buffer(sess, shm_blk_size * depth, true /* pinned */);
 
         op_cache.resize(depth);
+        if (ggml_backend_node_wall_trace_enabled()) {
+            trace_cache.resize(depth);
+        }
         start_usec.resize(depth, 0);
 
         // init done queue
@@ -1829,6 +1859,11 @@ struct ggml_hexagon_opqueue {
         req.n_ops     = op_batch->n_ops;
 
         op_cache[req.id]   = op_batch->ops;
+        if (!trace_cache.empty()) {
+            trace_cache[req.id].assign(
+                    op_batch->trace_ops.begin(),
+                    op_batch->trace_ops.begin() + req.n_ops);
+        }
         start_usec[req.id] = ggml_time_us();
 
         const size_t b_size = sizeof(htp_buf_desc)  * req.n_bufs;
@@ -1898,16 +1933,37 @@ struct ggml_hexagon_opqueue {
 
         if (opt_profile && rsp.n_ops > 0) {
             auto & ops = op_cache[rsp.id];
+            const tracevec * traces = trace_cache.empty() ? nullptr : &trace_cache[rsp.id];
 
             uint64_t batch_usec = ggml_time_us() - start_usec[rsp.id];
             uint32_t htp_usec   = 0;
 
             GGML_ASSERT(rsp.n_ops <= ops.size());
+            GGML_ASSERT(traces == nullptr || rsp.n_ops <= traces->size());
 
             const htp_prof_desc * pd = (const htp_prof_desc *) p_ptr;
             for (uint32_t i = 0; i < rsp.n_ops; i++) {
                 htp_usec += pd[i].usecs;
                 ggml_backend_op_load_profile_add_tensor_us(GGML_BACKEND_OP_LOAD_PROFILE_HTP, ops[i]->op, ops[i]->name, pd[i].usecs);
+                if (traces != nullptr && (*traces)[i].graph_id >= 0) {
+                    const ggml_hexagon_node_wall_trace_meta & trace = (*traces)[i];
+                    ggml_backend_node_wall_trace_add(
+                            trace.query_id,
+                            (enum ggml_backend_sched_profile_phase) trace.phase,
+                            trace.graph_id,
+                            trace.split_id,
+                            trace.node_index,
+                            ops[i]->name,
+                            ggml_op_name(ops[i]->op),
+                            trace.backend.c_str(),
+                            "htp_device_op",
+                            "",
+                            1,
+                            0,
+                            0,
+                            (double) pd[i].usecs,
+                            (double) pd[i].usecs);
+                }
                 ggml_hexagon_dump_op_prof(shm_buf->sess->name, ops[i], pd[i].usecs, pd[i].cycles, pd[i].pmu);
             }
 
@@ -2035,14 +2091,30 @@ void ggml_hexagon_session::flush_batch() {
     }
 }
 
-void ggml_hexagon_session::enqueue_op(htp_op_code opcode, const ggml_tensor *op) {
+void ggml_hexagon_session::enqueue_op(
+        htp_op_code opcode,
+        const ggml_tensor * op,
+        const ggml_cgraph * graph,
+        int local_node_index) {
     const bool breakdown = ggml_backend_op_load_profile_breakdown_enabled();
     const int64_t timer_t0_us = breakdown ? ggml_time_us() : 0;
 
     if (!op_batch->fit_op(op)) {
         flush_batch();
     }
-    op_batch->add_op(opcode, op);
+    ggml_hexagon_node_wall_trace_meta trace_meta;
+    const ggml_hexagon_node_wall_trace_meta * trace_meta_ptr = nullptr;
+    if (!op_batch->trace_ops.empty() && graph->trace_graph_id >= 0 &&
+            ggml_backend_node_wall_trace_enabled()) {
+        trace_meta.query_id = graph->trace_query_id;
+        trace_meta.phase = graph->trace_phase;
+        trace_meta.graph_id = graph->trace_graph_id;
+        trace_meta.split_id = graph->trace_split_id;
+        trace_meta.node_index = graph->trace_node_offset + local_node_index;
+        trace_meta.backend = graph->trace_backend ? graph->trace_backend : this->c_name();
+        trace_meta_ptr = &trace_meta;
+    }
+    op_batch->add_op(opcode, op, trace_meta_ptr);
 
     if (breakdown) {
         ggml_backend_op_load_profile_add_backend_timer_us(
@@ -3012,15 +3084,45 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
 
     HEX_VERBOSE("ggml-hex: %s graph-compute n_nodes %d\n", sess->c_name(), graph->n_nodes);
 
+    const bool node_wall_trace = graph->trace_graph_id >= 0 &&
+        ggml_backend_node_wall_trace_enabled();
+    std::vector<int> metadata_trace_nodes;
+    if (node_wall_trace) {
+        metadata_trace_nodes.reserve(graph->n_nodes);
+    }
+
     for (int i = 0; i < graph->n_nodes; ++i) {
         ggml_tensor * n = graph->nodes[i];
         if (op_is_compute(n) && (opt_opstage & HTP_OPSTAGE_QUEUE)) {
-            sess->enqueue_op(op_remap_to_htp(n), n);
+            sess->enqueue_op(op_remap_to_htp(n), n, graph, i);
+        } else if (node_wall_trace) {
+            metadata_trace_nodes.push_back(i);
         }
     }
 
-    // Wait until all pending ops complete
+    // Wait until all pending ops complete. Append zero-duration metadata rows
+    // afterwards so CSV bookkeeping cannot delay the device submission.
     sess->flush();
+
+    for (const int node_index : metadata_trace_nodes) {
+        const ggml_tensor * n = graph->nodes[node_index];
+        ggml_backend_node_wall_trace_add(
+                graph->trace_query_id,
+                (enum ggml_backend_sched_profile_phase) graph->trace_phase,
+                graph->trace_graph_id,
+                graph->trace_split_id,
+                graph->trace_node_offset + node_index,
+                n->name,
+                ggml_op_name(n->op),
+                graph->trace_backend ? graph->trace_backend : sess->c_name(),
+                "metadata_noop",
+                "",
+                0,
+                0,
+                0,
+                0.0,
+                0.0);
+    }
 
     if (breakdown) {
         ggml_backend_op_load_profile_add_backend_timer_us(
@@ -3763,10 +3865,11 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
                 vec_to_str<uint32_t, 16>(opt_pmu_evt).c_str());
     }
 
-    if ((ggml_backend_op_load_profile_enabled() || ggml_hexagon_csv_op_load_env_enabled()) && opt_profile == 0) {
+    if ((ggml_backend_op_load_profile_enabled() || ggml_hexagon_csv_op_load_env_enabled() ||
+            ggml_backend_node_wall_trace_enabled()) && opt_profile == 0) {
         opt_profile = 1;
         opt_pmu_evt = {};
-        GGML_LOG_INFO("ggml-hex: Profiling mode %u enabled for CSV_OP_LOAD\n", opt_profile);
+        GGML_LOG_INFO("ggml-hex: Profiling mode %u enabled for backend op tracing\n", opt_profile);
     }
 
     reg->context = new ggml_hexagon_registry(reg);
