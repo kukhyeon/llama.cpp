@@ -81,6 +81,8 @@ struct profile_policy {
     std::vector<policy_rule> weight_rules;
     std::vector<policy_rule> op_rules;
     ffn_parallel_policy ffn_parallel;
+    bool attn_out_shards_configured = false;
+    llama_backend_policy_attn_out_shards attn_out_shards;
     ffn_clock_point clock_point;
     token_range input_tokens;
     token_range ubatch_tokens;
@@ -104,6 +106,7 @@ struct policy_state {
 
     ffn_parallel_policy ffn_parallel;
     llama_backend_policy_attn_qkv_shards attn_qkv_shards;
+    llama_backend_policy_attn_out_shards attn_out_shards;
 
     bool ffn_clock_switch_enabled = false;
     std::string pending_clock_profile;
@@ -890,6 +893,153 @@ llama_backend_policy_attn_qkv_shards parse_attn_qkv_shards(
     return out;
 }
 
+llama_backend_policy_attn_out_shards parse_attn_out_shards(
+        const json & root,
+        const std::string & source) {
+    if (!root.is_object()) {
+        throw std::runtime_error(source + " must be an object");
+    }
+
+    llama_backend_policy_attn_out_shards out;
+    out.enabled = root.value("enabled", false);
+    out.phase = root.value("phase", std::string("prefill"));
+    out.partition_axis = root.value("partition_axis", std::string("input"));
+    out.reduce_backend = root.value("reduce_backend", std::string("CPU"));
+    out.source = source;
+
+    // The first version deliberately leaves decode and stateful attention on
+    // the ordinary path. Accepting "all" here would also make cover-only
+    // residency tempting even though that fallback is still required.
+    if (!str_eq_ci(out.phase, "prefill")) {
+        throw std::runtime_error(source + ".phase currently supports only prefill");
+    }
+    out.phase = "prefill";
+    if (!str_eq_ci(out.partition_axis, "input") &&
+            !str_eq_ci(out.partition_axis, "output")) {
+        throw std::runtime_error(source + ".partition_axis must be input or output");
+    }
+    out.partition_axis = lower(out.partition_axis);
+    if (out.reduce_backend.empty()) {
+        throw std::runtime_error(source + ".reduce_backend must be a non-empty string");
+    }
+    if (root.contains("head_dim")) {
+        if (!root["head_dim"].is_number_integer()) {
+            throw std::runtime_error(source + ".head_dim must be a positive integer");
+        }
+        out.head_dim = root["head_dim"].get<int64_t>();
+    }
+    if (out.head_dim <= 0) {
+        throw std::runtime_error(source + ".head_dim must be a positive integer");
+    }
+    parse_layer_range(root, source, out.layer_start, out.layer_end);
+
+    if (!root.contains("split_layout") || !root["split_layout"].is_array() ||
+            root["split_layout"].size() != 3) {
+        throw std::runtime_error(source + ".split_layout must contain exactly 3 entries");
+    }
+    if (!root.contains("split_sizes") || !root["split_sizes"].is_object() ||
+            root["split_sizes"].size() != 3) {
+        throw std::runtime_error(
+                source + ".split_sizes must contain exactly the 3 split_layout ids");
+    }
+
+    struct layout_entry {
+        std::string id;
+        std::string backend;
+        int64_t align = 1;
+    };
+    std::vector<layout_entry> layout;
+    layout.reserve(3);
+    std::unordered_set<std::string> split_ids;
+    std::unordered_set<std::string> split_backends;
+
+    // ggml tensor names are limited to GGML_MAX_NAME (64 including NUL).
+    // Reserve enough room for the longest emitted branch name:
+    // "attn_out_shard." + id + ".input-" + a 10-digit layer id.
+    static constexpr size_t max_layer_digits = std::numeric_limits<int>::digits10 + 1;
+    static constexpr size_t branch_fixed_length =
+        sizeof("attn_out_shard.") - 1 + sizeof(".input-") - 1 + max_layer_digits;
+    static_assert(GGML_MAX_NAME - 1 > branch_fixed_length);
+    static constexpr size_t max_split_id_length =
+        GGML_MAX_NAME - 1 - branch_fixed_length;
+
+    for (size_t i = 0; i < root["split_layout"].size(); ++i) {
+        const auto & item = root["split_layout"][i];
+        const std::string item_source =
+            source + ".split_layout[" + std::to_string(i) + "]";
+        if (!item.is_object()) {
+            throw std::runtime_error(item_source + " must be an object");
+        }
+
+        layout_entry entry;
+        entry.id = item.value("id", std::string());
+        entry.backend = item.value("backend", std::string());
+        if (!attn_qkv_shard_id_is_safe(entry.id) ||
+                entry.id.size() > max_split_id_length) {
+            throw std::runtime_error(
+                    item_source +
+                    ".id must be 1.." + std::to_string(max_split_id_length) +
+                    " ASCII letters, digits, '_' or '-' so graph names are not truncated");
+        }
+        if (entry.backend.empty()) {
+            throw std::runtime_error(item_source + ".backend must be a non-empty string");
+        }
+        if (!split_ids.insert(lower(entry.id)).second) {
+            throw std::runtime_error(source + ".split_layout ids must be unique ignoring case");
+        }
+        if (!split_backends.insert(lower(entry.backend)).second) {
+            throw std::runtime_error(source + ".split_layout backends must be unique ignoring case");
+        }
+
+        if (item.contains("align")) {
+            if (!item["align"].is_number_integer()) {
+                throw std::runtime_error(item_source + ".align must be a positive integer");
+            }
+            entry.align = item["align"].get<int64_t>();
+            if (entry.align <= 0) {
+                throw std::runtime_error(item_source + ".align must be a positive integer");
+            }
+        }
+        if (attn_qkv_shard_backend_needs_htp_alignment(entry.backend)) {
+            entry.align = std::max<int64_t>(entry.align, 256);
+        }
+        layout.push_back(std::move(entry));
+    }
+
+    const auto & sizes = root["split_sizes"];
+    int64_t start = 0;
+    for (const auto & entry : layout) {
+        if (!sizes.contains(entry.id) || !sizes[entry.id].is_number_integer()) {
+            throw std::runtime_error(
+                    source + ".split_sizes." + entry.id + " must be a positive integer");
+        }
+        const int64_t size = sizes[entry.id].get<int64_t>();
+        if (size <= 0 || start > std::numeric_limits<int64_t>::max() - size) {
+            throw std::runtime_error(
+                    source + ".split_sizes." + entry.id +
+                    " must be a positive non-overflowing integer");
+        }
+        if ((start % out.head_dim) != 0 || (size % out.head_dim) != 0 ||
+                (start % entry.align) != 0 || (size % entry.align) != 0) {
+            throw std::runtime_error(
+                    source + ".split_sizes." + entry.id +
+                    " start/size must be divisible by head_dim=" +
+                    std::to_string(out.head_dim) + " and lane align=" +
+                    std::to_string(entry.align));
+        }
+
+        llama_backend_policy_attn_out_shard split;
+        split.id = entry.id;
+        split.backend = entry.backend;
+        split.start = start;
+        split.size = size;
+        out.splits.push_back(std::move(split));
+        start += size;
+    }
+
+    return out;
+}
+
 bool effective_ffn_policy(llama_backend_policy_ffn_parallel & out) {
     ffn_parallel_policy policy = g_policy.ffn_parallel;
     std::string selected_profile = g_policy.active_profile;
@@ -937,6 +1087,7 @@ bool effective_ffn_policy(llama_backend_policy_ffn_parallel & out) {
 
 void parse_profile_section(
         const json & root,
+        const json & policy_root,
         const std::string & profile_name,
         bool policy_enabled,
         bool enable_weights,
@@ -969,6 +1120,43 @@ void parse_profile_section(
     if (root.contains("ffn_parallel")) {
         out.ffn_parallel = parse_ffn_parallel(root["ffn_parallel"], profile_source + ".ffn_parallel");
         out.ffn_parallel.enabled = policy_enabled && out.ffn_parallel.enabled;
+    }
+
+    if (root.contains("attn_out_shards")) {
+        const auto & override = root["attn_out_shards"];
+        const std::string source = profile_source + ".attn_out_shards";
+        if (!override.is_object()) {
+            throw std::runtime_error(source + " must be an object");
+        }
+        if (override.size() != 1 || !override.contains("split_sizes")) {
+            throw std::runtime_error(
+                    source + " may override only split_sizes; topology is inherited from root attn_out_shards");
+        }
+        if (!policy_root.contains("attn_out_shards") ||
+                !policy_root["attn_out_shards"].is_object()) {
+            throw std::runtime_error(
+                    source + " requires a root attn_out_shards policy");
+        }
+
+        const auto & sizes = override["split_sizes"];
+        const auto & root_sizes = policy_root["attn_out_shards"]["split_sizes"];
+        if (!sizes.is_object() || !root_sizes.is_object() ||
+                sizes.size() != root_sizes.size()) {
+            throw std::runtime_error(
+                    source + ".split_sizes must contain every root split id");
+        }
+        for (auto it = root_sizes.begin(); it != root_sizes.end(); ++it) {
+            if (!sizes.contains(it.key()) || !sizes[it.key()].is_number_integer()) {
+                throw std::runtime_error(
+                        source + ".split_sizes." + it.key() + " must be an integer");
+            }
+        }
+
+        json effective = policy_root["attn_out_shards"];
+        effective.merge_patch(override);
+        out.attn_out_shards = parse_attn_out_shards(effective, source);
+        out.attn_out_shards.enabled = policy_enabled && out.attn_out_shards.enabled;
+        out.attn_out_shards_configured = true;
     }
 
     if (root.contains("applicability")) {
@@ -1259,6 +1447,43 @@ void validate_profile_reference(
     }
 }
 
+const llama_backend_policy_attn_out_shards * effective_attn_out_policy_for_profile(
+        const policy_state & state,
+        const std::string & profile_name) {
+    const auto it = state.profiles.find(profile_name);
+    if (it == state.profiles.end()) {
+        return nullptr;
+    }
+    return it->second.attn_out_shards_configured
+        ? &it->second.attn_out_shards
+        : &state.attn_out_shards;
+}
+
+bool attn_out_policy_matches_layer(
+        const llama_backend_policy_attn_out_shards & policy,
+        int il) {
+    return policy.layer_start == -2 ||
+        (il >= policy.layer_start &&
+         (policy.layer_end == -2 || il <= policy.layer_end));
+}
+
+bool attn_out_policy_width(
+        const llama_backend_policy_attn_out_shards & policy,
+        int64_t & width) {
+    width = 0;
+    if (policy.splits.size() != 3) {
+        return false;
+    }
+    for (const auto & split : policy.splits) {
+        if (split.start != width || split.size <= 0 ||
+                width > std::numeric_limits<int64_t>::max() - split.size) {
+            return false;
+        }
+        width += split.size;
+    }
+    return true;
+}
+
 const llama_backend_policy_runtime_route_transition * find_runtime_route_transition(
         const llama_backend_policy_runtime_routes & routes,
         const std::string & from_profile) {
@@ -1353,9 +1578,9 @@ void parse_runtime_routes(const json & root, policy_state & state) {
     for (std::string & kind : routes.candidate_kinds) {
         kind = lower(trim(kind));
         if (kind != "weightless_stateless" && kind != "weighted_norm" &&
-                kind != "ffn_block") {
+                kind != "ffn_block" && kind != "attn_out_block") {
             throw std::runtime_error(
-                    "runtime_routes.candidate_kinds supports only weightless_stateless, weighted_norm, and ffn_block");
+                    "runtime_routes.candidate_kinds supports only weightless_stateless, weighted_norm, ffn_block, and attn_out_block");
         }
         if (!candidate_kinds.insert(kind).second) {
             throw std::runtime_error("runtime_routes.candidate_kinds contains duplicate '" + kind + "'");
@@ -1529,6 +1754,32 @@ void parse_runtime_routes(const json & root, policy_state & state) {
         require_profile_op("ffn_block", "ffn_norm", "MUL");
     }
 
+    if (candidate_kinds.find("attn_out_block") != candidate_kinds.end()) {
+        if (!state.attn_out_shards.enabled ||
+                state.attn_out_shards.partition_axis != "output") {
+            throw std::runtime_error(
+                    "runtime_routes attn_out_block requires an enabled root output-axis attn_out_shards policy");
+        }
+
+        int64_t root_width = 0;
+        if (!attn_out_policy_width(state.attn_out_shards, root_width)) {
+            throw std::runtime_error(
+                    "runtime_routes attn_out_block root policy must contain a complete three-lane partition");
+        }
+        for (const std::string & profile_name : routes.profiles) {
+            const auto * policy = effective_attn_out_policy_for_profile(state, profile_name);
+            int64_t profile_width = 0;
+            if (policy == nullptr || !policy->enabled ||
+                    policy->partition_axis != "output" ||
+                    !attn_out_policy_width(*policy, profile_width) ||
+                    profile_width != root_width) {
+                throw std::runtime_error(
+                        "runtime_routes attn_out_block profile '" + profile_name +
+                        "' requires an enabled output-axis three-lane split with the root partition width");
+            }
+        }
+    }
+
     if ((candidate_kinds.find("weighted_norm") != candidate_kinds.end() ||
          candidate_kinds.find("ffn_block") != candidate_kinds.end()) &&
             (!state.residency_enabled || state.residency_rules.empty())) {
@@ -1687,6 +1938,12 @@ bool llama_backend_policy_load(const char * path, bool enable_weights, bool enab
             next.attn_qkv_shards.enabled = next.enabled && next.attn_qkv_shards.enabled;
         }
 
+        if (root.contains("attn_out_shards")) {
+            next.attn_out_shards =
+                parse_attn_out_shards(root["attn_out_shards"], "attn_out_shards");
+            next.attn_out_shards.enabled = next.enabled && next.attn_out_shards.enabled;
+        }
+
         if (root.contains("ffn_clock_switch")) {
             if (!root["ffn_clock_switch"].is_object()) {
                 throw std::runtime_error("ffn_clock_switch must be an object");
@@ -1741,7 +1998,7 @@ bool llama_backend_policy_load(const char * path, bool enable_weights, bool enab
                 effective_profile.merge_patch(it.value());
                 profile_policy profile;
                 parse_profile_section(
-                        effective_profile, it.key(), next.enabled,
+                        effective_profile, root, it.key(), next.enabled,
                         enable_weights, enable_ops, profile);
                 next.profiles.emplace(it.key(), std::move(profile));
             }
@@ -1808,13 +2065,14 @@ bool llama_backend_policy_load(const char * path, bool enable_weights, bool enab
 
         g_policy = std::move(next);
 
-        LLAMA_LOG_INFO("backend_policy: loaded '%s' (weights=%s, weight_rules=%zu, ops=%s, op_rules=%zu, residency=%s, residency_rules=%zu, ffn_parallel=%s, attn_qkv_shards=%s, ffn_clock_switch=%s, profiles=%zu)\n",
+        LLAMA_LOG_INFO("backend_policy: loaded '%s' (weights=%s, weight_rules=%zu, ops=%s, op_rules=%zu, residency=%s, residency_rules=%zu, ffn_parallel=%s, attn_qkv_shards=%s, attn_out_shards=%s, ffn_clock_switch=%s, profiles=%zu)\n",
                 g_policy.path.c_str(),
                 g_policy.weights_enabled ? "on" : "off", g_policy.weight_rules.size(),
                 g_policy.ops_enabled ? "on" : "off", g_policy.op_rules.size(),
                 g_policy.residency_enabled ? "on" : "off", g_policy.residency_rules.size(),
                 g_policy.ffn_parallel.enabled ? "on" : "off",
                 g_policy.attn_qkv_shards.enabled ? "on" : "off",
+                g_policy.attn_out_shards.enabled ? "on" : "off",
                 g_policy.ffn_clock_switch_enabled ? "on" : "off",
                 g_policy.profiles.size());
         if (g_policy.runtime_routes.enabled) {
@@ -1872,6 +2130,11 @@ bool llama_backend_policy_ffn_parallel_enabled() {
 bool llama_backend_policy_attn_qkv_shards_enabled() {
     std::lock_guard<std::mutex> lock(g_policy_mutex);
     return g_policy.loaded && g_policy.attn_qkv_shards.enabled;
+}
+
+bool llama_backend_policy_attn_out_shards_enabled() {
+    std::lock_guard<std::mutex> lock(g_policy_mutex);
+    return g_policy.loaded && g_policy.attn_out_shards.enabled;
 }
 
 int llama_backend_policy_ffn_parallel_reduce_threads() {
@@ -2410,6 +2673,51 @@ bool llama_backend_policy_match_attn_qkv_shards(
     return true;
 }
 
+bool llama_backend_policy_match_attn_out_shards(
+        int il,
+        bool is_prefill,
+        llama_backend_policy_attn_out_shards & out) {
+    std::lock_guard<std::mutex> lock(g_policy_mutex);
+    out = {};
+
+    if (!g_policy.loaded || !g_policy.attn_out_shards.enabled || !is_prefill) {
+        return false;
+    }
+
+    const auto & policy = g_policy.attn_out_shards;
+    if (policy.layer_start != -2 &&
+            (il < policy.layer_start || (policy.layer_end != -2 && il > policy.layer_end))) {
+        return false;
+    }
+
+    out = policy;
+    return true;
+}
+
+bool llama_backend_policy_match_attn_out_shards_for_profile(
+        const char * profile_name,
+        int il,
+        bool is_prefill,
+        llama_backend_policy_attn_out_shards & out) {
+    std::lock_guard<std::mutex> lock(g_policy_mutex);
+    out = {};
+
+    if (!g_policy.loaded || profile_name == nullptr || profile_name[0] == '\0' ||
+            !is_prefill) {
+        return false;
+    }
+
+    const auto * policy = effective_attn_out_policy_for_profile(g_policy, profile_name);
+    if (policy == nullptr || !policy->enabled ||
+            !phase_matches(policy->phase, is_prefill) ||
+            !attn_out_policy_matches_layer(*policy, il)) {
+        return false;
+    }
+
+    out = *policy;
+    return true;
+}
+
 bool llama_backend_policy_match_ffn_parallel_for_profile(
         const char * profile_name,
         int il,
@@ -2543,7 +2851,7 @@ bool llama_backend_policy_list_ffn_parallel_load_policies(
 
 bool llama_backend_policy_build_ffn_residency_plan(
         int il,
-        llama_backend_policy_ffn_residency_plan & out) {
+        llama_backend_policy_residency_plan & out) {
     out = {};
 
     std::vector<llama_backend_policy_ffn_parallel> policies;
@@ -2626,7 +2934,7 @@ bool llama_backend_policy_build_ffn_residency_plan(
                 return;
             }
 
-            llama_backend_policy_ffn_split cover;
+            llama_backend_policy_residency_cover cover;
             cover.id = "cover." + kv.first + "." + std::to_string(cover_start) + "." +
                 std::to_string(cover_end - cover_start);
             cover.start = cover_start;
@@ -2661,6 +2969,111 @@ bool llama_backend_policy_build_ffn_residency_plan(
     }
 
     return !out.covers.empty();
+}
+
+bool llama_backend_policy_build_attn_out_residency_plan(
+        int il,
+        llama_backend_policy_residency_plan & out) {
+    std::lock_guard<std::mutex> lock(g_policy_mutex);
+    out = {};
+
+    if (!g_policy.loaded || !g_policy.attn_out_shards.enabled ||
+            !attn_out_policy_matches_layer(g_policy.attn_out_shards, il)) {
+        return false;
+    }
+
+    struct backend_intervals {
+        std::string key;
+        std::string backend;
+        std::vector<std::pair<int64_t, int64_t>> ranges;
+    };
+    std::vector<backend_intervals> grouped;
+
+    const auto append_policy = [&](const llama_backend_policy_attn_out_shards & policy) {
+        int64_t width = 0;
+        if (!policy.enabled || !attn_out_policy_matches_layer(policy, il) ||
+                !attn_out_policy_width(policy, width)) {
+            return false;
+        }
+
+        for (const auto & split : policy.splits) {
+            const std::string key = lower(split.backend);
+            auto it = std::find_if(grouped.begin(), grouped.end(), [&](const auto & entry) {
+                return entry.key == key;
+            });
+            if (it == grouped.end()) {
+                grouped.push_back({ key, split.backend, {} });
+                it = std::prev(grouped.end());
+            }
+            it->ranges.emplace_back(split.start, split.start + split.size);
+        }
+        return true;
+    };
+
+    if (!append_policy(g_policy.attn_out_shards)) {
+        return false;
+    }
+
+    const bool routed_attn_out = g_policy.runtime_routes.enabled &&
+        std::find(
+                g_policy.runtime_routes.candidate_kinds.begin(),
+                g_policy.runtime_routes.candidate_kinds.end(),
+                "attn_out_block") != g_policy.runtime_routes.candidate_kinds.end();
+    if (routed_attn_out) {
+        for (const std::string & profile_name : g_policy.runtime_routes.profiles) {
+            const auto * policy = effective_attn_out_policy_for_profile(g_policy, profile_name);
+            if (policy == nullptr || !append_policy(*policy)) {
+                out = {};
+                return false;
+            }
+        }
+    }
+
+    for (auto & entry : grouped) {
+        std::sort(entry.ranges.begin(), entry.ranges.end(), [](const auto & lhs, const auto & rhs) {
+            if (lhs.first != rhs.first) {
+                return lhs.first < rhs.first;
+            }
+            return lhs.second < rhs.second;
+        });
+
+        int64_t cover_start = -1;
+        int64_t cover_end = -1;
+        const auto append_cover = [&]() {
+            if (cover_start < 0 || cover_end <= cover_start) {
+                return;
+            }
+            llama_backend_policy_residency_cover cover;
+            cover.id = "cover." + entry.key + "." +
+                std::to_string(cover_start) + "." +
+                std::to_string(cover_end - cover_start);
+            cover.start = cover_start;
+            cover.size = cover_end - cover_start;
+            cover.backend = entry.backend;
+            out.covers.push_back(std::move(cover));
+        };
+
+        for (const auto & range : entry.ranges) {
+            if (cover_start < 0) {
+                cover_start = range.first;
+                cover_end = range.second;
+            } else if (range.first <= cover_end) {
+                cover_end = std::max(cover_end, range.second);
+            } else {
+                append_cover();
+                cover_start = range.first;
+                cover_end = range.second;
+            }
+        }
+        append_cover();
+    }
+
+    out.enabled = !out.covers.empty();
+    out.keep_full_source = true;
+    out.source = g_policy.attn_out_shards.partition_axis == "output"
+        ? "attn_out_shards axis-1 covers"
+        : "attn_out_shards axis-0 covers";
+    return out.enabled;
 }
 
 bool llama_backend_policy_buft_matches(

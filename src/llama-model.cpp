@@ -1589,7 +1589,7 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
     return ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
-        &pimpl->all_buft_list, tn, ne, flags);
+        &pimpl->all_buft_list, params.attn_out_shards, tn, ne, flags);
 }
 
 std::string llama_model::arch_name() const {
@@ -1969,13 +1969,13 @@ ggml_tensor * llama_model::get_backend_policy_residency_tensor(
     return nullptr;
 }
 
-llama_backend_policy_ffn_resident_cover llama_model::get_backend_policy_ffn_cover(
+llama_backend_policy_resident_cover llama_model::get_backend_policy_resident_cover(
         const ggml_tensor * tensor,
         const std::string & backend,
         int axis,
         int64_t start,
         int64_t size) const {
-    llama_backend_policy_ffn_resident_cover result;
+    llama_backend_policy_resident_cover result;
     if (tensor == nullptr || backend.empty() || start < 0 || size <= 0 ||
             start > std::numeric_limits<int64_t>::max() - size) {
         return result;
@@ -2027,6 +2027,15 @@ llama_backend_policy_ffn_resident_cover llama_model::get_backend_policy_ffn_cove
     }
 
     return result;
+}
+
+llama_backend_policy_ffn_resident_cover llama_model::get_backend_policy_ffn_cover(
+        const ggml_tensor * tensor,
+        const std::string & backend,
+        int axis,
+        int64_t start,
+        int64_t size) const {
+    return get_backend_policy_resident_cover(tensor, backend, axis, start, size);
 }
 
 float llama_model::get_rope_freq_base (const llama_cparams & cparams, int il) const {
@@ -2247,6 +2256,7 @@ llama_model_params llama_model_default_params() {
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
+        /*.attn_out_shards             =*/ false,
     };
 
     return result;

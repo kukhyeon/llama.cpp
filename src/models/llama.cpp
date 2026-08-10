@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <iterator>
 
 void llama_model_llama::load_arch_hparams(llama_model_loader & ml) {
     const auto n_vocab = vocab.n_tokens();
@@ -251,10 +252,16 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                 for (int il = il_start; il <= il_end; ++il) {
                     ggml_tensor * inp = build_module_inp("module_attn_out_proj_inp", n_embd, n_tokens);
                     cb(inp, "module_attn_out_proj_inp", il);
-                    ggml_tensor * out = build_lora_mm(model.layers[il].wo, inp, model.layers[il].wo_s);
-                    cb(out, "attn_out", il);
-                    if (model.layers[il].wo_b) {
-                        out = ggml_add(ctx0, out, model.layers[il].wo_b);
+                    ggml_tensor * out = nullptr;
+                    const bool sharded_attn_out = build_attn_out_shards(
+                            model.layers[il].wo, model.layers[il].wo_b,
+                            model.layers[il].wo_s, inp, il, "attn_out", out);
+                    if (!sharded_attn_out) {
+                        out = build_lora_mm(model.layers[il].wo, inp, model.layers[il].wo_s);
+                        cb(out, "attn_out", il);
+                        if (model.layers[il].wo_b) {
+                            out = ggml_add(ctx0, out, model.layers[il].wo_b);
+                        }
                     }
                     finish(out);
                 }
@@ -449,8 +456,13 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
     const bool runtime_weighted_norm_routes = runtime_layer_routes &&
         std::find(runtime_routes.candidate_kinds.begin(), runtime_routes.candidate_kinds.end(),
                 "weighted_norm") != runtime_routes.candidate_kinds.end();
+    const bool runtime_attn_out_routes = runtime_layer_routes &&
+        cparams.attn_out_shards && n_tokens <= 1024 &&
+        (loras == nullptr || loras->empty()) &&
+        std::find(runtime_routes.candidate_kinds.begin(), runtime_routes.candidate_kinds.end(),
+                "attn_out_block") != runtime_routes.candidate_kinds.end();
     std::vector<std::string> runtime_route_profiles;
-    if (runtime_ffn_routes || runtime_weighted_norm_routes) {
+    if (runtime_ffn_routes || runtime_weighted_norm_routes || runtime_attn_out_routes) {
         runtime_route_profiles.reserve(runtime_routes.profiles.size());
         runtime_route_profiles.push_back(runtime_routes.initial_profile);
         for (const std::string & profile : runtime_routes.profiles) {
@@ -593,10 +605,115 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                 cb(Qcur, "Qcur_normed", il);
                 cb(Kcur, "Kcur_normed", il);
             }
-            cur = build_attn(inp_attn,
-                    model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
-                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
-            cb(cur, "attn_out", il);
+            if (runtime_attn_out_routes) {
+                // Build attention and KV-cache work exactly once, stopping
+                // before W_O. Each profile then contributes only its prepared
+                // projection fork/join, all consuming this same canonical MHA
+                // result. The scheduler commits a selected alternate terminal
+                // into the initial profile's full-width output.
+                ggml_tensor * attn_core = build_attn(inp_attn,
+                        nullptr, nullptr, nullptr,
+                        Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+
+                struct prepared_attn_out_topology {
+                    llama_backend_policy_attn_out_shards policy;
+                    ggml_tensor * first = nullptr;
+                    ggml_tensor * output = nullptr;
+                };
+                std::vector<prepared_attn_out_topology> prepared;
+                prepared.reserve(runtime_route_profiles.size());
+
+                const auto same_topology = [](const auto & lhs, const auto & rhs) {
+                    if (lhs.enabled != rhs.enabled || lhs.phase != rhs.phase ||
+                            lhs.partition_axis != rhs.partition_axis ||
+                            lhs.layer_start != rhs.layer_start || lhs.layer_end != rhs.layer_end ||
+                            lhs.head_dim != rhs.head_dim ||
+                            lhs.reduce_backend != rhs.reduce_backend ||
+                            lhs.splits.size() != rhs.splits.size()) {
+                        return false;
+                    }
+                    for (size_t i = 0; i < lhs.splits.size(); ++i) {
+                        const auto & a = lhs.splits[i];
+                        const auto & b = rhs.splits[i];
+                        if (a.id != b.id || a.start != b.start || a.size != b.size ||
+                                a.backend != b.backend) {
+                            return false;
+                        }
+                    }
+                    return true;
+                };
+
+                ggml_tensor * canonical_out = nullptr;
+                for (const std::string & profile : runtime_route_profiles) {
+                    llama_backend_policy_attn_out_shards policy;
+                    if (!llama_backend_policy_match_attn_out_shards_for_profile(
+                                profile.c_str(), il, true, policy)) {
+                        GGML_ABORT(
+                                "runtime_routes: profile %s is missing layer %d attention-output shard policy",
+                                profile.c_str(), il);
+                    }
+
+                    auto existing = std::find_if(
+                            prepared.begin(), prepared.end(), [&](const auto & candidate) {
+                                return same_topology(candidate.policy, policy);
+                            });
+                    if (existing == prepared.end()) {
+                        char route_tag[20];
+                        const uint64_t plan_id =
+                            llama_backend_policy_runtime_route_plan_id(profile.c_str());
+                        std::snprintf(route_tag, sizeof(route_tag), "r%016llx",
+                                (unsigned long long) plan_id);
+
+                        prepared_attn_out_topology topology;
+                        topology.policy = policy;
+                        if (!build_attn_out_shards(
+                                    model.layers[il].wo,
+                                    model.layers[il].wo_b,
+                                    model.layers[il].wo_s,
+                                    attn_core, il, "attn_out",
+                                    topology.output, &topology.policy,
+                                    route_tag, &topology.first)) {
+                            GGML_ABORT(
+                                    "runtime_routes: failed to build profile %s layer %d attention-output shard subgraph",
+                                    profile.c_str(), il);
+                        }
+                        // Unlike the initial profile, an alternate terminal
+                        // has no ordinary downstream consumer during graph
+                        // construction. Expand it explicitly so all three
+                        // lanes and both CONCAT nodes form one contiguous
+                        // route subgraph before the next topology is emitted.
+                        ggml_build_forward_expand(gf, topology.output);
+                        prepared.push_back(std::move(topology));
+                        existing = std::prev(prepared.end());
+                    }
+
+                    if (route_subgraph_cb_func) {
+                        route_subgraph_cb_func(
+                                "attn_out_block", profile.c_str(), il,
+                                existing->first, existing->output);
+                    }
+                    if (profile == runtime_routes.initial_profile) {
+                        canonical_out = existing->output;
+                    }
+                }
+                if (canonical_out == nullptr) {
+                    GGML_ABORT(
+                            "runtime_routes: initial attention-output profile %s was not built",
+                            runtime_routes.initial_profile.c_str());
+                }
+                cur = canonical_out;
+            } else {
+                bool sharded_attn_out = false;
+                cur = build_attn(inp_attn,
+                        model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
+                        Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il,
+                        &sharded_attn_out, "attn_out");
+                // build_attn_out_shards owns the success callback so its strict
+                // reduce_backend binding cannot be overwritten here.
+                if (!sharded_attn_out) {
+                    cb(cur, "attn_out", il);
+                }
+            }
         }
         if (il == n_layer - 1 && inp_out_ids) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);

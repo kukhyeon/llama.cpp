@@ -18,12 +18,15 @@ struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
 
-struct llama_backend_policy_ffn_resident_cover {
+struct llama_backend_policy_resident_cover {
     struct ggml_tensor * tensor = nullptr;
     int64_t cover_start = 0;
     int64_t cover_size = 0;
     int64_t local_start = 0;
 };
+
+// Transitional source name for the original FFN-only lookup result.
+using llama_backend_policy_ffn_resident_cover = llama_backend_policy_resident_cover;
 
 // available models
 enum llm_type {
@@ -615,10 +618,23 @@ struct llama_model {
 
     bool has_tensor_overrides() const;
 
+    // True when model loading was requested to prepare attention output shards.
+    bool attn_out_shards_enabled() const { return params.attn_out_shards; }
+
     const struct ggml_tensor * get_tensor(const char * name) const;
     struct ggml_tensor * get_backend_policy_residency_tensor(
             const struct ggml_tensor * tensor,
             const std::vector<std::string> & backends) const;
+    // Return the smallest resident cover containing [start, start + size) for
+    // this source tensor, backend, and source axis.
+    llama_backend_policy_resident_cover get_backend_policy_resident_cover(
+            const struct ggml_tensor * tensor,
+            const std::string & backend,
+            int axis,
+            int64_t start,
+            int64_t size) const;
+
+    // Compatibility wrapper for the original FFN-specific API name.
     llama_backend_policy_ffn_resident_cover get_backend_policy_ffn_cover(
             const struct ggml_tensor * tensor,
             const std::string & backend,

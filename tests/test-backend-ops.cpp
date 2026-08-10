@@ -8188,6 +8188,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         GGML_TYPE_Q8_0, 256, 32, 1, 64, 128, 0, 32));
     test_cases.emplace_back(new test_mul_mat_src0_region(
         GGML_TYPE_Q8_0, 256, 32, 8, 64, 128, 8, 16));
+    // Output-axis W_O shard: every lane consumes the full K input and selects
+    // a disjoint output-row interval from its resident cover. Keep both cover
+    // dimensions at the Adreno transformed-weight threshold so device runs
+    // exercise the OpenCL REGION kernel instead of reporting it unsupported.
+    test_cases.emplace_back(new test_mul_mat_src0_region(
+        GGML_TYPE_Q8_0, 512, 512, 64, 0, 512, 128, 256));
     // HTP Q8x4x2-aligned wide-cover slices: pure HMX, HMX + M tail,
     // and the large-K out-stationary path.
     test_cases.emplace_back(new test_mul_mat_src0_region(

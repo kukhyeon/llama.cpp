@@ -1102,11 +1102,17 @@ static ggml_backend_buffer_type_t select_policy_weight_buft(
         const llama_hparams & hparams,
         ggml_tensor * tensor,
         ggml_op op,
-        const llama_backend_policy_match & policy_match) {
+        const llama_backend_policy_match & policy_match,
+        const buft_list_t * allowed_bufts = nullptr) {
     // Weight policy resolves to buffer types, not backend instances. Try the
     // requested names in order and keep the first candidate that the owning
     // backend can actually use for this tensor/op.
-    const buft_list_t buft_list = collect_policy_buft_list();
+    const buft_list_t discovered_bufts = allowed_bufts == nullptr
+        ? collect_policy_buft_list()
+        : buft_list_t {};
+    const buft_list_t & buft_list = allowed_bufts != nullptr
+        ? *allowed_bufts
+        : discovered_bufts;
 
     for (const std::string & backend_name : policy_match.backends) {
         for (const auto & cur : buft_list) {
@@ -1155,6 +1161,25 @@ static std::string sanitize_cover_name_part(std::string value) {
     return value;
 }
 
+static uint64_t stable_attn_out_cover_name_hash(
+        const char * source_name,
+        const std::string & backend) {
+    // FNV-1a keeps W_O cover names deterministic without embedding the full
+    // (already long) GGUF tensor and backend names in GGML_MAX_NAME bytes.
+    uint64_t hash = UINT64_C(14695981039346656037);
+    const auto append = [&](const unsigned char * data, size_t size) {
+        for (size_t i = 0; i < size; ++i) {
+            hash ^= data[i];
+            hash *= UINT64_C(1099511628211);
+        }
+    };
+    append((const unsigned char *) source_name, std::strlen(source_name));
+    const unsigned char separator = 0;
+    append(&separator, 1);
+    append((const unsigned char *) backend.data(), backend.size());
+    return hash;
+}
+
 static void init_tensor_meta_2d(ggml_tensor & meta, ggml_type type, int64_t ne0, int64_t ne1, const char * name) {
     std::memset(&meta, 0, sizeof(meta));
     meta.type = type;
@@ -1171,7 +1196,8 @@ static void init_tensor_meta_2d(ggml_tensor & meta, ggml_type type, int64_t ne0,
 
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
-        const buft_list_t * buft_list_layer, const buft_list_t * buft_list_all, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+        const buft_list_t * buft_list_layer, const buft_list_t * buft_list_all, bool prepare_attn_out_shards,
+        const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
@@ -1185,9 +1211,22 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             // each one keeps this sizing independent of backend aliases and
             // avoids exhausting metadata before all covers are declared.
             for (uint32_t il = 0; il < hparams.n_layer; ++il) {
-                llama_backend_policy_ffn_residency_plan plan;
+                llama_backend_policy_residency_plan plan;
                 if (llama_backend_policy_build_ffn_residency_plan((int) il, plan)) {
                     max_n_tensors += 3 * plan.covers.size();
+                }
+            }
+
+            // Llama W_O has one cover tensor per policy lane on the selected
+            // input or output axis. Keep the reservation behind the model-load
+            // ablation flag so OFF leaves both allocation and metadata sizing
+            // on the ordinary path.
+            if (prepare_attn_out_shards && get_arch() == LLM_ARCH_LLAMA) {
+                for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                    llama_backend_policy_residency_plan plan;
+                    if (llama_backend_policy_build_attn_out_residency_plan((int) il, plan)) {
+                        max_n_tensors += plan.covers.size();
+                    }
                 }
             }
 
@@ -1388,30 +1427,42 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return buft;
     };
 
-    auto create_ffn_covers = [&](const ggml_tensor * cur, const char * tensor_name, int ffn_axis, const llama_backend_policy_ffn_residency_plan & residency_plan) {
+    auto create_residency_covers = [&](const ggml_tensor * cur, const char * tensor_name, int axis,
+                                       const char * cover_family, const llama_backend_policy_residency_plan & residency_plan,
+                                       const buft_list_t * allowed_cover_bufts) {
         if (buft_list_all == nullptr) {
+            return false;
+        }
+        if (cur == nullptr || tensor_name == nullptr || tensor_name[0] == '\0' ||
+                (cur != nullptr && (cur->ne[2] != 1 || cur->ne[3] != 1)) ||
+                (axis != 0 && axis != 1) || cover_family == nullptr || cover_family[0] == '\0') {
+            LLAMA_LOG_WARN("backend_policy: invalid residency cover materialization request for %s (axis=%d, tag=%s)\n",
+                    tensor_name == nullptr ? "<null>" : tensor_name, axis,
+                    cover_family == nullptr ? "<null>" : cover_family);
             return false;
         }
 
         bool complete = true;
-        const int64_t cover_dim = ffn_axis == 0 ? cur->ne[0] : cur->ne[1];
+        const int64_t cover_dim = axis == 0 ? cur->ne[0] : cur->ne[1];
+        const bool require_unique_execution_devices = std::strcmp(cover_family, "attn_out") == 0;
+        std::unordered_set<ggml_backend_dev_t> cover_devices;
 
         for (const auto & cover : residency_plan.covers) {
             if (cover.start < 0 || cover.size <= 0 ||
                     cover.start > std::numeric_limits<int64_t>::max() - cover.size ||
                     cover.start + cover.size > cover_dim) {
-                LLAMA_LOG_WARN("backend_policy: ffn cover %s for %s is out of range [0, %" PRId64 ")\n",
-                        cover.id.c_str(), tensor_name, cover_dim);
+                LLAMA_LOG_WARN("backend_policy: %s cover %s for %s is out of range [0, %" PRId64 ")\n",
+                        cover_family, cover.id.c_str(), tensor_name, cover_dim);
                 complete = false;
                 continue;
             }
 
-            const int64_t cover_ne0 = ffn_axis == 0 ? cover.size : cur->ne[0];
-            const int64_t cover_ne1 = ffn_axis == 0 ? cur->ne[1] : cover.size;
+            const int64_t cover_ne0 = axis == 0 ? cover.size : cur->ne[0];
+            const int64_t cover_ne1 = axis == 0 ? cur->ne[1] : cover.size;
             const int64_t block_size = ggml_blck_size(cur->type);
-            if (cover_ne0 % block_size != 0 || (ffn_axis == 0 && cover.start % block_size != 0)) {
-                LLAMA_LOG_WARN("backend_policy: ffn cover %s for %s has an axis-0 range not aligned to block size %" PRId64 "; skipping cover\n",
-                        cover.id.c_str(), tensor_name, block_size);
+            if (cover_ne0 % block_size != 0 || (axis == 0 && cover.start % block_size != 0)) {
+                LLAMA_LOG_WARN("backend_policy: %s cover %s for %s has an axis-0 range not aligned to block size %" PRId64 "; skipping cover\n",
+                        cover_family, cover.id.c_str(), tensor_name, block_size);
                 complete = false;
                 continue;
             }
@@ -1419,11 +1470,20 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             // This is the physical connected-union identity, independent of
             // the active clock profile. It is extracted and packed exactly
             // once; graph nodes later select profile-local regions from it.
-            const std::string cover_name =
-                std::string(tensor_name) + "#ffn_cover." +
-                sanitize_cover_name_part(cover.backend) + "." +
-                std::to_string(ffn_axis) + "." +
-                std::to_string(cover.start) + "." + std::to_string(cover.size);
+            const std::string cover_name = require_unique_execution_devices
+                ? format(
+                        "aoc.%016" PRIx64 ".%d.%" PRId64 ".%" PRId64,
+                        stable_attn_out_cover_name_hash(tensor_name, cover.backend),
+                        axis, cover.start, cover.size)
+                : std::string(tensor_name) + "#" + cover_family + "_cover." +
+                    sanitize_cover_name_part(cover.backend) + "." +
+                    std::to_string(axis) + "." +
+                    std::to_string(cover.start) + "." + std::to_string(cover.size);
+            if (require_unique_execution_devices && cover_name.size() >= GGML_MAX_NAME) {
+                throw std::runtime_error(format(
+                        "backend_policy: generated attention output cover name is too long for %s",
+                        tensor_name));
+            }
 
             ggml_tensor cover_meta;
             init_tensor_meta_2d(cover_meta, cur->type, cover_ne0, cover_ne1, cover_name.c_str());
@@ -1434,12 +1494,28 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             copy_match.source = residency_plan.source;
 
             ggml_backend_buffer_type_t cover_buft =
-                select_policy_weight_buft(hparams, &cover_meta, GGML_OP_MUL_MAT_SRC0_REGION, copy_match);
+                select_policy_weight_buft(
+                        hparams, &cover_meta, GGML_OP_MUL_MAT_SRC0_REGION,
+                        copy_match, allowed_cover_bufts);
             if (cover_buft == nullptr) {
-                LLAMA_LOG_WARN("backend_policy: ffn cover %s for %s requested %s, but no compatible buffer type was found\n",
-                        cover.id.c_str(), tensor_name, cover.backend.c_str());
+                LLAMA_LOG_WARN("backend_policy: %s cover %s for %s requested %s, but no compatible buffer type was found\n",
+                        cover_family, cover.id.c_str(), tensor_name, cover.backend.c_str());
                 complete = false;
                 continue;
+            }
+
+            if (require_unique_execution_devices) {
+                ggml_backend_dev_t cover_dev = ggml_backend_buft_get_device(cover_buft);
+                if (cover_dev == nullptr && cover_buft == ggml_backend_cpu_buffer_type()) {
+                    cover_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                }
+                if (cover_dev == nullptr || !cover_devices.insert(cover_dev).second) {
+                    LLAMA_LOG_WARN(
+                            "backend_policy: %s cover %s for %s maps backend alias %s to a duplicate or unknown execution device\n",
+                            cover_family, cover.id.c_str(), tensor_name, cover.backend.c_str());
+                    complete = false;
+                    continue;
+                }
             }
 
             ggml_context * cover_ctx = ctx_for_buft(cover_buft);
@@ -1452,14 +1528,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             residency_tensors.insert(resident);
             residency_tensors_by_name[tensor_name].push_back(resident);
             residency_cover_infos[resident] = {
-                tensor_name, cover.backend, ffn_axis, cover.start, cover.size
+                tensor_name, cover.backend, axis, cover.start, cover.size
             };
             size_data += ggml_nbytes(resident);
 
-            LLAMA_LOG_DEBUG("backend_policy: ffn cover tensor %s (%zu MiB %s) from %s axis=%d start=%" PRId64 " size=%" PRId64 " using %s\n",
-                    cover_name.c_str(),
+            LLAMA_LOG_DEBUG("backend_policy: %s cover tensor %s (%zu MiB %s) from %s axis=%d start=%" PRId64 " size=%" PRId64 " using %s\n",
+                    cover_family, cover_name.c_str(),
                     ggml_nbytes(resident) / 1024 / 1024, ggml_type_name(resident->type),
-                    residency_plan.source.c_str(), ffn_axis, cover.start, cover.size,
+                    residency_plan.source.c_str(), axis, cover.start, cover.size,
                     ggml_backend_buft_name(cover_buft));
         }
 
@@ -1507,7 +1583,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     ggml_tensor * t_meta = get_tensor_meta(tn.str().c_str());
 
     int ffn_axis = -1;
-    llama_backend_policy_ffn_residency_plan ffn_residency_plan;
+    llama_backend_policy_residency_plan ffn_residency_plan;
     const bool ffn_parallel_layer_enabled =
         t_meta != nullptr &&
         is_ffn_parallel_weight_tensor(tn, ffn_axis) &&
@@ -1515,6 +1591,58 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     const bool ffn_parallel_cover_only =
         ffn_parallel_layer_enabled &&
         !ffn_residency_plan.keep_full_source;
+
+    const bool attn_out_weight_tensor =
+        prepare_attn_out_shards &&
+        get_arch() == LLM_ARCH_LLAMA &&
+        tn.tensor == LLM_TENSOR_ATTN_OUT &&
+        tn.bid >= 0 &&
+        tn.suffix != nullptr &&
+        std::strcmp(tn.suffix, "weight") == 0;
+
+    llama_backend_policy_attn_out_shards attn_out_policy;
+    llama_backend_policy_residency_plan attn_out_residency_plan;
+    bool attn_out_layer_enabled = false;
+    if (attn_out_weight_tensor) {
+        if (!llama_backend_policy_attn_out_shards_enabled()) {
+            throw std::runtime_error(
+                    "backend_policy: attn_out_shards model-load option requires an enabled attn_out_shards policy");
+        }
+
+        if (llama_backend_policy_match_attn_out_shards(tn.bid, true, attn_out_policy)) {
+            if (t_meta == nullptr ||
+                    !llama_backend_policy_build_attn_out_residency_plan(
+                            tn.bid, attn_out_residency_plan) ||
+                    attn_out_residency_plan.covers.size() != 3) {
+                throw std::runtime_error(format(
+                        "backend_policy: failed to build complete attn_out_shards residency for layer %d",
+                        tn.bid));
+            }
+
+            const int64_t model_head_dim = hparams.n_embd_head_k((uint32_t) tn.bid);
+            if (attn_out_policy.head_dim != model_head_dim) {
+                throw std::runtime_error(format(
+                        "backend_policy: attn_out_shards head_dim %" PRId64
+                        " does not match Llama layer %d head_dim %" PRId64,
+                        attn_out_policy.head_dim, tn.bid, model_head_dim));
+            }
+
+            const auto & last = attn_out_policy.splits.back();
+            const int64_t split_width = last.start + last.size;
+            const bool output_axis = attn_out_policy.partition_axis == "output";
+            const int attn_out_axis = output_axis ? 1 : 0;
+            const int64_t projection_width = t_meta->ne[attn_out_axis];
+            if (split_width != projection_width) {
+                throw std::runtime_error(format(
+                        "backend_policy: attn_out_shards split width %" PRId64
+                        " does not match %s %s width %" PRId64,
+                        split_width, tn.str().c_str(),
+                        output_axis ? "output" : "input", projection_width));
+            }
+
+            attn_out_layer_enabled = true;
+        }
+    }
 
     llm_tensor residency_tn_tensor = tn.tensor;
     if (tn.tensor == LLM_TENSOR_TOKEN_EMBD && (flags & TENSOR_DUPLICATED)) {
@@ -1545,7 +1673,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         virtual_tensors.insert(tensor);
         virtual_tensor_names.insert(ggml_get_name(tensor));
 
-        if (!create_ffn_covers(cur, ggml_get_name(tensor), ffn_axis, ffn_residency_plan)) {
+        if (!create_residency_covers(
+                    cur, ggml_get_name(tensor), ffn_axis, "ffn", ffn_residency_plan, nullptr)) {
             throw std::runtime_error(format(
                     "backend_policy: failed to create complete cover-only FFN residency for tensor %s",
                     ggml_get_name(tensor)));
@@ -1591,10 +1720,26 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         // Always create independently packed connected covers, even when the
         // full source happens to use the same buffer type. A region matmul
         // interprets offsets relative to the cover's physical packed layout.
-        (void) create_ffn_covers(cur, ggml_get_name(tensor), ffn_axis, ffn_residency_plan);
+        (void) create_residency_covers(
+                cur, ggml_get_name(tensor), ffn_axis, "ffn", ffn_residency_plan, nullptr);
     }
 
-    if (!ffn_parallel_layer_enabled && llama_backend_policy_residency_enabled() && buft_list_all != nullptr) {
+    if (attn_out_layer_enabled) {
+        // The full source remains resident for decode and the feature-off
+        // graph, but all three independently packed lane covers on the chosen
+        // W_O axis are mandatory when preparation is requested.
+        const int attn_out_axis = attn_out_policy.partition_axis == "output" ? 1 : 0;
+        if (!create_residency_covers(
+                    cur, ggml_get_name(tensor), attn_out_axis, "attn_out", attn_out_residency_plan,
+                    buft_list_all)) {
+            throw std::runtime_error(format(
+                    "backend_policy: failed to create complete attention output residency for tensor %s",
+                    ggml_get_name(tensor)));
+        }
+    }
+
+    if (!ffn_parallel_layer_enabled && !attn_out_layer_enabled &&
+            llama_backend_policy_residency_enabled() && buft_list_all != nullptr) {
 
         llama_backend_policy_match residency_match;
         const char * tensor_name = ggml_get_name(tensor);
@@ -1902,7 +2047,7 @@ bool llama_model_loader::load_all_data(
         if (cover != nullptr) {
             const ggml_tensor * src = weight->tensor;
             if (src->type != cur->type) {
-                throw std::runtime_error(format("ffn cover '%s' has source type %s but cover type %s",
+                throw std::runtime_error(format("residency cover '%s' has source type %s but cover type %s",
                             ggml_get_name(cur), ggml_type_name(src->type), ggml_type_name(cur->type)));
             }
 
@@ -1933,7 +2078,7 @@ bool llama_model_loader::load_all_data(
                     read_source(source_offset, dst + (size_t) row * dst_row_size, dst_row_size);
                 }
             } else {
-                throw std::runtime_error(format("ffn cover '%s' has invalid axis %d", ggml_get_name(cur), cover->axis));
+                throw std::runtime_error(format("residency cover '%s' has invalid axis %d", ggml_get_name(cur), cover->axis));
             }
 
             ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);

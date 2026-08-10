@@ -369,6 +369,7 @@ llama_context::llama_context(
     cparams.module_bench_backend     = params.module_bench_backend ? params.module_bench_backend : "";
     cparams.attn_qkv_parallel        = params.attn_qkv_parallel;
     cparams.attn_qkv_shards          = params.attn_qkv_shards;
+    cparams.attn_out_shards          = params.attn_out_shards;
 
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
     cparams.rope_freq_base   = params.rope_freq_base  == 0.0f ? hparams.rope_freq_base_train  : params.rope_freq_base;
@@ -522,6 +523,7 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: kv_unified    = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
     LLAMA_LOG_INFO("%s: attn_qkv_parallel = %s\n", __func__, cparams.attn_qkv_parallel ? "true" : "false");
     LLAMA_LOG_INFO("%s: attn_qkv_shards   = %s\n", __func__, cparams.attn_qkv_shards ? "true" : "false");
+    LLAMA_LOG_INFO("%s: attn_out_shards   = %s\n", __func__, cparams.attn_out_shards ? "true" : "false");
     LLAMA_LOG_INFO("%s: freq_base     = %.1f\n", __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale    = %g\n",   __func__, cparams.rope_freq_scale);
 
@@ -563,6 +565,142 @@ llama_context::llama_context(
             throw std::runtime_error("failed to initialize CPU backend");
         }
         backends.emplace_back(backend_cpu);
+
+        // Static W_O sharding is intentionally strict: every policy name must
+        // resolve to one initialized context backend, and the three lanes must
+        // resolve to three different execution devices. Textually different
+        // aliases such as HTP0 and HTP0-REPACK still name the same executor.
+        if (cparams.attn_out_shards) {
+            llama_backend_policy_attn_out_shards policy;
+            bool has_matching_layer = false;
+            const ggml_tensor * post_join_scale = nullptr;
+            const ggml_tensor * post_join_bias  = nullptr;
+            for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                if (llama_backend_policy_match_attn_out_shards((int) il, true, policy)) {
+                    has_matching_layer = true;
+                    if (post_join_scale == nullptr) {
+                        post_join_scale = model.layers[il].wo_s;
+                    }
+                    if (post_join_bias == nullptr) {
+                        post_join_bias = model.layers[il].wo_b;
+                    }
+                }
+            }
+
+            if (has_matching_layer) {
+                if (policy.splits.size() != 3) {
+                    throw std::runtime_error(
+                            "attn_out_shards matched layer does not contain exactly three lanes");
+                }
+
+                auto resolve_backend = [&](const std::string & name, const char * role) {
+                    ggml_backend_t resolved = nullptr;
+                    for (const auto & backend : backends) {
+                        ggml_backend_t candidate = backend.get();
+                        if (!llama_backend_policy_backend_matches(candidate, name)) {
+                            continue;
+                        }
+                        if (resolved != nullptr && resolved != candidate) {
+                            throw std::runtime_error(format(
+                                    "attn_out_shards %s backend '%s' is ambiguous across initialized backends",
+                                    role, name.c_str()));
+                        }
+                        resolved = candidate;
+                    }
+                    if (resolved == nullptr) {
+                        throw std::runtime_error(format(
+                                "attn_out_shards %s backend '%s' is not initialized in this context",
+                                role, name.c_str()));
+                    }
+                    return resolved;
+                };
+
+                std::unordered_set<ggml_backend_dev_t> lane_devices;
+                for (const auto & split : policy.splits) {
+                    ggml_backend_t lane_backend = resolve_backend(split.backend, "lane");
+                    ggml_backend_dev_t lane_dev = ggml_backend_get_device(lane_backend);
+                    if (lane_dev == nullptr || !lane_devices.insert(lane_dev).second) {
+                        throw std::runtime_error(format(
+                                "attn_out_shards lane '%s' backend '%s' aliases another lane's execution device",
+                                split.id.c_str(), split.backend.c_str()));
+                    }
+                }
+
+                ggml_backend_t reduce_backend =
+                    resolve_backend(policy.reduce_backend, "reduce");
+
+                const ggml_init_params validation_params = {
+                    /*.mem_size   =*/ 12 * ggml_tensor_overhead(),
+                    /*.mem_buffer =*/ nullptr,
+                    /*.no_alloc   =*/ true,
+                };
+                ggml_context * validation_ctx = ggml_init(validation_params);
+                if (validation_ctx == nullptr) {
+                    throw std::runtime_error("failed to create attn_out_shards join validation context");
+                }
+                ggml_tensor * joined = nullptr;
+                const bool output_axis = policy.partition_axis == "output";
+                bool join_supported = false;
+                if (output_axis) {
+                    ggml_tensor * lane0 = ggml_new_tensor_2d(
+                            validation_ctx, GGML_TYPE_F32, policy.splits[0].size, 2);
+                    ggml_tensor * lane1 = ggml_new_tensor_2d(
+                            validation_ctx, GGML_TYPE_F32, policy.splits[1].size, 2);
+                    ggml_tensor * lane2 = ggml_new_tensor_2d(
+                            validation_ctx, GGML_TYPE_F32, policy.splits[2].size, 2);
+                    ggml_tensor * inner = ggml_concat(validation_ctx, lane1, lane2, 0);
+                    joined = ggml_concat(validation_ctx, lane0, inner, 0);
+                    join_supported =
+                        ggml_backend_supports_op(reduce_backend, inner) &&
+                        ggml_backend_supports_op(reduce_backend, joined);
+                } else {
+                    ggml_tensor * lhs = ggml_new_tensor_2d(
+                            validation_ctx, GGML_TYPE_F32, hparams.n_embd, 2);
+                    ggml_tensor * rhs = ggml_new_tensor_2d(
+                            validation_ctx, GGML_TYPE_F32, hparams.n_embd, 2);
+                    joined = ggml_add(validation_ctx, lhs, rhs);
+                    join_supported = ggml_backend_supports_op(reduce_backend, joined);
+                }
+                ggml_tensor * scale = post_join_scale != nullptr
+                    ? ggml_new_tensor_4d(
+                            validation_ctx, post_join_scale->type,
+                            post_join_scale->ne[0], post_join_scale->ne[1],
+                            post_join_scale->ne[2], post_join_scale->ne[3])
+                    : nullptr;
+                ggml_tensor * product = scale != nullptr
+                    ? ggml_mul(validation_ctx, joined, scale)
+                    : nullptr;
+                const bool scale_supported = product == nullptr ||
+                    ggml_backend_supports_op(reduce_backend, product);
+                ggml_tensor * bias = post_join_bias != nullptr
+                    ? ggml_new_tensor_4d(
+                            validation_ctx, post_join_bias->type,
+                            post_join_bias->ne[0], post_join_bias->ne[1],
+                            post_join_bias->ne[2], post_join_bias->ne[3])
+                    : nullptr;
+                ggml_tensor * biased = bias != nullptr
+                    ? ggml_add(validation_ctx, joined, bias)
+                    : nullptr;
+                const bool bias_supported = biased == nullptr ||
+                    ggml_backend_supports_op(reduce_backend, biased);
+                ggml_free(validation_ctx);
+                if (!join_supported) {
+                    throw std::runtime_error(format(
+                            "attn_out_shards reduce backend '%s' does not support the required F32 %s",
+                            policy.reduce_backend.c_str(), output_axis ? "CONCAT" : "ADD"));
+                }
+                if (!scale_supported) {
+                    throw std::runtime_error(format(
+                            "attn_out_shards reduce backend '%s' does not support the required F32 MUL for wo_s",
+                            policy.reduce_backend.c_str()));
+                }
+                if (!bias_supported) {
+                    throw std::runtime_error(format(
+                            "attn_out_shards reduce backend '%s' does not support the required F32 ADD for wo_b",
+                            policy.reduce_backend.c_str()));
+                }
+            }
+        }
 
         // create a list of the set_n_threads functions in the backends
         for (auto & backend : backends) {
@@ -2690,7 +2828,7 @@ bool llama_context::runtime_route_prepare_graph(
         original_node_indices.emplace(node, i);
     }
 
-    // Prebuilt weighted/FFN variants are already complete route ranges. Keep
+    // Prebuilt weighted/attention-output/FFN variants are already complete route ranges. Keep
     // the generic weightless candidate pass from cloning an interior RMS/ADD
     // node and creating overlapping scheduler groups.
     std::vector<bool> prebuilt_subgraph_nodes((size_t) original_n_nodes, false);
@@ -3002,6 +3140,16 @@ bool llama_context::runtime_route_prepare_graph(
                 "ffn_block") != routes.candidate_kinds.end()) {
         requested_subgraph_kinds.emplace_back("ffn_block");
     }
+    const bool have_attn_out_subgraphs = std::any_of(
+            runtime_route_subgraphs.begin(), runtime_route_subgraphs.end(),
+            [](const auto & candidate) {
+                return candidate.kind == "attn_out_block";
+            });
+    if (cparams.attn_out_shards && have_attn_out_subgraphs &&
+            std::find(routes.candidate_kinds.begin(), routes.candidate_kinds.end(),
+                    "attn_out_block") != routes.candidate_kinds.end()) {
+        requested_subgraph_kinds.emplace_back("attn_out_block");
+    }
 
     size_t route_subgraph_groups = 0;
     if (routes.mode != "prepare") {
@@ -3307,7 +3455,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     // down node. Reserve against the connected cover union; this is slightly
     // conservative when an active profile uses only part of that union.
     for (uint32_t il = 0; il < model.hparams.n_layer; ++il) {
-        llama_backend_policy_ffn_residency_plan plan;
+        llama_backend_policy_residency_plan plan;
         if (llama_backend_policy_build_ffn_residency_plan((int) il, plan)) {
             res += 4u * plan.covers.size();
         }
@@ -3320,6 +3468,14 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         // experiment cannot exhaust graph metadata on all-layer prefill.
         constexpr uint64_t nodes_per_qkv_sharded_layer = 24;
         res += (uint64_t) model.hparams.n_layer * nodes_per_qkv_sharded_layer;
+    }
+
+    if (cparams.attn_out_shards && n_tokens > 1) {
+        // Input-axis mode uses three slices plus region matmuls and an ADD
+        // reduction. Output-axis mode replaces those slices with two CONCAT
+        // joins. This reserve covers either mode plus scale/bias metadata.
+        constexpr uint64_t nodes_per_attn_out_sharded_layer = 16;
+        res += (uint64_t) model.hparams.n_layer * nodes_per_attn_out_sharded_layer;
     }
 
     if (runtime_routes_configured) {
@@ -3358,6 +3514,21 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
             constexpr uint64_t nodes_per_weighted_norm_variant = 2;
             res += (uint64_t) model.hparams.n_layer * routes.profiles.size() *
                 nodes_per_weighted_norm_variant;
+        }
+        if (cparams.attn_out_shards && n_tokens > 1 &&
+                llama_backend_policy_resolve_runtime_routes(true, routes) &&
+                (routes.mode == "clock" || routes.mode == "fixed") &&
+                std::find(routes.candidate_kinds.begin(), routes.candidate_kinds.end(),
+                        "attn_out_block") != routes.candidate_kinds.end()) {
+            // A profile-specific W_O variant contains three REGION matmuls,
+            // up to three input VIEW/CONT pairs for the compatibility axis,
+            // two joins, and optional scale/bias/final naming nodes. Most
+            // clock profiles share a topology and are deduplicated by the
+            // Llama graph builder, but reserve the non-deduplicated upper
+            // bound so policy edits cannot exhaust graph metadata.
+            constexpr uint64_t nodes_per_attn_out_variant = 16;
+            res += (uint64_t) model.hparams.n_layer * routes.profiles.size() *
+                nodes_per_attn_out_variant;
         }
     }
 
@@ -3672,8 +3843,23 @@ llm_graph_cb llama_context::graph_get_cb() const {
                 meta.base_name == "ffn_inp" && cur->op == GGML_OP_ADD;
             const bool is_ffn_internal =
                 meta.base_name.size() >= 4 && meta.base_name.compare(0, 4, "ffn_") == 0;
+            const auto has_prefix = [&](const char * prefix) {
+                const size_t prefix_len = std::strlen(prefix);
+                return meta.base_name.size() >= prefix_len &&
+                    meta.base_name.compare(0, prefix_len, prefix) == 0;
+            };
+            // Static attention forks and their assembly/reduction nodes already
+            // have strict backend ownership and scheduler grouping. They must
+            // never be cloned as overlapping generic runtime-route candidates.
+            const bool is_static_attention_parallel_internal =
+                has_prefix("attn_qkv.") ||
+                has_prefix("attn_qkv_shard.") ||
+                has_prefix("attn_qkv_join.") ||
+                has_prefix("attn_out_shard.") ||
+                has_prefix("attn_out_parallel_");
             meta.excluded = meta.excluded ||
-                (is_ffn_internal && !is_routable_ffn_input) || meta.layer_out;
+                (is_ffn_internal && !is_routable_ffn_input) ||
+                is_static_attention_parallel_internal || meta.layer_out;
         }
 
         if (llama_backend_policy_residency_enabled()) {
@@ -4722,6 +4908,7 @@ llama_context_params llama_context_default_params() {
         /*.kv_unified                  =*/ false,
         /*.attn_qkv_parallel           =*/ false,
         /*.attn_qkv_shards             =*/ false,
+        /*.attn_out_shards             =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
     };
@@ -4758,6 +4945,24 @@ llama_context * llama_init_from_model(
                 "%s: attn_qkv_shards requires an enabled attn_qkv_shards policy and residency copies\n",
                 __func__);
         return nullptr;
+    }
+    if (params.attn_out_shards) {
+        if (!model->attn_out_shards_enabled()) {
+            LLAMA_LOG_ERROR(
+                    "%s: attn_out_shards must be enabled in llama_model_params before model load\n",
+                    __func__);
+            return nullptr;
+        }
+        if (!llama_backend_policy_attn_out_shards_enabled()) {
+            LLAMA_LOG_ERROR(
+                    "%s: attn_out_shards requires an enabled attn_out_shards policy\n",
+                    __func__);
+            return nullptr;
+        }
+        if (model->arch != LLM_ARCH_LLAMA) {
+            LLAMA_LOG_ERROR("%s: attn_out_shards currently supports only LLaMA models\n", __func__);
+            return nullptr;
+        }
     }
 
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && model->arch == LLM_ARCH_GROK) {

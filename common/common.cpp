@@ -1533,6 +1533,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
+    mparams.attn_out_shards = params.attn_out_shards;
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
@@ -1594,6 +1595,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.module_bench_backend     = params.module_bench_backend.c_str();
     cparams.attn_qkv_parallel        = params.attn_qkv_parallel;
     cparams.attn_qkv_shards          = params.attn_qkv_shards;
+    cparams.attn_out_shards          = params.attn_out_shards;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

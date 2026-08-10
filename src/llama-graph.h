@@ -20,6 +20,7 @@ struct llama_cparams;
 struct llama_layer;
 struct llama_model;
 struct llama_backend_policy_ffn_parallel;
+struct llama_backend_policy_attn_out_shards;
 
 struct llama_memory_context_i;
 
@@ -671,6 +672,7 @@ struct llm_graph_params {
             cparams.module_bench_backend     == other.cparams.module_bench_backend &&
             cparams.attn_qkv_parallel        == other.cparams.attn_qkv_parallel &&
             cparams.attn_qkv_shards          == other.cparams.attn_qkv_shards &&
+            cparams.attn_out_shards          == other.cparams.attn_out_shards &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             model == other.model &&
@@ -882,6 +884,22 @@ struct llm_graph_context {
                       int   il,
             llm_graph_qkv & out) const;
 
+    // Split W_O along the policy-selected axis. Input-axis lanes receive
+    // compact attention slices and produce full-width partials for ADD;
+    // output-axis lanes share the full input and produce disjoint slices for
+    // CONCAT. Scale and bias are applied once after either join.
+    bool build_attn_out_shards(
+              ggml_tensor * wo,
+              ggml_tensor * wo_b,
+              ggml_tensor * wo_s,
+              ggml_tensor * cur,
+                      int   il,
+             const char * final_name,
+            ggml_tensor *& out,
+        const llama_backend_policy_attn_out_shards * policy_override = nullptr,
+             const char * route_tag = nullptr,
+            ggml_tensor ** out_first = nullptr) const;
+
     ggml_tensor * build_ffn(
              ggml_tensor * cur,
              ggml_tensor * up,
@@ -999,7 +1017,9 @@ struct llm_graph_context {
             ggml_tensor * sinks, // [n_head_q]
             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+                   bool * out_wo_sharded = nullptr,
+           const char *   sharded_wo_final_name = "kqv_wo") const;
 
     llm_graph_input_attn_kv * build_attn_inp_kv() const;
 
@@ -1015,7 +1035,9 @@ struct llm_graph_context {
             ggml_tensor * sinks, // [n_head_q]
             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v] // TODO: remove
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+                   bool * out_wo_sharded = nullptr,
+           const char *   sharded_wo_final_name = "kqv_wo") const;
 
     llm_graph_input_attn_k  * build_attn_inp_k() const;
 

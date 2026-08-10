@@ -805,6 +805,148 @@ static bool run_multi_consumer_commit_case() {
     return ok;
 }
 
+static bool run_attn_out_fork_join_subgraph_case() {
+    const char * scenario = "attn-out-fork-join-subgraph";
+    const size_t graph_size = 64;
+    const ggml_init_params params = {
+        /* .mem_size   = */ 128 * ggml_tensor_overhead() +
+                              ggml_graph_overhead_custom(graph_size, false),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+
+    ggml_context * ctx = ggml_init(params);
+    ggml_backend_t backends[2] = {
+        ggml_backend_cpu_init(),
+        ggml_backend_cpu_init(),
+    };
+    ggml_backend_sched_t sched = backends[0] != nullptr && backends[1] != nullptr
+        ? ggml_backend_sched_new(backends, nullptr, 2, 128, false, true)
+        : nullptr;
+    auto cleanup = [&]() {
+        ggml_backend_sched_free(sched);
+        ggml_backend_free(backends[0]);
+        ggml_backend_free(backends[1]);
+        ggml_free(ctx);
+    };
+    if (!check(ctx != nullptr && sched != nullptr, scenario, "backend setup failed")) {
+        cleanup();
+        return false;
+    }
+
+    ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 6, 1);
+    ggml_set_input(input);
+    ggml_set_name(input, "attn-out-route-input");
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, graph_size, false);
+
+    struct fork_join_variant {
+        ggml_tensor * first = nullptr;
+        ggml_tensor * output = nullptr;
+    };
+    struct selector_weight {
+        ggml_tensor * tensor = nullptr;
+        int64_t start = 0;
+        int64_t size = 0;
+    };
+    std::vector<selector_weight> selector_weights;
+    auto build_variant = [&](const int sizes[3], const char * tag,
+                             ggml_backend_t lane0_backend,
+                             ggml_backend_t lane1_backend) {
+        static const char * lane_ids[3] = { "cpu", "gpu", "npu" };
+        ggml_tensor * lanes[3] = {};
+        int64_t start = 0;
+        for (int lane = 0; lane < 3; ++lane) {
+            // Mirror output-axis W_O: every projection consumes the same full
+            // activation and independently produces a disjoint-width result.
+            // Selector matrices make the two different partitions assemble
+            // to the same canonical vector without introducing VIEW nodes,
+            // which real output-axis W_O also does not contain.
+            ggml_tensor * weight =
+                ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 6, sizes[lane]);
+            ggml_set_input(weight);
+            ggml_set_name(weight, (std::string("attn-out-weight-") + tag + "-" +
+                    lane_ids[lane]).c_str());
+            lanes[lane] = ggml_mul_mat(ctx, weight, input);
+            selector_weights.push_back({ weight, start, sizes[lane] });
+            const std::string name = std::string("attn_out_shard.") +
+                lane_ids[lane] + "-" + tag + ".proj-0";
+            ggml_set_name(lanes[lane], name.c_str());
+            ggml_backend_sched_set_tensor_backend(
+                    sched, lanes[lane], lane == 1 ? lane1_backend : lane0_backend);
+            start += sizes[lane];
+        }
+
+        ggml_tensor * inner = ggml_concat(ctx, lanes[1], lanes[2], 0);
+        ggml_tensor * joined = ggml_concat(ctx, lanes[0], inner, 0);
+        ggml_set_name(inner, (std::string("attn-out-inner-") + tag).c_str());
+        ggml_set_name(joined, (std::string("attn-out-joined-") + tag).c_str());
+        ggml_backend_sched_set_tensor_backend(sched, inner, lane0_backend);
+        ggml_backend_sched_set_tensor_backend(sched, joined, lane0_backend);
+        ggml_build_forward_expand(graph, joined);
+        return fork_join_variant { lanes[0], joined };
+    };
+
+    const int canonical_sizes[3] = { 2, 2, 2 };
+    const int alternate_sizes[3] = { 1, 2, 3 };
+    const fork_join_variant canonical = build_variant(
+            canonical_sizes, "r0000000000000000", backends[0], backends[1]);
+    const fork_join_variant alternate = build_variant(
+            alternate_sizes, "r0000000000000001", backends[1], backends[0]);
+
+    ggml_tensor * output = ggml_scale(ctx, canonical.output, 1.0f);
+    ggml_set_name(output, "attn-out-route-output");
+    ggml_set_output(output);
+    ggml_backend_sched_set_tensor_backend(sched, output, backends[0]);
+    ggml_build_forward_expand(graph, output);
+
+    bool setup_ok =
+        ggml_backend_sched_register_route_subgraph(
+                sched, canonical.first, canonical.output,
+                canonical.first, canonical.output, 0, 0) &&
+        ggml_backend_sched_register_route_subgraph(
+                sched, canonical.first, canonical.output,
+                alternate.first, alternate.output, 1, 0);
+    ggml_backend_sched_layer_checkpoint_set_plan_id(sched, 1);
+    setup_ok = setup_ok && ggml_backend_sched_alloc_graph(sched, graph);
+    if (!check(setup_ok, scenario, "fork/join route preparation failed")) {
+        cleanup();
+        return false;
+    }
+
+    const float expected[6] = { 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f };
+    ggml_backend_tensor_set(input, expected, 0, sizeof(expected));
+    for (const auto & selector : selector_weights) {
+        std::vector<float> values((size_t) 6 * (size_t) selector.size, 0.0f);
+        for (int64_t row = 0; row < selector.size; ++row) {
+            values[(size_t) row * 6 + (size_t) selector.start + (size_t) row] = 1.0f;
+        }
+        ggml_backend_tensor_set(
+                selector.tensor, values.data(), 0, values.size() * sizeof(values[0]));
+    }
+    bool ok = check(
+            ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS,
+            scenario, "graph compute failed");
+    float actual[6] = {};
+    if (ok) {
+        ggml_backend_tensor_get(output, actual, 0, sizeof(actual));
+        for (int i = 0; i < 6; ++i) {
+            ok = check(std::fabs(actual[i] - expected[i]) < 1e-5f,
+                    scenario, "alternate fork/join output mismatch") && ok;
+        }
+    }
+
+    ggml_backend_sched_route_candidate_stats stats = {};
+    ggml_backend_sched_get_route_candidate_stats(sched, &stats);
+    ok =
+        check(stats.groups_executed == 1, scenario, "unexpected route group count") &&
+        check(stats.alternate_selected == 1, scenario, "alternate fork/join was not selected") &&
+        check(stats.canonical_commits == 1, scenario, "alternate output was not committed") &&
+        check(stats.plan_misses == 0, scenario, "unexpected plan miss") && ok;
+
+    cleanup();
+    return ok;
+}
+
 static bool run_default_off_case() {
     const char * scenario = "default-off";
     callback_script baseline_script;
@@ -875,6 +1017,7 @@ int main() {
     ok = run_boundary_producer_cancels_stale_request_case() && ok;
     ok = run_subgraph_layer_switch_case() && ok;
     ok = run_multi_consumer_commit_case() && ok;
+    ok = run_attn_out_fork_join_subgraph_case() && ok;
     ok = run_alternate_terminal_lifetime_case() && ok;
 
     if (ok) {

@@ -243,6 +243,35 @@ int main(void) {
     assert(attn_qkv_modes_non_conflict_params.attn_qkv_parallel == false);
     assert(attn_qkv_modes_non_conflict_params.attn_qkv_shards == true);
 
+    common_params attn_out_shards_default_params;
+    assert(attn_out_shards_default_params.attn_out_shards == false);
+    const llama_model_params attn_out_model_api_default_params = llama_model_default_params();
+    assert(attn_out_model_api_default_params.attn_out_shards == false);
+    const llama_context_params attn_out_context_api_default_params = llama_context_default_params();
+    assert(attn_out_context_api_default_params.attn_out_shards == false);
+
+    common_params attn_out_shards_on_params;
+    argv = {"binary_name", "-m", "model.gguf", "--attn-out-shards", "on"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), attn_out_shards_on_params, LLAMA_EXAMPLE_COMPLETION));
+    assert(attn_out_shards_on_params.attn_out_shards == true);
+    const llama_model_params attn_out_model_on_params = common_model_params_to_llama(attn_out_shards_on_params);
+    assert(attn_out_model_on_params.attn_out_shards == true);
+    const llama_context_params attn_out_context_on_params = common_context_params_to_llama(attn_out_shards_on_params);
+    assert(attn_out_context_on_params.attn_out_shards == true);
+
+    common_params attn_out_shards_off_params;
+    argv = {"binary_name", "-m", "model.gguf", "--attn-out-shards", "off"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), attn_out_shards_off_params, LLAMA_EXAMPLE_COMPLETION));
+    assert(attn_out_shards_off_params.attn_out_shards == false);
+    const llama_model_params attn_out_model_off_params = common_model_params_to_llama(attn_out_shards_off_params);
+    assert(attn_out_model_off_params.attn_out_shards == false);
+    const llama_context_params attn_out_context_off_params = common_context_params_to_llama(attn_out_shards_off_params);
+    assert(attn_out_context_off_params.attn_out_shards == false);
+
+    common_params attn_out_shards_invalid_params;
+    argv = {"binary_name", "-m", "model.gguf", "--attn-out-shards", "invalid"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), attn_out_shards_invalid_params, LLAMA_EXAMPLE_COMPLETION));
+
     common_params max_query_unlimited_params;
     argv = {"binary_name", "-m", "model.gguf", "--max-query-number", "-1"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), max_query_unlimited_params, LLAMA_EXAMPLE_COMPLETION));
@@ -291,6 +320,12 @@ int main(void) {
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), attn_qkv_modes_env_conflict_params, LLAMA_EXAMPLE_COMPLETION));
     unsetenv("LLAMA_ARG_ATTN_QKV_PARALLEL");
     unsetenv("LLAMA_ARG_ATTN_QKV_SHARDS");
+
+    setenv("LLAMA_ARG_ATTN_OUT_SHARDS", "on", true);
+    common_params attn_out_shards_env_params;
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), attn_out_shards_env_params, LLAMA_EXAMPLE_COMPLETION));
+    assert(attn_out_shards_env_params.attn_out_shards == true);
+    unsetenv("LLAMA_ARG_ATTN_OUT_SHARDS");
 
     printf("test-arg-parser: test negated environment variables\n\n");
 
