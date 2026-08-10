@@ -517,6 +517,11 @@ struct common_params {
     // exclusive with whole-projection attn_qkv_parallel execution.
     bool attn_qkv_shards = false;
 
+    // Input-row sharding of the prefill attention output projection. This is
+    // propagated to both model-load and context params so residency is ready
+    // before the partitioned graph can be selected.
+    bool attn_out_shards = false;
+
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale
 

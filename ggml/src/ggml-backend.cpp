@@ -786,6 +786,9 @@ struct ggml_backend_sched_split {
     int i_end;
     int checkpoint_index_after;
     bool is_ffn_parallel_reduce;
+    bool has_attn_out_parallel_concat;
+    int attn_out_parallel_concat_layer;
+    int attn_out_parallel_concat_branches;
     bool contains_transformer_layer;
     struct ggml_tensor * inputs[GGML_SCHED_MAX_SPLIT_INPUTS];
     int n_inputs;
@@ -897,6 +900,7 @@ struct ggml_backend_sched_route_candidate_state {
 };
 
 using ggml_backend_cpu_prewake_hold_t = bool (*)(ggml_backend_t backend, uint32_t hold_us);
+using ggml_backend_async_flush_t = void (*)(ggml_backend_t backend);
 
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
@@ -949,6 +953,8 @@ struct ggml_backend_sched {
     uint32_t cpu_graph_prewake_idle_us;
     int64_t cpu_graph_last_end_us[GGML_SCHED_MAX_BACKENDS];
     ggml_backend_cpu_prewake_hold_t cpu_graph_prewake_hold_fns[GGML_SCHED_MAX_BACKENDS];
+    ggml_backend_async_flush_t async_flush_fns[GGML_SCHED_MAX_BACKENDS];
+    bool attn_out_defer_opencl_sync;
 
     // Non-trivial worker state is owned separately because this scheduler is
     // allocated with calloc/free.
@@ -1007,8 +1013,11 @@ using ggml_backend_sched_ffn_job_fn = void (*)(void *);
 enum ggml_backend_sched_ffn_worker_mode {
     GGML_SCHED_FFN_WORKER_NONE = 0,
     GGML_SCHED_FFN_WORKER_CALLER,
+    GGML_SCHED_FFN_WORKER_CALLER_DEFERRED,
     GGML_SCHED_FFN_WORKER_PERSISTENT,
+    GGML_SCHED_FFN_WORKER_PERSISTENT_DEFERRED,
     GGML_SCHED_FFN_WORKER_TRANSIENT,
+    GGML_SCHED_FFN_WORKER_TRANSIENT_DEFERRED,
     GGML_SCHED_FFN_WORKER_SERIAL,
 };
 
@@ -1044,6 +1053,8 @@ struct alignas(64) ggml_backend_sched_ffn_worker_timeline {
     int64_t graph_compute_return_us = -1;
     int64_t sync_begin_us = -1;
     int64_t sync_end_us = -1;
+    int64_t sync_tid = -1;
+    int sync_cpu = -1;
     int64_t job_end_us = -1;
     int64_t completion_publish_us = -1;
     int64_t collect_begin_us = -1;
@@ -1368,6 +1379,28 @@ static bool ggml_backend_sched_ffn_persistent_workers_enabled() {
         strcmp(value, "yes") == 0 || strcmp(value, "YES") == 0;
 }
 
+static bool ggml_backend_sched_attn_out_defer_opencl_sync_enabled() {
+    const char * value = getenv("GGML_ATTN_OUT_DEFER_OPENCL_SYNC");
+    if (value == nullptr || value[0] == '\0') {
+        return true;
+    }
+    if (strcmp(value, "1") == 0 || strcmp(value, "on") == 0 || strcmp(value, "ON") == 0 ||
+            strcmp(value, "true") == 0 || strcmp(value, "TRUE") == 0 ||
+            strcmp(value, "yes") == 0 || strcmp(value, "YES") == 0) {
+        return true;
+    }
+    if (strcmp(value, "0") == 0 || strcmp(value, "off") == 0 || strcmp(value, "OFF") == 0 ||
+            strcmp(value, "false") == 0 || strcmp(value, "FALSE") == 0 ||
+            strcmp(value, "no") == 0 || strcmp(value, "NO") == 0) {
+        return false;
+    }
+
+    GGML_LOG_WARN(
+            "%s: invalid GGML_ATTN_OUT_DEFER_OPENCL_SYNC='%s'; using legacy immediate synchronization\n",
+            __func__, value);
+    return false;
+}
+
 static int ggml_backend_sched_ffn_worker_cpu(const char * env_name, int fallback_cpu) {
     GGML_ASSERT(env_name != nullptr);
 
@@ -1442,6 +1475,8 @@ struct ggml_backend_sched_ffn_device_job {
     enum ggml_status * status = nullptr;
     int64_t * dt_us = nullptr;
     ggml_backend_sched_ffn_worker_timeline * timeline = nullptr;
+    ggml_backend_async_flush_t flush_after_submit = nullptr;
+    bool sync_after = true;
 };
 
 static void ggml_backend_sched_run_ffn_device_job(void * context) {
@@ -1463,15 +1498,26 @@ static void ggml_backend_sched_run_ffn_device_job(void * context) {
             job->timeline->graph_compute_return_us = ggml_time_us();
         }
         if (status == GGML_STATUS_SUCCESS) {
-            // Parallel FFN device branches must finish before the reduce split can
-            // consume them. Keep this synchronization on the backend's dedicated
-            // persistent host thread.
-            if (job->timeline != nullptr) {
-                job->timeline->sync_begin_us = ggml_time_us();
+            if (job->flush_after_submit != nullptr) {
+                // Start an output-axis W_O OpenCL lane without waiting for host
+                // completion here. The scheduler owns the matching synchronize
+                // after all parallel submissions have been collected and before
+                // the CONCAT join is allowed to run.
+                job->flush_after_submit(job->backend);
             }
-            ggml_backend_synchronize(job->backend);
-            if (job->timeline != nullptr) {
-                job->timeline->sync_end_us = ggml_time_us();
+            if (job->sync_after) {
+                // Ordinary parallel device branches must finish before their join
+                // split can consume them. Keep that synchronization on the
+                // backend's dedicated persistent host thread.
+                if (job->timeline != nullptr) {
+                    job->timeline->sync_begin_us = ggml_time_us();
+                    job->timeline->sync_tid = ggml_backend_sched_current_tid();
+                    job->timeline->sync_cpu = ggml_backend_sched_current_cpu();
+                }
+                ggml_backend_synchronize(job->backend);
+                if (job->timeline != nullptr) {
+                    job->timeline->sync_end_us = ggml_time_us();
+                }
             }
         }
     } catch (const std::exception & error) {
@@ -1627,7 +1673,7 @@ static ggml_backend_node_wall_trace_state g_node_wall_trace;
 static constexpr size_t GGML_NODE_WALL_TRACE_ROW_RESERVE = 8192;
 
 struct ggml_backend_sched_ffn_worker_trace_row {
-    int schema_version = 2;
+    int schema_version = 3;
     int64_t trace_session_id = -1;
     int64_t group_seq = -1;
     int64_t job_id = -1;
@@ -1970,13 +2016,23 @@ static const char * ggml_sched_profile_phase_name(enum ggml_backend_sched_profil
 
 static const char * ggml_ffn_worker_mode_name(enum ggml_backend_sched_ffn_worker_mode mode) {
     switch (mode) {
-        case GGML_SCHED_FFN_WORKER_CALLER:     return "caller";
-        case GGML_SCHED_FFN_WORKER_PERSISTENT: return "persistent";
-        case GGML_SCHED_FFN_WORKER_TRANSIENT:  return "transient";
-        case GGML_SCHED_FFN_WORKER_SERIAL:     return "serial_fallback";
-        case GGML_SCHED_FFN_WORKER_NONE:       return "none";
+        case GGML_SCHED_FFN_WORKER_CALLER:               return "caller";
+        case GGML_SCHED_FFN_WORKER_CALLER_DEFERRED:      return "caller_deferred_sync";
+        case GGML_SCHED_FFN_WORKER_PERSISTENT:           return "persistent";
+        case GGML_SCHED_FFN_WORKER_PERSISTENT_DEFERRED:  return "persistent_deferred_sync";
+        case GGML_SCHED_FFN_WORKER_TRANSIENT:            return "transient";
+        case GGML_SCHED_FFN_WORKER_TRANSIENT_DEFERRED:   return "transient_deferred_sync";
+        case GGML_SCHED_FFN_WORKER_SERIAL:               return "serial_fallback";
+        case GGML_SCHED_FFN_WORKER_NONE:                 return "none";
     }
     return "unknown";
+}
+
+static bool ggml_ffn_worker_mode_is_deferred(
+        enum ggml_backend_sched_ffn_worker_mode mode) {
+    return mode == GGML_SCHED_FFN_WORKER_CALLER_DEFERRED ||
+        mode == GGML_SCHED_FFN_WORKER_PERSISTENT_DEFERRED ||
+        mode == GGML_SCHED_FFN_WORKER_TRANSIENT_DEFERRED;
 }
 
 static const char * ggml_ffn_collect_kind_name(enum ggml_backend_sched_ffn_collect_kind kind) {
@@ -2002,7 +2058,7 @@ static constexpr char GGML_FFN_WORKER_TRACE_CSV_HEADER[] =
         "affinity_cpu,start_cpu,end_cpu,wait_blocked,collect_order,"
         "group_begin_us,copy_end_us,compute_begin_us,dispatch_begin_us,dispatch_end_us,"
         "job_enqueued_us,worker_dequeue_us,job_start_us,backend_begin_us,"
-        "graph_compute_return_us,sync_begin_us,sync_end_us,job_end_us,"
+        "graph_compute_return_us,sync_begin_us,sync_end_us,sync_tid,sync_cpu,job_end_us,"
         "completion_publish_us,collect_begin_us,collect_end_us,group_end_us,"
         "group_copy_us,post_copy_setup_us,dispatch_us,queue_delay_us,dispatch_to_start_us,"
         "worker_setup_us,graph_call_us,post_graph_cleanup_us,sync_wait_us,"
@@ -2160,6 +2216,8 @@ static void ggml_ffn_worker_trace_flush_rows(void) {
             row.timeline.graph_compute_return_us,
             row.timeline.sync_begin_us,
             row.timeline.sync_end_us,
+            row.timeline.sync_tid,
+            row.timeline.sync_cpu,
             row.timeline.job_end_us,
             row.timeline.completion_publish_us,
             row.timeline.collect_begin_us,
@@ -3749,6 +3807,46 @@ static bool ggml_backend_sched_parse_attn_qkv_shard_branch_name(
     return true;
 }
 
+static bool ggml_backend_sched_parse_attn_out_shard_branch_name(
+        const char * name,
+        std::string * branch,
+        int * layer) {
+    static constexpr char prefix[] = "attn_out_shard.";
+    if (name == nullptr || strncmp(name, prefix, sizeof(prefix) - 1) != 0) {
+        return false;
+    }
+
+    const char * branch_start = name + sizeof(prefix) - 1;
+    const char * stage_start = strchr(branch_start, '.');
+    const char * layer_start = stage_start != nullptr
+        ? strrchr(stage_start + 1, '-')
+        : nullptr;
+    if (stage_start == nullptr || stage_start == branch_start ||
+            layer_start == nullptr || layer_start <= stage_start + 1 ||
+            layer_start[1] == '\0') {
+        return false;
+    }
+
+    const std::string stage(stage_start + 1, layer_start - stage_start - 1);
+    if (stage != "input" && stage != "proj") {
+        return false;
+    }
+
+    char * end = nullptr;
+    const long parsed_layer = strtol(layer_start + 1, &end, 10);
+    if (end == layer_start + 1 || *end != '\0') {
+        return false;
+    }
+
+    if (branch != nullptr) {
+        branch->assign(branch_start, stage_start - branch_start);
+    }
+    if (layer != nullptr) {
+        *layer = (int) parsed_layer;
+    }
+    return true;
+}
+
 static bool ggml_backend_sched_parse_parallel_branch_name(
         const char * name,
         std::string * kind,
@@ -3763,6 +3861,12 @@ static bool ggml_backend_sched_parse_parallel_branch_name(
     if (ggml_backend_sched_parse_attn_qkv_shard_branch_name(name, branch, layer)) {
         if (kind != nullptr) {
             *kind = "attn_qkv_shard";
+        }
+        return true;
+    }
+    if (ggml_backend_sched_parse_attn_out_shard_branch_name(name, branch, layer)) {
+        if (kind != nullptr) {
+            *kind = "attn_out_shard";
         }
         return true;
     }
@@ -3795,6 +3899,14 @@ static bool ggml_backend_sched_parse_parallel_branch_node(
         return true;
     }
     if (node != nullptr &&
+            ggml_backend_sched_parse_attn_out_shard_branch_name(
+                node->name, branch, layer)) {
+        if (kind != nullptr) {
+            *kind = "attn_out_shard";
+        }
+        return true;
+    }
+    if (node != nullptr &&
             ggml_backend_sched_parse_attn_qkv_branch_name(node->name, branch, layer)) {
         if (kind != nullptr) {
             *kind = "attn_qkv";
@@ -3804,36 +3916,43 @@ static bool ggml_backend_sched_parse_parallel_branch_node(
     return false;
 }
 
-static bool ggml_backend_sched_is_ffn_parallel_branch_node(const struct ggml_tensor * node) {
-    return ggml_backend_sched_parse_ffn_parallel_branch_node(node, nullptr, nullptr);
+static bool ggml_backend_sched_is_parallel_branch_node(const struct ggml_tensor * node) {
+    return ggml_backend_sched_parse_parallel_branch_node(node, nullptr, nullptr, nullptr);
 }
 
-struct ggml_backend_sched_ffn_reduce_info {
+struct ggml_backend_sched_parallel_reduce_info {
+    std::string kind;
     int layer = -1;
     std::vector<std::string> branches;
 };
 
-static bool ggml_backend_sched_collect_ffn_parallel_reduce_info(
-        const struct ggml_tensor * node, ggml_backend_sched_ffn_reduce_info * info) {
+static bool ggml_backend_sched_collect_parallel_join_info(
+        const struct ggml_tensor * node,
+        enum ggml_op join_op,
+        ggml_backend_sched_parallel_reduce_info * info) {
+    std::string kind;
     std::string branch;
     int layer = -1;
-    if (ggml_backend_sched_parse_ffn_parallel_branch_node(node, &branch, &layer)) {
+    if (ggml_backend_sched_parse_parallel_branch_node(node, &kind, &branch, &layer)) {
+        info->kind = std::move(kind);
         info->layer = layer;
         info->branches = { std::move(branch) };
         return true;
     }
-    if (node == nullptr || node->op != GGML_OP_ADD || node->src[0] == nullptr || node->src[1] == nullptr) {
+    if (node == nullptr || node->op != join_op ||
+            node->src[0] == nullptr || node->src[1] == nullptr) {
         return false;
     }
 
-    ggml_backend_sched_ffn_reduce_info lhs;
-    ggml_backend_sched_ffn_reduce_info rhs;
-    if (!ggml_backend_sched_collect_ffn_parallel_reduce_info(node->src[0], &lhs) ||
-            !ggml_backend_sched_collect_ffn_parallel_reduce_info(node->src[1], &rhs) ||
-            lhs.layer != rhs.layer) {
+    ggml_backend_sched_parallel_reduce_info lhs;
+    ggml_backend_sched_parallel_reduce_info rhs;
+    if (!ggml_backend_sched_collect_parallel_join_info(node->src[0], join_op, &lhs) ||
+            !ggml_backend_sched_collect_parallel_join_info(node->src[1], join_op, &rhs) ||
+            lhs.kind != rhs.kind || lhs.layer != rhs.layer) {
         return false;
     }
 
+    info->kind = std::move(lhs.kind);
     info->layer = lhs.layer;
     info->branches = std::move(lhs.branches);
     for (std::string & rhs_branch : rhs.branches) {
@@ -3845,10 +3964,34 @@ static bool ggml_backend_sched_collect_ffn_parallel_reduce_info(
     return true;
 }
 
-static bool ggml_backend_sched_is_ffn_parallel_reduce_node(const struct ggml_tensor * node) {
-    ggml_backend_sched_ffn_reduce_info info;
+static bool ggml_backend_sched_collect_parallel_reduce_info(
+        const struct ggml_tensor * node, ggml_backend_sched_parallel_reduce_info * info) {
+    return ggml_backend_sched_collect_parallel_join_info(node, GGML_OP_ADD, info);
+}
+
+static bool ggml_backend_sched_is_parallel_reduce_node(const struct ggml_tensor * node) {
+    ggml_backend_sched_parallel_reduce_info info;
     return node != nullptr && node->op == GGML_OP_ADD &&
-        ggml_backend_sched_collect_ffn_parallel_reduce_info(node, &info) && info.branches.size() >= 2;
+        ggml_backend_sched_collect_parallel_reduce_info(node, &info) && info.branches.size() >= 2;
+}
+
+static bool ggml_backend_sched_is_parallel_concat_node(const struct ggml_tensor * node) {
+    ggml_backend_sched_parallel_reduce_info info;
+    return node != nullptr && node->op == GGML_OP_CONCAT &&
+        ggml_backend_sched_collect_parallel_join_info(node, GGML_OP_CONCAT, &info) &&
+        info.branches.size() >= 2;
+}
+
+static bool ggml_backend_sched_is_parallel_join_node(const struct ggml_tensor * node) {
+    return ggml_backend_sched_is_parallel_reduce_node(node) ||
+        ggml_backend_sched_is_parallel_concat_node(node);
+}
+
+static bool ggml_backend_sched_is_ffn_parallel_reduce_node(const struct ggml_tensor * node) {
+    ggml_backend_sched_parallel_reduce_info info;
+    return node != nullptr && node->op == GGML_OP_ADD &&
+        ggml_backend_sched_collect_parallel_reduce_info(node, &info) &&
+        info.kind == "ffn" && info.branches.size() >= 2;
 }
 
 static bool ggml_backend_sched_route_tensor_registered(
@@ -3930,12 +4073,12 @@ static bool ggml_backend_sched_prepare_route_candidate_graph(
             return false;
         }
         if (!registration.subgraph &&
-                (ggml_backend_sched_is_ffn_parallel_branch_node(canonical) ||
-                ggml_backend_sched_is_ffn_parallel_reduce_node(canonical) ||
-                ggml_backend_sched_is_ffn_parallel_branch_node(variant) ||
-                ggml_backend_sched_is_ffn_parallel_reduce_node(variant))) {
+                (ggml_backend_sched_is_parallel_branch_node(canonical) ||
+                ggml_backend_sched_is_parallel_join_node(canonical) ||
+                ggml_backend_sched_is_parallel_branch_node(variant) ||
+                ggml_backend_sched_is_parallel_join_node(variant))) {
             GGML_LOG_ERROR(
-                    "%s: FFN branch/reduce node cannot be a route candidate (%s -> %s)\n",
+                    "%s: parallel branch/join node cannot be a route candidate (%s -> %s)\n",
                     __func__, canonical->name, variant->name);
             return false;
         }
@@ -4552,6 +4695,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         split->n_inputs = 0;
         split->checkpoint_index_after = -1;
         split->is_ffn_parallel_reduce = false;
+        split->has_attn_out_parallel_concat = false;
+        split->attn_out_parallel_concat_layer = -1;
+        split->attn_out_parallel_concat_branches = 0;
         int cur_backend_id = split->backend_id;
         int pending_checkpoint_index = -1;
         size_t next_checkpoint = 0;
@@ -4566,10 +4712,30 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         bool cur_split_has_compute_node = false;
         std::unordered_map<std::string, std::unordered_set<std::string>>
             parallel_branches_by_kind_layer;
+        std::vector<bool> parallel_join_nodes(graph->n_nodes, false);
         std::vector<bool> ffn_parallel_reduce_nodes(graph->n_nodes, false);
+        std::vector<std::string> parallel_join_kinds(graph->n_nodes);
+        std::vector<int> parallel_join_layers(graph->n_nodes, -1);
+        std::vector<int> parallel_join_branch_counts(graph->n_nodes, 0);
         for (int j = 0; j < graph->n_nodes; ++j) {
             const struct ggml_tensor * node = graph->nodes[j];
-            ffn_parallel_reduce_nodes[j] = ggml_backend_sched_is_ffn_parallel_reduce_node(node);
+            // Classify one homogeneous ADD-reduction or CONCAT-assembly tree.
+            // FFN's CPU thread override remains ADD-only, while either join op
+            // must be kept out of the final branch split.
+            ggml_backend_sched_parallel_reduce_info join_info;
+            const bool has_supported_join_op = node != nullptr &&
+                (node->op == GGML_OP_ADD || node->op == GGML_OP_CONCAT);
+            const bool is_parallel_join = has_supported_join_op &&
+                ggml_backend_sched_collect_parallel_join_info(node, node->op, &join_info) &&
+                join_info.branches.size() >= 2;
+            parallel_join_nodes[j] = is_parallel_join;
+            ffn_parallel_reduce_nodes[j] = is_parallel_join && node->op == GGML_OP_ADD &&
+                join_info.kind == "ffn";
+            if (is_parallel_join) {
+                parallel_join_kinds[j] = join_info.kind;
+                parallel_join_layers[j] = join_info.layer;
+                parallel_join_branch_counts[j] = (int) join_info.branches.size();
+            }
             std::string kind;
             std::string branch;
             int layer = -1;
@@ -4642,6 +4808,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             int node_parallel_layer = -1;
             const bool node_is_parallel_branch = ggml_backend_sched_parse_parallel_branch_node(
                     node, &node_parallel_kind, &node_parallel_branch, &node_parallel_layer);
+            const bool node_is_parallel_join = parallel_join_nodes[i];
             const bool node_is_ffn_parallel_reduce = ffn_parallel_reduce_nodes[i];
             const int node_route_group = route_candidate_mode
                 ? route_state->node_to_group[i] : -1;
@@ -4676,24 +4843,27 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     node_is_parallel_branch &&
                     (cur_parallel_kind == "attn_qkv" || node_parallel_kind == "attn_qkv" ||
                      cur_parallel_kind == "attn_qkv_shard" ||
-                     node_parallel_kind == "attn_qkv_shard") &&
+                     node_parallel_kind == "attn_qkv_shard" ||
+                     cur_parallel_kind == "attn_out_shard" ||
+                     node_parallel_kind == "attn_out_shard") &&
                     (cur_parallel_kind != node_parallel_kind ||
                      cur_parallel_branch != node_parallel_branch ||
                      cur_parallel_layer != node_parallel_layer)) {
                 // Whole Q/K/V branches need one split per projection. Sharded
-                // QKV instead keeps all Q/K/V work for a lane together and
-                // starts a new split only when the lane changes. Execution
-                // safely chooses serial fallback for duplicate backend IDs.
-                // Keep the legacy same-backend FFN behavior unchanged.
+                // QKV keeps all Q/K/V work for a lane together, while sharded
+                // W_O keeps its compact input and projection together. Both
+                // start a new split only when the lane changes. Execution safely
+                // chooses serial fallback for duplicate backend IDs. Keep the
+                // legacy same-backend FFN behavior unchanged.
                 need_new_split = true;
             }
             if (node_backend_id == cur_backend_id &&
                     cur_split_has_parallel_branch &&
-                    node_is_ffn_parallel_reduce) {
-                // Keep each FFN shard branch split pure. When the reduce backend
-                // equals the backend of the last branch, the default scheduler
-                // would fuse that branch and the reduce ADDs into one split. That
-                // prevents the branch from joining the parallel FFN group.
+                    node_is_parallel_join) {
+                // Keep each parallel branch split pure. When the reduce backend
+                // or CONCAT backend equals the backend of the last branch, the
+                // default scheduler would fuse that branch and the join into one
+                // split. That prevents the branch from joining its parallel group.
                 need_new_split = true;
             }
             if (node_backend_id == cur_backend_id &&
@@ -4781,6 +4951,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 split->n_inputs = 0;
                 split->checkpoint_index_after = -1;
                 split->is_ffn_parallel_reduce = false;
+                split->has_attn_out_parallel_concat = false;
+                split->attn_out_parallel_concat_layer = -1;
+                split->attn_out_parallel_concat_branches = 0;
                 cur_backend_id = node_backend_id;
                 cur_split_has_parallel_branch = false;
                 cur_split_needs_parallel_branch_isolation = false;
@@ -4804,6 +4977,17 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             if (node_is_ffn_parallel_reduce) {
                 cur_split_has_ffn_parallel_reduce = true;
                 split->is_ffn_parallel_reduce = true;
+            }
+            if (node_is_parallel_join && node->op == GGML_OP_CONCAT &&
+                    parallel_join_kinds[i] == "attn_out_shard" &&
+                    parallel_join_branch_counts[i] >
+                        split->attn_out_parallel_concat_branches) {
+                // Preserve the pre-copy graph classification. Pass 5 replaces
+                // foreign lane sources with copy tensors, so reconstructing the
+                // CONCAT ancestry later during execution would lose branch names.
+                split->has_attn_out_parallel_concat = true;
+                split->attn_out_parallel_concat_layer = parallel_join_layers[i];
+                split->attn_out_parallel_concat_branches = parallel_join_branch_counts[i];
             }
             cur_route_group = node_route_group;
             cur_route_variant = node_route_variant;
@@ -5184,8 +5368,17 @@ static bool ggml_backend_sched_split_ffn_branch_info(
     ggml_backend_sched_ffn_branch_info split_info;
 
     for (int i = 0; i < split->graph.n_nodes; ++i) {
+        const struct ggml_tensor * node = split->graph.nodes[i];
+        // View nodes are metadata-only and pass 5 deliberately does not use
+        // them as split boundaries. A following lane's input view can therefore
+        // fall inside the preceding compute split's index range. Ignore such
+        // views when checking that all executable nodes belong to one branch.
+        if (ggml_is_view_op(node->op)) {
+            continue;
+        }
+
         ggml_backend_sched_ffn_branch_info node_info;
-        if (!ggml_backend_sched_parse_ffn_branch_node(split->graph.nodes[i], &node_info)) {
+        if (!ggml_backend_sched_parse_ffn_branch_node(node, &node_info)) {
             return false;
         }
 
@@ -5269,7 +5462,63 @@ static int ggml_backend_sched_collect_parallel_ffn_group(
         return 3;
     }
 
+    if (first.kind == "attn_out_shard") {
+        // W_O may be an input-axis partition followed by ADD reduction or an
+        // output-axis partition followed by CONCAT assembly. Either layout is
+        // safe to launch only when all three unique lanes were isolated as
+        // consecutive branch splits.
+        if (infos->size() != 3) {
+            infos->clear();
+            return 0;
+        }
+        return 3;
+    }
+
     return infos->size() >= 2 || allow_single ? (int) infos->size() : 0;
+}
+
+static int ggml_backend_sched_attn_out_deferred_sync_branch(
+        const ggml_backend_sched_t sched,
+        const struct ggml_backend_sched_split * splits,
+        int scan_end,
+        int split_id,
+        int group_size,
+        const std::vector<ggml_backend_sched_ffn_branch_info> & infos,
+        bool run_group_serially) {
+    GGML_ASSERT(sched != nullptr);
+    GGML_ASSERT(splits != nullptr);
+
+    if (!sched->attn_out_defer_opencl_sync || run_group_serially || group_size != 3 ||
+            (int) infos.size() != group_size || infos[0].kind != "attn_out_shard") {
+        return -1;
+    }
+
+    const int join_split_id = split_id + group_size;
+    if (join_split_id >= scan_end) {
+        return -1;
+    }
+
+    const struct ggml_backend_sched_split * join_split = &splits[join_split_id];
+    if (!join_split->has_attn_out_parallel_concat ||
+            join_split->attn_out_parallel_concat_layer != infos[0].layer ||
+            join_split->attn_out_parallel_concat_branches != group_size) {
+        return -1;
+    }
+
+    int deferred_branch = -1;
+    for (int i = 0; i < group_size; ++i) {
+        const int backend_id = splits[split_id + i].backend_id;
+        if (backend_id != join_split->backend_id || sched->async_flush_fns[backend_id] == nullptr) {
+            continue;
+        }
+        if (deferred_branch >= 0) {
+            // Unique group backends should make this impossible, but fail closed
+            // if a future graph layout violates that contract.
+            return -1;
+        }
+        deferred_branch = i;
+    }
+    return deferred_branch;
 }
 
 struct ggml_backend_sched_trace_io_times {
@@ -5359,6 +5608,11 @@ static int64_t ggml_ffn_worker_trace_delta(int64_t end_us, int64_t begin_us) {
     return end_us >= 0 && begin_us >= 0 ? end_us - begin_us : -1;
 }
 
+static int64_t ggml_ffn_worker_trace_effective_finish_us(
+        const ggml_backend_sched_ffn_worker_timeline & timeline) {
+    return std::max(timeline.job_end_us, timeline.sync_end_us);
+}
+
 static void ggml_backend_sched_ffn_worker_trace_append_group(
         ggml_backend_sched_t sched,
         int64_t graph_id,
@@ -5388,22 +5642,27 @@ static void ggml_backend_sched_ffn_worker_trace_append_group(
 
     for (int i = 0; i < ffn_group_size; ++i) {
         const ggml_backend_sched_ffn_worker_timeline & timeline = timelines[i];
+        const bool deferred_sync = ggml_ffn_worker_mode_is_deferred(timeline.mode);
         if (timeline.backend_begin_us >= 0) {
             first_backend_begin_us = first_backend_begin_us < 0
                 ? timeline.backend_begin_us
                 : std::min(first_backend_begin_us, timeline.backend_begin_us);
             last_backend_begin_us = std::max(last_backend_begin_us, timeline.backend_begin_us);
         }
-        if (timeline.sync_end_us >= 0) {
-            last_backend_finish_us = std::max(last_backend_finish_us, timeline.sync_end_us);
+        const int64_t effective_finish_us =
+            ggml_ffn_worker_trace_effective_finish_us(timeline);
+        if (!deferred_sync && effective_finish_us >= 0) {
+            last_backend_finish_us = std::max(last_backend_finish_us, effective_finish_us);
         }
         if (timeline.completion_publish_us >= 0) {
             last_completion_publish_us = std::max(
                     last_completion_publish_us, timeline.completion_publish_us);
         }
-        longest_branch_wall_us = std::max(
-                longest_branch_wall_us,
-                ggml_ffn_worker_trace_delta(timeline.job_end_us, timeline.job_start_us));
+        if (!deferred_sync) {
+            longest_branch_wall_us = std::max(
+                    longest_branch_wall_us,
+                    ggml_ffn_worker_trace_delta(effective_finish_us, timeline.job_start_us));
+        }
     }
 
     const int64_t group_seq = g_ffn_worker_trace.next_group_seq++;
@@ -5436,7 +5695,9 @@ static void ggml_backend_sched_ffn_worker_trace_append_group(
         row.layer = ffn_group_infos[i].layer;
         row.node_count = graph.n_nodes;
         row.status = statuses[i];
-        row.sched_compute_wall_us = sched_compute_wall_us[i] > 0
+        const bool deferred_sync =
+            ggml_ffn_worker_mode_is_deferred(timelines[i].mode);
+        row.sched_compute_wall_us = !deferred_sync && sched_compute_wall_us[i] > 0
             ? sched_compute_wall_us[i]
             : -1;
         row.group_begin_us = group_begin_us;
@@ -5463,6 +5724,8 @@ static void ggml_backend_sched_ffn_worker_trace_append_group(
                 ffn_group_infos[i].branch.c_str());
 
         const ggml_backend_sched_ffn_worker_timeline & timeline = row.timeline;
+        const int64_t effective_finish_us =
+            ggml_ffn_worker_trace_effective_finish_us(timeline);
         row.group_copy_us = ggml_ffn_worker_trace_delta(copy_end_us, group_begin_us);
         row.post_copy_setup_us = ggml_ffn_worker_trace_delta(compute_begin_us, copy_end_us);
         row.dispatch_us = ggml_ffn_worker_trace_delta(
@@ -5475,14 +5738,20 @@ static void ggml_backend_sched_ffn_worker_trace_append_group(
                 timeline.backend_begin_us, timeline.job_start_us);
         row.graph_call_us = ggml_ffn_worker_trace_delta(
                 timeline.graph_compute_return_us, timeline.backend_begin_us);
-        row.post_graph_cleanup_us = ggml_ffn_worker_trace_delta(
+        row.post_graph_cleanup_us = deferred_sync
+            ? -1
+            : ggml_ffn_worker_trace_delta(
                 timeline.sync_begin_us, timeline.graph_compute_return_us);
         row.sync_wait_us = ggml_ffn_worker_trace_delta(
                 timeline.sync_end_us, timeline.sync_begin_us);
-        row.job_finalize_us = ggml_ffn_worker_trace_delta(
-                timeline.job_end_us, timeline.sync_end_us);
-        row.branch_wall_us = ggml_ffn_worker_trace_delta(
-                timeline.job_end_us, timeline.job_start_us);
+        row.job_finalize_us = deferred_sync
+            ? -1
+            : ggml_ffn_worker_trace_delta(effective_finish_us, timeline.sync_end_us);
+        // A deferred full sync begins only after sibling CPU/NPU work. Its end
+        // proves join readiness but cannot recover this lane's device wall.
+        row.branch_wall_us = deferred_sync
+            ? -1
+            : ggml_ffn_worker_trace_delta(effective_finish_us, timeline.job_start_us);
         row.publish_delay_us = ggml_ffn_worker_trace_delta(
                 timeline.completion_publish_us, timeline.job_end_us);
         row.collect_wait_us = ggml_ffn_worker_trace_delta(
@@ -5490,16 +5759,18 @@ static void ggml_backend_sched_ffn_worker_trace_append_group(
         row.start_offset_us = ggml_ffn_worker_trace_delta(
                 timeline.backend_begin_us, compute_begin_us);
         row.finish_offset_us = ggml_ffn_worker_trace_delta(
-                timeline.sync_end_us, compute_begin_us);
+                effective_finish_us, compute_begin_us);
         row.group_start_skew_us = group_start_skew_us;
         row.group_tail_after_last_backend_us = group_tail_after_last_backend_us;
         row.group_tail_after_last_publish_us = group_tail_after_last_publish_us;
         row.group_compute_wall_us = ggml_ffn_worker_trace_delta(group_end_us, compute_begin_us);
         row.group_wall_us = ggml_ffn_worker_trace_delta(group_end_us, group_begin_us);
         row.is_longest_duration =
-            row.branch_wall_us >= 0 && row.branch_wall_us == longest_branch_wall_us ? 1 : 0;
+            !deferred_sync && row.branch_wall_us >= 0 &&
+            row.branch_wall_us == longest_branch_wall_us ? 1 : 0;
         row.is_last_backend_finisher =
-            timeline.sync_end_us >= 0 && timeline.sync_end_us == last_backend_finish_us ? 1 : 0;
+            !deferred_sync && effective_finish_us >= 0 &&
+            effective_finish_us == last_backend_finish_us ? 1 : 0;
         row.is_last_completion_publisher =
             timeline.completion_publish_us >= 0 &&
             timeline.completion_publish_us == last_completion_publish_us ? 1 : 0;
@@ -6095,7 +6366,8 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
             struct ggml_backend_sched_split * split,
             int64_t * dt_us,
             bool sync_after,
-            ggml_backend_sched_ffn_worker_timeline * timeline) {
+            ggml_backend_sched_ffn_worker_timeline * timeline,
+            ggml_backend_async_flush_t flush_after_submit = nullptr) {
         ggml_backend_t split_backend = sched->backends[split->backend_id];
         ggml_backend_set_n_threads_t set_n_threads = ffn_reduce_set_n_threads(split);
         const int64_t t0_us = ggml_time_us();
@@ -6114,11 +6386,16 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                 timeline->graph_compute_return_us = ggml_time_us();
             }
         }
+        if (ec == GGML_STATUS_SUCCESS && flush_after_submit != nullptr) {
+            flush_after_submit(split_backend);
+        }
         if (ec == GGML_STATUS_SUCCESS && sync_after) {
             // FFN parallel groups need backend completion inside the parallel section.
             // Otherwise async backends can defer the real wait to the following split.
             if (timeline != nullptr) {
                 timeline->sync_begin_us = ggml_time_us();
+                timeline->sync_tid = ggml_backend_sched_current_tid();
+                timeline->sync_cpu = ggml_backend_sched_current_cpu();
             }
             ggml_backend_synchronize(split_backend);
             if (timeline != nullptr) {
@@ -6382,6 +6659,14 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                 }
             }
             const bool run_group_serially = !group_backends_unique || cpu_branch_count > 1;
+            const int deferred_sync_i = ggml_backend_sched_attn_out_deferred_sync_branch(
+                    sched,
+                    splits,
+                    ffn_scan_end,
+                    split_id,
+                    ffn_group_size,
+                    ffn_group_infos,
+                    run_group_serially);
 
             const int64_t group_t0_us = ggml_time_us();
             const int64_t copy_t0_us = group_t0_us;
@@ -6417,6 +6702,8 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
 
             std::vector<int64_t> dt_us(ffn_group_size, 0);
             std::vector<enum ggml_status> status(ffn_group_size, GGML_STATUS_SUCCESS);
+            int64_t deferred_submit_us = -1;
+            int64_t deferred_sync_wait_us = -1;
             const bool use_persistent_device_workers = sched->ffn_device_executor != nullptr;
             std::vector<std::thread> workers;
             if (!run_group_serially && !use_persistent_device_workers) {
@@ -6481,7 +6768,9 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                         ggml_backend_sched_ffn_worker_timeline * timeline =
                             group_timelines != nullptr ? &group_timelines[i] : nullptr;
                         if (timeline != nullptr) {
-                            timeline->mode = GGML_SCHED_FFN_WORKER_PERSISTENT;
+                            timeline->mode = i == deferred_sync_i
+                                ? GGML_SCHED_FFN_WORKER_PERSISTENT_DEFERRED
+                                : GGML_SCHED_FFN_WORKER_PERSISTENT;
                             timeline->collect_kind = GGML_SCHED_FFN_COLLECT_TICKET_WAIT;
                             timeline->dispatch_begin_us = ggml_time_us();
                         }
@@ -6490,6 +6779,10 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                         device_jobs[i].status = &status[i];
                         device_jobs[i].dt_us = &dt_us[i];
                         device_jobs[i].timeline = timeline;
+                        device_jobs[i].flush_after_submit = i == deferred_sync_i
+                            ? sched->async_flush_fns[device_split->backend_id]
+                            : nullptr;
+                        device_jobs[i].sync_after = i != deferred_sync_i;
                         const bool submitted = sched->ffn_device_executor->submit(
                                 device_split->backend_id,
                                 ggml_backend_sched_run_ffn_device_job,
@@ -6518,7 +6811,9 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                         ggml_backend_sched_ffn_worker_timeline * timeline =
                             group_timelines != nullptr ? &group_timelines[i] : nullptr;
                         if (timeline != nullptr) {
-                            timeline->mode = GGML_SCHED_FFN_WORKER_TRANSIENT;
+                            timeline->mode = i == deferred_sync_i
+                                ? GGML_SCHED_FFN_WORKER_TRANSIENT_DEFERRED
+                                : GGML_SCHED_FFN_WORKER_TRANSIENT;
                             timeline->collect_kind = GGML_SCHED_FFN_COLLECT_THREAD_JOIN;
                             timeline->dispatch_begin_us = ggml_time_us();
                         }
@@ -6548,7 +6843,13 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                             }
                             try {
                                 status[i] = compute_split_no_callback(
-                                        &splits[split_id + i], &dt_us[i], true, worker_timeline);
+                                        &splits[split_id + i],
+                                        &dt_us[i],
+                                        i != deferred_sync_i,
+                                        worker_timeline,
+                                        i == deferred_sync_i
+                                            ? sched->async_flush_fns[splits[split_id + i].backend_id]
+                                            : nullptr);
                             } catch (const std::exception & error) {
                                 status[i] = GGML_STATUS_FAILED;
                                 GGML_LOG_ERROR(
@@ -6585,14 +6886,22 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                 ggml_backend_sched_ffn_worker_timeline * main_timeline =
                     group_timelines != nullptr ? &group_timelines[main_i] : nullptr;
                 if (main_timeline != nullptr) {
-                    main_timeline->mode = GGML_SCHED_FFN_WORKER_CALLER;
+                    main_timeline->mode = main_i == deferred_sync_i
+                        ? GGML_SCHED_FFN_WORKER_CALLER_DEFERRED
+                        : GGML_SCHED_FFN_WORKER_CALLER;
                     main_timeline->worker_tid = ggml_backend_sched_current_tid();
                     main_timeline->start_cpu = ggml_backend_sched_current_cpu();
                     main_timeline->job_start_us = ggml_time_us();
                 }
                 try {
                     status[main_i] = compute_split_no_callback(
-                            &splits[split_id + main_i], &dt_us[main_i], true, main_timeline);
+                            &splits[split_id + main_i],
+                            &dt_us[main_i],
+                            main_i != deferred_sync_i,
+                            main_timeline,
+                            main_i == deferred_sync_i
+                                ? sched->async_flush_fns[splits[split_id + main_i].backend_id]
+                                : nullptr);
                 } catch (const std::exception & error) {
                     status[main_i] = GGML_STATUS_FAILED;
                     GGML_LOG_ERROR(
@@ -6642,12 +6951,66 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                         timeline->collect_end_us = ggml_time_us();
                     }
                 }
+
+                if (deferred_sync_i >= 0) {
+                    struct ggml_backend_sched_split * deferred_split =
+                        &splits[split_id + deferred_sync_i];
+                    ggml_backend_t deferred_backend =
+                        sched->backends[deferred_split->backend_id];
+                    ggml_backend_sched_ffn_worker_timeline * deferred_timeline =
+                        group_timelines != nullptr ? &group_timelines[deferred_sync_i] : nullptr;
+                    deferred_submit_us = dt_us[deferred_sync_i];
+                    const int64_t sync_begin_us = ggml_time_us();
+                    if (deferred_timeline != nullptr) {
+                        deferred_timeline->sync_begin_us = sync_begin_us;
+                        deferred_timeline->sync_tid = ggml_backend_sched_current_tid();
+                        deferred_timeline->sync_cpu = ggml_backend_sched_current_cpu();
+                    }
+                    try {
+                        // All worker submission tickets have been collected, so
+                        // the scheduler can safely re-enter this backend. Drain
+                        // it once here before the OpenCL CONCAT split rather than
+                        // blocking its worker immediately after the short W_O op.
+                        ggml_backend_synchronize(deferred_backend);
+                    } catch (const std::exception & error) {
+                        status[deferred_sync_i] = GGML_STATUS_FAILED;
+                        GGML_LOG_ERROR(
+                                "%s: deferred %s synchronize for backend %s, layer %d threw an exception: %s\n",
+                                __func__,
+                                ffn_group_infos[deferred_sync_i].kind.c_str(),
+                                ggml_backend_name(deferred_backend),
+                                ffn_group_infos[deferred_sync_i].layer,
+                                error.what());
+                    } catch (...) {
+                        status[deferred_sync_i] = GGML_STATUS_FAILED;
+                        GGML_LOG_ERROR(
+                                "%s: deferred %s synchronize for backend %s, layer %d threw an exception\n",
+                                __func__,
+                                ffn_group_infos[deferred_sync_i].kind.c_str(),
+                                ggml_backend_name(deferred_backend),
+                                ffn_group_infos[deferred_sync_i].layer);
+                    }
+                    const int64_t sync_end_us = ggml_time_us();
+                    if (deferred_timeline != nullptr) {
+                        deferred_timeline->sync_end_us = sync_end_us;
+                    }
+                    deferred_sync_wait_us = sync_end_us - sync_begin_us;
+                    // Keep this value as host-active time only: async submission
+                    // plus the later join-boundary wait. The interval between
+                    // them is sibling CPU/NPU work and must not be reported as
+                    // GPU compute time.
+                    dt_us[deferred_sync_i] += deferred_sync_wait_us;
+                }
             }
             const int64_t compute_t1_us = ggml_time_us();
             const int64_t group_t1_us = compute_t1_us;
             const char * group_timing_mode = run_group_serially
                 ? "serial_fallback"
-                : use_persistent_device_workers ? "persistent_synced_wall" : "synced_wall";
+                : deferred_sync_i >= 0
+                    ? use_persistent_device_workers
+                        ? "persistent_deferred_sync"
+                        : "deferred_sync"
+                    : use_persistent_device_workers ? "persistent_synced_wall" : "synced_wall";
 
             if (worker_trace_graph_id >= 0) {
                 ggml_backend_sched_ffn_worker_trace_append_group(
@@ -6700,9 +7063,11 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
             std::string branch_list;
             for (int i = 0; i < ffn_group_size; ++i) {
                 ggml_backend_t group_backend = sched->backends[splits[split_id + i].backend_id];
-                serial_compute_us += dt_us[i];
-                min_branch_us = std::min(min_branch_us, dt_us[i]);
-                max_branch_us = std::max(max_branch_us, dt_us[i]);
+                if (i != deferred_sync_i) {
+                    serial_compute_us += dt_us[i];
+                    min_branch_us = std::min(min_branch_us, dt_us[i]);
+                    max_branch_us = std::max(max_branch_us, dt_us[i]);
+                }
 
                 if (!split_list.empty()) {
                     split_list += "/";
@@ -6716,10 +7081,21 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                 branch_list += "[";
                 branch_list += ffn_group_infos[i].branch;
                 branch_list += "] ";
-                char branch_ms[32];
-                snprintf(branch_ms, sizeof(branch_ms), "%.3f", (double) dt_us[i] / 1000.0);
-                branch_list += branch_ms;
-                branch_list += " ms";
+                char branch_ms[64];
+                if (i == deferred_sync_i) {
+                    snprintf(
+                            branch_ms,
+                            sizeof(branch_ms),
+                            "submit %.3f + join-sync %.3f",
+                            (double) std::max<int64_t>(deferred_submit_us, 0) / 1000.0,
+                            (double) std::max<int64_t>(deferred_sync_wait_us, 0) / 1000.0);
+                    branch_list += branch_ms;
+                    branch_list += " ms (device wall n/a)";
+                } else {
+                    snprintf(branch_ms, sizeof(branch_ms), "%.3f", (double) dt_us[i] / 1000.0);
+                    branch_list += branch_ms;
+                    branch_list += " ms";
+                }
             }
             const int64_t overlap_us = std::max<int64_t>(0, serial_compute_us - compute_wall_us);
             const double speedup = compute_wall_us > 0 ? (double) serial_compute_us / (double) compute_wall_us : 0.0;
@@ -6727,18 +7103,30 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
             double overlap = min_branch_us > 0 && min_branch_us != LLONG_MAX ? 100.0 * (double) overlap_us / (double) min_branch_us : 0.0;
             overlap = std::min(100.0, std::max(0.0, overlap));
 
-            GGML_LOG_DEBUG(
-                    "sched: parallel %s group layer %d splits %s: %s, compute_wall %.3f ms, group_wall %.3f ms, copy %.3f ms, speedup %.2fx, overlap %.1f%%, balance %.1f%%\n",
-                    ffn_group_infos[0].kind.c_str(),
-                    ffn_group_infos[0].layer,
-                    split_list.c_str(),
-                    branch_list.c_str(),
-                    (double) compute_wall_us / 1000.0,
-                    (double) group_wall_us / 1000.0,
-                    (double) copy_us / 1000.0,
-                    speedup,
-                    overlap,
-                    balance);
+            if (deferred_sync_i >= 0) {
+                GGML_LOG_DEBUG(
+                        "sched: parallel %s group layer %d splits %s: %s, compute_wall %.3f ms, group_wall %.3f ms, copy %.3f ms, speedup/overlap/balance n/a (deferred device wall)\n",
+                        ffn_group_infos[0].kind.c_str(),
+                        ffn_group_infos[0].layer,
+                        split_list.c_str(),
+                        branch_list.c_str(),
+                        (double) compute_wall_us / 1000.0,
+                        (double) group_wall_us / 1000.0,
+                        (double) copy_us / 1000.0);
+            } else {
+                GGML_LOG_DEBUG(
+                        "sched: parallel %s group layer %d splits %s: %s, compute_wall %.3f ms, group_wall %.3f ms, copy %.3f ms, speedup %.2fx, overlap %.1f%%, balance %.1f%%\n",
+                        ffn_group_infos[0].kind.c_str(),
+                        ffn_group_infos[0].layer,
+                        split_list.c_str(),
+                        branch_list.c_str(),
+                        (double) compute_wall_us / 1000.0,
+                        (double) group_wall_us / 1000.0,
+                        (double) copy_us / 1000.0,
+                        speedup,
+                        overlap,
+                        balance);
+            }
 
             if (trace_graph_id >= 0) {
                 for (int i = 0; i < ffn_group_size; ++i) {
@@ -6748,8 +7136,8 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                             split_id + i,
                             &splits[split_id + i],
                             io_times[i],
-                            dt_us[i],
-                            dt_us[i],
+                            i == deferred_sync_i ? deferred_submit_us : dt_us[i],
+                            i == deferred_sync_i ? -1 : dt_us[i],
                             true,
                             ffn_group_infos[i].kind.c_str(),
                             ffn_group_infos[i].branch.c_str(),
@@ -6925,6 +7313,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
             "GGML_FFN_GPU_WORKER_CPU", sched->ffn_device_worker_cpu);
     sched->ffn_npu_worker_cpu = ggml_backend_sched_ffn_worker_cpu(
             "GGML_FFN_NPU_WORKER_CPU", sched->ffn_device_worker_cpu);
+    sched->attn_out_defer_opencl_sync =
+        ggml_backend_sched_attn_out_defer_opencl_sync_enabled();
     sched->cpu_graph_prewake_hold_us = ggml_backend_sched_cpu_graph_prewake_hold_us();
     sched->cpu_graph_prewake_idle_us = sched->cpu_graph_prewake_hold_us > 0
         ? ggml_backend_sched_cpu_graph_prewake_idle_us()
@@ -6960,15 +7350,22 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->splits_capacity = initial_splits_capacity;
 
     int cpu_graph_prewake_backend_count = 0;
+    int async_flush_backend_count = 0;
     for (int b = 0; b < n_backends; b++) {
         sched->backends[b] = backends[b];
         sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
         GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
 
+        ggml_backend_dev_t dev = ggml_backend_get_device(backends[b]);
+        ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (reg != nullptr) {
+            sched->async_flush_fns[b] = (ggml_backend_async_flush_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_async_flush");
+            async_flush_backend_count += sched->async_flush_fns[b] != nullptr ? 1 : 0;
+        }
+
         if (sched->cpu_graph_prewake_hold_us > 0) {
-            ggml_backend_dev_t dev = ggml_backend_get_device(backends[b]);
             if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
-                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
                 if (reg != nullptr) {
                     sched->cpu_graph_prewake_hold_fns[b] =
                         (ggml_backend_cpu_prewake_hold_t) ggml_backend_reg_get_proc_address(
@@ -6984,6 +7381,15 @@ ggml_backend_sched_t ggml_backend_sched_new(
                 sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
             }
         }
+    }
+
+    if (async_flush_backend_count > 0) {
+        GGML_LOG_INFO(
+                "%s: attention-output deferred OpenCL synchronization %s (%d async-flush backend%s)\n",
+                __func__,
+                sched->attn_out_defer_opencl_sync ? "enabled" : "disabled",
+                async_flush_backend_count,
+                async_flush_backend_count == 1 ? "" : "s");
     }
 
     if (sched->cpu_graph_prewake_hold_us > 0) {
@@ -7303,9 +7709,9 @@ bool ggml_backend_sched_prepare_layer_checkpoints(
                     __func__, checkpoint_index);
             return false;
         }
-        if (ggml_backend_sched_is_ffn_parallel_branch_node(boundary)) {
+        if (ggml_backend_sched_is_parallel_branch_node(boundary)) {
             GGML_LOG_ERROR(
-                    "%s: checkpoint %d (%s) is inside an FFN parallel branch; "
+                    "%s: checkpoint %d (%s) is inside a parallel branch; "
                     "use the complete layer output instead\n",
                     __func__, checkpoint_index, boundary->name);
             return false;
@@ -7452,12 +7858,12 @@ static bool ggml_backend_sched_register_route_candidate_impl(
         return false;
     }
     if (!subgraph &&
-            (ggml_backend_sched_is_ffn_parallel_branch_node(canonical) ||
-            ggml_backend_sched_is_ffn_parallel_reduce_node(canonical) ||
-            ggml_backend_sched_is_ffn_parallel_branch_node(variant) ||
-            ggml_backend_sched_is_ffn_parallel_reduce_node(variant))) {
+            (ggml_backend_sched_is_parallel_branch_node(canonical) ||
+            ggml_backend_sched_is_parallel_join_node(canonical) ||
+            ggml_backend_sched_is_parallel_branch_node(variant) ||
+            ggml_backend_sched_is_parallel_join_node(variant))) {
         GGML_LOG_ERROR(
-                "%s: FFN branch/reduce node cannot be a route candidate (%s -> %s)\n",
+                "%s: parallel branch/join node cannot be a route candidate (%s -> %s)\n",
                 __func__, canonical->name, variant->name);
         return false;
     }

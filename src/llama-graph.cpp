@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
@@ -1428,6 +1429,269 @@ bool llm_graph_context::build_qkv_shards(
     return true;
 }
 
+bool llm_graph_context::build_attn_out_shards(
+        ggml_tensor * wo,
+        ggml_tensor * wo_b,
+        ggml_tensor * wo_s,
+        ggml_tensor * cur,
+                int   il,
+       const char * final_name,
+      ggml_tensor *& out,
+        const llama_backend_policy_attn_out_shards * policy_override,
+       const char * route_tag,
+      ggml_tensor ** out_first) const {
+    out = nullptr;
+    if (out_first != nullptr) {
+        *out_first = nullptr;
+    }
+
+    // Keep the ordinary W_O path byte-for-byte unchanged unless every static
+    // prerequisite is present. In particular, LoRA corrections are defined on
+    // the full projection and must not be silently omitted from a sharded base.
+    if (!cparams.attn_out_shards || arch != LLM_ARCH_LLAMA || n_tokens <= 1 ||
+            model == nullptr || !model->attn_out_shards_enabled() ||
+            wo == nullptr || cur == nullptr || final_name == nullptr || final_name[0] == '\0' ||
+            !ggml_is_contiguous_rows(cur) ||
+            (loras != nullptr && !loras->empty())) {
+        return false;
+    }
+
+    llama_backend_policy_attn_out_shards policy = {};
+    if (policy_override != nullptr) {
+        policy = *policy_override;
+    } else {
+        if (!llama_backend_policy_match_attn_out_shards(il, true, policy)) {
+            return false;
+        }
+    }
+    const bool output_axis = policy.partition_axis == "output";
+    // Output-axis lanes feed the complete activation directly to REGION.
+    // OpenCL's Q8_0 REGION kernel requires that source to be fully contiguous;
+    // input-axis mode instead materializes each slice through ggml_cont().
+    if (output_axis && !ggml_is_contiguous(cur)) {
+        return false;
+    }
+    if (policy.splits.size() != 3 || policy.head_dim <= 0 ||
+            (policy.partition_axis != "input" && !output_axis) ||
+            policy.reduce_backend.empty()) {
+        GGML_ABORT(
+                "backend_policy: attn_out_shards layer %d matched an invalid policy",
+                il);
+    }
+
+    const int64_t n_head_dim = hparams.n_embd_head_k((uint32_t) il);
+    const int64_t n_in = wo->ne[0];
+    const int64_t n_out = wo->ne[1];
+    const int64_t block_size = ggml_blck_size(wo->type);
+    bool valid = policy.head_dim == n_head_dim &&
+        cur->ne[0] == n_in && cur->ne[1] == n_tokens &&
+        cur->ne[2] == 1 && cur->ne[3] == 1 &&
+        wo->ne[2] == 1 && wo->ne[3] == 1;
+
+    struct attn_out_lane {
+        llama_backend_policy_attn_out_shard split;
+        llama_backend_policy_resident_cover cover;
+        ggml_tensor * view = nullptr;
+        ggml_tensor * input = nullptr;
+        ggml_tensor * projection = nullptr;
+    };
+
+    std::vector<attn_out_lane> lanes;
+    lanes.reserve(policy.splits.size());
+    for (const auto & split : policy.splits) {
+        attn_out_lane lane;
+        lane.split = split;
+        lanes.push_back(std::move(lane));
+    }
+    std::sort(lanes.begin(), lanes.end(), [](const auto & lhs, const auto & rhs) {
+        return lhs.split.start < rhs.split.start;
+    });
+
+    const int64_t partition_width = output_axis ? n_out : n_in;
+    const int cover_axis = output_axis ? 1 : 0;
+    int64_t covered = 0;
+    std::unordered_set<std::string> lane_ids;
+    for (auto & lane : lanes) {
+        const auto & split = lane.split;
+        valid = valid && !split.id.empty() && !split.backend.empty() &&
+            lane_ids.insert(split.id).second &&
+            split.start == covered && split.size > 0 &&
+            split.start % policy.head_dim == 0 && split.size % policy.head_dim == 0 &&
+            (output_axis ||
+                (split.start % block_size == 0 && split.size % block_size == 0)) &&
+            split.start <= partition_width - split.size;
+        if (!valid) {
+            break;
+        }
+
+        lane.cover = model->get_backend_policy_resident_cover(
+                wo, split.backend, cover_axis, split.start, split.size);
+        valid = lane.cover.tensor != nullptr &&
+            lane.cover.tensor->type == wo->type &&
+            lane.cover.local_start >= 0 &&
+            lane.cover.local_start <= lane.cover.cover_size - split.size &&
+            (output_axis || lane.cover.local_start % block_size == 0) &&
+            lane.cover.tensor->ne[0] == (output_axis ? n_in : lane.cover.cover_size) &&
+            lane.cover.tensor->ne[1] == (output_axis ? lane.cover.cover_size : n_out) &&
+            lane.cover.tensor->ne[2] == 1 && lane.cover.tensor->ne[3] == 1;
+        if (!valid) {
+            break;
+        }
+        covered += split.size;
+    }
+    valid = valid && covered == partition_width;
+    if (!valid) {
+        GGML_ABORT(
+                "backend_policy: attn_out_shards layer %d matched policy but has an invalid shape or incomplete three-lane W_O axis-%d cover",
+                il, cover_axis);
+    }
+
+    // Hexagon's REGION kernel deliberately limits the activation row count to
+    // 1024. The full W_O source remains resident, so oversized prefills can
+    // safely use the ordinary projection without weakening exact-cover checks.
+    if (n_tokens > 1024 && sched != nullptr) {
+        const auto is_htp_backend = [](ggml_backend_t backend) {
+            if (backend == nullptr || ggml_backend_get_device(backend) == nullptr) {
+                return false;
+            }
+            std::string name = ggml_backend_dev_name(ggml_backend_get_device(backend));
+            std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) {
+                return (char) std::tolower(c);
+            });
+            return name.find("htp") != std::string::npos ||
+                   name.find("hexagon") != std::string::npos;
+        };
+
+        for (const auto & lane : lanes) {
+            for (int ib = 0; ib < ggml_backend_sched_get_n_backends(sched); ++ib) {
+                ggml_backend_t backend = ggml_backend_sched_get_backend(sched, ib);
+                if (llama_backend_policy_backend_matches(backend, lane.split.backend) &&
+                        is_htp_backend(backend)) {
+                    LLAMA_LOG_DEBUG(
+                            "backend_policy: attn_out_shards layer %d has n_tokens=%" PRId64
+                            " above the HTP REGION limit; using ordinary W_O\n",
+                            il, n_tokens);
+                    return false;
+                }
+            }
+        }
+    }
+
+    std::unordered_set<ggml_backend_t> lane_backends;
+    std::vector<ggml_tensor *> partials;
+    partials.reserve(lanes.size());
+
+    // Runtime variants need distinct, scheduler-parseable branch names.  The
+    // route tag is a short hexadecimal plan identifier supplied by the Llama
+    // graph builder; it deliberately contains no '.' because the parallel
+    // collector treats the first dot after attn_out_shard as the stage
+    // separator. Static v1 names remain byte-for-byte unchanged.
+    const std::string route_suffix = route_tag != nullptr && route_tag[0] != '\0'
+        ? std::string("-") + route_tag
+        : std::string();
+    const auto tagged_name = [&](const char * base) {
+        return route_suffix.empty() ? std::string(base) : std::string(base) + route_suffix;
+    };
+
+    if (!output_axis) {
+        // Materialize all metadata-only slices before any executable branch.
+        // This keeps VIEW nodes in one dependency prefix instead of attaching
+        // the next lane's view to the previous lane's compute split, and makes
+        // each branch a pure CONT -> projection unit for cross-device
+        // copy/allocation logic.
+        for (auto & lane : lanes) {
+            const auto & split = lane.split;
+            lane.view = ggml_view_2d(
+                    ctx0, cur, split.size, cur->ne[1], cur->nb[1],
+                    (size_t) split.start * cur->nb[0]);
+            ggml_build_forward_expand(gf, lane.view);
+        }
+    }
+
+    for (auto & lane : lanes) {
+        const auto & split = lane.split;
+        if (output_axis) {
+            // Every output-axis lane consumes the same complete attention
+            // result. The scheduler copies that contiguous tensor to remote
+            // lane backends; no per-lane VIEW/CONT packing is required.
+            lane.input = cur;
+            lane.projection = ggml_mul_mat_src0_region(
+                    ctx0, lane.cover.tensor, lane.input,
+                    0, n_in,
+                    lane.cover.local_start, split.size);
+        } else {
+            lane.input = ggml_cont(ctx0, lane.view);
+            const std::string input_name =
+                "attn_out_shard." + split.id + route_suffix + ".input";
+            cb_route(lane.input, input_name.c_str(), il, split.backend.c_str());
+
+            lane.projection = ggml_mul_mat_src0_region(
+                    ctx0, lane.cover.tensor, lane.input,
+                    lane.cover.local_start, split.size,
+                    0, lane.cover.tensor->ne[1]);
+        }
+
+        const std::string projection_name =
+            "attn_out_shard." + split.id + route_suffix + ".proj";
+        cb_route(lane.projection, projection_name.c_str(), il, split.backend.c_str());
+
+        const ggml_backend_t projection_backend = sched != nullptr
+            ? ggml_backend_sched_get_tensor_backend(sched, lane.projection)
+            : nullptr;
+        const ggml_backend_t input_backend = !output_axis && sched != nullptr
+            ? ggml_backend_sched_get_tensor_backend(sched, lane.input)
+            : projection_backend;
+        if (projection_backend == nullptr || input_backend != projection_backend ||
+                !lane_backends.insert(projection_backend).second) {
+            GGML_ABORT(
+                    "backend_policy: attn_out_shards layer %d lane %s did not resolve to a unique backend",
+                    il, split.id.c_str());
+        }
+
+        // Finish one lane before emitting the next so the scheduler sees three
+        // consecutive, pure projection branches (or CONT+projection branches
+        // for the input-axis compatibility path).
+        ggml_build_forward_expand(gf, lane.projection);
+        if (out_first != nullptr && *out_first == nullptr) {
+            *out_first = output_axis ? lane.projection : lane.input;
+        }
+        partials.push_back(lane.projection);
+    }
+
+    // Both joins are right-associated and lanes are already ordered by global
+    // start. Input-axis partials overlap and therefore use a fixed ADD order;
+    // output-axis partials are disjoint and are concatenated along ne[0].
+    ggml_tensor * acc = partials.back();
+    for (size_t i = partials.size() - 1; i > 0; --i) {
+        acc = output_axis
+            ? ggml_concat(ctx0, partials[i - 1], acc, 0)
+            : ggml_add(ctx0, partials[i - 1], acc);
+        cb_route(
+                acc,
+                tagged_name(output_axis
+                    ? "attn_out_parallel_concat"
+                    : "attn_out_parallel_sum").c_str(),
+                il, policy.reduce_backend.c_str());
+    }
+    if (wo_s != nullptr) {
+        acc = ggml_mul(ctx0, acc, wo_s);
+        cb_route(acc, tagged_name("attn_out_parallel_scale").c_str(),
+                il, policy.reduce_backend.c_str());
+    }
+    if (wo_b != nullptr) {
+        acc = ggml_add(ctx0, acc, wo_b);
+        cb_route(acc, tagged_name("attn_out_parallel_bias").c_str(),
+                il, policy.reduce_backend.c_str());
+    }
+
+    // This helper owns both the canonical final name and the strict reduction
+    // placement. Calling the ordinary callback again in a caller could allow a
+    // generic ops policy to overwrite reduce_backend on this same tensor.
+    cb_route(acc, tagged_name(final_name).c_str(), il, policy.reduce_backend.c_str());
+    out = acc;
+    return true;
+}
+
 
 ggml_tensor * llm_graph_context::build_ffn(
          ggml_tensor * cur,
@@ -1541,11 +1805,11 @@ ggml_tensor * llm_graph_context::build_ffn(
 
             for (const auto & split : exec_splits) {
                 const auto up_cover =
-                    model->get_backend_policy_ffn_cover(up, split.backend, 1, split.start, split.size);
+                    model->get_backend_policy_resident_cover(up, split.backend, 1, split.start, split.size);
                 const auto gate_cover =
-                    model->get_backend_policy_ffn_cover(gate, split.backend, 1, split.start, split.size);
+                    model->get_backend_policy_resident_cover(gate, split.backend, 1, split.start, split.size);
                 const auto down_cover =
-                    model->get_backend_policy_ffn_cover(down, split.backend, 0, split.start, split.size);
+                    model->get_backend_policy_resident_cover(down, split.backend, 0, split.start, split.size);
 
                 if (up_cover.tensor == nullptr || gate_cover.tensor == nullptr || down_cover.tensor == nullptr) {
                     valid = false;
@@ -2588,8 +2852,13 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * sinks,
         ggml_tensor * v_mla,
             float     kq_scale,
-            int       il) const {
+            int       il,
+            bool    * out_wo_sharded,
+       const char *   sharded_wo_final_name) const {
     GGML_UNUSED(n_tokens);
+    if (out_wo_sharded != nullptr) {
+        *out_wo_sharded = false;
+    }
 
     // these nodes are added to the graph together so that they are not reordered
     // by doing so, the number of splits in the graph is reduced
@@ -2613,12 +2882,21 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
-    if (wo) {
+    ggml_tensor * sharded_out = nullptr;
+    const bool sharded_wo = wo != nullptr &&
+        build_attn_out_shards(
+                wo, wo_b, wo_s, cur, il, sharded_wo_final_name, sharded_out);
+    if (sharded_wo) {
+        cur = sharded_out;
+        if (out_wo_sharded != nullptr) {
+            *out_wo_sharded = true;
+        }
+    } else if (wo) {
         cur = build_lora_mm(wo, cur, wo_s);
         cb(cur, "kqv_wo", il);
     }
 
-    if (wo_b) {
+    if (wo_b && !sharded_wo) {
         cur = ggml_add(ctx0, cur, wo_b);
     }
 
@@ -2670,8 +2948,13 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * sinks,
         ggml_tensor * v_mla, // TODO: remove
             float     kq_scale,
-            int       il) const {
+            int       il,
+            bool    * out_wo_sharded,
+       const char *   sharded_wo_final_name) const {
     GGML_ASSERT(v_mla == nullptr);
+    if (out_wo_sharded != nullptr) {
+        *out_wo_sharded = false;
+    }
 
     if (inp->self_k_rot) {
         q_cur = ggml_mul_mat_aux(ctx0, q_cur, inp->self_k_rot);
@@ -2713,7 +2996,16 @@ ggml_tensor * llm_graph_context::build_attn(
         cur = ggml_mul_mat_aux(ctx0, cur, inp->self_v_rot);
     }
 
-    if (wo) {
+    ggml_tensor * sharded_out = nullptr;
+    const bool sharded_wo = wo != nullptr &&
+        build_attn_out_shards(
+                wo, wo_b, wo_s, cur, il, sharded_wo_final_name, sharded_out);
+    if (sharded_wo) {
+        cur = sharded_out;
+        if (out_wo_sharded != nullptr) {
+            *out_wo_sharded = true;
+        }
+    } else if (wo) {
         if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_JAIS2) {
             // GLM4, GLM4_MOE, and JAIS2 seem to have numerical issues with half-precision accumulators
             cur = build_lora_mm(wo, cur);
@@ -2728,7 +3020,7 @@ ggml_tensor * llm_graph_context::build_attn(
         }
     }
 
-    if (wo_b) {
+    if (wo_b && !sharded_wo) {
         cur = ggml_add(ctx0, cur, wo_b);
     }
 

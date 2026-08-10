@@ -349,6 +349,7 @@ extern "C" {
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
+        bool attn_out_shards; // prepare attention output-projection shards while loading the model [EXPERIMENTAL]
     };
 
     struct llama_sampler_seq_config {
@@ -416,6 +417,7 @@ extern "C" {
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
         bool attn_qkv_parallel; // run independent prefill Q/K/V projection branches concurrently [EXPERIMENTAL]
         bool attn_qkv_shards;   // shard each prefill Q/K/V projection across policy backends [EXPERIMENTAL]
+        bool attn_out_shards;   // shard the prefill attention output projection across policy backends [EXPERIMENTAL]
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)

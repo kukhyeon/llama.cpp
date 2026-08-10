@@ -4280,6 +4280,11 @@ static void ggml_backend_opencl_synchronize(ggml_backend_t backend) {
     }
 }
 
+static void ggml_backend_opencl_async_flush(ggml_backend_t backend) {
+    auto * backend_ctx = static_cast<ggml_backend_opencl_context *>(backend->context);
+    CL_CHECK(clFlush(backend_ctx->queue));
+}
+
 // Synchronizes the 'backend_ctx's device with others so that commands
 // enqueued to it won't start until commands in the other devices have
 // completed.
@@ -7171,11 +7176,19 @@ static ggml_backend_dev_t ggml_backend_opencl_reg_device_get(ggml_backend_reg_t 
     GGML_UNUSED(index);
 }
 
+static void * ggml_backend_opencl_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (name != nullptr && strcmp(name, "ggml_backend_async_flush") == 0) {
+        return reinterpret_cast<void *>(ggml_backend_opencl_async_flush);
+    }
+    GGML_UNUSED(reg);
+    return nullptr;
+}
+
 static struct ggml_backend_reg_i ggml_backend_opencl_reg_i = {
     /* .get_name         = */ ggml_backend_opencl_reg_get_name,
     /* .device_count     = */ ggml_backend_opencl_reg_device_count,
     /* .device_get       = */ ggml_backend_opencl_reg_device_get,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_opencl_reg_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_opencl_reg(void) {

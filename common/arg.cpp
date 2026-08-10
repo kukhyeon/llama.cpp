@@ -1408,6 +1408,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_ATTN_QKV_SHARDS"));
     add_opt(common_arg(
+        {"--attn-out-shards"}, "on|off",
+        "shard the prefill attention output projection across policy backends (default: off; residency is prepared during model load)",
+        [](common_params & params, const std::string & value) {
+            const std::string normalized = common_arg_lower(value);
+            if (is_truthy(normalized)) {
+                params.attn_out_shards = true;
+            } else if (is_falsey(normalized)) {
+                params.attn_out_shards = false;
+            } else {
+                throw std::invalid_argument(
+                    string_format("error: unknown value for --attn-out-shards: '%s'\n", value.c_str()));
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_ATTN_OUT_SHARDS"));
+    add_opt(common_arg(
         {"--strict"}, "on|off",
         "enable ignite strict generation limit",
         [](common_params & params, const std::string & value) {

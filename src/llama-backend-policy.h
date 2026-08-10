@@ -57,18 +57,58 @@ struct llama_backend_policy_attn_qkv_shards {
     std::string source;
 };
 
-// Model-load residency for every FFN policy that can become active at runtime.
-// Each entry is one connected union cover for a backend. Overlapping or
-// touching profile intervals are merged, while genuinely disjoint intervals
-// remain separate covers. The cover tensor is independently packed by its
-// backend and runtime profiles select a logical sub-region with
-// GGML_OP_MUL_MAT_SRC0_REGION.
-struct llama_backend_policy_ffn_residency_plan {
+struct llama_backend_policy_attn_out_shard {
+    std::string id;
+    int64_t start = 0;
+    int64_t size = 0;
+    std::string backend;
+};
+
+// Static policy for splitting either axis of the Llama attention output
+// projection. Input-axis lanes produce full-width partial outputs which are
+// reduced; output-axis lanes consume the full input and produce disjoint
+// output ranges which are assembled on reduce_backend. Policies authored
+// before partition_axis was introduced retain the original input-axis path.
+struct llama_backend_policy_attn_out_shards {
     bool enabled = false;
-    bool keep_full_source = true;
-    std::vector<llama_backend_policy_ffn_split> covers;
+    std::string phase = "prefill";
+    std::string partition_axis = "input";
+    int layer_start = -2;
+    int layer_end = -2;
+    int64_t head_dim = 128;
+    std::string reduce_backend = "CPU";
+    std::vector<llama_backend_policy_attn_out_shard> splits;
     std::string source;
 };
+
+// One physical resident interval for a partitioned model weight. The source
+// tensor axis is bound by the module-specific planner/loader because one
+// logical split may map to different axes on different weights.
+struct llama_backend_policy_residency_cover {
+    std::string id;
+    int64_t start = 0;
+    int64_t size = 0;
+    std::string backend;
+};
+
+// Generic model-load residency descriptor produced by module-specific policy
+// planners. Each entry is one connected union cover for a backend. Overlapping
+// or touching intervals may be merged, while genuinely disjoint intervals
+// remain separate covers. Each cover tensor is independently packed by its
+// backend and graph builders select logical sub-regions with
+// GGML_OP_MUL_MAT_SRC0_REGION. Target tensors, axes, allocation counts, and
+// graph-node costs remain module-specific and are intentionally not inferred
+// from this plan.
+struct llama_backend_policy_residency_plan {
+    bool enabled = false;
+    bool keep_full_source = true;
+    std::vector<llama_backend_policy_residency_cover> covers;
+    std::string source;
+};
+
+// Transitional source alias for callers that only name the former FFN plan;
+// new code should use the module-independent descriptor directly.
+using llama_backend_policy_ffn_residency_plan = llama_backend_policy_residency_plan;
 
 // Optional catalog for pre-built, layer-boundary backend routes. The catalog
 // is inert unless runtime_routes.enabled is true in the policy. Profiles are
@@ -107,6 +147,7 @@ bool llama_backend_policy_ops_enabled();
 bool llama_backend_policy_residency_enabled();
 bool llama_backend_policy_ffn_parallel_enabled();
 bool llama_backend_policy_attn_qkv_shards_enabled();
+bool llama_backend_policy_attn_out_shards_enabled();
 int  llama_backend_policy_ffn_parallel_reduce_threads();
 
 // Update the process-global runtime profile from the current execution phase
@@ -200,6 +241,22 @@ bool llama_backend_policy_match_attn_qkv_shards(
         bool is_prefill,
         llama_backend_policy_attn_qkv_shards & out);
 
+// Resolve the root-level, prefill-only attention output projection policy for
+// one layer. This remains the static fallback when no routed profile is used.
+bool llama_backend_policy_match_attn_out_shards(
+        int il,
+        bool is_prefill,
+        llama_backend_policy_attn_out_shards & out);
+
+// Resolve one profile's attention output projection split. Profiles may
+// override only split_sizes; profiles without an override inherit the root
+// policy unchanged.
+bool llama_backend_policy_match_attn_out_shards_for_profile(
+        const char * profile_name,
+        int il,
+        bool is_prefill,
+        llama_backend_policy_attn_out_shards & out);
+
 // Resolve one prepared profile without mutating the legacy process-global
 // active profile. Layer-boundary plans use this while constructing all FFN
 // variants up front.
@@ -230,7 +287,14 @@ bool llama_backend_policy_list_ffn_parallel_load_policies(
 // phase="all".
 bool llama_backend_policy_build_ffn_residency_plan(
         int il,
-        llama_backend_policy_ffn_residency_plan & out);
+        llama_backend_policy_residency_plan & out);
+
+// Build the selected-axis connected-cover union for the root attention output
+// policy and every routed attn_out_block profile. The ordinary full source is
+// always retained for decode, out-of-range layers, and feature-off fallback.
+bool llama_backend_policy_build_attn_out_residency_plan(
+        int il,
+        llama_backend_policy_residency_plan & out);
 
 // Match a requested policy name to a backend buffer type. This is used during
 // model loading, where weights are assigned to buffer types rather than to

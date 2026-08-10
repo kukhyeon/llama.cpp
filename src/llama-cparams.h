@@ -40,6 +40,7 @@ struct llama_cparams {
     bool op_offload;
     bool attn_qkv_parallel;
     bool attn_qkv_shards;
+    bool attn_out_shards;
     bool kv_unified;
     bool pipeline_parallel;
 
