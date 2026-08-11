@@ -81,6 +81,8 @@ struct profile_policy {
     std::vector<policy_rule> weight_rules;
     std::vector<policy_rule> op_rules;
     ffn_parallel_policy ffn_parallel;
+    bool attn_qkv_shards_configured = false;
+    llama_backend_policy_attn_qkv_shards attn_qkv_shards;
     bool attn_out_shards_configured = false;
     llama_backend_policy_attn_out_shards attn_out_shards;
     ffn_clock_point clock_point;
@@ -757,10 +759,14 @@ llama_backend_policy_attn_qkv_shards parse_attn_qkv_shards(
     out.assemble_backend = root.value("assemble_backend", std::string("CPU"));
     out.source = source;
 
+    // Preserve the existing schema even though the graph builder currently
+    // attempts Q/K/V sharding only for prefill. A decode-only policy remains
+    // graph-inert; "all" contributes its prefill half to cover planning.
     if (!str_eq_ci(out.phase, "all") && !str_eq_ci(out.phase, "prefill") &&
             !str_eq_ci(out.phase, "decode")) {
         throw std::runtime_error(source + ".phase must be all, prefill, or decode");
     }
+    out.phase = lower(out.phase);
     if (out.assemble_backend.empty()) {
         throw std::runtime_error(source + ".assemble_backend must be a non-empty string");
     }
@@ -1122,6 +1128,56 @@ void parse_profile_section(
         out.ffn_parallel.enabled = policy_enabled && out.ffn_parallel.enabled;
     }
 
+    if (root.contains("attn_qkv_shards")) {
+        const auto & override = root["attn_qkv_shards"];
+        const std::string source = profile_source + ".attn_qkv_shards";
+        if (!override.is_object()) {
+            throw std::runtime_error(source + " must be an object");
+        }
+        if (override.size() != 1 || !override.contains("split_sizes")) {
+            throw std::runtime_error(
+                    source + " may override only split_sizes; topology is inherited from root attn_qkv_shards");
+        }
+        if (!policy_root.contains("attn_qkv_shards") ||
+                !policy_root["attn_qkv_shards"].is_object()) {
+            throw std::runtime_error(source + " requires a root attn_qkv_shards policy");
+        }
+
+        const auto & sizes = override["split_sizes"];
+        const auto & root_sizes = policy_root["attn_qkv_shards"]["split_sizes"];
+        if (!sizes.is_object() || sizes.size() != 3 ||
+                !sizes.contains("q") || !sizes.contains("k") || !sizes.contains("v") ||
+                !root_sizes.is_object() || root_sizes.size() != 3 ||
+                !root_sizes.contains("q") || !root_sizes.contains("k") || !root_sizes.contains("v")) {
+            throw std::runtime_error(
+                    source + ".split_sizes must contain exactly q, k, and v");
+        }
+        for (const char * projection : { "q", "k", "v" }) {
+            const auto & projection_sizes = sizes[projection];
+            const auto & root_projection_sizes = root_sizes[projection];
+            if (!projection_sizes.is_object() || !root_projection_sizes.is_object() ||
+                    projection_sizes.size() != root_projection_sizes.size()) {
+                throw std::runtime_error(
+                        source + ".split_sizes." + projection +
+                        " must contain every root split id");
+            }
+            for (auto it = root_projection_sizes.begin(); it != root_projection_sizes.end(); ++it) {
+                if (!projection_sizes.contains(it.key()) ||
+                        !projection_sizes[it.key()].is_number_integer()) {
+                    throw std::runtime_error(
+                            source + ".split_sizes." + projection + "." + it.key() +
+                            " must be an integer");
+                }
+            }
+        }
+
+        json effective = policy_root["attn_qkv_shards"];
+        effective.merge_patch(override);
+        out.attn_qkv_shards = parse_attn_qkv_shards(effective, source);
+        out.attn_qkv_shards.enabled = policy_enabled && out.attn_qkv_shards.enabled;
+        out.attn_qkv_shards_configured = true;
+    }
+
     if (root.contains("attn_out_shards")) {
         const auto & override = root["attn_out_shards"];
         const std::string source = profile_source + ".attn_out_shards";
@@ -1447,6 +1503,63 @@ void validate_profile_reference(
     }
 }
 
+const llama_backend_policy_attn_qkv_shards * effective_attn_qkv_policy_for_profile(
+        const policy_state & state,
+        const std::string & profile_name) {
+    const auto it = state.profiles.find(profile_name);
+    if (it == state.profiles.end()) {
+        return nullptr;
+    }
+    return it->second.attn_qkv_shards_configured
+        ? &it->second.attn_qkv_shards
+        : &state.attn_qkv_shards;
+}
+
+bool attn_qkv_policy_matches_layer(
+        const llama_backend_policy_attn_qkv_shards & policy,
+        int il) {
+    return policy.layer_start == -2 ||
+        (il >= policy.layer_start &&
+         (policy.layer_end == -2 || il <= policy.layer_end));
+}
+
+bool attn_qkv_policy_width(
+        const llama_backend_policy_attn_qkv_shards & policy,
+        llama_backend_policy_attn_qkv_projection projection,
+        int64_t & width) {
+    width = 0;
+    if (policy.splits.size() != 3) {
+        return false;
+    }
+
+    for (const auto & split : policy.splits) {
+        int64_t start = 0;
+        int64_t size = 0;
+        switch (projection) {
+            case LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_Q:
+                start = split.q_start;
+                size = split.q_size;
+                break;
+            case LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_K:
+                start = split.k_start;
+                size = split.k_size;
+                break;
+            case LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_V:
+                start = split.v_start;
+                size = split.v_size;
+                break;
+            default:
+                return false;
+        }
+        if (start != width || size <= 0 ||
+                width > std::numeric_limits<int64_t>::max() - size) {
+            return false;
+        }
+        width += size;
+    }
+    return true;
+}
+
 const llama_backend_policy_attn_out_shards * effective_attn_out_policy_for_profile(
         const policy_state & state,
         const std::string & profile_name) {
@@ -1578,9 +1691,10 @@ void parse_runtime_routes(const json & root, policy_state & state) {
     for (std::string & kind : routes.candidate_kinds) {
         kind = lower(trim(kind));
         if (kind != "weightless_stateless" && kind != "weighted_norm" &&
-                kind != "ffn_block" && kind != "attn_out_block") {
+                kind != "ffn_block" && kind != "attn_qkv_block" &&
+                kind != "attn_out_block") {
             throw std::runtime_error(
-                    "runtime_routes.candidate_kinds supports only weightless_stateless, weighted_norm, ffn_block, and attn_out_block");
+                    "runtime_routes.candidate_kinds supports only weightless_stateless, weighted_norm, ffn_block, attn_qkv_block, and attn_out_block");
         }
         if (!candidate_kinds.insert(kind).second) {
             throw std::runtime_error("runtime_routes.candidate_kinds contains duplicate '" + kind + "'");
@@ -1752,6 +1866,73 @@ void parse_runtime_routes(const json & root, policy_state & state) {
         }
         require_profile_op("ffn_block", "ffn_rms_norm", "RMS_NORM");
         require_profile_op("ffn_block", "ffn_norm", "MUL");
+    }
+
+    if (candidate_kinds.find("attn_qkv_block") != candidate_kinds.end()) {
+        if (!state.attn_qkv_shards.enabled ||
+                !phase_matches(state.attn_qkv_shards.phase, true)) {
+            throw std::runtime_error(
+                    "runtime_routes attn_qkv_block requires an enabled root prefill attn_qkv_shards policy");
+        }
+        if (!str_eq_ci(routes.phase, "prefill")) {
+            throw std::runtime_error(
+                    "runtime_routes attn_qkv_block currently requires phase=prefill");
+        }
+
+        // Routed graph names append a 16-hex plan id, projection role, op
+        // role, and layer suffix. Keep the inherited lane id short enough to
+        // remain unique within GGML_MAX_NAME; static QKV policies retain the
+        // original unrestricted safe-character compatibility.
+        constexpr size_t routed_qkv_split_id_max = 12;
+        for (const auto & split : state.attn_qkv_shards.splits) {
+            if (split.id.size() > routed_qkv_split_id_max) {
+                throw std::runtime_error(
+                        "runtime_routes attn_qkv_block split id '" + split.id +
+                        "' must be at most " +
+                        std::to_string(routed_qkv_split_id_max) +
+                        " bytes so routed graph names are not truncated");
+            }
+        }
+
+        int64_t root_q_width = 0;
+        int64_t root_k_width = 0;
+        int64_t root_v_width = 0;
+        if (!attn_qkv_policy_width(
+                    state.attn_qkv_shards,
+                    LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_Q,
+                    root_q_width) ||
+                !attn_qkv_policy_width(
+                    state.attn_qkv_shards,
+                    LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_K,
+                    root_k_width) ||
+                !attn_qkv_policy_width(
+                    state.attn_qkv_shards,
+                    LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_V,
+                    root_v_width)) {
+            throw std::runtime_error(
+                    "runtime_routes attn_qkv_block root policy must contain complete three-lane Q/K/V partitions");
+        }
+
+        for (const std::string & profile_name : routes.profiles) {
+            const auto * policy = effective_attn_qkv_policy_for_profile(state, profile_name);
+            int64_t q_width = 0;
+            int64_t k_width = 0;
+            int64_t v_width = 0;
+            if (policy == nullptr || !policy->enabled ||
+                    !attn_qkv_policy_width(
+                        *policy, LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_Q, q_width) ||
+                    !attn_qkv_policy_width(
+                        *policy, LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_K, k_width) ||
+                    !attn_qkv_policy_width(
+                        *policy, LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_V, v_width) ||
+                    q_width != root_q_width ||
+                    k_width != root_k_width ||
+                    v_width != root_v_width) {
+                throw std::runtime_error(
+                        "runtime_routes attn_qkv_block profile '" + profile_name +
+                        "' requires complete Q/K/V splits with the root projection widths");
+            }
+        }
     }
 
     if (candidate_kinds.find("attn_out_block") != candidate_kinds.end()) {
@@ -2673,6 +2854,30 @@ bool llama_backend_policy_match_attn_qkv_shards(
     return true;
 }
 
+bool llama_backend_policy_match_attn_qkv_shards_for_profile(
+        const char * profile_name,
+        int il,
+        bool is_prefill,
+        llama_backend_policy_attn_qkv_shards & out) {
+    std::lock_guard<std::mutex> lock(g_policy_mutex);
+    out = {};
+
+    if (!g_policy.loaded || profile_name == nullptr || profile_name[0] == '\0' ||
+            !is_prefill) {
+        return false;
+    }
+
+    const auto * policy = effective_attn_qkv_policy_for_profile(g_policy, profile_name);
+    if (policy == nullptr || !policy->enabled ||
+            !phase_matches(policy->phase, is_prefill) ||
+            !attn_qkv_policy_matches_layer(*policy, il)) {
+        return false;
+    }
+
+    out = *policy;
+    return true;
+}
+
 bool llama_backend_policy_match_attn_out_shards(
         int il,
         bool is_prefill,
@@ -2969,6 +3174,151 @@ bool llama_backend_policy_build_ffn_residency_plan(
     }
 
     return !out.covers.empty();
+}
+
+bool llama_backend_policy_build_attn_qkv_residency_plan(
+        int il,
+        llama_backend_policy_attn_qkv_projection projection,
+        llama_backend_policy_residency_plan & out) {
+    std::lock_guard<std::mutex> lock(g_policy_mutex);
+    out = {};
+
+    const char * projection_name = nullptr;
+    switch (projection) {
+        case LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_Q:
+            projection_name = "q";
+            break;
+        case LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_K:
+            projection_name = "k";
+            break;
+        case LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_V:
+            projection_name = "v";
+            break;
+        default:
+            return false;
+    }
+
+    if (!g_policy.loaded || !g_policy.attn_qkv_shards.enabled ||
+            !phase_matches(g_policy.attn_qkv_shards.phase, true) ||
+            !attn_qkv_policy_matches_layer(g_policy.attn_qkv_shards, il)) {
+        return false;
+    }
+
+    struct backend_intervals {
+        std::string key;
+        std::string backend;
+        std::vector<std::pair<int64_t, int64_t>> ranges;
+    };
+    std::vector<backend_intervals> grouped;
+    int64_t root_width = 0;
+    if (!attn_qkv_policy_width(g_policy.attn_qkv_shards, projection, root_width)) {
+        return false;
+    }
+
+    const auto append_policy = [&](const llama_backend_policy_attn_qkv_shards & policy) {
+        int64_t width = 0;
+        if (!policy.enabled || !phase_matches(policy.phase, true) ||
+                !attn_qkv_policy_matches_layer(policy, il) ||
+                !attn_qkv_policy_width(policy, projection, width) ||
+                width != root_width) {
+            return false;
+        }
+
+        for (const auto & split : policy.splits) {
+            int64_t start = 0;
+            int64_t size = 0;
+            switch (projection) {
+                case LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_Q:
+                    start = split.q_start;
+                    size = split.q_size;
+                    break;
+                case LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_K:
+                    start = split.k_start;
+                    size = split.k_size;
+                    break;
+                case LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_V:
+                    start = split.v_start;
+                    size = split.v_size;
+                    break;
+                default:
+                    return false;
+            }
+
+            const std::string key = lower(split.backend);
+            auto it = std::find_if(grouped.begin(), grouped.end(), [&](const auto & entry) {
+                return entry.key == key;
+            });
+            if (it == grouped.end()) {
+                grouped.push_back({ key, split.backend, {} });
+                it = std::prev(grouped.end());
+            }
+            it->ranges.emplace_back(start, start + size);
+        }
+        return true;
+    };
+
+    if (!append_policy(g_policy.attn_qkv_shards)) {
+        return false;
+    }
+
+    const bool routed_attn_qkv = g_policy.runtime_routes.enabled &&
+        std::find(
+                g_policy.runtime_routes.candidate_kinds.begin(),
+                g_policy.runtime_routes.candidate_kinds.end(),
+                "attn_qkv_block") != g_policy.runtime_routes.candidate_kinds.end();
+    if (routed_attn_qkv) {
+        for (const std::string & profile_name : g_policy.runtime_routes.profiles) {
+            const auto * policy = effective_attn_qkv_policy_for_profile(g_policy, profile_name);
+            if (policy == nullptr || !append_policy(*policy)) {
+                out = {};
+                return false;
+            }
+        }
+    }
+
+    for (auto & entry : grouped) {
+        std::sort(entry.ranges.begin(), entry.ranges.end(), [](const auto & lhs, const auto & rhs) {
+            if (lhs.first != rhs.first) {
+                return lhs.first < rhs.first;
+            }
+            return lhs.second < rhs.second;
+        });
+
+        int64_t cover_start = -1;
+        int64_t cover_end = -1;
+        const auto append_cover = [&]() {
+            if (cover_start < 0 || cover_end <= cover_start) {
+                return;
+            }
+            llama_backend_policy_residency_cover cover;
+            cover.id = std::string("cover.") + projection_name + "." + entry.key + "." +
+                std::to_string(cover_start) + "." +
+                std::to_string(cover_end - cover_start);
+            cover.start = cover_start;
+            cover.size = cover_end - cover_start;
+            cover.backend = entry.backend;
+            out.covers.push_back(std::move(cover));
+        };
+
+        for (const auto & range : entry.ranges) {
+            if (cover_start < 0) {
+                cover_start = range.first;
+                cover_end = range.second;
+            } else if (range.first <= cover_end) {
+                cover_end = std::max(cover_end, range.second);
+            } else {
+                append_cover();
+                cover_start = range.first;
+                cover_end = range.second;
+            }
+        }
+        append_cover();
+    }
+
+    out.enabled = !out.covers.empty();
+    out.keep_full_source = true;
+    out.source = std::string("attn_qkv_shards ") + projection_name + " axis-1 covers";
+    return out.enabled;
 }
 
 bool llama_backend_policy_build_attn_out_residency_plan(

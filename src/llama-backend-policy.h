@@ -57,6 +57,12 @@ struct llama_backend_policy_attn_qkv_shards {
     std::string source;
 };
 
+enum llama_backend_policy_attn_qkv_projection {
+    LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_Q = 0,
+    LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_K = 1,
+    LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_V = 2,
+};
+
 struct llama_backend_policy_attn_out_shard {
     std::string id;
     int64_t start = 0;
@@ -235,8 +241,17 @@ bool llama_backend_policy_match_ffn_parallel(
         llama_backend_policy_ffn_parallel & out);
 
 // Resolve the root-level attention Q/K/V output-shard policy for one layer and
-// phase. Profiles intentionally do not override this policy.
+// phase. This remains the static fallback when no routed profile is used.
 bool llama_backend_policy_match_attn_qkv_shards(
+        int il,
+        bool is_prefill,
+        llama_backend_policy_attn_qkv_shards & out);
+
+// Resolve one profile's Q/K/V output splits. Profiles may override only the
+// complete q/k/v split_sizes object; lane ids, backends, ordering, head_dim,
+// layer range, phase, and assembly backend are inherited from the root.
+bool llama_backend_policy_match_attn_qkv_shards_for_profile(
+        const char * profile_name,
         int il,
         bool is_prefill,
         llama_backend_policy_attn_qkv_shards & out);
@@ -287,6 +302,15 @@ bool llama_backend_policy_list_ffn_parallel_load_policies(
 // phase="all".
 bool llama_backend_policy_build_ffn_residency_plan(
         int il,
+        llama_backend_policy_residency_plan & out);
+
+// Build the axis-1 connected-cover union for one of the separate Q/K/V
+// projection weights. The union includes the root policy and every profile in
+// the routed attn_qkv_block allowlist. The canonical full source is always
+// retained for decode, feature-off, fused-QKV, LoRA, and ordinary fallback.
+bool llama_backend_policy_build_attn_qkv_residency_plan(
+        int il,
+        llama_backend_policy_attn_qkv_projection projection,
         llama_backend_policy_residency_plan & out);
 
 // Build the selected-axis connected-cover union for the root attention output

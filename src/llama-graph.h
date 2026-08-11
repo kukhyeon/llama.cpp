@@ -20,6 +20,7 @@ struct llama_cparams;
 struct llama_layer;
 struct llama_model;
 struct llama_backend_policy_ffn_parallel;
+struct llama_backend_policy_attn_qkv_shards;
 struct llama_backend_policy_attn_out_shards;
 
 struct llama_memory_context_i;
@@ -544,7 +545,7 @@ public:
 using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il, const char * backend_hint)>;
 using llm_graph_route_subgraph_cb = std::function<void(
         const char * kind, const char * profile, int il,
-        ggml_tensor * first, ggml_tensor * output)>;
+        ggml_tensor * first, const std::vector<ggml_tensor *> & outputs)>;
 
 class llm_graph_result;
 
@@ -882,7 +883,11 @@ struct llm_graph_context {
                   int64_t   n_head,
                   int64_t   n_head_kv,
                       int   il,
-            llm_graph_qkv & out) const;
+            llm_graph_qkv & out,
+        const llama_backend_policy_attn_qkv_shards * policy_override = nullptr,
+             const char * route_tag = nullptr,
+            ggml_tensor ** out_first = nullptr,
+                     bool reshape_outputs = true) const;
 
     // Split W_O along the policy-selected axis. Input-axis lanes receive
     // compact attention slices and produce full-width partials for ADD;

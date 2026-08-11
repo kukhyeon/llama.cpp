@@ -1151,6 +1151,28 @@ static bool is_ffn_parallel_weight_tensor(const LLM_TN_IMPL & tn, int & axis) {
     }
 }
 
+static bool is_attn_qkv_shard_weight_tensor(
+        const LLM_TN_IMPL & tn,
+        llama_backend_policy_attn_qkv_projection & projection) {
+    if (tn.suffix == nullptr || std::strcmp(tn.suffix, "weight") != 0 || tn.bid < 0) {
+        return false;
+    }
+
+    switch (tn.tensor) {
+        case LLM_TENSOR_ATTN_Q:
+            projection = LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_Q;
+            return true;
+        case LLM_TENSOR_ATTN_K:
+            projection = LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_K;
+            return true;
+        case LLM_TENSOR_ATTN_V:
+            projection = LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_V;
+            return true;
+        default:
+            return false;
+    }
+}
+
 static std::string sanitize_cover_name_part(std::string value) {
     for (char & c : value) {
         const unsigned char uc = (unsigned char) c;
@@ -1161,11 +1183,12 @@ static std::string sanitize_cover_name_part(std::string value) {
     return value;
 }
 
-static uint64_t stable_attn_out_cover_name_hash(
+static uint64_t stable_residency_cover_name_hash(
         const char * source_name,
-        const std::string & backend) {
-    // FNV-1a keeps W_O cover names deterministic without embedding the full
-    // (already long) GGUF tensor and backend names in GGML_MAX_NAME bytes.
+        const std::string & backend,
+        const char * cover_family = nullptr) {
+    // FNV-1a keeps every cover name deterministic and compact without
+    // embedding long GGUF tensor/backend names in GGML_MAX_NAME bytes.
     uint64_t hash = UINT64_C(14695981039346656037);
     const auto append = [&](const unsigned char * data, size_t size) {
         for (size_t i = 0; i < size; ++i) {
@@ -1177,6 +1200,10 @@ static uint64_t stable_attn_out_cover_name_hash(
     const unsigned char separator = 0;
     append(&separator, 1);
     append((const unsigned char *) backend.data(), backend.size());
+    if (cover_family != nullptr) {
+        append(&separator, 1);
+        append((const unsigned char *) cover_family, std::strlen(cover_family));
+    }
     return hash;
 }
 
@@ -1196,7 +1223,8 @@ static void init_tensor_meta_2d(ggml_tensor & meta, ggml_type type, int64_t ne0,
 
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
-        const buft_list_t * buft_list_layer, const buft_list_t * buft_list_all, bool prepare_attn_out_shards,
+        const buft_list_t * buft_list_layer, const buft_list_t * buft_list_all,
+        bool prepare_attn_qkv_shards, bool prepare_attn_out_shards,
         const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         auto it = ctx_map.find(buft);
@@ -1214,6 +1242,24 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 llama_backend_policy_residency_plan plan;
                 if (llama_backend_policy_build_ffn_residency_plan((int) il, plan)) {
                     max_n_tensors += 3 * plan.covers.size();
+                }
+            }
+
+            // Separate Llama Q/K/V weights each receive their own axis-1
+            // connected-cover union. A backend can legitimately need more
+            // than one disjoint cover when routed profile boundaries move.
+            if (prepare_attn_qkv_shards && get_arch() == LLM_ARCH_LLAMA) {
+                for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                    for (const auto projection : {
+                            LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_Q,
+                            LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_K,
+                            LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_V }) {
+                        llama_backend_policy_residency_plan plan;
+                        if (llama_backend_policy_build_attn_qkv_residency_plan(
+                                    (int) il, projection, plan)) {
+                            max_n_tensors += plan.covers.size();
+                        }
+                    }
                 }
             }
 
@@ -1444,8 +1490,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
         bool complete = true;
         const int64_t cover_dim = axis == 0 ? cur->ne[0] : cur->ne[1];
-        const bool require_unique_execution_devices = std::strcmp(cover_family, "attn_out") == 0;
-        std::unordered_set<ggml_backend_dev_t> cover_devices;
+        const bool require_unique_execution_devices =
+            std::strcmp(cover_family, "attn_out") == 0 ||
+            std::strcmp(cover_family, "attn_qkv") == 0;
+        std::unordered_map<std::string, ggml_backend_dev_t> backend_devices;
+        std::unordered_map<ggml_backend_dev_t, std::string> device_backends;
 
         for (const auto & cover : residency_plan.covers) {
             if (cover.start < 0 || cover.size <= 0 ||
@@ -1470,18 +1519,26 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             // This is the physical connected-union identity, independent of
             // the active clock profile. It is extracted and packed exactly
             // once; graph nodes later select profile-local regions from it.
-            const std::string cover_name = require_unique_execution_devices
+            const bool is_attn_out_cover = std::strcmp(cover_family, "attn_out") == 0;
+            const bool is_attn_qkv_cover = std::strcmp(cover_family, "attn_qkv") == 0;
+            const std::string cover_name = is_attn_out_cover
                 ? format(
                         "aoc.%016" PRIx64 ".%d.%" PRId64 ".%" PRId64,
-                        stable_attn_out_cover_name_hash(tensor_name, cover.backend),
+                        stable_residency_cover_name_hash(tensor_name, cover.backend),
                         axis, cover.start, cover.size)
-                : std::string(tensor_name) + "#" + cover_family + "_cover." +
-                    sanitize_cover_name_part(cover.backend) + "." +
-                    std::to_string(axis) + "." +
-                    std::to_string(cover.start) + "." + std::to_string(cover.size);
-            if (require_unique_execution_devices && cover_name.size() >= GGML_MAX_NAME) {
+                : is_attn_qkv_cover
+                    ? format(
+                            "qkc.%016" PRIx64 ".%d.%" PRId64 ".%" PRId64,
+                            stable_residency_cover_name_hash(
+                                tensor_name, cover.backend, cover_family),
+                            axis, cover.start, cover.size)
+                    : std::string(tensor_name) + "#" + cover_family + "_cover." +
+                        sanitize_cover_name_part(cover.backend) + "." +
+                        std::to_string(axis) + "." +
+                        std::to_string(cover.start) + "." + std::to_string(cover.size);
+            if ((is_attn_out_cover || is_attn_qkv_cover) && cover_name.size() >= GGML_MAX_NAME) {
                 throw std::runtime_error(format(
-                        "backend_policy: generated attention output cover name is too long for %s",
+                        "backend_policy: generated residency cover name is too long for %s",
                         tensor_name));
             }
 
@@ -1509,17 +1566,35 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 if (cover_dev == nullptr && cover_buft == ggml_backend_cpu_buffer_type()) {
                     cover_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
                 }
-                if (cover_dev == nullptr || !cover_devices.insert(cover_dev).second) {
+                const auto known_backend = backend_devices.find(cover.backend);
+                const auto known_device = device_backends.find(cover_dev);
+                const bool invalid_mapping = cover_dev == nullptr ||
+                    (known_backend != backend_devices.end() && known_backend->second != cover_dev) ||
+                    (known_device != device_backends.end() && known_device->second != cover.backend);
+                if (invalid_mapping) {
                     LLAMA_LOG_WARN(
                             "backend_policy: %s cover %s for %s maps backend alias %s to a duplicate or unknown execution device\n",
                             cover_family, cover.id.c_str(), tensor_name, cover.backend.c_str());
                     complete = false;
                     continue;
                 }
+                backend_devices.emplace(cover.backend, cover_dev);
+                device_backends.emplace(cover_dev, cover.backend);
             }
 
             ggml_context * cover_ctx = ctx_for_buft(cover_buft);
-            if (ggml_get_tensor(cover_ctx, cover_name.c_str()) != nullptr) {
+            if (ggml_tensor * existing = ggml_get_tensor(cover_ctx, cover_name.c_str())) {
+                const auto info_it = residency_cover_infos.find(existing);
+                if (info_it == residency_cover_infos.end() ||
+                        info_it->second.source_name != tensor_name ||
+                        info_it->second.backend != cover.backend ||
+                        info_it->second.axis != axis ||
+                        info_it->second.start != cover.start ||
+                        info_it->second.size != cover.size) {
+                    throw std::runtime_error(format(
+                            "backend_policy: residency cover name collision for %s",
+                            tensor_name));
+                }
                 continue;
             }
 
@@ -1591,6 +1666,64 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     const bool ffn_parallel_cover_only =
         ffn_parallel_layer_enabled &&
         !ffn_residency_plan.keep_full_source;
+
+    llama_backend_policy_attn_qkv_projection attn_qkv_projection =
+        LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_Q;
+    const bool attn_qkv_weight_tensor =
+        prepare_attn_qkv_shards &&
+        get_arch() == LLM_ARCH_LLAMA &&
+        is_attn_qkv_shard_weight_tensor(tn, attn_qkv_projection);
+
+    llama_backend_policy_attn_qkv_shards attn_qkv_policy;
+    llama_backend_policy_residency_plan attn_qkv_residency_plan;
+    bool attn_qkv_layer_enabled = false;
+    if (attn_qkv_weight_tensor) {
+        if (!llama_backend_policy_attn_qkv_shards_enabled()) {
+            throw std::runtime_error(
+                    "backend_policy: attn_qkv_shards model-load option requires an enabled attn_qkv_shards policy");
+        }
+
+        if (llama_backend_policy_match_attn_qkv_shards(tn.bid, true, attn_qkv_policy)) {
+            if (t_meta == nullptr ||
+                    !llama_backend_policy_build_attn_qkv_residency_plan(
+                        tn.bid, attn_qkv_projection, attn_qkv_residency_plan) ||
+                    attn_qkv_residency_plan.covers.size() < 3) {
+                throw std::runtime_error(format(
+                        "backend_policy: failed to build complete attn_qkv_shards residency for layer %d tensor %s",
+                        tn.bid, tn.str().c_str()));
+            }
+
+            const int64_t model_head_dim = hparams.n_embd_head_k((uint32_t) tn.bid);
+            if (attn_qkv_policy.head_dim != model_head_dim) {
+                throw std::runtime_error(format(
+                        "backend_policy: attn_qkv_shards head_dim %" PRId64
+                        " does not match Llama layer %d head_dim %" PRId64,
+                        attn_qkv_policy.head_dim, tn.bid, model_head_dim));
+            }
+
+            const auto & last = attn_qkv_policy.splits.back();
+            int64_t split_width = 0;
+            switch (attn_qkv_projection) {
+                case LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_Q:
+                    split_width = last.q_start + last.q_size;
+                    break;
+                case LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_K:
+                    split_width = last.k_start + last.k_size;
+                    break;
+                case LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_V:
+                    split_width = last.v_start + last.v_size;
+                    break;
+            }
+            if (split_width != t_meta->ne[1]) {
+                throw std::runtime_error(format(
+                        "backend_policy: attn_qkv_shards split width %" PRId64
+                        " does not match %s output width %" PRId64,
+                        split_width, tn.str().c_str(), t_meta->ne[1]));
+            }
+
+            attn_qkv_layer_enabled = true;
+        }
+    }
 
     const bool attn_out_weight_tensor =
         prepare_attn_out_shards &&
@@ -1724,6 +1857,19 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 cur, ggml_get_name(tensor), ffn_axis, "ffn", ffn_residency_plan, nullptr);
     }
 
+    if (attn_qkv_layer_enabled) {
+        // Keep the canonical full source for ordinary decode/off/LoRA
+        // fallback, while routed prefill variants consume only independently
+        // packed output-axis covers.
+        if (!create_residency_covers(
+                    cur, ggml_get_name(tensor), 1, "attn_qkv",
+                    attn_qkv_residency_plan, buft_list_all)) {
+            throw std::runtime_error(format(
+                    "backend_policy: failed to create complete attention Q/K/V residency for tensor %s",
+                    ggml_get_name(tensor)));
+        }
+    }
+
     if (attn_out_layer_enabled) {
         // The full source remains resident for decode and the feature-off
         // graph, but all three independently packed lane covers on the chosen
@@ -1738,7 +1884,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
     }
 
-    if (!ffn_parallel_layer_enabled && !attn_out_layer_enabled &&
+    if (!ffn_parallel_layer_enabled && !attn_qkv_layer_enabled && !attn_out_layer_enabled &&
             llama_backend_policy_residency_enabled() && buft_list_all != nullptr) {
 
         llama_backend_policy_match residency_match;

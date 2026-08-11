@@ -837,8 +837,10 @@ struct ggml_backend_sched_layer_checkpoint_state {
 struct ggml_backend_sched_route_candidate_registration {
     struct ggml_tensor * canonical_first = nullptr;
     struct ggml_tensor * canonical = nullptr;
+    std::vector<struct ggml_tensor *> canonical_outputs;
     struct ggml_tensor * variant_first = nullptr;
     struct ggml_tensor * variant = nullptr;
+    std::vector<struct ggml_tensor *> variant_outputs;
     uint64_t plan_id = 0;
     int layer = -1;
     bool subgraph = false;
@@ -847,6 +849,7 @@ struct ggml_backend_sched_route_candidate_registration {
 struct ggml_backend_sched_route_candidate_variant {
     struct ggml_tensor * first = nullptr;
     struct ggml_tensor * tensor = nullptr;
+    std::vector<struct ggml_tensor *> outputs;
     int node_start = -1;
     int node_end = -1;   // inclusive terminal/output node
     int split_start = -1;
@@ -860,6 +863,7 @@ struct ggml_backend_sched_route_candidate_plan {
 
 struct ggml_backend_sched_route_candidate_group {
     struct ggml_tensor * canonical = nullptr;
+    std::vector<struct ggml_tensor *> canonical_outputs;
     int layer = -1;
     int canonical_node_index = -1;
     int canonical_variant_index = -1;
@@ -4001,8 +4005,13 @@ static bool ggml_backend_sched_route_tensor_registered(
         return false;
     }
     for (const auto & registration : state->registrations) {
-        if (registration.canonical_first == tensor || registration.canonical == tensor ||
-                registration.variant_first == tensor || registration.variant == tensor) {
+        if (registration.canonical_first == tensor || registration.variant_first == tensor ||
+                std::find(registration.canonical_outputs.begin(),
+                    registration.canonical_outputs.end(), tensor) !=
+                    registration.canonical_outputs.end() ||
+                std::find(registration.variant_outputs.begin(),
+                    registration.variant_outputs.end(), tensor) !=
+                    registration.variant_outputs.end()) {
             return true;
         }
     }
@@ -4060,17 +4069,52 @@ static bool ggml_backend_sched_prepare_route_candidate_graph(
         }
     }
 
-    // First collect registrations by canonical tensor. Canonical is always a
-    // valid fallback even when no plan explicitly maps to it.
+    // First collect registrations by canonical output bundle. The canonical
+    // range is always a valid fallback even when no plan explicitly maps to
+    // it. A single-output registration is represented as a one-element
+    // bundle, so the execution path below stays identical for legacy users.
     for (const auto & registration : state->registrations) {
         struct ggml_tensor * canonical = registration.canonical;
         struct ggml_tensor * variant = registration.variant;
         if (registration.canonical_first == nullptr || canonical == nullptr ||
                 registration.variant_first == nullptr || variant == nullptr ||
-                registration.layer < 0 || ggml_is_view_op(canonical->op) ||
-                ggml_is_view_op(variant->op)) {
+                registration.canonical_outputs.empty() ||
+                registration.canonical_outputs.size() != registration.variant_outputs.size() ||
+                registration.canonical_outputs.back() != canonical ||
+                registration.variant_outputs.back() != variant ||
+                registration.layer < 0 ||
+                ggml_is_view_op(registration.canonical_first->op) ||
+                ggml_is_view_op(registration.variant_first->op)) {
             GGML_LOG_ERROR("%s: invalid route-candidate registration\n", __func__);
             return false;
+        }
+
+        for (size_t output_index = 0;
+                output_index < registration.canonical_outputs.size(); ++output_index) {
+            struct ggml_tensor * canonical_output =
+                registration.canonical_outputs[output_index];
+            struct ggml_tensor * variant_output =
+                registration.variant_outputs[output_index];
+            if (canonical_output == nullptr || variant_output == nullptr ||
+                    ggml_is_view_op(canonical_output->op) ||
+                    ggml_is_view_op(variant_output->op) ||
+                    !ggml_are_same_layout(canonical_output, variant_output)) {
+                GGML_LOG_ERROR(
+                        "%s: route output %zu has invalid or mismatched layout\n",
+                        __func__, output_index);
+                return false;
+            }
+            if (std::find(registration.canonical_outputs.begin(),
+                        registration.canonical_outputs.begin() + output_index,
+                        canonical_output) !=
+                    registration.canonical_outputs.begin() + output_index ||
+                    std::find(registration.variant_outputs.begin(),
+                        registration.variant_outputs.begin() + output_index,
+                        variant_output) !=
+                    registration.variant_outputs.begin() + output_index) {
+                GGML_LOG_ERROR("%s: route output bundles contain duplicates\n", __func__);
+                return false;
+            }
         }
         if (!registration.subgraph &&
                 (ggml_backend_sched_is_parallel_branch_node(canonical) ||
@@ -4082,10 +4126,9 @@ static bool ggml_backend_sched_prepare_route_candidate_graph(
                     __func__, canonical->name, variant->name);
             return false;
         }
-        if (!ggml_are_same_layout(canonical, variant) ||
-                (!registration.subgraph &&
+        if (!registration.subgraph &&
                  (canonical->op != variant->op ||
-                  memcmp(canonical->op_params, variant->op_params, GGML_MAX_OP_PARAMS) != 0))) {
+                  memcmp(canonical->op_params, variant->op_params, GGML_MAX_OP_PARAMS) != 0)) {
             GGML_LOG_ERROR(
                     "%s: route variant %s does not match canonical op/layout %s\n",
                     __func__, variant->name, canonical->name);
@@ -4105,6 +4148,12 @@ static bool ggml_backend_sched_prepare_route_candidate_graph(
         int group_index = -1;
         for (int i = 0; i < (int) state->groups.size(); ++i) {
             if (state->groups[i].canonical == canonical) {
+                if (state->groups[i].canonical_outputs != registration.canonical_outputs) {
+                    GGML_LOG_ERROR(
+                            "%s: canonical route terminal %s belongs to inconsistent output bundles\n",
+                            __func__, canonical->name);
+                    return false;
+                }
                 group_index = i;
                 break;
             }
@@ -4112,10 +4161,13 @@ static bool ggml_backend_sched_prepare_route_candidate_graph(
         if (group_index < 0) {
             ggml_backend_sched_route_candidate_group group;
             group.canonical = canonical;
+            group.canonical_outputs = registration.canonical_outputs;
             group.layer = registration.layer;
-            group.variants.push_back({
-                    registration.canonical_first, canonical,
-                    -1, -1, -1, -1 });
+            ggml_backend_sched_route_candidate_variant canonical_variant;
+            canonical_variant.first = registration.canonical_first;
+            canonical_variant.tensor = canonical;
+            canonical_variant.outputs = registration.canonical_outputs;
+            group.variants.push_back(std::move(canonical_variant));
             state->groups.push_back(std::move(group));
             group_index = (int) state->groups.size() - 1;
         }
@@ -4146,42 +4198,42 @@ static bool ggml_backend_sched_prepare_route_candidate_graph(
         int variant_index = -1;
         for (int i = 0; i < (int) group.variants.size(); ++i) {
             if (group.variants[i].tensor == variant &&
-                    group.variants[i].first == registration.variant_first) {
+                    group.variants[i].first == registration.variant_first &&
+                    group.variants[i].outputs == registration.variant_outputs) {
                 variant_index = i;
                 break;
             }
         }
         if (variant_index < 0) {
-            group.variants.push_back({
-                    registration.variant_first, variant,
-                    -1, -1, -1, -1 });
+            ggml_backend_sched_route_candidate_variant route_variant;
+            route_variant.first = registration.variant_first;
+            route_variant.tensor = variant;
+            route_variant.outputs = registration.variant_outputs;
+            group.variants.push_back(std::move(route_variant));
             variant_index = (int) group.variants.size() - 1;
         }
         group.plans.push_back({ registration.plan_id, variant_index });
     }
 
-    // No candidate tensor may participate in two groups in any role.
+    // No registered range endpoint or output may participate in two groups in
+    // any role. Full range overlap is checked below after graph order resolves.
+    std::unordered_map<const struct ggml_tensor *, int> route_tensor_groups;
     for (int group_index = 0; group_index < (int) state->groups.size(); ++group_index) {
         const auto & group = state->groups[group_index];
         for (const auto & variant : group.variants) {
-            for (int other_index = 0; other_index < (int) state->groups.size(); ++other_index) {
-                if (other_index == group_index) {
-                    continue;
-                }
-                const auto & other = state->groups[other_index];
-                if (other.canonical == variant.tensor) {
+            std::vector<const struct ggml_tensor *> registered_tensors;
+            registered_tensors.reserve(variant.outputs.size() + 1);
+            registered_tensors.push_back(variant.first);
+            for (const struct ggml_tensor * output : variant.outputs) {
+                registered_tensors.push_back(output);
+            }
+            for (const struct ggml_tensor * tensor : registered_tensors) {
+                const auto [it, inserted] = route_tensor_groups.emplace(tensor, group_index);
+                if (!inserted && it->second != group_index) {
                     GGML_LOG_ERROR(
                             "%s: route tensor %s belongs to multiple candidate groups\n",
-                            __func__, variant.tensor->name);
+                            __func__, tensor->name);
                     return false;
-                }
-                for (const auto & other_variant : other.variants) {
-                    if (other_variant.tensor == variant.tensor) {
-                        GGML_LOG_ERROR(
-                                "%s: route tensor %s belongs to multiple candidate groups\n",
-                                __func__, variant.tensor->name);
-                        return false;
-                    }
                 }
             }
         }
@@ -4198,6 +4250,26 @@ static bool ggml_backend_sched_prepare_route_candidate_graph(
             if (variant.node_start < 0 || variant.node_end < variant.node_start) {
                 GGML_LOG_ERROR(
                         "%s: route subgraph %s -> %s is missing, duplicated, or reversed in graph\n",
+                        __func__, variant.first->name, variant.tensor->name);
+                return false;
+            }
+            int previous_output_index = variant.node_start - 1;
+            for (const struct ggml_tensor * output : variant.outputs) {
+                const int output_node_index = graph_node_index(output);
+                if (output_node_index < variant.node_start ||
+                        output_node_index > variant.node_end ||
+                        output_node_index <= previous_output_index) {
+                    GGML_LOG_ERROR(
+                            "%s: route output %s is outside or out of order in range %s -> %s\n",
+                            __func__, output != nullptr ? output->name : "",
+                            variant.first->name, variant.tensor->name);
+                    return false;
+                }
+                previous_output_index = output_node_index;
+            }
+            if (previous_output_index != variant.node_end) {
+                GGML_LOG_ERROR(
+                        "%s: final route output must delimit range %s -> %s\n",
                         __func__, variant.first->name, variant.tensor->name);
                 return false;
             }
@@ -4223,7 +4295,8 @@ static bool ggml_backend_sched_prepare_route_candidate_graph(
         group.canonical_variant_index = 0;
         group.canonical_node_index = group.variants[0].node_start;
         if (group.variants[0].tensor != group.canonical ||
-                group.variants[0].first == nullptr) {
+                group.variants[0].first == nullptr ||
+                group.variants[0].outputs != group.canonical_outputs) {
             GGML_LOG_ERROR("%s: internal canonical route ordering failure\n", __func__);
             return false;
         }
@@ -4237,11 +4310,15 @@ static bool ggml_backend_sched_prepare_route_candidate_graph(
                 return false;
             }
             expected_start = variant.node_end + 1;
-            if (i > 0 && (variant.tensor->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) {
-                GGML_LOG_ERROR(
-                        "%s: alternate route terminal %s cannot be a graph output\n",
-                        __func__, variant.tensor->name);
-                return false;
+            if (i > 0) {
+                for (const struct ggml_tensor * output : variant.outputs) {
+                    if ((output->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) {
+                        GGML_LOG_ERROR(
+                                "%s: alternate route terminal %s cannot be a graph output\n",
+                                __func__, output->name);
+                        return false;
+                    }
+                }
             }
         }
 
@@ -4255,7 +4332,8 @@ static bool ggml_backend_sched_prepare_route_candidate_graph(
             int variant_index = -1;
             for (int i = 0; i < (int) group.variants.size(); ++i) {
                 if (group.variants[i].first == registration.variant_first &&
-                        group.variants[i].tensor == registration.variant) {
+                        group.variants[i].tensor == registration.variant &&
+                        group.variants[i].outputs == registration.variant_outputs) {
                     variant_index = i;
                     break;
                 }
@@ -4295,9 +4373,9 @@ static bool ggml_backend_sched_prepare_route_candidate_graph(
         }
     }
 
-    // Every non-terminal value is private to its own variant. Alternate
-    // terminals are scratch results consumed only by the scheduler's commit;
-    // canonical-terminal consumers must begin after all alternate ranges.
+    // Every non-output value is private to its own variant. Alternate outputs
+    // are scratch results consumed only by the scheduler's atomic commit;
+    // canonical-output consumers must begin after all alternate ranges.
     for (const auto & group : state->groups) {
         const int group_end = group.variants.back().node_end;
         for (int variant_index = 0; variant_index < (int) group.variants.size(); ++variant_index) {
@@ -4307,12 +4385,14 @@ static bool ggml_backend_sched_prepare_route_candidate_graph(
                 const struct ggml_tensor * dependency = graph->nodes[dependency_index];
                 for (int node_index : graph_consumers[(size_t) dependency_index]) {
                     const struct ggml_tensor * node = graph->nodes[node_index];
-                    const bool dependency_is_terminal = dependency == variant.tensor;
+                    const bool dependency_is_output =
+                        std::find(variant.outputs.begin(), variant.outputs.end(), dependency) !=
+                        variant.outputs.end();
                     const bool consumer_inside_variant =
                         node_index >= variant.node_start && node_index <= variant.node_end;
                     const bool allowed_canonical_consumer =
                         variant_index == group.canonical_variant_index &&
-                        dependency_is_terminal && node_index > group_end;
+                        dependency_is_output && node_index > group_end;
                     if (!consumer_inside_variant && !allowed_canonical_consumer) {
                         GGML_LOG_ERROR(
                                 "%s: route value %s escapes variant %s -> %s through node %s\n",
@@ -5139,7 +5219,13 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     int route_lifetime_dependencies = 0;
     if (route_candidate_mode && route_state->prepared) {
         for (const auto & group : route_state->groups) {
-            route_lifetime_dependencies += std::max(0, (int) group.variants.size() - 1);
+            for (int variant_index = 0;
+                    variant_index < (int) group.variants.size(); ++variant_index) {
+                if (variant_index != group.canonical_variant_index) {
+                    route_lifetime_dependencies +=
+                        (int) group.variants[variant_index].outputs.size();
+                }
+            }
         }
     }
     int graph_size = std::max(graph->n_nodes, graph->n_leafs) +
@@ -5223,18 +5309,21 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             const auto & variant = group.variants[variant_index];
             if (variant_index != group.canonical_variant_index &&
                     i + 1 == variant.split_end) {
-                // Alternate terminals are consumed by the scheduler commit,
-                // not by an ordinary graph node. Give ggml-alloc an explicit
-                // post-terminal dependency so their scratch storage can be
-                // reused immediately after commit instead of remaining live
-                // until the end of the whole prefill graph.
-                assert(graph_copy->size > graph_copy->n_nodes);
-                struct ggml_tensor * lifetime_dep =
-                    ggml_view_tensor(sched->ctx, variant.tensor);
-                lifetime_dep->src[0] = variant.tensor;
-                sched->node_backend_ids[graph_copy->n_nodes] =
-                    tensor_backend_id(variant.tensor);
-                graph_copy->nodes[graph_copy->n_nodes++] = lifetime_dep;
+                // Alternate outputs are consumed together by the scheduler
+                // commit, not by ordinary graph nodes. Give ggml-alloc one
+                // explicit post-range dependency per output so early Q/K
+                // terminals remain live until V finishes and the whole bundle
+                // can be committed atomically. Their scratch storage becomes
+                // reusable immediately afterward.
+                for (struct ggml_tensor * output : variant.outputs) {
+                    assert(graph_copy->size > graph_copy->n_nodes);
+                    struct ggml_tensor * lifetime_dep =
+                        ggml_view_tensor(sched->ctx, output);
+                    lifetime_dep->src[0] = output;
+                    sched->node_backend_ids[graph_copy->n_nodes] =
+                        tensor_backend_id(output);
+                    graph_copy->nodes[graph_copy->n_nodes++] = lifetime_dep;
+                }
             }
         }
     }
@@ -6528,30 +6617,64 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                 return;
             }
 
-            struct ggml_tensor * variant = group.variants[variant_index].tensor;
-            struct ggml_tensor * canonical = group.canonical;
-            const int variant_split_id = group.variants[variant_index].split_end - 1;
-            const int canonical_split_id =
-                group.variants[group.canonical_variant_index].split_end - 1;
-            GGML_ASSERT(variant_split_id >= 0 && variant_split_id < sched->n_splits);
-            GGML_ASSERT(canonical_split_id >= 0 && canonical_split_id < sched->n_splits);
-            ggml_backend_t variant_backend = sched->backends[splits[variant_split_id].backend_id];
-            ggml_backend_t canonical_backend = sched->backends[splits[canonical_split_id].backend_id];
+            const auto & variant_outputs = group.variants[variant_index].outputs;
+            const auto & canonical_outputs = group.canonical_outputs;
+            GGML_ASSERT(!variant_outputs.empty());
+            GGML_ASSERT(variant_outputs.size() == canonical_outputs.size());
+
+            ggml_backend_t variant_backends[GGML_SCHED_MAX_BACKENDS] = {};
+            ggml_backend_t canonical_backends[GGML_SCHED_MAX_BACKENDS] = {};
+            int n_variant_backends = 0;
+            int n_canonical_backends = 0;
+            auto append_backend = [](ggml_backend_t * backends, int * n_backends,
+                                     ggml_backend_t backend) {
+                if (std::find(backends, backends + *n_backends, backend) ==
+                        backends + *n_backends) {
+                    GGML_ASSERT(*n_backends < GGML_SCHED_MAX_BACKENDS);
+                    backends[(*n_backends)++] = backend;
+                }
+            };
+            for (size_t output_index = 0;
+                    output_index < variant_outputs.size(); ++output_index) {
+                const int variant_backend_id = tensor_backend_id(variant_outputs[output_index]);
+                const int canonical_backend_id = tensor_backend_id(canonical_outputs[output_index]);
+                GGML_ASSERT(variant_backend_id >= 0 && variant_backend_id < sched->n_backends);
+                GGML_ASSERT(canonical_backend_id >= 0 && canonical_backend_id < sched->n_backends);
+                append_backend(variant_backends, &n_variant_backends,
+                        sched->backends[variant_backend_id]);
+                append_backend(canonical_backends, &n_canonical_backends,
+                        sched->backends[canonical_backend_id]);
+            }
 
             const int64_t wait_t0_us = ggml_time_us();
-            ggml_backend_synchronize(variant_backend);
+            for (int backend_index = 0;
+                    backend_index < n_variant_backends; ++backend_index) {
+                ggml_backend_synchronize(variant_backends[backend_index]);
+            }
             // The canonical allocation may reuse storage whose previous user
             // was submitted asynchronously on the canonical backend. A direct
             // blocking tensor copy is not guaranteed to be ordered behind that
             // backend queue, so wait for the destination as well before
             // overwriting it. This is the correctness-first baseline until the
             // canonical commit becomes a location-aware queued/zero-copy path.
-            if (canonical_backend != variant_backend) {
-                ggml_backend_synchronize(canonical_backend);
+            for (int backend_index = 0;
+                    backend_index < n_canonical_backends; ++backend_index) {
+                ggml_backend_t backend = canonical_backends[backend_index];
+                if (std::find(variant_backends,
+                            variant_backends + n_variant_backends, backend) ==
+                        variant_backends + n_variant_backends) {
+                    ggml_backend_synchronize(backend);
+                }
             }
             const int64_t wait_t1_us = ggml_time_us();
             const int64_t copy_t0_us = wait_t1_us;
-            ggml_backend_tensor_copy(variant, canonical);
+            // No downstream split is submitted until every pair has been
+            // copied, so consumers can never observe a mixed Q/K/V profile.
+            for (size_t output_index = 0;
+                    output_index < variant_outputs.size(); ++output_index) {
+                ggml_backend_tensor_copy(
+                        variant_outputs[output_index], canonical_outputs[output_index]);
+            }
             const int64_t copy_t1_us = ggml_time_us();
             const int64_t wait_us = wait_t1_us - wait_t0_us;
             const int64_t copy_us = copy_t1_us - copy_t0_us;
@@ -6562,6 +6685,9 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
             }
             ggml_sched_profile_add_wait_us(wait_us);
             ggml_sched_profile_add_copy_us(copy_us);
+            // Preserve the public counter's group-level meaning: a bundle is
+            // one atomic canonical commit even though it copies several
+            // terminal tensors.
             state.stats.canonical_commits++;
             state.stats.commit_wait_us += (uint64_t) std::max<int64_t>(wait_us, 0);
             state.stats.commit_copy_us += (uint64_t) std::max<int64_t>(copy_us, 0);
@@ -7828,13 +7954,21 @@ void ggml_backend_sched_reset_layer_checkpoint_stats(ggml_backend_sched_t sched)
 static bool ggml_backend_sched_register_route_candidate_impl(
         ggml_backend_sched_t sched,
         struct ggml_tensor * canonical_first,
-        struct ggml_tensor * canonical,
+        struct ggml_tensor * const * canonical_outputs,
         struct ggml_tensor * variant_first,
-        struct ggml_tensor * variant,
+        struct ggml_tensor * const * variant_outputs,
+        int n_outputs,
         uint64_t plan_id,
         int layer,
         bool subgraph) {
     GGML_ASSERT(sched != nullptr);
+
+    if (n_outputs <= 0 || canonical_outputs == nullptr || variant_outputs == nullptr) {
+        GGML_LOG_ERROR("%s: route output bundle must not be empty\n", __func__);
+        return false;
+    }
+    struct ggml_tensor * canonical = canonical_outputs[n_outputs - 1];
+    struct ggml_tensor * variant = variant_outputs[n_outputs - 1];
 
     if (sched->is_alloc) {
         GGML_LOG_ERROR("%s: route candidates must be registered before graph allocation\n", __func__);
@@ -7857,6 +7991,30 @@ static bool ggml_backend_sched_register_route_candidate_impl(
         GGML_LOG_ERROR("%s: invalid route-candidate arguments\n", __func__);
         return false;
     }
+    for (int output_index = 0; output_index < n_outputs; ++output_index) {
+        struct ggml_tensor * canonical_output = canonical_outputs[output_index];
+        struct ggml_tensor * variant_output = variant_outputs[output_index];
+        if (canonical_output == nullptr || variant_output == nullptr ||
+                ggml_is_view_op(canonical_output->op) ||
+                ggml_is_view_op(variant_output->op) ||
+                !ggml_are_same_layout(canonical_output, variant_output)) {
+            GGML_LOG_ERROR(
+                    "%s: route output %d has invalid or mismatched layout\n",
+                    __func__, output_index);
+            return false;
+        }
+        for (int previous_index = 0; previous_index < output_index; ++previous_index) {
+            if (canonical_outputs[previous_index] == canonical_output ||
+                    variant_outputs[previous_index] == variant_output) {
+                GGML_LOG_ERROR("%s: route output bundles contain duplicates\n", __func__);
+                return false;
+            }
+        }
+    }
+    if (!subgraph && n_outputs != 1) {
+        GGML_LOG_ERROR("%s: a single-node route must have exactly one output\n", __func__);
+        return false;
+    }
     if (!subgraph &&
             (ggml_backend_sched_is_parallel_branch_node(canonical) ||
             ggml_backend_sched_is_parallel_join_node(canonical) ||
@@ -7869,8 +8027,13 @@ static bool ggml_backend_sched_register_route_candidate_impl(
     }
     if (sched->layer_checkpoints != nullptr && sched->layer_checkpoints->enabled) {
         for (const auto & checkpoint : sched->layer_checkpoints->checkpoints) {
-            if (checkpoint.boundary == canonical_first || checkpoint.boundary == canonical ||
-                    checkpoint.boundary == variant_first || checkpoint.boundary == variant) {
+            const bool is_output =
+                std::find(canonical_outputs, canonical_outputs + n_outputs,
+                    checkpoint.boundary) != canonical_outputs + n_outputs ||
+                std::find(variant_outputs, variant_outputs + n_outputs,
+                    checkpoint.boundary) != variant_outputs + n_outputs;
+            if (checkpoint.boundary == canonical_first ||
+                    checkpoint.boundary == variant_first || is_output) {
                 GGML_LOG_ERROR(
                         "%s: route candidate %s is already a checkpoint boundary\n",
                         __func__, checkpoint.boundary->name);
@@ -7892,9 +8055,19 @@ static bool ggml_backend_sched_register_route_candidate_impl(
         }
     }
     try {
-        state->registrations.push_back({
-                canonical_first, canonical, variant_first, variant,
-                plan_id, layer, subgraph });
+        ggml_backend_sched_route_candidate_registration registration;
+        registration.canonical_first = canonical_first;
+        registration.canonical = canonical;
+        registration.canonical_outputs.assign(
+                canonical_outputs, canonical_outputs + n_outputs);
+        registration.variant_first = variant_first;
+        registration.variant = variant;
+        registration.variant_outputs.assign(
+                variant_outputs, variant_outputs + n_outputs);
+        registration.plan_id = plan_id;
+        registration.layer = layer;
+        registration.subgraph = subgraph;
+        state->registrations.push_back(std::move(registration));
     } catch (const std::exception & error) {
         GGML_LOG_ERROR("%s: failed to store route candidate: %s\n", __func__, error.what());
         return false;
@@ -7922,9 +8095,11 @@ bool ggml_backend_sched_register_route_candidate(
         struct ggml_tensor * variant,
         uint64_t plan_id,
         int layer) {
+    struct ggml_tensor * canonical_outputs[] = { canonical };
+    struct ggml_tensor * variant_outputs[] = { variant };
     return ggml_backend_sched_register_route_candidate_impl(
-            sched, canonical, canonical, variant, variant,
-            plan_id, layer, false);
+            sched, canonical, canonical_outputs, variant, variant_outputs,
+            1, plan_id, layer, false);
 }
 
 bool ggml_backend_sched_register_route_subgraph(
@@ -7935,10 +8110,27 @@ bool ggml_backend_sched_register_route_subgraph(
         struct ggml_tensor * variant_output,
         uint64_t plan_id,
         int layer) {
+    struct ggml_tensor * canonical_outputs[] = { canonical_output };
+    struct ggml_tensor * variant_outputs[] = { variant_output };
     return ggml_backend_sched_register_route_candidate_impl(
-            sched, canonical_first, canonical_output,
-            variant_first, variant_output,
-            plan_id, layer, true);
+            sched, canonical_first, canonical_outputs,
+            variant_first, variant_outputs,
+            1, plan_id, layer, true);
+}
+
+bool ggml_backend_sched_register_route_subgraph_bundle(
+        ggml_backend_sched_t sched,
+        struct ggml_tensor * canonical_first,
+        struct ggml_tensor * const * canonical_outputs,
+        struct ggml_tensor * variant_first,
+        struct ggml_tensor * const * variant_outputs,
+        int n_outputs,
+        uint64_t plan_id,
+        int layer) {
+    return ggml_backend_sched_register_route_candidate_impl(
+            sched, canonical_first, canonical_outputs,
+            variant_first, variant_outputs,
+            n_outputs, plan_id, layer, true);
 }
 
 void ggml_backend_sched_clear_route_candidates(ggml_backend_sched_t sched) {

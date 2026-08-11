@@ -2,9 +2,14 @@
 #include "ggml-cpu.h"
 #include "ggml.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -237,6 +242,197 @@ static bool check(bool condition, const char * scenario, const char * detail) {
     if (!condition) {
         std::fprintf(stderr, "%s: %s\n", scenario, detail);
         return false;
+    }
+    return true;
+}
+
+class route_trace_capture {
+public:
+    explicit route_trace_capture(const char * tag) {
+        std::error_code ec;
+        const std::filesystem::path directory = std::filesystem::temp_directory_path(ec);
+        if (ec) {
+            return;
+        }
+        const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+        for (int attempt = 0; attempt < 100; ++attempt) {
+            const std::filesystem::path candidate = directory /
+                ("llama-test-backend-sched-route-" + std::to_string(stamp) + "-" +
+                 tag + "-" + std::to_string(attempt) + ".csv");
+            if (std::filesystem::exists(candidate, ec)) {
+                if (ec) {
+                    return;
+                }
+                continue;
+            }
+            std::ofstream file(candidate, std::ios::binary | std::ios::trunc);
+            if (file) {
+                path_ = candidate.string();
+                break;
+            }
+        }
+    }
+
+    ~route_trace_capture() {
+        finish();
+        std::error_code ec;
+        if (!path_.empty()) {
+            (void) std::filesystem::remove(path_, ec);
+        }
+    }
+
+    bool start(int query_id) {
+        if (path_.empty()) {
+            return false;
+        }
+        ggml_backend_sched_trace_set_enabled(false);
+        ggml_backend_sched_trace_set_path(path_.c_str());
+        ggml_backend_sched_trace_set_enabled(true);
+        ggml_backend_sched_trace_reset();
+        ggml_backend_sched_trace_set_query_id(query_id);
+        ggml_backend_sched_trace_set_ubatch(0, 0, 1);
+        active_ = true;
+        return true;
+    }
+
+    void finish() {
+        if (!active_) {
+            return;
+        }
+        ggml_backend_sched_trace_flush();
+        ggml_backend_sched_trace_set_enabled(false);
+        active_ = false;
+    }
+
+    const std::string & path() const {
+        return path_;
+    }
+
+private:
+    std::string path_;
+    bool active_ = false;
+};
+
+struct route_trace_row {
+    int group_id = -1;
+    int node_count = -1;
+    bool is_parallel_group = false;
+    std::string first_node;
+    std::string last_node;
+    std::string parallel_kind;
+    std::string parallel_branch;
+};
+
+static bool parse_route_trace_csv_line(
+        const std::string & line,
+        std::vector<std::string> * fields) {
+    fields->clear();
+    std::string field;
+    bool quoted = false;
+    for (size_t i = 0; i < line.size(); ++i) {
+        const char ch = line[i];
+        if (ch == '"') {
+            if (quoted && i + 1 < line.size() && line[i + 1] == '"') {
+                field.push_back('"');
+                ++i;
+            } else {
+                quoted = !quoted;
+            }
+        } else if (ch == ',' && !quoted) {
+            fields->push_back(std::move(field));
+            field.clear();
+        } else if (ch != '\r') {
+            field.push_back(ch);
+        }
+    }
+    if (quoted) {
+        return false;
+    }
+    fields->push_back(std::move(field));
+    return true;
+}
+
+static int route_trace_column(
+        const std::vector<std::string> & columns,
+        const char * name) {
+    const auto it = std::find(columns.begin(), columns.end(), name);
+    return it == columns.end() ? -1 : (int) std::distance(columns.begin(), it);
+}
+
+static bool parse_route_trace_int(const std::string & text, int * value) {
+    char * end = nullptr;
+    const long parsed = std::strtol(text.c_str(), &end, 10);
+    if (end == text.c_str() || *end != '\0') {
+        return false;
+    }
+    *value = (int) parsed;
+    return true;
+}
+
+static bool read_route_trace(
+        const std::string & path,
+        const char * scenario,
+        std::vector<route_trace_row> * rows) {
+    std::ifstream file(path, std::ios::binary);
+    if (!check((bool) file, scenario, "failed to open scheduler trace")) {
+        return false;
+    }
+
+    std::string line;
+    std::vector<std::string> columns;
+    if (!check(
+                std::getline(file, line) &&
+                    parse_route_trace_csv_line(line, &columns),
+                scenario, "failed to read scheduler trace header")) {
+        return false;
+    }
+    const int group_id_col = route_trace_column(columns, "group_id");
+    const int node_count_col = route_trace_column(columns, "node_count");
+    const int first_node_col = route_trace_column(columns, "first_node");
+    const int last_node_col = route_trace_column(columns, "last_node");
+    const int is_parallel_group_col = route_trace_column(columns, "is_parallel_group");
+    const int parallel_kind_col = route_trace_column(columns, "parallel_group_kind");
+    const int parallel_branch_col = route_trace_column(columns, "parallel_branch");
+    const int required_columns[] = {
+        group_id_col,
+        node_count_col,
+        first_node_col,
+        last_node_col,
+        is_parallel_group_col,
+        parallel_kind_col,
+        parallel_branch_col,
+    };
+    for (int column : required_columns) {
+        if (!check(column >= 0, scenario, "scheduler trace is missing a required column")) {
+            return false;
+        }
+    }
+
+    rows->clear();
+    std::vector<std::string> fields;
+    while (std::getline(file, line)) {
+        if (line.empty()) {
+            continue;
+        }
+        if (!check(parse_route_trace_csv_line(line, &fields),
+                    scenario, "malformed scheduler trace row") ||
+                !check(fields.size() == columns.size(),
+                    scenario, "scheduler trace column count mismatch")) {
+            return false;
+        }
+        route_trace_row row;
+        if (!check(parse_route_trace_int(fields[group_id_col], &row.group_id),
+                    scenario, "invalid scheduler trace group id") ||
+                !check(parse_route_trace_int(fields[node_count_col], &row.node_count),
+                    scenario, "invalid scheduler trace node count")) {
+            return false;
+        }
+        row.is_parallel_group = fields[is_parallel_group_col] == "1";
+        row.first_node = fields[first_node_col];
+        row.last_node = fields[last_node_col];
+        row.parallel_kind = fields[parallel_kind_col];
+        row.parallel_branch = fields[parallel_branch_col];
+        rows->push_back(std::move(row));
     }
     return true;
 }
@@ -805,6 +1001,413 @@ static bool run_multi_consumer_commit_case() {
     return ok;
 }
 
+static bool run_multi_output_bundle_case() {
+    const char * scenario = "multi-output-atomic-bundle";
+    constexpr int n_outputs = 3;
+    const size_t graph_size = 64;
+    const ggml_init_params params = {
+        /* .mem_size   = */ 128 * ggml_tensor_overhead() +
+                              ggml_graph_overhead_custom(graph_size, false),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+
+    ggml_context * ctx = ggml_init(params);
+    ggml_backend_t backends[2] = {
+        ggml_backend_cpu_init(),
+        ggml_backend_cpu_init(),
+    };
+    ggml_backend_sched_t sched = backends[0] != nullptr && backends[1] != nullptr
+        ? ggml_backend_sched_new(backends, nullptr, 2, 128, false, true)
+        : nullptr;
+    auto cleanup = [&]() {
+        ggml_backend_sched_free(sched);
+        ggml_backend_free(backends[0]);
+        ggml_backend_free(backends[1]);
+        ggml_free(ctx);
+    };
+    if (!check(ctx != nullptr && sched != nullptr, scenario, "backend setup failed")) {
+        cleanup();
+        return false;
+    }
+
+    ggml_tensor * x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+    ggml_tensor * y = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+    ggml_set_input(x);
+    ggml_set_input(y);
+    ggml_set_name(x, "route-bundle-x");
+    ggml_set_name(y, "route-bundle-y");
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, graph_size, false);
+    ggml_tensor * canonical_outputs[n_outputs] = {
+        ggml_add(ctx, x, y),
+        ggml_mul(ctx, x, y),
+        ggml_sub(ctx, x, y),
+    };
+    ggml_tensor * alternate_outputs[n_outputs] = {
+        ggml_mul(ctx, x, y),
+        ggml_add(ctx, x, y),
+        ggml_sub(ctx, y, x),
+    };
+    const char * canonical_names[n_outputs] = {
+        "route-bundle-canonical-q",
+        "route-bundle-canonical-k",
+        "route-bundle-canonical-v",
+    };
+    const char * alternate_names[n_outputs] = {
+        "route-bundle-alternate-q",
+        "route-bundle-alternate-k",
+        "route-bundle-alternate-v",
+    };
+    for (int output_index = 0; output_index < n_outputs; ++output_index) {
+        ggml_set_name(canonical_outputs[output_index], canonical_names[output_index]);
+        ggml_backend_sched_set_tensor_backend(
+                sched, canonical_outputs[output_index], backends[0]);
+        ggml_build_forward_expand(graph, canonical_outputs[output_index]);
+    }
+    for (int output_index = 0; output_index < n_outputs; ++output_index) {
+        ggml_set_name(alternate_outputs[output_index], alternate_names[output_index]);
+        ggml_backend_sched_set_tensor_backend(
+                sched, alternate_outputs[output_index], backends[1]);
+        ggml_build_forward_expand(graph, alternate_outputs[output_index]);
+    }
+
+    // Each downstream node observes a different canonical terminal. If the
+    // alternate route commits only the final V value, or releases Q/K scratch
+    // storage before V completes, at least one output check below fails.
+    ggml_tensor * outputs[n_outputs] = {};
+    for (int output_index = 0; output_index < n_outputs; ++output_index) {
+        outputs[output_index] = ggml_scale(ctx, canonical_outputs[output_index], 1.0f);
+        const std::string name = "route-bundle-output-" + std::to_string(output_index);
+        ggml_set_name(outputs[output_index], name.c_str());
+        ggml_set_output(outputs[output_index]);
+        ggml_backend_sched_set_tensor_backend(sched, outputs[output_index], backends[0]);
+        ggml_build_forward_expand(graph, outputs[output_index]);
+    }
+
+    // Reject a malformed bundle without changing the scheduler registration
+    // state. All valid plan mappings below share one canonical bundle.
+    ggml_tensor * wrong_layout = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 3);
+    ggml_tensor * mismatched_outputs[n_outputs] = {
+        alternate_outputs[0], alternate_outputs[1], wrong_layout,
+    };
+    bool setup_ok = !ggml_backend_sched_register_route_subgraph_bundle(
+            sched,
+            canonical_outputs[0], canonical_outputs,
+            alternate_outputs[0], mismatched_outputs,
+            n_outputs, 99, 0);
+    setup_ok = setup_ok &&
+        ggml_backend_sched_register_route_subgraph_bundle(
+                sched,
+                canonical_outputs[0], canonical_outputs,
+                canonical_outputs[0], canonical_outputs,
+                n_outputs, 0, 0) &&
+        ggml_backend_sched_register_route_subgraph_bundle(
+                sched,
+                canonical_outputs[0], canonical_outputs,
+                alternate_outputs[0], alternate_outputs,
+                n_outputs, 1, 0) &&
+        // Multiple policy profiles may inherit exactly the same topology.
+        ggml_backend_sched_register_route_subgraph_bundle(
+                sched,
+                canonical_outputs[0], canonical_outputs,
+                alternate_outputs[0], alternate_outputs,
+                n_outputs, 2, 0);
+    ggml_backend_sched_layer_checkpoint_set_plan_id(sched, 0);
+    setup_ok = setup_ok && ggml_backend_sched_alloc_graph(sched, graph);
+    if (!check(setup_ok, scenario, "bundle route preparation failed")) {
+        cleanup();
+        return false;
+    }
+
+    const float x_data[4] = { 1.0f, 2.0f, 3.0f, 4.0f };
+    const float y_data[4] = { 5.0f, 6.0f, 7.0f, 8.0f };
+    auto compute_and_check = [&](uint64_t plan_id, bool alternate) {
+        // User-owned graph inputs may be refreshed between scheduler runs;
+        // exercise every plan from the same explicit input state.
+        ggml_backend_tensor_set(x, x_data, 0, sizeof(x_data));
+        ggml_backend_tensor_set(y, y_data, 0, sizeof(y_data));
+        ggml_backend_sched_layer_checkpoint_set_plan_id(sched, plan_id);
+        if (!check(
+                    ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS,
+                    scenario, "graph compute failed")) {
+            return false;
+        }
+        for (int output_index = 0; output_index < n_outputs; ++output_index) {
+            float actual[4] = {};
+            ggml_backend_tensor_get(outputs[output_index], actual, 0, sizeof(actual));
+            for (int i = 0; i < 4; ++i) {
+                float expected = 0.0f;
+                if (!alternate) {
+                    expected = output_index == 0 ? x_data[i] + y_data[i] :
+                        output_index == 1 ? x_data[i] * y_data[i] :
+                        x_data[i] - y_data[i];
+                } else {
+                    expected = output_index == 0 ? x_data[i] * y_data[i] :
+                        output_index == 1 ? x_data[i] + y_data[i] :
+                        y_data[i] - x_data[i];
+                }
+                if (!check(std::fabs(actual[i] - expected) < 1e-5f,
+                            scenario, "bundle output mismatch")) {
+                    std::fprintf(stderr,
+                            "  plan %llu output %d index %d: got %.6f, expected %.6f\n",
+                            (unsigned long long) plan_id, output_index, i,
+                            actual[i], expected);
+                    return false;
+                }
+            }
+        }
+        return true;
+    };
+
+    bool ok =
+        compute_and_check(0, false) &&
+        compute_and_check(1, true) &&
+        compute_and_check(2, true) &&
+        // An unknown profile falls back to the complete canonical bundle.
+        compute_and_check(77, false);
+
+    ggml_backend_sched_route_candidate_stats stats = {};
+    ggml_backend_sched_get_route_candidate_stats(sched, &stats);
+    ok =
+        check(stats.registered_mappings == 3, scenario, "mapping count mismatch") &&
+        check(stats.prepared_groups == 1, scenario, "prepared group count mismatch") &&
+        check(stats.groups_executed == 4, scenario, "executed group count mismatch") &&
+        check(stats.canonical_selected == 2, scenario, "canonical selection mismatch") &&
+        check(stats.alternate_selected == 2, scenario, "alternate selection mismatch") &&
+        check(stats.canonical_commits == 2, scenario, "bundle commit count mismatch") &&
+        check(stats.plan_misses == 1, scenario, "unknown plan fallback mismatch") && ok;
+
+    cleanup();
+    return ok;
+}
+
+static bool run_qkv_composite_lane_bundle_case() {
+    const char * scenario = "qkv-composite-lane-route-bundle";
+    constexpr int n_lanes = 3;
+    constexpr int n_outputs = 3;
+    constexpr int64_t shard_width = 4;
+    constexpr int64_t output_width = n_lanes * shard_width;
+    const size_t graph_size = 128;
+    const ggml_init_params params = {
+        /* .mem_size   = */ 192 * ggml_tensor_overhead() +
+                              ggml_graph_overhead_custom(graph_size, false),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+
+    ggml_context * ctx = ggml_init(params);
+    ggml_backend_t backends[n_lanes] = {
+        ggml_backend_cpu_init(),
+        ggml_backend_cpu_init(),
+        ggml_backend_cpu_init(),
+    };
+    ggml_backend_sched_t sched =
+        backends[0] != nullptr && backends[1] != nullptr && backends[2] != nullptr
+        ? ggml_backend_sched_new(backends, nullptr, n_lanes, 256, false, true)
+        : nullptr;
+    auto cleanup = [&]() {
+        ggml_backend_sched_free(sched);
+        for (ggml_backend_t backend : backends) {
+            ggml_backend_free(backend);
+        }
+        ggml_free(ctx);
+    };
+    if (!check(ctx != nullptr && sched != nullptr, scenario, "backend setup failed")) {
+        cleanup();
+        return false;
+    }
+
+    ggml_tensor * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, shard_width);
+    ggml_set_input(input);
+    ggml_set_name(input, "qkv-route-composite-input");
+    ggml_backend_sched_set_tensor_backend(sched, input, backends[0]);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, graph_size, false);
+
+    struct composite_variant {
+        ggml_tensor * first = nullptr;
+        ggml_tensor * lane_nodes[n_lanes][n_outputs] = {};
+        ggml_tensor * outputs[n_outputs] = {};
+    };
+    static const char * projection_names[n_outputs] = { "q", "k", "v" };
+    auto build_variant = [&](const char * tag, int factor_base) {
+        composite_variant variant;
+
+        // Match the production graph's backend-major ordering: one lane owns
+        // Q, K, and V consecutively before graph construction moves to the
+        // next processor lane.
+        for (int lane = 0; lane < n_lanes; ++lane) {
+            for (int projection = 0; projection < n_outputs; ++projection) {
+                const float factor =
+                    (float) (factor_base + projection * n_lanes + lane + 1);
+                ggml_tensor * node = ggml_scale(ctx, input, factor);
+                const std::string name =
+                    "attn_qkv_shard." + std::string(tag) + "-lane" +
+                    std::to_string(lane) + "." + projection_names[projection] +
+                    ".proj-0";
+                ggml_set_name(node, name.c_str());
+                ggml_backend_sched_set_tensor_backend(sched, node, backends[lane]);
+                ggml_build_forward_expand(graph, node);
+                variant.lane_nodes[lane][projection] = node;
+                if (variant.first == nullptr) {
+                    variant.first = node;
+                }
+            }
+        }
+
+        // Assemble Q, K, and V independently after all nine lane operations.
+        // V is expanded last and therefore explicitly delimits the route range.
+        for (int projection = 0; projection < n_outputs; ++projection) {
+            ggml_tensor * inner = ggml_concat(
+                    ctx,
+                    variant.lane_nodes[1][projection],
+                    variant.lane_nodes[2][projection],
+                    0);
+            ggml_tensor * output = ggml_concat(
+                    ctx,
+                    variant.lane_nodes[0][projection],
+                    inner,
+                    0);
+            const std::string prefix =
+                "attn_qkv_join." + std::string(projection_names[projection]) +
+                "." + tag;
+            ggml_set_name(inner, (prefix + ".concat1-0").c_str());
+            ggml_set_name(output, (prefix + ".concat0-0").c_str());
+            ggml_backend_sched_set_tensor_backend(sched, inner, backends[0]);
+            ggml_backend_sched_set_tensor_backend(sched, output, backends[0]);
+            ggml_build_forward_expand(graph, output);
+            variant.outputs[projection] = output;
+        }
+        return variant;
+    };
+
+    const composite_variant canonical = build_variant("canonical", 0);
+    const composite_variant alternate = build_variant("alternate", 9);
+
+    ggml_tensor * downstream[n_outputs] = {};
+    for (int projection = 0; projection < n_outputs; ++projection) {
+        downstream[projection] = ggml_scale(ctx, canonical.outputs[projection], 1.0f);
+        const std::string name =
+            "qkv-route-composite-downstream-" + std::to_string(projection);
+        ggml_set_name(downstream[projection], name.c_str());
+        ggml_set_output(downstream[projection]);
+        ggml_backend_sched_set_tensor_backend(sched, downstream[projection], backends[0]);
+        ggml_build_forward_expand(graph, downstream[projection]);
+    }
+
+    bool setup_ok =
+        ggml_backend_sched_register_route_subgraph_bundle(
+                sched,
+                canonical.first, canonical.outputs,
+                canonical.first, canonical.outputs,
+                n_outputs, 0, 0) &&
+        ggml_backend_sched_register_route_subgraph_bundle(
+                sched,
+                canonical.first, canonical.outputs,
+                alternate.first, alternate.outputs,
+                n_outputs, 1, 0);
+    ggml_backend_sched_layer_checkpoint_set_plan_id(sched, 1);
+    setup_ok = setup_ok && ggml_backend_sched_alloc_graph(sched, graph);
+    if (!check(setup_ok, scenario, "QKV composite route preparation failed")) {
+        cleanup();
+        return false;
+    }
+
+    route_trace_capture trace(scenario);
+    if (!check(trace.start(201), scenario, "failed to start scheduler trace")) {
+        cleanup();
+        return false;
+    }
+    const float input_data[shard_width] = { 1.0f, 2.0f, 3.0f, 4.0f };
+    ggml_backend_tensor_set(input, input_data, 0, sizeof(input_data));
+    bool ok = check(
+            ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS,
+            scenario, "graph compute failed");
+    trace.finish();
+
+    // All three alternate projection terminals must be committed before these
+    // canonical downstream nodes execute.
+    for (int projection = 0; ok && projection < n_outputs; ++projection) {
+        float actual[output_width] = {};
+        ggml_backend_tensor_get(
+                downstream[projection], actual, 0, sizeof(actual));
+        for (int lane = 0; lane < n_lanes; ++lane) {
+            const float factor =
+                (float) (9 + projection * n_lanes + lane + 1);
+            for (int element = 0; element < shard_width; ++element) {
+                const int index = lane * shard_width + element;
+                const float expected = input_data[element] * factor;
+                if (!check(std::fabs(actual[index] - expected) < 1e-5f,
+                            scenario, "committed Q/K/V output mismatch")) {
+                    std::fprintf(stderr,
+                            "  projection %s lane %d index %d: got %.6f, expected %.6f\n",
+                            projection_names[projection], lane, element,
+                            actual[index], expected);
+                    ok = false;
+                    break;
+                }
+            }
+        }
+    }
+
+    ggml_backend_sched_route_candidate_stats stats = {};
+    ggml_backend_sched_get_route_candidate_stats(sched, &stats);
+    ok =
+        check(stats.registered_mappings == 2, scenario, "mapping count mismatch") &&
+        check(stats.prepared_groups == 1, scenario, "prepared group count mismatch") &&
+        check(stats.prepared_candidate_splits == 8,
+            scenario, "canonical/alternate QKV ranges did not each form four splits") &&
+        check(stats.groups_executed == 1, scenario, "route group count mismatch") &&
+        check(stats.canonical_selected == 0, scenario, "canonical route unexpectedly selected") &&
+        check(stats.alternate_selected == 1, scenario, "alternate route was not selected") &&
+        check(stats.inactive_splits_skipped == 4,
+            scenario, "non-selected canonical range was not fully skipped") &&
+        check(stats.canonical_commits == 1, scenario, "QKV bundle commit count mismatch") && ok;
+
+    std::vector<route_trace_row> trace_rows;
+    ok = read_route_trace(trace.path(), scenario, &trace_rows) && ok;
+    std::vector<route_trace_row> grouped_rows;
+    bool canonical_range_was_traced = false;
+    for (const route_trace_row & row : trace_rows) {
+        canonical_range_was_traced = canonical_range_was_traced ||
+            row.first_node.find("attn_qkv_shard.canonical-") != std::string::npos ||
+            row.last_node.find("attn_qkv_shard.canonical-") != std::string::npos;
+        if (row.is_parallel_group && row.parallel_kind == "attn_qkv_shard") {
+            grouped_rows.push_back(row);
+        }
+    }
+    ok =
+        check(!canonical_range_was_traced,
+            scenario, "inactive canonical lane range appeared in execution trace") &&
+        check(grouped_rows.size() == n_lanes,
+            scenario, "selected alternate did not execute one three-lane QKV group") && ok;
+    if (grouped_rows.size() == n_lanes) {
+        const int group_id = grouped_rows[0].group_id;
+        for (int lane = 0; lane < n_lanes; ++lane) {
+            const route_trace_row & row = grouped_rows[lane];
+            const std::string branch = "alternate-lane" + std::to_string(lane);
+            const std::string expected_first =
+                "attn_qkv_shard." + branch + ".q.proj-0";
+            const std::string expected_last =
+                "attn_qkv_shard." + branch + ".v.proj-0";
+            ok =
+                check(row.group_id == group_id && group_id >= 0,
+                    scenario, "composite lanes did not share one group id") &&
+                check(row.parallel_branch == branch,
+                    scenario, "alternate composite lane order mismatch") &&
+                check(row.node_count == n_outputs,
+                    scenario, "Q/K/V did not remain in one backend-major lane split") &&
+                check(row.first_node == expected_first,
+                    scenario, "composite lane did not begin with Q") &&
+                check(row.last_node == expected_last,
+                    scenario, "composite lane did not end with V") && ok;
+        }
+    }
+
+    cleanup();
+    return ok;
+}
+
 static bool run_attn_out_fork_join_subgraph_case() {
     const char * scenario = "attn-out-fork-join-subgraph";
     const size_t graph_size = 64;
@@ -998,6 +1601,11 @@ static bool run_default_off_case() {
 } // namespace
 
 int main() {
+#if defined(_WIN32)
+    (void) _putenv_s("SCHED_TRACE_PHASE", "both");
+#else
+    (void) setenv("SCHED_TRACE_PHASE", "both", 1);
+#endif
     bool ok = true;
     ok = run_default_off_case() && ok;
     ok = run_two_layer_case(
@@ -1017,6 +1625,8 @@ int main() {
     ok = run_boundary_producer_cancels_stale_request_case() && ok;
     ok = run_subgraph_layer_switch_case() && ok;
     ok = run_multi_consumer_commit_case() && ok;
+    ok = run_multi_output_bundle_case() && ok;
+    ok = run_qkv_composite_lane_bundle_case() && ok;
     ok = run_attn_out_fork_join_subgraph_case() && ok;
     ok = run_alternate_terminal_lifetime_case() && ok;
 

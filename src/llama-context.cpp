@@ -2785,9 +2785,9 @@ bool llama_context::runtime_route_prepare_graph(
 
     struct route_registration {
         ggml_tensor * canonical_first;
-        ggml_tensor * canonical;
+        std::vector<ggml_tensor *> canonical_outputs;
         ggml_tensor * variant_first;
-        ggml_tensor * variant;
+        std::vector<ggml_tensor *> variant_outputs;
         uint64_t plan_id;
         int layer;
         bool subgraph;
@@ -2834,7 +2834,9 @@ bool llama_context::runtime_route_prepare_graph(
     std::vector<bool> prebuilt_subgraph_nodes((size_t) original_n_nodes, false);
     for (const auto & subgraph : runtime_route_subgraphs) {
         const auto first_it = original_node_indices.find(subgraph.first);
-        const auto output_it = original_node_indices.find(subgraph.output);
+        const auto output_it = subgraph.outputs.empty()
+            ? original_node_indices.end()
+            : original_node_indices.find(subgraph.outputs.back());
         if (first_it == original_node_indices.end() ||
                 output_it == original_node_indices.end() ||
                 output_it->second < first_it->second) {
@@ -2842,6 +2844,20 @@ bool llama_context::runtime_route_prepare_graph(
                     "runtime_routes: prebuilt %s subgraph %s layer %d is missing or reversed\n",
                     subgraph.kind.c_str(), subgraph.profile.c_str(), subgraph.layer);
             return false;
+        }
+        int previous_output_index = first_it->second - 1;
+        for (ggml_tensor * output : subgraph.outputs) {
+            const auto terminal_it = original_node_indices.find(output);
+            if (terminal_it == original_node_indices.end() ||
+                    terminal_it->second < first_it->second ||
+                    terminal_it->second < previous_output_index ||
+                    terminal_it->second > output_it->second) {
+                LLAMA_LOG_ERROR(
+                        "runtime_routes: prebuilt %s subgraph %s layer %d has invalid terminal ordering\n",
+                        subgraph.kind.c_str(), subgraph.profile.c_str(), subgraph.layer);
+                return false;
+            }
+            previous_output_index = terminal_it->second;
         }
         for (int i = first_it->second; i <= output_it->second; ++i) {
             prebuilt_subgraph_nodes[(size_t) i] = true;
@@ -3126,7 +3142,7 @@ bool llama_context::runtime_route_prepare_graph(
                 }
             }
             registrations.push_back({
-                    canonical, canonical, variant, variant,
+                    canonical, { canonical }, variant, { variant },
                     choice.plan_id, meta.layer, false });
         }
     }
@@ -3139,6 +3155,16 @@ bool llama_context::runtime_route_prepare_graph(
     if (std::find(routes.candidate_kinds.begin(), routes.candidate_kinds.end(),
                 "ffn_block") != routes.candidate_kinds.end()) {
         requested_subgraph_kinds.emplace_back("ffn_block");
+    }
+    const bool have_attn_qkv_subgraphs = std::any_of(
+            runtime_route_subgraphs.begin(), runtime_route_subgraphs.end(),
+            [](const auto & candidate) {
+                return candidate.kind == "attn_qkv_block";
+            });
+    if (cparams.attn_qkv_shards && have_attn_qkv_subgraphs &&
+            std::find(routes.candidate_kinds.begin(), routes.candidate_kinds.end(),
+                    "attn_qkv_block") != routes.candidate_kinds.end()) {
+        requested_subgraph_kinds.emplace_back("attn_qkv_block");
     }
     const bool have_attn_out_subgraphs = std::any_of(
             runtime_route_subgraphs.begin(), runtime_route_subgraphs.end(),
@@ -3189,8 +3215,8 @@ bool llama_context::runtime_route_prepare_graph(
                         return false;
                     }
                     registrations.push_back({
-                            canonical->first, canonical->output,
-                            variant->first, variant->output,
+                            canonical->first, canonical->outputs,
+                            variant->first, variant->outputs,
                             plan_ids.at(profile), layer, true });
                     ++supported_matches.at(profile);
                 }
@@ -3272,17 +3298,21 @@ bool llama_context::runtime_route_prepare_graph(
 
     for (const auto & registration : registrations) {
         const bool registered = registration.subgraph
-            ? ggml_backend_sched_register_route_subgraph(
-                    sched.get(), registration.canonical_first, registration.canonical,
-                    registration.variant_first, registration.variant,
+            ? ggml_backend_sched_register_route_subgraph_bundle(
+                    sched.get(), registration.canonical_first,
+                    registration.canonical_outputs.data(),
+                    registration.variant_first,
+                    registration.variant_outputs.data(),
+                    (int) registration.canonical_outputs.size(),
                     registration.plan_id, registration.layer)
             : ggml_backend_sched_register_route_candidate(
-                    sched.get(), registration.canonical, registration.variant,
+                    sched.get(), registration.canonical_outputs.front(),
+                    registration.variant_outputs.front(),
                     registration.plan_id, registration.layer);
         if (!registered) {
             LLAMA_LOG_ERROR(
                     "runtime_routes: failed to register candidate for %s (plan=%llu, layer=%d)\n",
-                    ggml_get_name(registration.canonical),
+                    ggml_get_name(registration.canonical_outputs.front()),
                     (unsigned long long) registration.plan_id,
                     registration.layer);
             return false;
@@ -3493,6 +3523,20 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         if (n_tokens > 1 &&
                 llama_backend_policy_resolve_runtime_routes(true, routes) &&
                 (routes.mode == "clock" || routes.mode == "fixed") &&
+                cparams.attn_qkv_shards &&
+                std::find(routes.candidate_kinds.begin(), routes.candidate_kinds.end(),
+                        "attn_qkv_block") != routes.candidate_kinds.end()) {
+            // One QKV topology contains nine REGION matmuls, six CONCAT
+            // nodes, optional post-ops, and three 2D route terminals. The
+            // builder deduplicates inherited ratios, but reserve the full
+            // profile catalog so policy changes remain allocation-safe.
+            constexpr uint64_t nodes_per_qkv_variant = 24;
+            res += (uint64_t) model.hparams.n_layer * routes.profiles.size() *
+                nodes_per_qkv_variant;
+        }
+        if (n_tokens > 1 &&
+                llama_backend_policy_resolve_runtime_routes(true, routes) &&
+                (routes.mode == "clock" || routes.mode == "fixed") &&
                 std::find(routes.candidate_kinds.begin(), routes.candidate_kinds.end(),
                         "ffn_block") != routes.candidate_kinds.end()) {
             // Each prebuilt dense-FFN route contains weighted RMS+MUL, three
@@ -3678,12 +3722,15 @@ llm_graph_params llama_context::graph_params(
         /*.cb          =*/ graph_get_cb(),
         /*.route_subgraph_cb =*/ [this](
                 const char * kind, const char * profile, int il,
-                ggml_tensor * first, ggml_tensor * output) {
+                ggml_tensor * first, const std::vector<ggml_tensor *> & outputs) {
             if (!runtime_route_collect_metadata || kind == nullptr || profile == nullptr ||
-                    first == nullptr || output == nullptr || il < 0) {
+                    first == nullptr || outputs.empty() || il < 0 ||
+                    std::any_of(outputs.begin(), outputs.end(), [](ggml_tensor * output) {
+                        return output == nullptr;
+                    })) {
                 return;
             }
-            runtime_route_subgraphs.push_back({ kind, profile, il, first, output });
+            runtime_route_subgraphs.push_back({ kind, profile, il, first, outputs });
         },
         /*.res         =*/ res,
     };
@@ -4938,13 +4985,23 @@ llama_context * llama_init_from_model(
         LLAMA_LOG_ERROR("%s: attn_qkv_parallel and attn_qkv_shards are mutually exclusive\n", __func__);
         return nullptr;
     }
-    if (params.attn_qkv_shards &&
-            (!llama_backend_policy_attn_qkv_shards_enabled() ||
-             !llama_backend_policy_residency_enabled())) {
-        LLAMA_LOG_ERROR(
-                "%s: attn_qkv_shards requires an enabled attn_qkv_shards policy and residency copies\n",
-                __func__);
-        return nullptr;
+    if (params.attn_qkv_shards) {
+        if (!model->attn_qkv_shards_enabled()) {
+            LLAMA_LOG_ERROR(
+                    "%s: attn_qkv_shards must be enabled in llama_model_params before model load\n",
+                    __func__);
+            return nullptr;
+        }
+        if (!llama_backend_policy_attn_qkv_shards_enabled()) {
+            LLAMA_LOG_ERROR(
+                    "%s: attn_qkv_shards requires an enabled attn_qkv_shards policy\n",
+                    __func__);
+            return nullptr;
+        }
+        if (model->arch != LLM_ARCH_LLAMA) {
+            LLAMA_LOG_ERROR("%s: attn_qkv_shards currently supports only LLaMA models\n", __func__);
+            return nullptr;
+        }
     }
     if (params.attn_out_shards) {
         if (!model->attn_out_shards_enabled()) {

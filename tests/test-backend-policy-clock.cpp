@@ -311,6 +311,332 @@ bool test_attn_qkv_shards_policy() {
     return true;
 }
 
+bool test_profile_attn_qkv_shards_policy() {
+    static constexpr char routed_policy[] = R"JSON(
+{
+  "version": 1,
+  "enabled": true,
+  "attn_qkv_shards": {
+    "enabled": true,
+    "phase": "prefill",
+    "layer_range": [0, 27],
+    "head_dim": 128,
+    "assemble_backend": "OpenCL",
+    "split_layout": [
+      { "id": "cpu", "backend": "CPU", "align": 128 },
+      { "id": "gpu", "backend": "OpenCL", "align": 128 },
+      { "id": "npu", "backend": "HTP0-REPACK" }
+    ],
+    "split_sizes": {
+      "q": { "cpu": 256, "gpu": 256, "npu": 1024 },
+      "k": { "cpu": 256, "gpu": 256, "npu": 512 },
+      "v": { "cpu": 256, "gpu": 256, "npu": 512 }
+    }
+  },
+  "profiles": {
+    "shifted": {
+      "attn_qkv_shards": {
+        "split_sizes": {
+          "q": { "cpu": 1024, "gpu": 256, "npu": 256 },
+          "k": { "cpu": 512, "gpu": 256, "npu": 256 },
+          "v": { "cpu": 256, "gpu": 512, "npu": 256 }
+        }
+      }
+    },
+    "root-fallback": {}
+  },
+  "runtime_routes": {
+    "enabled": true,
+    "mode": "fixed",
+    "phase": "prefill",
+    "initial_profile": "shifted",
+    "profiles": ["shifted", "root-fallback"],
+    "transitions": "complete",
+    "candidate_kinds": ["attn_qkv_block"],
+    "boundary": { "node": "l_out", "backend": "auto", "granularity": "layer" },
+    "output_mode": "canonical",
+    "strict": true
+  }
+}
+)JSON";
+
+    static constexpr char topology_override_policy[] = R"JSON(
+{
+  "version": 1,
+  "enabled": true,
+  "attn_qkv_shards": {
+    "enabled": true,
+    "split_layout": [
+      { "id": "cpu", "backend": "CPU" },
+      { "id": "gpu", "backend": "OpenCL" },
+      { "id": "npu", "backend": "HTP0-REPACK" }
+    ],
+    "split_sizes": {
+      "q": { "cpu": 256, "gpu": 256, "npu": 256 },
+      "k": { "cpu": 128, "gpu": 128, "npu": 256 },
+      "v": { "cpu": 128, "gpu": 128, "npu": 256 }
+    }
+  },
+  "profiles": {
+    "invalid": {
+      "attn_qkv_shards": {
+        "assemble_backend": "CPU",
+        "split_sizes": {
+          "q": { "cpu": 256, "gpu": 256, "npu": 256 },
+          "k": { "cpu": 128, "gpu": 128, "npu": 256 },
+          "v": { "cpu": 128, "gpu": 128, "npu": 256 }
+        }
+      }
+    }
+  }
+}
+)JSON";
+
+    static constexpr char incomplete_override_policy[] = R"JSON(
+{
+  "version": 1,
+  "enabled": true,
+  "attn_qkv_shards": {
+    "enabled": true,
+    "split_layout": [
+      { "id": "cpu", "backend": "CPU" },
+      { "id": "gpu", "backend": "OpenCL" },
+      { "id": "npu", "backend": "HTP0-REPACK" }
+    ],
+    "split_sizes": {
+      "q": { "cpu": 256, "gpu": 256, "npu": 256 },
+      "k": { "cpu": 128, "gpu": 128, "npu": 256 },
+      "v": { "cpu": 128, "gpu": 128, "npu": 256 }
+    }
+  },
+  "profiles": {
+    "invalid": {
+      "attn_qkv_shards": {
+        "split_sizes": {
+          "q": { "cpu": 256, "gpu": 256, "npu": 256 },
+          "k": { "cpu": 128, "gpu": 128, "npu": 256 }
+        }
+      }
+    }
+  }
+}
+)JSON";
+
+    static constexpr char mismatched_width_policy[] = R"JSON(
+{
+  "version": 1,
+  "enabled": true,
+  "attn_qkv_shards": {
+    "enabled": true,
+    "split_layout": [
+      { "id": "cpu", "backend": "CPU", "align": 128 },
+      { "id": "gpu", "backend": "OpenCL", "align": 128 },
+      { "id": "npu", "backend": "HTP0-REPACK" }
+    ],
+    "split_sizes": {
+      "q": { "cpu": 256, "gpu": 256, "npu": 1024 },
+      "k": { "cpu": 128, "gpu": 128, "npu": 256 },
+      "v": { "cpu": 128, "gpu": 128, "npu": 256 }
+    }
+  },
+  "profiles": {
+    "invalid": {
+      "attn_qkv_shards": {
+        "split_sizes": {
+          "q": { "cpu": 768, "gpu": 256, "npu": 256 },
+          "k": { "cpu": 128, "gpu": 128, "npu": 256 },
+          "v": { "cpu": 128, "gpu": 128, "npu": 256 }
+        }
+      }
+    }
+  },
+  "runtime_routes": {
+    "enabled": true,
+    "mode": "fixed",
+    "phase": "prefill",
+    "initial_profile": "invalid",
+    "profiles": ["invalid"],
+    "transitions": "complete",
+    "candidate_kinds": ["attn_qkv_block"]
+  }
+}
+)JSON";
+
+    static constexpr char decode_phase_policy[] = R"JSON(
+{
+  "version": 1,
+  "enabled": true,
+  "attn_qkv_shards": {
+    "enabled": true,
+    "phase": "decode",
+    "split_layout": [
+      { "id": "cpu", "backend": "CPU" },
+      { "id": "gpu", "backend": "OpenCL" },
+      { "id": "npu", "backend": "HTP0-REPACK" }
+    ],
+    "split_sizes": {
+      "q": { "cpu": 256, "gpu": 256, "npu": 256 },
+      "k": { "cpu": 128, "gpu": 128, "npu": 256 },
+      "v": { "cpu": 128, "gpu": 128, "npu": 256 }
+    }
+  }
+}
+)JSON";
+
+    static constexpr char routed_long_id_policy[] = R"JSON(
+{
+  "version": 1,
+  "enabled": true,
+  "attn_qkv_shards": {
+    "enabled": true,
+    "split_layout": [
+      { "id": "cpu_lane_long", "backend": "CPU" },
+      { "id": "gpu", "backend": "OpenCL" },
+      { "id": "npu", "backend": "HTP0-REPACK" }
+    ],
+    "split_sizes": {
+      "q": { "cpu_lane_long": 256, "gpu": 256, "npu": 256 },
+      "k": { "cpu_lane_long": 128, "gpu": 128, "npu": 256 },
+      "v": { "cpu_lane_long": 128, "gpu": 128, "npu": 256 }
+    }
+  },
+  "profiles": { "only": {} },
+  "runtime_routes": {
+    "enabled": true,
+    "mode": "fixed",
+    "phase": "prefill",
+    "initial_profile": "only",
+    "profiles": ["only"],
+    "transitions": "complete",
+    "candidate_kinds": ["attn_qkv_block"]
+  }
+}
+)JSON";
+
+    // The routed limit must not break the existing static QKV path, whose
+    // shorter node format can still carry the same safe-character lane id.
+    static constexpr char static_long_id_policy[] = R"JSON(
+{
+  "version": 1,
+  "enabled": true,
+  "attn_qkv_shards": {
+    "enabled": true,
+    "split_layout": [
+      { "id": "cpu_lane_long", "backend": "CPU" },
+      { "id": "gpu", "backend": "OpenCL" },
+      { "id": "npu", "backend": "HTP0-REPACK" }
+    ],
+    "split_sizes": {
+      "q": { "cpu_lane_long": 256, "gpu": 256, "npu": 256 },
+      "k": { "cpu_lane_long": 128, "gpu": 128, "npu": 256 },
+      "v": { "cpu_lane_long": 128, "gpu": 128, "npu": 256 }
+    }
+  }
+}
+)JSON";
+
+    temporary_policy_file routed_file(
+            "test-backend-policy-attn-qkv-profile-routed.json", routed_policy);
+    temporary_policy_file topology_file(
+            "test-backend-policy-attn-qkv-profile-topology.json", topology_override_policy);
+    temporary_policy_file incomplete_file(
+            "test-backend-policy-attn-qkv-profile-incomplete.json", incomplete_override_policy);
+    temporary_policy_file mismatched_width_file(
+            "test-backend-policy-attn-qkv-profile-width.json", mismatched_width_policy);
+    temporary_policy_file decode_phase_file(
+            "test-backend-policy-attn-qkv-decode.json", decode_phase_policy);
+    temporary_policy_file routed_long_id_file(
+            "test-backend-policy-attn-qkv-routed-long-id.json", routed_long_id_policy);
+    temporary_policy_file static_long_id_file(
+            "test-backend-policy-attn-qkv-static-long-id.json", static_long_id_policy);
+
+    llama_backend_policy_clear();
+    CHECK(llama_backend_policy_load(routed_file.path(), false, false));
+
+    llama_backend_policy_runtime_routes routes;
+    CHECK(llama_backend_policy_resolve_runtime_routes(true, routes));
+    CHECK(std::find(routes.candidate_kinds.begin(), routes.candidate_kinds.end(),
+                    "attn_qkv_block") != routes.candidate_kinds.end());
+
+    llama_backend_policy_attn_qkv_shards policy;
+    CHECK(llama_backend_policy_match_attn_qkv_shards_for_profile(
+            "shifted", 0, true, policy));
+    CHECK(policy.source == "profiles.shifted.attn_qkv_shards");
+    CHECK(policy.splits.size() == 3);
+    CHECK(policy.splits[0].id == "cpu" && policy.splits[0].backend == "CPU");
+    CHECK(policy.splits[0].q_start == 0 && policy.splits[0].q_size == 1024);
+    CHECK(policy.splits[1].q_start == 1024 && policy.splits[1].q_size == 256);
+    CHECK(policy.splits[2].q_start == 1280 && policy.splits[2].q_size == 256);
+    CHECK(policy.splits[0].k_size == 512 && policy.splits[2].k_start == 768);
+    CHECK(policy.splits[0].v_size == 256 && policy.splits[2].v_start == 768);
+
+    CHECK(llama_backend_policy_match_attn_qkv_shards_for_profile(
+            "root-fallback", 27, true, policy));
+    CHECK(policy.source == "attn_qkv_shards");
+    CHECK(policy.splits[0].q_size == 256);
+    CHECK(!llama_backend_policy_match_attn_qkv_shards_for_profile(
+            "unknown", 0, true, policy));
+    CHECK(!llama_backend_policy_match_attn_qkv_shards_for_profile(
+            "shifted", 28, true, policy));
+    CHECK(!llama_backend_policy_match_attn_qkv_shards_for_profile(
+            "shifted", 0, false, policy));
+
+    // Root matching stays static and is not mutated by profile resolution.
+    CHECK(llama_backend_policy_match_attn_qkv_shards(0, true, policy));
+    CHECK(policy.source == "attn_qkv_shards");
+    CHECK(policy.splits[0].q_size == 256);
+
+    llama_backend_policy_residency_plan plan;
+    CHECK(llama_backend_policy_build_attn_qkv_residency_plan(
+            0, LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_Q, plan));
+    CHECK(plan.enabled);
+    CHECK(plan.keep_full_source);
+    CHECK(plan.source == "attn_qkv_shards q axis-1 covers");
+    CHECK(plan.covers.size() == 4);
+
+    std::vector<llama_backend_policy_residency_cover> gpu_covers;
+    for (const auto & cover : plan.covers) {
+        if (cover.backend == "OpenCL") {
+            gpu_covers.push_back(cover);
+        }
+    }
+    CHECK(gpu_covers.size() == 2);
+    CHECK(gpu_covers[0].start == 256 && gpu_covers[0].size == 256);
+    CHECK(gpu_covers[1].start == 1024 && gpu_covers[1].size == 256);
+
+    CHECK(llama_backend_policy_build_attn_qkv_residency_plan(
+            0, LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_K, plan));
+    CHECK(plan.source == "attn_qkv_shards k axis-1 covers");
+    CHECK(plan.covers.size() == 3);
+    CHECK(!llama_backend_policy_build_attn_qkv_residency_plan(
+            28, LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_Q, plan));
+
+    for (const char * invalid : {
+            topology_file.path(), incomplete_file.path(),
+            mismatched_width_file.path(), routed_long_id_file.path() }) {
+        CHECK(!llama_backend_policy_load(invalid, false, false));
+        // Failed profile/root loads are transactional.
+        CHECK(llama_backend_policy_match_attn_qkv_shards_for_profile(
+                "shifted", 0, true, policy));
+        CHECK(policy.splits[0].q_size == 1024);
+    }
+
+    // Decode remains schema-compatible with the original static policy, but
+    // it is deliberately inert for the current prefill-only graph/cover path.
+    CHECK(llama_backend_policy_load(decode_phase_file.path(), false, false));
+    CHECK(!llama_backend_policy_match_attn_qkv_shards(0, true, policy));
+    CHECK(llama_backend_policy_match_attn_qkv_shards(0, false, policy));
+    CHECK(!llama_backend_policy_build_attn_qkv_residency_plan(
+            0, LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_Q, plan));
+
+    CHECK(llama_backend_policy_load(static_long_id_file.path(), false, false));
+    CHECK(llama_backend_policy_match_attn_qkv_shards(0, true, policy));
+    CHECK(policy.splits[0].id == "cpu_lane_long");
+
+    llama_backend_policy_clear();
+    return true;
+}
+
 bool test_attn_out_shards_policy() {
     static constexpr char valid_policy[] = R"JSON(
 {
@@ -1781,6 +2107,10 @@ int main() {
             return 1;
         }
         if (!test_attn_qkv_shards_policy()) {
+            llama_backend_policy_clear();
+            return 1;
+        }
+        if (!test_profile_attn_qkv_shards_policy()) {
             llama_backend_policy_clear();
             return 1;
         }

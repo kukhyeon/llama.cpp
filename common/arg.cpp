@@ -1394,7 +1394,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_ATTN_QKV_PARALLEL"));
     add_opt(common_arg(
         {"--attn-qkv-shards"}, "on|off",
-        "shard each prefill Q/K/V projection across policy backends (default: off; mutually exclusive with --attn-qkv-parallel)",
+        "shard each prefill Q/K/V projection across policy backends (default: off; residency is prepared during model load; mutually exclusive with --attn-qkv-parallel)",
         [](common_params & params, const std::string & value) {
             const std::string normalized = common_arg_lower(value);
             if (is_truthy(normalized)) {
