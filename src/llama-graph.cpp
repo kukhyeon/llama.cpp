@@ -1231,13 +1231,24 @@ bool llm_graph_context::build_qkv_shards(
                   int64_t   n_head,
                   int64_t   n_head_kv,
                       int   il,
-            llm_graph_qkv & out) const {
+            llm_graph_qkv & out,
+        const llama_backend_policy_attn_qkv_shards * policy_override,
+             const char * route_tag,
+            ggml_tensor ** out_first,
+                     bool reshape_outputs) const {
     out = {};
+    if (out_first != nullptr) {
+        *out_first = nullptr;
+    }
 
     llama_backend_policy_attn_qkv_shards policy;
     const bool is_prefill = n_tokens > 1;
-    if (!llama_backend_policy_match_attn_qkv_shards(il, is_prefill, policy)) {
-        return false;
+    if (policy_override != nullptr) {
+        policy = *policy_override;
+    } else {
+        if (!llama_backend_policy_match_attn_qkv_shards(il, is_prefill, policy)) {
+            return false;
+        }
     }
 
     const int64_t n_embd_q  = n_embd_head * n_head;
@@ -1247,6 +1258,7 @@ bool llm_graph_context::build_qkv_shards(
         layer.wqkv == nullptr &&
         layer.wq != nullptr && layer.wk != nullptr && layer.wv != nullptr &&
         (loras == nullptr || loras->empty()) &&
+        ggml_is_contiguous(cur) &&
         policy.head_dim == n_embd_head &&
         layer.wq->ne[0] == cur->ne[0] && layer.wq->ne[1] == n_embd_q &&
         layer.wk->ne[0] == cur->ne[0] && layer.wk->ne[1] == n_embd_kv &&
@@ -1259,11 +1271,30 @@ bool llm_graph_context::build_qkv_shards(
         return false;
     }
 
+    if (n_tokens > 1024) {
+        const auto is_htp_name = [](std::string name) {
+            std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) {
+                return (char) std::tolower(c);
+            });
+            return name.find("htp") != std::string::npos ||
+                name.find("hexagon") != std::string::npos;
+        };
+        if (std::any_of(policy.splits.begin(), policy.splits.end(), [&](const auto & split) {
+                    return is_htp_name(split.backend);
+                })) {
+            LLAMA_LOG_DEBUG(
+                    "backend_policy: attn_qkv_shards layer %d has n_tokens=%" PRId64
+                    " above the HTP REGION limit; using ordinary Q/K/V\n",
+                    il, n_tokens);
+            return false;
+        }
+    }
+
     struct qkv_lane {
         llama_backend_policy_attn_qkv_shard split;
-        ggml_tensor * wq = nullptr;
-        ggml_tensor * wk = nullptr;
-        ggml_tensor * wv = nullptr;
+        llama_backend_policy_resident_cover wq;
+        llama_backend_policy_resident_cover wk;
+        llama_backend_policy_resident_cover wv;
         ggml_tensor * q = nullptr;
         ggml_tensor * k = nullptr;
         ggml_tensor * v = nullptr;
@@ -1274,16 +1305,33 @@ bool llm_graph_context::build_qkv_shards(
     for (const auto & split : policy.splits) {
         qkv_lane lane;
         lane.split = split;
-        const std::vector<std::string> backend = { split.backend };
-        lane.wq = model->get_backend_policy_residency_tensor(layer.wq, backend);
-        lane.wk = model->get_backend_policy_residency_tensor(layer.wk, backend);
-        lane.wv = model->get_backend_policy_residency_tensor(layer.wv, backend);
-        if (lane.wq == nullptr || lane.wk == nullptr || lane.wv == nullptr) {
+        lane.wq = model->get_backend_policy_resident_cover(
+                layer.wq, split.backend, 1, split.q_start, split.q_size);
+        lane.wk = model->get_backend_policy_resident_cover(
+                layer.wk, split.backend, 1, split.k_start, split.k_size);
+        lane.wv = model->get_backend_policy_resident_cover(
+                layer.wv, split.backend, 1, split.v_start, split.v_size);
+        if (lane.wq.tensor == nullptr || lane.wk.tensor == nullptr || lane.wv.tensor == nullptr) {
             LLAMA_LOG_WARN(
-                    "backend_policy: attn_qkv_shards layer %d lane %s is missing resident Q/K/V "
-                    "weights for %s; falling back\n",
+                    "backend_policy: attn_qkv_shards layer %d lane %s is missing Q/K/V "
+                    "axis-1 cover weights for %s; falling back\n",
                     il, split.id.c_str(), split.backend.c_str());
             return false;
+        }
+        const auto valid_cover = [](const auto & cover, const ggml_tensor * source, int64_t size) {
+            return cover.tensor != nullptr && source != nullptr &&
+                cover.local_start >= 0 && cover.cover_size > 0 &&
+                cover.local_start + size <= cover.cover_size &&
+                cover.tensor->ne[0] == source->ne[0] &&
+                cover.tensor->ne[1] == cover.cover_size &&
+                cover.tensor->ne[2] == 1 && cover.tensor->ne[3] == 1;
+        };
+        if (!valid_cover(lane.wq, layer.wq, split.q_size) ||
+                !valid_cover(lane.wk, layer.wk, split.k_size) ||
+                !valid_cover(lane.wv, layer.wv, split.v_size)) {
+            GGML_ABORT(
+                    "backend_policy: attn_qkv_shards layer %d lane %s has an invalid Q/K/V axis-1 cover",
+                    il, split.id.c_str());
         }
         LLAMA_LOG_DEBUG(
                 "backend_policy: attn_qkv_shards layer %d lane %s backend %s "
@@ -1326,21 +1374,28 @@ bool llm_graph_context::build_qkv_shards(
         return false;
     }
 
+    const std::string route_suffix = route_tag != nullptr && route_tag[0] != '\0'
+        ? std::string("-") + route_tag
+        : std::string();
+    const auto tagged_name = [&](const std::string & base) {
+        return route_suffix.empty() ? base : base + route_suffix;
+    };
+
     auto make_shard = [&](qkv_lane & lane, char projection) {
         ggml_tensor * weight = nullptr;
-        int64_t start = 0;
+        int64_t local_start = 0;
         int64_t size = 0;
         switch (projection) {
-            case 'q': weight = lane.wq; start = lane.split.q_start; size = lane.split.q_size; break;
-            case 'k': weight = lane.wk; start = lane.split.k_start; size = lane.split.k_size; break;
-            case 'v': weight = lane.wv; start = lane.split.v_start; size = lane.split.v_size; break;
+            case 'q': weight = lane.wq.tensor; local_start = lane.wq.local_start; size = lane.split.q_size; break;
+            case 'k': weight = lane.wk.tensor; local_start = lane.wk.local_start; size = lane.split.k_size; break;
+            case 'v': weight = lane.wv.tensor; local_start = lane.wv.local_start; size = lane.split.v_size; break;
             default: GGML_ABORT("invalid QKV projection selector");
         }
 
         ggml_tensor * shard = ggml_mul_mat_src0_region(
                 ctx0, weight, cur,
-                0, weight->ne[0], start, size);
-        const std::string name = std::string("attn_qkv_shard.") + lane.split.id + "." +
+                0, weight->ne[0], local_start, size);
+        const std::string name = std::string("attn_qkv_shard.") + lane.split.id + route_suffix + "." +
             projection + ".proj";
         cb_route(shard, name.c_str(), il, lane.split.backend.c_str());
         return shard;
@@ -1365,6 +1420,9 @@ bool llm_graph_context::build_qkv_shards(
         ggml_build_forward_expand(gf, lane.q);
         ggml_build_forward_expand(gf, lane.k);
         ggml_build_forward_expand(gf, lane.v);
+        if (out_first != nullptr && *out_first == nullptr) {
+            *out_first = lane.q;
+        }
     }
 
     auto assemble = [&](char projection) {
@@ -1388,8 +1446,9 @@ bool llm_graph_context::build_qkv_shards(
         ggml_tensor * result = parts.back().second;
         for (size_t i = parts.size() - 1; i > 0; --i) {
             result = ggml_concat(ctx0, parts[i - 1].second, result, 0);
-            const std::string name = std::string("attn_qkv_join.") + projection +
-                ".concat" + std::to_string(i - 1);
+            const std::string name = tagged_name(
+                    std::string("attn_qkv_join.") + projection +
+                    ".concat" + std::to_string(i - 1));
             cb_route(result, name.c_str(), il, policy.assemble_backend.c_str());
         }
         return result;
@@ -1406,18 +1465,26 @@ bool llm_graph_context::build_qkv_shards(
         const std::string prefix = std::string("attn_qkv_join.") + projection;
         if (scale != nullptr) {
             value = ggml_mul(ctx0, value, scale);
-            cb_route(value, (prefix + ".scale").c_str(), il, policy.assemble_backend.c_str());
+            cb_route(value, tagged_name(prefix + ".scale").c_str(), il, policy.assemble_backend.c_str());
         }
         if (bias != nullptr) {
             value = ggml_add(ctx0, value, bias);
-            cb_route(value, (prefix + ".bias").c_str(), il, policy.assemble_backend.c_str());
+            cb_route(value, tagged_name(prefix + ".bias").c_str(), il, policy.assemble_backend.c_str());
         }
         if (hparams.f_clamp_kqv > 0.0f) {
             value = ggml_clamp(ctx0, value, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
-            cb_route(value, (prefix + ".clamp").c_str(), il, policy.assemble_backend.c_str());
+            cb_route(value, tagged_name(prefix + ".clamp").c_str(), il, policy.assemble_backend.c_str());
+        }
+        if (!reshape_outputs) {
+            // Runtime routing commits these three non-view 2D terminals as one
+            // atomic bundle. Canonical reshapes, RoPE, and KV-cache side
+            // effects are built once by the caller after all variants.
+            cb_route(value, tagged_name(prefix + ".output2d").c_str(), il,
+                    policy.assemble_backend.c_str());
+            return value;
         }
         value = ggml_reshape_3d(ctx0, value, n_embd_head, heads, n_tokens);
-        cb(value, (prefix + ".reshape").c_str(), il, policy.assemble_backend.c_str());
+        cb(value, tagged_name(prefix + ".reshape").c_str(), il, policy.assemble_backend.c_str());
         return value;
     };
 

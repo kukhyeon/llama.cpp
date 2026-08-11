@@ -349,6 +349,7 @@ extern "C" {
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
+        bool attn_qkv_shards; // prepare attention Q/K/V projection shards while loading the model [EXPERIMENTAL]
         bool attn_out_shards; // prepare attention output-projection shards while loading the model [EXPERIMENTAL]
     };
 

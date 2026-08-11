@@ -618,6 +618,9 @@ struct llama_model {
 
     bool has_tensor_overrides() const;
 
+    // True when model loading was requested to prepare attention projection shards.
+    bool attn_qkv_shards_enabled() const { return params.attn_qkv_shards; }
+
     // True when model loading was requested to prepare attention output shards.
     bool attn_out_shards_enabled() const { return params.attn_out_shards; }
 

@@ -202,7 +202,8 @@ struct llama_model_loader {
 
     struct ggml_tensor * create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
-        const buft_list_t * buft_list_layer, const buft_list_t * buft_list_all, bool prepare_attn_out_shards,
+        const buft_list_t * buft_list_layer, const buft_list_t * buft_list_all,
+        bool prepare_attn_qkv_shards, bool prepare_attn_out_shards,
         const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
 
     bool is_residency_tensor(const ggml_tensor * tensor) const {

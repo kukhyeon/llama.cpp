@@ -1589,7 +1589,7 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
     return ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
-        &pimpl->all_buft_list, params.attn_out_shards, tn, ne, flags);
+        &pimpl->all_buft_list, params.attn_qkv_shards, params.attn_out_shards, tn, ne, flags);
 }
 
 std::string llama_model::arch_name() const {
@@ -2256,6 +2256,7 @@ llama_model_params llama_model_default_params() {
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
+        /*.attn_qkv_shards             =*/ false,
         /*.attn_out_shards             =*/ false,
     };
 

@@ -456,13 +456,19 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
     const bool runtime_weighted_norm_routes = runtime_layer_routes &&
         std::find(runtime_routes.candidate_kinds.begin(), runtime_routes.candidate_kinds.end(),
                 "weighted_norm") != runtime_routes.candidate_kinds.end();
+    const bool runtime_attn_qkv_routes = runtime_layer_routes &&
+        cparams.attn_qkv_shards && n_tokens <= 1024 &&
+        (loras == nullptr || loras->empty()) &&
+        std::find(runtime_routes.candidate_kinds.begin(), runtime_routes.candidate_kinds.end(),
+                "attn_qkv_block") != runtime_routes.candidate_kinds.end();
     const bool runtime_attn_out_routes = runtime_layer_routes &&
         cparams.attn_out_shards && n_tokens <= 1024 &&
         (loras == nullptr || loras->empty()) &&
         std::find(runtime_routes.candidate_kinds.begin(), runtime_routes.candidate_kinds.end(),
                 "attn_out_block") != runtime_routes.candidate_kinds.end();
     std::vector<std::string> runtime_route_profiles;
-    if (runtime_ffn_routes || runtime_weighted_norm_routes || runtime_attn_out_routes) {
+    if (runtime_ffn_routes || runtime_weighted_norm_routes ||
+            runtime_attn_qkv_routes || runtime_attn_out_routes) {
         runtime_route_profiles.reserve(runtime_routes.profiles.size());
         runtime_route_profiles.push_back(runtime_routes.initial_profile);
         for (const std::string & profile : runtime_routes.profiles) {
@@ -534,7 +540,7 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
 
                 if (route_subgraph_cb_func) {
                     route_subgraph_cb_func(
-                            "weighted_norm", profile.c_str(), il, first, weighted);
+                            "weighted_norm", profile.c_str(), il, first, { weighted });
                 }
                 if (profile == runtime_routes.initial_profile) {
                     canonical_norm = weighted;
@@ -558,11 +564,122 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
             ggml_tensor * rope_factors = model.get_rope_factors(cparams, il);
 
             // compute Q and K and RoPE them
-            llm_graph_qkv qkv;
-            const bool sharded_qkv =
-                cparams.attn_qkv_shards && n_tokens > 1 &&
-                build_qkv_shards(model.layers[il], cur,
-                        n_embd_head, n_head, n_head_kv, il, qkv);
+            llm_graph_qkv qkv = {};
+            bool sharded_qkv = false;
+            if (runtime_attn_qkv_routes) {
+                struct prepared_qkv_topology {
+                    llama_backend_policy_attn_qkv_shards policy;
+                    ggml_tensor * first = nullptr;
+                    llm_graph_qkv outputs = {};
+                };
+                std::vector<prepared_qkv_topology> prepared;
+                prepared.reserve(runtime_route_profiles.size());
+
+                const auto same_topology = [](const auto & lhs, const auto & rhs) {
+                    if (lhs.enabled != rhs.enabled || lhs.phase != rhs.phase ||
+                            lhs.layer_start != rhs.layer_start || lhs.layer_end != rhs.layer_end ||
+                            lhs.head_dim != rhs.head_dim ||
+                            lhs.assemble_backend != rhs.assemble_backend ||
+                            lhs.splits.size() != rhs.splits.size()) {
+                        return false;
+                    }
+                    for (size_t i = 0; i < lhs.splits.size(); ++i) {
+                        const auto & a = lhs.splits[i];
+                        const auto & b = rhs.splits[i];
+                        if (a.id != b.id || a.backend != b.backend ||
+                                a.q_start != b.q_start || a.q_size != b.q_size ||
+                                a.k_start != b.k_start || a.k_size != b.k_size ||
+                                a.v_start != b.v_start || a.v_size != b.v_size) {
+                            return false;
+                        }
+                    }
+                    return true;
+                };
+
+                llm_graph_qkv canonical_outputs = {};
+                llama_backend_policy_attn_qkv_shards canonical_policy;
+                for (const std::string & profile : runtime_route_profiles) {
+                    llama_backend_policy_attn_qkv_shards policy;
+                    if (!llama_backend_policy_match_attn_qkv_shards_for_profile(
+                                profile.c_str(), il, true, policy)) {
+                        GGML_ABORT(
+                                "runtime_routes: profile %s is missing layer %d QKV shard policy",
+                                profile.c_str(), il);
+                    }
+
+                    auto existing = std::find_if(
+                            prepared.begin(), prepared.end(), [&](const auto & candidate) {
+                                return same_topology(candidate.policy, policy);
+                            });
+                    if (existing == prepared.end()) {
+                        char route_tag[20];
+                        const uint64_t plan_id =
+                            llama_backend_policy_runtime_route_plan_id(profile.c_str());
+                        std::snprintf(route_tag, sizeof(route_tag), "r%016llx",
+                                (unsigned long long) plan_id);
+
+                        prepared_qkv_topology topology;
+                        topology.policy = policy;
+                        if (!build_qkv_shards(
+                                    model.layers[il], cur,
+                                    n_embd_head, n_head, n_head_kv, il,
+                                    topology.outputs, &topology.policy,
+                                    route_tag, &topology.first, false)) {
+                            GGML_ABORT(
+                                    "runtime_routes: failed to build profile %s layer %d QKV shard subgraph",
+                                    profile.c_str(), il);
+                        }
+                        // Alternate terminals have no ordinary downstream
+                        // consumer. Expand all three explicitly and keep V as
+                        // the final node delimiting this contiguous variant.
+                        ggml_build_forward_expand(gf, topology.outputs.q);
+                        ggml_build_forward_expand(gf, topology.outputs.k);
+                        ggml_build_forward_expand(gf, topology.outputs.v);
+                        prepared.push_back(std::move(topology));
+                        existing = std::prev(prepared.end());
+                    }
+
+                    if (route_subgraph_cb_func) {
+                        route_subgraph_cb_func(
+                                "attn_qkv_block", profile.c_str(), il,
+                                existing->first,
+                                { existing->outputs.q, existing->outputs.k, existing->outputs.v });
+                    }
+                    if (profile == runtime_routes.initial_profile) {
+                        canonical_outputs = existing->outputs;
+                        canonical_policy = existing->policy;
+                    }
+                }
+                if (canonical_outputs.q == nullptr || canonical_outputs.k == nullptr ||
+                        canonical_outputs.v == nullptr) {
+                    GGML_ABORT(
+                            "runtime_routes: initial QKV profile %s was not built",
+                            runtime_routes.initial_profile.c_str());
+                }
+
+                // VIEW terminals are deliberately outside every routed range.
+                // The scheduler first selects and atomically commits all three
+                // 2D projections, then the ordinary stateful attention path
+                // consumes these canonical reshapes exactly once.
+                qkv.q = ggml_reshape_3d(
+                        ctx0, canonical_outputs.q, n_embd_head, n_head, n_tokens);
+                qkv.k = ggml_reshape_3d(
+                        ctx0, canonical_outputs.k, n_embd_head, n_head_kv, n_tokens);
+                qkv.v = ggml_reshape_3d(
+                        ctx0, canonical_outputs.v, n_embd_head, n_head_kv, n_tokens);
+                cb(qkv.q, "attn_qkv_join.q.reshape", il,
+                        canonical_policy.assemble_backend.c_str());
+                cb(qkv.k, "attn_qkv_join.k.reshape", il,
+                        canonical_policy.assemble_backend.c_str());
+                cb(qkv.v, "attn_qkv_join.v.reshape", il,
+                        canonical_policy.assemble_backend.c_str());
+                sharded_qkv = true;
+            } else {
+                sharded_qkv =
+                    cparams.attn_qkv_shards && n_tokens > 1 &&
+                    build_qkv_shards(model.layers[il], cur,
+                            n_embd_head, n_head, n_head_kv, il, qkv);
+            }
             const bool parallel_qkv =
                 !sharded_qkv && cparams.attn_qkv_parallel &&
                 n_tokens > 1 && model.layers[il].wqkv == nullptr;
@@ -690,7 +807,7 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                     if (route_subgraph_cb_func) {
                         route_subgraph_cb_func(
                                 "attn_out_block", profile.c_str(), il,
-                                existing->first, existing->output);
+                                existing->first, { existing->output });
                     }
                     if (profile == runtime_routes.initial_profile) {
                         canonical_out = existing->output;
@@ -778,7 +895,7 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
 
                     if (route_subgraph_cb_func) {
                         route_subgraph_cb_func(
-                                "ffn_block", profile.c_str(), il, first, route_out);
+                                "ffn_block", profile.c_str(), il, first, { route_out });
                     }
                     if (profile == runtime_routes.initial_profile) {
                         canonical_out = route_out;

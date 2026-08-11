@@ -486,6 +486,25 @@ extern "C" {
             struct ggml_tensor * variant_output,
             uint64_t plan_id,
             int layer);
+    // Register one contiguous route variant with several terminal outputs.
+    // All outputs are selected and committed atomically for a plan. The last
+    // element of each output array delimits its corresponding graph range;
+    // every earlier output must also be a node inside that range. Canonical
+    // consumers must appear after all variant ranges. This is intended for
+    // multi-result layer-local segments such as Q/K/V projections.
+    //
+    // The scheduler copies every selected alternate output to its matching
+    // canonical output before any downstream node is submitted. Output pairs
+    // must have identical layouts. n_outputs must be positive.
+    GGML_API bool ggml_backend_sched_register_route_subgraph_bundle(
+            ggml_backend_sched_t sched,
+            struct ggml_tensor * canonical_first,
+            struct ggml_tensor * const * canonical_outputs,
+            struct ggml_tensor * variant_first,
+            struct ggml_tensor * const * variant_outputs,
+            int n_outputs,
+            uint64_t plan_id,
+            int layer);
     GGML_API void ggml_backend_sched_clear_route_candidates(ggml_backend_sched_t sched);
     GGML_API void ggml_backend_sched_get_route_candidate_stats(
             ggml_backend_sched_t sched,
