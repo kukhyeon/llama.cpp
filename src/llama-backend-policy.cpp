@@ -570,8 +570,8 @@ ffn_parallel_policy parse_ffn_parallel(const json & root, const std::string & so
             split.start = item.value("start", (int64_t) -1);
             split.size = item.value("size", (int64_t) -1);
             split.backend = item.value("backend", std::string());
-            if (split.start < 0 || split.size <= 0 || split.backend.empty()) {
-                throw std::runtime_error(source + ".splits[" + std::to_string(i) + "] requires backend, start, and positive size");
+            if (split.start < 0 || split.size < 0 || split.backend.empty()) {
+                throw std::runtime_error(source + ".splits[" + std::to_string(i) + "] requires backend, start, and non-negative size");
             }
             if (split.start > std::numeric_limits<int64_t>::max() - split.size) {
                 throw std::runtime_error(source + ".splits[" + std::to_string(i) + "] range overflows int64");
@@ -607,13 +607,13 @@ ffn_parallel_policy parse_ffn_parallel(const json & root, const std::string & so
             if (!root["split_sizes"].contains(split.id) ||
                     !root["split_sizes"][split.id].is_number_integer()) {
                 throw std::runtime_error(
-                        source + ".split_sizes." + split.id + " must be a positive integer");
+                        source + ".split_sizes." + split.id + " must be a non-negative integer");
             }
             split.size = root["split_sizes"][split.id].get<int64_t>();
             split.start = start;
-            if (split.size <= 0 || start > std::numeric_limits<int64_t>::max() - split.size) {
+            if (split.size < 0 || start > std::numeric_limits<int64_t>::max() - split.size) {
                 throw std::runtime_error(
-                        source + ".split_sizes." + split.id + " must be a positive non-overflowing integer");
+                        source + ".split_sizes." + split.id + " must be a non-negative non-overflowing integer");
             }
             start += split.size;
             out.splits.push_back(std::move(split));
@@ -635,9 +635,19 @@ ffn_parallel_policy parse_ffn_parallel(const json & root, const std::string & so
     // policy cannot allocate weights successfully and abort much later.
     auto sorted_splits = out.splits;
     std::sort(sorted_splits.begin(), sorted_splits.end(), [](const auto & lhs, const auto & rhs) {
-        return lhs.start < rhs.start;
+        if (lhs.start != rhs.start) {
+            return lhs.start < rhs.start;
+        }
+        // A disabled lane and the following active lane share one boundary.
+        // Visit the zero-width interval first so both observe the same covered
+        // prefix without making explicit split order significant.
+        if ((lhs.size == 0) != (rhs.size == 0)) {
+            return lhs.size == 0;
+        }
+        return lhs.id < rhs.id;
     });
     int64_t covered = 0;
+    size_t active_splits = 0;
     for (const auto & split : sorted_splits) {
         if (split.start != covered) {
             throw std::runtime_error(source + ".splits must form a contiguous partition starting at 0");
@@ -648,6 +658,10 @@ ffn_parallel_policy parse_ffn_parallel(const json & root, const std::string & so
                     std::to_string(out.align));
         }
         covered += split.size;
+        active_splits += split.size > 0 ? 1 : 0;
+    }
+    if (active_splits == 0) {
+        throw std::runtime_error(source + ".splits must contain at least one positive processor lane");
     }
 
     return out;
@@ -683,9 +697,9 @@ bool parse_env_ffn_splits(std::vector<llama_backend_policy_ffn_split> & splits) 
         const std::string size_str = trim(item.substr(colon + 1));
         char * end = nullptr;
         const long long size = std::strtoll(size_str.c_str(), &end, 10);
-        if (split.backend.empty() || end == size_str.c_str() || *end != '\0' || size <= 0 ||
+        if (split.backend.empty() || end == size_str.c_str() || *end != '\0' || size < 0 ||
                 start > std::numeric_limits<int64_t>::max() - size) {
-            LLAMA_LOG_WARN("backend_policy: invalid LLAMA_FFN_PARALLEL_SPLITS item '%s'; expected backend:positive_size\n", item.c_str());
+            LLAMA_LOG_WARN("backend_policy: invalid LLAMA_FFN_PARALLEL_SPLITS item '%s'; expected backend:non_negative_size\n", item.c_str());
             splits.clear();
             return false;
         }
@@ -697,7 +711,16 @@ bool parse_env_ffn_splits(std::vector<llama_backend_policy_ffn_split> & splits) 
         ++idx;
     }
 
-    return !splits.empty();
+    const size_t active_splits = std::count_if(
+            splits.begin(), splits.end(), [](const auto & split) { return split.size > 0; });
+    if (active_splits == 0) {
+        LLAMA_LOG_WARN(
+                "backend_policy: LLAMA_FFN_PARALLEL_SPLITS requires at least one positive size\n");
+        splits.clear();
+        return false;
+    }
+
+    return true;
 }
 
 llama_backend_policy_ffn_parallel materialize_ffn_policy(const ffn_parallel_policy & policy) {
@@ -863,16 +886,16 @@ llama_backend_policy_attn_qkv_shards parse_attn_qkv_shards(
             const auto & entry = layout[i];
             if (!sizes.contains(entry.id) || !sizes[entry.id].is_number_integer()) {
                 throw std::runtime_error(
-                        projection_source + "." + entry.id + " must be a positive integer");
+                        projection_source + "." + entry.id + " must be a non-negative integer");
             }
             const int64_t size = sizes[entry.id].get<int64_t>();
-            if (size <= 0 || start > std::numeric_limits<int64_t>::max() - size) {
+            if (size < 0 || start > std::numeric_limits<int64_t>::max() - size) {
                 throw std::runtime_error(
                         projection_source + "." + entry.id +
-                        " must be a positive non-overflowing integer");
+                        " must be a non-negative non-overflowing integer");
             }
-            if ((start % out.head_dim) != 0 || (size % out.head_dim) != 0 ||
-                    (start % entry.lane_align) != 0 || (size % entry.lane_align) != 0) {
+            if (size > 0 && ((start % out.head_dim) != 0 || (size % out.head_dim) != 0 ||
+                    (start % entry.lane_align) != 0 || (size % entry.lane_align) != 0)) {
                 throw std::runtime_error(
                         projection_source + "." + entry.id +
                         " start/size must be divisible by head_dim=" +
@@ -883,6 +906,15 @@ llama_backend_policy_attn_qkv_shards parse_attn_qkv_shards(
             out.splits[i].*start_member = start;
             out.splits[i].*size_member = size;
             start += size;
+        }
+
+        const size_t active_splits = std::count_if(
+                out.splits.begin(), out.splits.end(), [&](const auto & split) {
+                    return split.*size_member > 0;
+                });
+        if (active_splits < 2 || active_splits > 3) {
+            throw std::runtime_error(
+                    projection_source + " must contain 2 or 3 positive processor lanes");
         }
     };
 
@@ -895,6 +927,22 @@ llama_backend_policy_attn_qkv_shards parse_attn_qkv_shards(
     populate_projection(
             "v", &llama_backend_policy_attn_qkv_shard::v_start,
             &llama_backend_policy_attn_qkv_shard::v_size);
+
+    // A QKV processor lane is one composite scheduler branch. Supporting a
+    // projection-local zero would leave that branch structurally different
+    // across Q/K/V and make lane exclusion ambiguous. A lane is therefore
+    // either active for all three projections or inactive for all three.
+    for (const auto & split : out.splits) {
+        const int active_projections =
+            (split.q_size > 0 ? 1 : 0) +
+            (split.k_size > 0 ? 1 : 0) +
+            (split.v_size > 0 ? 1 : 0);
+        if (active_projections != 0 && active_projections != 3) {
+            throw std::runtime_error(
+                    source + ".split_sizes lane '" + split.id +
+                    "' must be zero or positive for Q, K, and V together");
+        }
+    }
 
     return out;
 }
@@ -1017,16 +1065,16 @@ llama_backend_policy_attn_out_shards parse_attn_out_shards(
     for (const auto & entry : layout) {
         if (!sizes.contains(entry.id) || !sizes[entry.id].is_number_integer()) {
             throw std::runtime_error(
-                    source + ".split_sizes." + entry.id + " must be a positive integer");
+                source + ".split_sizes." + entry.id + " must be a non-negative integer");
         }
         const int64_t size = sizes[entry.id].get<int64_t>();
-        if (size <= 0 || start > std::numeric_limits<int64_t>::max() - size) {
+        if (size < 0 || start > std::numeric_limits<int64_t>::max() - size) {
             throw std::runtime_error(
                     source + ".split_sizes." + entry.id +
-                    " must be a positive non-overflowing integer");
+                    " must be a non-negative non-overflowing integer");
         }
-        if ((start % out.head_dim) != 0 || (size % out.head_dim) != 0 ||
-                (start % entry.align) != 0 || (size % entry.align) != 0) {
+        if (size > 0 && ((start % out.head_dim) != 0 || (size % out.head_dim) != 0 ||
+                (start % entry.align) != 0 || (size % entry.align) != 0)) {
             throw std::runtime_error(
                     source + ".split_sizes." + entry.id +
                     " start/size must be divisible by head_dim=" +
@@ -1041,6 +1089,15 @@ llama_backend_policy_attn_out_shards parse_attn_out_shards(
         split.size = size;
         out.splits.push_back(std::move(split));
         start += size;
+    }
+
+    const size_t active_splits = std::count_if(
+            out.splits.begin(), out.splits.end(), [](const auto & split) {
+                return split.size > 0;
+            });
+    if (active_splits < 2 || active_splits > 3) {
+        throw std::runtime_error(
+                source + ".split_sizes must contain 2 or 3 positive processor lanes");
     }
 
     return out;
@@ -1551,7 +1608,7 @@ bool attn_qkv_policy_width(
             default:
                 return false;
         }
-        if (start != width || size <= 0 ||
+        if (start != width || size < 0 ||
                 width > std::numeric_limits<int64_t>::max() - size) {
             return false;
         }
@@ -1588,7 +1645,7 @@ bool attn_out_policy_width(
         return false;
     }
     for (const auto & split : policy.splits) {
-        if (split.start != width || split.size <= 0 ||
+        if (split.start != width || split.size < 0 ||
                 width > std::numeric_limits<int64_t>::max() - split.size) {
             return false;
         }
@@ -1910,7 +1967,7 @@ void parse_runtime_routes(const json & root, policy_state & state) {
                     LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_V,
                     root_v_width)) {
             throw std::runtime_error(
-                    "runtime_routes attn_qkv_block root policy must contain complete three-lane Q/K/V partitions");
+                    "runtime_routes attn_qkv_block root policy must contain complete Q/K/V partitions with 2 or 3 active lanes");
         }
 
         for (const std::string & profile_name : routes.profiles) {
@@ -1945,7 +2002,7 @@ void parse_runtime_routes(const json & root, policy_state & state) {
         int64_t root_width = 0;
         if (!attn_out_policy_width(state.attn_out_shards, root_width)) {
             throw std::runtime_error(
-                    "runtime_routes attn_out_block root policy must contain a complete three-lane partition");
+                    "runtime_routes attn_out_block root policy must contain a complete partition with 2 or 3 active lanes");
         }
         for (const std::string & profile_name : routes.profiles) {
             const auto * policy = effective_attn_out_policy_for_profile(state, profile_name);
@@ -1956,7 +2013,7 @@ void parse_runtime_routes(const json & root, policy_state & state) {
                     profile_width != root_width) {
                 throw std::runtime_error(
                         "runtime_routes attn_out_block profile '" + profile_name +
-                        "' requires an enabled output-axis three-lane split with the root partition width");
+                        "' requires an enabled output-axis split with 2 or 3 active lanes and the root partition width");
             }
         }
     }
@@ -2321,9 +2378,14 @@ bool llama_backend_policy_attn_out_shards_enabled() {
 int llama_backend_policy_ffn_parallel_reduce_threads() {
     std::lock_guard<std::mutex> lock(g_policy_mutex);
     llama_backend_policy_ffn_parallel policy;
-    return g_policy.loaded && effective_ffn_policy(policy) && policy.splits.size() >= 2
-        ? policy.reduce_threads
-        : 0;
+    if (!g_policy.loaded || !effective_ffn_policy(policy)) {
+        return 0;
+    }
+    const size_t active_splits = std::count_if(
+            policy.splits.begin(), policy.splits.end(), [](const auto & split) {
+                return split.size > 0;
+            });
+    return active_splits >= 2 ? policy.reduce_threads : 0;
 }
 
 bool llama_backend_policy_ffn_clock_switch_enabled(void) {
@@ -3084,6 +3146,9 @@ bool llama_backend_policy_build_ffn_residency_plan(
         }
 
         for (const auto & split : policy.splits) {
+            if (split.size == 0) {
+                continue;
+            }
             const std::string key = lower(split.backend);
             auto & entry = grouped[key];
             if (entry.backend.empty()) {
@@ -3244,6 +3309,10 @@ bool llama_backend_policy_build_attn_qkv_residency_plan(
                     return false;
             }
 
+            if (size == 0) {
+                continue;
+            }
+
             const std::string key = lower(split.backend);
             auto it = std::find_if(grouped.begin(), grouped.end(), [&](const auto & entry) {
                 return entry.key == key;
@@ -3347,6 +3416,9 @@ bool llama_backend_policy_build_attn_out_residency_plan(
         }
 
         for (const auto & split : policy.splits) {
+            if (split.size == 0) {
+                continue;
+            }
             const std::string key = lower(split.backend);
             auto it = std::find_if(grouped.begin(), grouped.end(), [&](const auto & entry) {
                 return entry.key == key;

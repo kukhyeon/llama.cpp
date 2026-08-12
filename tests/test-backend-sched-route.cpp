@@ -1597,8 +1597,7 @@ static bool run_qkv_composite_lane_bundle_case() {
     const char * scenario = "qkv-composite-lane-route-bundle";
     constexpr int n_lanes = 3;
     constexpr int n_outputs = 3;
-    constexpr int64_t shard_width = 4;
-    constexpr int64_t output_width = n_lanes * shard_width;
+    constexpr int64_t output_width = 12;
     const size_t graph_size = 128;
     const ggml_init_params params = {
         /* .mem_size   = */ 192 * ggml_tensor_overhead() +
@@ -1629,7 +1628,7 @@ static bool run_qkv_composite_lane_bundle_case() {
         return false;
     }
 
-    ggml_tensor * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, shard_width);
+    ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, output_width, 1);
     ggml_set_input(input);
     ggml_set_name(input, "qkv-route-composite-input");
     ggml_backend_sched_set_tensor_backend(sched, input, backends[0]);
@@ -1640,18 +1639,36 @@ static bool run_qkv_composite_lane_bundle_case() {
         ggml_tensor * lane_nodes[n_lanes][n_outputs] = {};
         ggml_tensor * outputs[n_outputs] = {};
     };
+    struct selector_weight {
+        ggml_tensor * tensor = nullptr;
+        int64_t start = 0;
+        int64_t size = 0;
+        float factor = 0.0f;
+    };
+    std::vector<selector_weight> selector_weights;
     static const char * projection_names[n_outputs] = { "q", "k", "v" };
-    auto build_variant = [&](const char * tag, int factor_base) {
+    auto build_variant = [&](const char * tag, int factor_base, const int sizes[n_lanes]) {
         composite_variant variant;
+        int64_t start = 0;
+        std::vector<int> active_lanes;
 
         // Match the production graph's backend-major ordering: one lane owns
         // Q, K, and V consecutively before graph construction moves to the
         // next processor lane.
         for (int lane = 0; lane < n_lanes; ++lane) {
+            if (sizes[lane] == 0) {
+                continue;
+            }
+            active_lanes.push_back(lane);
             for (int projection = 0; projection < n_outputs; ++projection) {
                 const float factor =
                     (float) (factor_base + projection * n_lanes + lane + 1);
-                ggml_tensor * node = ggml_scale(ctx, input, factor);
+                ggml_tensor * weight =
+                    ggml_new_tensor_2d(ctx, GGML_TYPE_F32, output_width, sizes[lane]);
+                ggml_set_input(weight);
+                ggml_set_name(weight, ("qkv-route-weight-" + std::string(tag) + "-lane" +
+                        std::to_string(lane) + "-" + projection_names[projection]).c_str());
+                ggml_tensor * node = ggml_mul_mat(ctx, weight, input);
                 const std::string name =
                     "attn_qkv_shard." + std::string(tag) + "-lane" +
                     std::to_string(lane) + "." + projection_names[projection] +
@@ -1659,32 +1676,46 @@ static bool run_qkv_composite_lane_bundle_case() {
                 ggml_set_name(node, name.c_str());
                 ggml_backend_sched_set_tensor_backend(sched, node, backends[lane]);
                 ggml_build_forward_expand(graph, node);
+                selector_weights.push_back({ weight, start, sizes[lane], factor });
                 variant.lane_nodes[lane][projection] = node;
                 if (variant.first == nullptr) {
                     variant.first = node;
                 }
             }
+            start += sizes[lane];
         }
+        GGML_ASSERT(active_lanes.size() >= 2 && active_lanes.size() <= 3);
+        GGML_ASSERT(start == output_width);
 
-        // Assemble Q, K, and V independently after all nine lane operations.
-        // V is expanded last and therefore explicitly delimits the route range.
+        // Assemble Q, K, and V independently after every active lane's
+        // projection operations. V is expanded last and therefore explicitly
+        // delimits the route range.
         for (int projection = 0; projection < n_outputs; ++projection) {
-            ggml_tensor * inner = ggml_concat(
-                    ctx,
-                    variant.lane_nodes[1][projection],
-                    variant.lane_nodes[2][projection],
-                    0);
-            ggml_tensor * output = ggml_concat(
-                    ctx,
-                    variant.lane_nodes[0][projection],
-                    inner,
-                    0);
             const std::string prefix =
                 "attn_qkv_join." + std::string(projection_names[projection]) +
                 "." + tag;
-            ggml_set_name(inner, (prefix + ".concat1-0").c_str());
+            ggml_tensor * output = nullptr;
+            if (active_lanes.size() == 2) {
+                output = ggml_concat(
+                        ctx,
+                        variant.lane_nodes[active_lanes[0]][projection],
+                        variant.lane_nodes[active_lanes[1]][projection],
+                        0);
+            } else {
+                ggml_tensor * inner = ggml_concat(
+                        ctx,
+                        variant.lane_nodes[active_lanes[1]][projection],
+                        variant.lane_nodes[active_lanes[2]][projection],
+                        0);
+                ggml_set_name(inner, (prefix + ".concat1-0").c_str());
+                ggml_backend_sched_set_tensor_backend(sched, inner, backends[0]);
+                output = ggml_concat(
+                        ctx,
+                        variant.lane_nodes[active_lanes[0]][projection],
+                        inner,
+                        0);
+            }
             ggml_set_name(output, (prefix + ".concat0-0").c_str());
-            ggml_backend_sched_set_tensor_backend(sched, inner, backends[0]);
             ggml_backend_sched_set_tensor_backend(sched, output, backends[0]);
             ggml_build_forward_expand(graph, output);
             variant.outputs[projection] = output;
@@ -1692,8 +1723,10 @@ static bool run_qkv_composite_lane_bundle_case() {
         return variant;
     };
 
-    const composite_variant canonical = build_variant("canonical", 0);
-    const composite_variant alternate = build_variant("alternate", 9);
+    const int canonical_sizes[n_lanes] = { 4, 4, 4 };
+    const int alternate_sizes[n_lanes] = { 0, 4, 8 };
+    const composite_variant canonical = build_variant("canonical", 0, canonical_sizes);
+    const composite_variant alternate = build_variant("alternate", 9, alternate_sizes);
 
     ggml_tensor * downstream[n_outputs] = {};
     for (int projection = 0; projection < n_outputs; ++projection) {
@@ -1729,8 +1762,21 @@ static bool run_qkv_composite_lane_bundle_case() {
         cleanup();
         return false;
     }
-    const float input_data[shard_width] = { 1.0f, 2.0f, 3.0f, 4.0f };
+    const float input_data[output_width] = {
+        1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f,
+        7.0f, 8.0f, 9.0f, 10.0f, 11.0f, 12.0f,
+    };
     ggml_backend_tensor_set(input, input_data, 0, sizeof(input_data));
+    for (const selector_weight & selector : selector_weights) {
+        std::vector<float> values(
+                (size_t) output_width * (size_t) selector.size, 0.0f);
+        for (int64_t row = 0; row < selector.size; ++row) {
+            values[(size_t) row * (size_t) output_width +
+                   (size_t) selector.start + (size_t) row] = selector.factor;
+        }
+        ggml_backend_tensor_set(
+                selector.tensor, values.data(), 0, values.size() * sizeof(values[0]));
+    }
     bool ok = check(
             ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS,
             scenario, "graph compute failed");
@@ -1742,17 +1788,19 @@ static bool run_qkv_composite_lane_bundle_case() {
         float actual[output_width] = {};
         ggml_backend_tensor_get(
                 downstream[projection], actual, 0, sizeof(actual));
+        int index = 0;
         for (int lane = 0; lane < n_lanes; ++lane) {
-            const float factor =
-                (float) (9 + projection * n_lanes + lane + 1);
-            for (int element = 0; element < shard_width; ++element) {
-                const int index = lane * shard_width + element;
-                const float expected = input_data[element] * factor;
+            if (alternate_sizes[lane] == 0) {
+                continue;
+            }
+            const float factor = (float) (9 + projection * n_lanes + lane + 1);
+            for (int element = 0; element < alternate_sizes[lane]; ++element, ++index) {
+                const float expected = input_data[index] * factor;
                 if (!check(std::fabs(actual[index] - expected) < 1e-5f,
                             scenario, "committed Q/K/V output mismatch")) {
                     std::fprintf(stderr,
                             "  projection %s lane %d index %d: got %.6f, expected %.6f\n",
-                            projection_names[projection], lane, element,
+                            projection_names[projection], lane, index,
                             actual[index], expected);
                     ok = false;
                     break;
@@ -1766,8 +1814,8 @@ static bool run_qkv_composite_lane_bundle_case() {
     ok =
         check(stats.registered_mappings == 2, scenario, "mapping count mismatch") &&
         check(stats.prepared_groups == 1, scenario, "prepared group count mismatch") &&
-        check(stats.prepared_candidate_splits == 8,
-            scenario, "canonical/alternate QKV ranges did not each form four splits") &&
+        check(stats.prepared_candidate_splits == 7,
+            scenario, "three-way/two-way QKV candidate split count mismatch") &&
         check(stats.groups_executed == 1, scenario, "route group count mismatch") &&
         check(stats.canonical_selected == 0, scenario, "canonical route unexpectedly selected") &&
         check(stats.alternate_selected == 1, scenario, "alternate route was not selected") &&
@@ -1790,12 +1838,13 @@ static bool run_qkv_composite_lane_bundle_case() {
     ok =
         check(!canonical_range_was_traced,
             scenario, "inactive canonical lane range appeared in execution trace") &&
-        check(grouped_rows.size() == n_lanes,
-            scenario, "selected alternate did not execute one three-lane QKV group") && ok;
-    if (grouped_rows.size() == n_lanes) {
+        check(grouped_rows.size() == 2,
+            scenario, "selected alternate did not execute one two-lane QKV group") && ok;
+    if (grouped_rows.size() == 2) {
         const int group_id = grouped_rows[0].group_id;
-        for (int lane = 0; lane < n_lanes; ++lane) {
-            const route_trace_row & row = grouped_rows[lane];
+        for (int row_index = 0; row_index < 2; ++row_index) {
+            const int lane = row_index + 1;
+            const route_trace_row & row = grouped_rows[row_index];
             const std::string branch = "alternate-lane" + std::to_string(lane);
             const std::string expected_first =
                 "attn_qkv_shard." + branch + ".q.proj-0";
@@ -1868,8 +1917,12 @@ static bool run_attn_out_fork_join_subgraph_case() {
                              ggml_backend_t lane1_backend) {
         static const char * lane_ids[3] = { "cpu", "gpu", "npu" };
         ggml_tensor * lanes[3] = {};
+        std::vector<ggml_tensor *> active_lanes;
         int64_t start = 0;
         for (int lane = 0; lane < 3; ++lane) {
+            if (sizes[lane] == 0) {
+                continue;
+            }
             // Mirror output-axis W_O: every projection consumes the same full
             // activation and independently produces a disjoint-width result.
             // Selector matrices make the two different partitions assemble
@@ -1887,21 +1940,25 @@ static bool run_attn_out_fork_join_subgraph_case() {
             ggml_set_name(lanes[lane], name.c_str());
             ggml_backend_sched_set_tensor_backend(
                     sched, lanes[lane], lane == 1 ? lane1_backend : lane0_backend);
+            active_lanes.push_back(lanes[lane]);
             start += sizes[lane];
         }
 
-        ggml_tensor * inner = ggml_concat(ctx, lanes[1], lanes[2], 0);
-        ggml_tensor * joined = ggml_concat(ctx, lanes[0], inner, 0);
-        ggml_set_name(inner, (std::string("attn-out-inner-") + tag).c_str());
+        GGML_ASSERT(active_lanes.size() >= 2 && active_lanes.size() <= 3);
+        ggml_tensor * joined = ggml_concat(ctx, active_lanes[0], active_lanes[1], 0);
+        ggml_set_name(joined, (std::string("attn-out-inner-") + tag).c_str());
+        ggml_backend_sched_set_tensor_backend(sched, joined, lane0_backend);
+        if (active_lanes.size() == 3) {
+            joined = ggml_concat(ctx, joined, active_lanes[2], 0);
+        }
         ggml_set_name(joined, (std::string("attn-out-joined-") + tag).c_str());
-        ggml_backend_sched_set_tensor_backend(sched, inner, lane0_backend);
         ggml_backend_sched_set_tensor_backend(sched, joined, lane0_backend);
         ggml_build_forward_expand(graph, joined);
-        return fork_join_variant { lanes[0], joined };
+        return fork_join_variant { active_lanes.front(), joined };
     };
 
     const int canonical_sizes[3] = { 2, 2, 2 };
-    const int alternate_sizes[3] = { 1, 2, 3 };
+    const int alternate_sizes[3] = { 0, 2, 4 };
     const fork_join_variant canonical = build_variant(
             canonical_sizes, "r0000000000000000", backends[0], backends[1]);
     const fork_join_variant alternate = build_variant(
@@ -1937,9 +1994,15 @@ static bool run_attn_out_fork_join_subgraph_case() {
         ggml_backend_tensor_set(
                 selector.tensor, values.data(), 0, values.size() * sizeof(values[0]));
     }
+    route_trace_capture trace(scenario);
+    if (!check(trace.start(202), scenario, "failed to start scheduler trace")) {
+        cleanup();
+        return false;
+    }
     bool ok = check(
             ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS,
             scenario, "graph compute failed");
+    trace.finish();
     float actual[6] = {};
     if (ok) {
         ggml_backend_tensor_get(output, actual, 0, sizeof(actual));
@@ -1956,6 +2019,17 @@ static bool run_attn_out_fork_join_subgraph_case() {
         check(stats.alternate_selected == 1, scenario, "alternate fork/join was not selected") &&
         check(stats.canonical_commits == 1, scenario, "alternate output was not committed") &&
         check(stats.plan_misses == 0, scenario, "unexpected plan miss") && ok;
+
+    std::vector<route_trace_row> trace_rows;
+    ok = read_route_trace(trace.path(), scenario, &trace_rows) && ok;
+    std::vector<route_trace_row> grouped_rows;
+    for (const route_trace_row & row : trace_rows) {
+        if (row.is_parallel_group && row.parallel_kind == "attn_out_shard") {
+            grouped_rows.push_back(row);
+        }
+    }
+    ok = check(grouped_rows.size() == 2, scenario,
+            "selected two-way W_O route did not execute one two-lane group") && ok;
 
     cleanup();
     return ok;

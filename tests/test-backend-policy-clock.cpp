@@ -227,6 +227,126 @@ bool test_failed_load_is_transactional(const char * invalid_policy_path) {
     return true;
 }
 
+bool test_zero_ffn_shards_policy() {
+    static constexpr char compact_policy[] = R"JSON(
+{
+  "enabled": true,
+  "ffn_parallel": {
+    "enabled": true,
+    "phase": "all",
+    "layer_range": [0, 0],
+    "align": 64,
+    "split_layout": [
+      { "id": "npu", "backend": "HTP0-REPACK" },
+      { "id": "gpu", "backend": "OpenCL" },
+      { "id": "cpu", "backend": "CPU_REPACK" }
+    ],
+    "split_sizes": { "npu": 256, "gpu": 256, "cpu": 0 }
+  }
+}
+)JSON";
+
+    static constexpr char explicit_policy[] = R"JSON(
+{
+  "enabled": true,
+  "ffn_parallel": {
+    "enabled": true,
+    "phase": "all",
+    "layer_range": [0, 0],
+    "align": 64,
+    "splits": [
+      { "id": "cpu", "backend": "CPU_REPACK", "start": 0,   "size": 0 },
+      { "id": "gpu", "backend": "OpenCL",    "start": 0,   "size": 256 },
+      { "id": "npu", "backend": "HTP0-REPACK", "start": 256, "size": 256 }
+    ]
+  }
+}
+)JSON";
+
+    static constexpr char all_zero_policy[] = R"JSON(
+{
+  "enabled": true,
+  "ffn_parallel": {
+    "enabled": true,
+    "phase": "all",
+    "align": 64,
+    "split_layout": [
+      { "id": "npu", "backend": "HTP0-REPACK" },
+      { "id": "gpu", "backend": "OpenCL" },
+      { "id": "cpu", "backend": "CPU_REPACK" }
+    ],
+    "split_sizes": { "npu": 0, "gpu": 0, "cpu": 0 }
+  }
+}
+)JSON";
+
+    static constexpr char negative_policy[] = R"JSON(
+{
+  "enabled": true,
+  "ffn_parallel": {
+    "enabled": true,
+    "phase": "all",
+    "align": 64,
+    "split_layout": [
+      { "id": "npu", "backend": "HTP0-REPACK" },
+      { "id": "gpu", "backend": "OpenCL" },
+      { "id": "cpu", "backend": "CPU_REPACK" }
+    ],
+    "split_sizes": { "npu": 256, "gpu": 256, "cpu": -64 }
+  }
+}
+)JSON";
+
+    temporary_policy_file compact_file(
+            "test-backend-policy-zero-ffn-compact.json", compact_policy);
+    temporary_policy_file explicit_file(
+            "test-backend-policy-zero-ffn-explicit.json", explicit_policy);
+    temporary_policy_file all_zero_file(
+            "test-backend-policy-zero-ffn-all-zero.json", all_zero_policy);
+    temporary_policy_file negative_file(
+            "test-backend-policy-zero-ffn-negative.json", negative_policy);
+
+    llama_backend_policy_clear();
+    CHECK(llama_backend_policy_load(compact_file.path(), false, false));
+
+    llama_backend_policy_ffn_parallel policy;
+    CHECK(llama_backend_policy_match_ffn_parallel(0, true, policy));
+    CHECK(policy.splits.size() == 3);
+    CHECK(policy.splits[0].id == "npu" && policy.splits[0].start == 0 && policy.splits[0].size == 256);
+    CHECK(policy.splits[1].id == "gpu" && policy.splits[1].start == 256 && policy.splits[1].size == 256);
+    CHECK(policy.splits[2].id == "cpu" && policy.splits[2].start == 512 && policy.splits[2].size == 0);
+
+    llama_backend_policy_residency_plan plan;
+    CHECK(llama_backend_policy_build_ffn_residency_plan(0, plan));
+    CHECK(!plan.keep_full_source);
+    CHECK(plan.covers.size() == 2);
+    CHECK(std::none_of(plan.covers.begin(), plan.covers.end(), [](const auto & cover) {
+        return cover.backend == "CPU_REPACK";
+    }));
+
+    CHECK(llama_backend_policy_load(explicit_file.path(), false, false));
+    CHECK(llama_backend_policy_match_ffn_parallel(0, true, policy));
+    CHECK(policy.splits.size() == 3);
+    CHECK(policy.splits[0].id == "cpu" && policy.splits[0].start == 0 && policy.splits[0].size == 0);
+    CHECK(llama_backend_policy_build_ffn_residency_plan(0, plan));
+    CHECK(plan.covers.size() == 2);
+
+    CHECK(!llama_backend_policy_load(all_zero_file.path(), false, false));
+    CHECK(!llama_backend_policy_load(negative_file.path(), false, false));
+
+    {
+        scoped_environment env_splits(
+                "LLAMA_FFN_PARALLEL_SPLITS", "HTP0-REPACK:256,OpenCL:256,CPU_REPACK:0");
+        CHECK(llama_backend_policy_match_ffn_parallel(0, true, policy));
+        CHECK(policy.source == "LLAMA_FFN_PARALLEL_SPLITS");
+        CHECK(policy.splits.size() == 3);
+        CHECK(policy.splits[2].size == 0 && policy.splits[2].start == 512);
+    }
+
+    llama_backend_policy_clear();
+    return true;
+}
+
 bool test_attn_qkv_shards_policy() {
     static constexpr char valid_policy[] = R"JSON(
 {
@@ -308,6 +428,337 @@ bool test_attn_qkv_shards_policy() {
 
     llama_backend_policy_clear();
     CHECK(!llama_backend_policy_attn_qkv_shards_enabled());
+    return true;
+}
+
+bool test_zero_attention_shards_policy() {
+    static constexpr char qkv_policy[] = R"JSON(
+{
+  "enabled": true,
+  "attn_qkv_shards": {
+    "enabled": true,
+    "phase": "prefill",
+    "head_dim": 128,
+    "assemble_backend": "OpenCL",
+    "split_layout": [
+      { "id": "cpu", "backend": "CPU", "align": 128 },
+      { "id": "gpu", "backend": "OpenCL", "align": 128 },
+      { "id": "npu", "backend": "HTP0-REPACK", "align": 256 }
+    ],
+    "split_sizes": {
+      "q": { "cpu": 0, "gpu": 1024, "npu": 2048 },
+      "k": { "cpu": 0, "gpu": 256, "npu": 768 },
+      "v": { "cpu": 0, "gpu": 256, "npu": 768 }
+    }
+  }
+}
+)JSON";
+
+    static constexpr char attn_out_policy[] = R"JSON(
+{
+  "enabled": true,
+  "attn_out_shards": {
+    "enabled": true,
+    "phase": "prefill",
+    "partition_axis": "output",
+    "head_dim": 128,
+    "reduce_backend": "OpenCL",
+    "split_layout": [
+      { "id": "cpu", "backend": "CPU", "align": 128 },
+      { "id": "gpu", "backend": "OpenCL", "align": 128 },
+      { "id": "npu", "backend": "HTP0-REPACK", "align": 256 }
+    ],
+    "split_sizes": { "cpu": 0, "gpu": 1024, "npu": 2048 }
+  }
+}
+)JSON";
+
+    static constexpr char partial_qkv_zero_policy[] = R"JSON(
+{
+  "enabled": true,
+  "attn_qkv_shards": {
+    "enabled": true,
+    "split_layout": [
+      { "id": "cpu", "backend": "CPU", "align": 128 },
+      { "id": "gpu", "backend": "OpenCL", "align": 128 },
+      { "id": "npu", "backend": "HTP0-REPACK", "align": 256 }
+    ],
+    "split_sizes": {
+      "q": { "cpu": 0, "gpu": 1024, "npu": 2048 },
+      "k": { "cpu": 128, "gpu": 128, "npu": 768 },
+      "v": { "cpu": 0, "gpu": 256, "npu": 768 }
+    }
+  }
+}
+)JSON";
+
+    static constexpr char one_active_qkv_policy[] = R"JSON(
+{
+  "enabled": true,
+  "attn_qkv_shards": {
+    "enabled": true,
+    "split_layout": [
+      { "id": "cpu", "backend": "CPU" },
+      { "id": "gpu", "backend": "OpenCL" },
+      { "id": "npu", "backend": "HTP0-REPACK" }
+    ],
+    "split_sizes": {
+      "q": { "cpu": 0, "gpu": 0, "npu": 2048 },
+      "k": { "cpu": 0, "gpu": 0, "npu": 768 },
+      "v": { "cpu": 0, "gpu": 0, "npu": 768 }
+    }
+  }
+}
+)JSON";
+
+    static constexpr char negative_qkv_policy[] = R"JSON(
+{
+  "enabled": true,
+  "attn_qkv_shards": {
+    "enabled": true,
+    "split_layout": [
+      { "id": "cpu", "backend": "CPU" },
+      { "id": "gpu", "backend": "OpenCL" },
+      { "id": "npu", "backend": "HTP0-REPACK" }
+    ],
+    "split_sizes": {
+      "q": { "cpu": -128, "gpu": 1024, "npu": 2048 },
+      "k": { "cpu": 0, "gpu": 256, "npu": 768 },
+      "v": { "cpu": 0, "gpu": 256, "npu": 768 }
+    }
+  }
+}
+)JSON";
+
+    static constexpr char one_active_attn_out_policy[] = R"JSON(
+{
+  "enabled": true,
+  "attn_out_shards": {
+    "enabled": true,
+    "partition_axis": "output",
+    "split_layout": [
+      { "id": "cpu", "backend": "CPU" },
+      { "id": "gpu", "backend": "OpenCL" },
+      { "id": "npu", "backend": "HTP0-REPACK" }
+    ],
+    "split_sizes": { "cpu": 0, "gpu": 0, "npu": 2048 }
+  }
+}
+)JSON";
+
+    static constexpr char negative_attn_out_policy[] = R"JSON(
+{
+  "enabled": true,
+  "attn_out_shards": {
+    "enabled": true,
+    "partition_axis": "output",
+    "split_layout": [
+      { "id": "cpu", "backend": "CPU" },
+      { "id": "gpu", "backend": "OpenCL" },
+      { "id": "npu", "backend": "HTP0-REPACK" }
+    ],
+    "split_sizes": { "cpu": -128, "gpu": 256, "npu": 768 }
+  }
+}
+)JSON";
+
+    static constexpr char routed_zero_policy[] = R"JSON(
+{
+  "enabled": true,
+  "attn_qkv_shards": {
+    "enabled": true,
+    "phase": "prefill",
+    "head_dim": 128,
+    "assemble_backend": "OpenCL",
+    "split_layout": [
+      { "id": "cpu", "backend": "CPU", "align": 128 },
+      { "id": "gpu", "backend": "OpenCL", "align": 128 },
+      { "id": "npu", "backend": "HTP0-REPACK", "align": 256 }
+    ],
+    "split_sizes": {
+      "q": { "cpu": 1024, "gpu": 1024, "npu": 1024 },
+      "k": { "cpu": 256, "gpu": 256, "npu": 512 },
+      "v": { "cpu": 256, "gpu": 256, "npu": 512 }
+    }
+  },
+  "attn_out_shards": {
+    "enabled": true,
+    "phase": "prefill",
+    "partition_axis": "output",
+    "head_dim": 128,
+    "reduce_backend": "OpenCL",
+    "split_layout": [
+      { "id": "cpu", "backend": "CPU", "align": 128 },
+      { "id": "gpu", "backend": "OpenCL", "align": 128 },
+      { "id": "npu", "backend": "HTP0-REPACK", "align": 256 }
+    ],
+    "split_sizes": { "cpu": 1024, "gpu": 1024, "npu": 1024 }
+  },
+  "profiles": {
+    "root-fallback": {},
+    "cpu-gpu": {
+      "attn_qkv_shards": {
+        "split_sizes": {
+          "q": { "cpu": 1024, "gpu": 2048, "npu": 0 },
+          "k": { "cpu": 256, "gpu": 768, "npu": 0 },
+          "v": { "cpu": 256, "gpu": 768, "npu": 0 }
+        }
+      },
+      "attn_out_shards": {
+        "split_sizes": { "cpu": 1024, "gpu": 2048, "npu": 0 }
+      }
+    },
+    "gpu-npu": {
+      "attn_qkv_shards": {
+        "split_sizes": {
+          "q": { "cpu": 0, "gpu": 1024, "npu": 2048 },
+          "k": { "cpu": 0, "gpu": 256, "npu": 768 },
+          "v": { "cpu": 0, "gpu": 256, "npu": 768 }
+        }
+      },
+      "attn_out_shards": {
+        "split_sizes": { "cpu": 0, "gpu": 1024, "npu": 2048 }
+      }
+    },
+    "cpu-npu": {
+      "attn_qkv_shards": {
+        "split_sizes": {
+          "q": { "cpu": 1024, "gpu": 0, "npu": 2048 },
+          "k": { "cpu": 256, "gpu": 0, "npu": 768 },
+          "v": { "cpu": 256, "gpu": 0, "npu": 768 }
+        }
+      },
+      "attn_out_shards": {
+        "split_sizes": { "cpu": 1024, "gpu": 0, "npu": 2048 }
+      }
+    }
+  },
+  "runtime_routes": {
+    "enabled": true,
+    "mode": "fixed",
+    "phase": "prefill",
+    "initial_profile": "root-fallback",
+    "profiles": ["root-fallback", "cpu-gpu", "gpu-npu", "cpu-npu"],
+    "transitions": "complete",
+    "candidate_kinds": ["attn_qkv_block", "attn_out_block"],
+    "boundary": { "node": "l_out", "backend": "auto", "granularity": "layer" },
+    "output_mode": "canonical",
+    "strict": true
+  }
+}
+)JSON";
+
+    temporary_policy_file qkv_file(
+            "test-backend-policy-zero-attn-qkv.json", qkv_policy);
+    temporary_policy_file attn_out_file(
+            "test-backend-policy-zero-attn-out.json", attn_out_policy);
+    temporary_policy_file partial_qkv_file(
+            "test-backend-policy-zero-attn-qkv-partial.json", partial_qkv_zero_policy);
+    temporary_policy_file one_active_qkv_file(
+            "test-backend-policy-zero-attn-qkv-one-active.json", one_active_qkv_policy);
+    temporary_policy_file negative_qkv_file(
+            "test-backend-policy-zero-attn-qkv-negative.json", negative_qkv_policy);
+    temporary_policy_file one_active_attn_out_file(
+            "test-backend-policy-zero-attn-out-one-active.json", one_active_attn_out_policy);
+    temporary_policy_file negative_attn_out_file(
+            "test-backend-policy-zero-attn-out-negative.json", negative_attn_out_policy);
+    temporary_policy_file routed_zero_file(
+            "test-backend-policy-zero-attn-routed.json", routed_zero_policy);
+
+    llama_backend_policy_clear();
+    CHECK(llama_backend_policy_load(qkv_file.path(), false, false));
+
+    llama_backend_policy_attn_qkv_shards qkv;
+    CHECK(llama_backend_policy_match_attn_qkv_shards(0, true, qkv));
+    CHECK(qkv.splits.size() == 3);
+    CHECK(qkv.splits[0].id == "cpu");
+    CHECK(qkv.splits[0].q_start == 0 && qkv.splits[0].q_size == 0);
+    CHECK(qkv.splits[0].k_start == 0 && qkv.splits[0].k_size == 0);
+    CHECK(qkv.splits[0].v_start == 0 && qkv.splits[0].v_size == 0);
+    CHECK(qkv.splits[1].q_start == 0 && qkv.splits[1].q_size == 1024);
+    CHECK(qkv.splits[2].q_start == 1024 && qkv.splits[2].q_size == 2048);
+
+    llama_backend_policy_residency_plan plan;
+    CHECK(llama_backend_policy_build_attn_qkv_residency_plan(
+            0, LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_Q, plan));
+    CHECK(plan.covers.size() == 2);
+    CHECK(std::none_of(plan.covers.begin(), plan.covers.end(), [](const auto & cover) {
+        return cover.backend == "CPU";
+    }));
+
+    CHECK(llama_backend_policy_load(attn_out_file.path(), false, false));
+    llama_backend_policy_attn_out_shards attn_out;
+    CHECK(llama_backend_policy_match_attn_out_shards(0, true, attn_out));
+    CHECK(attn_out.splits.size() == 3);
+    CHECK(attn_out.splits[0].id == "cpu" && attn_out.splits[0].start == 0 && attn_out.splits[0].size == 0);
+    CHECK(attn_out.splits[1].start == 0 && attn_out.splits[1].size == 1024);
+    CHECK(attn_out.splits[2].start == 1024 && attn_out.splits[2].size == 2048);
+    CHECK(llama_backend_policy_build_attn_out_residency_plan(0, plan));
+    CHECK(plan.covers.size() == 2);
+    CHECK(std::none_of(plan.covers.begin(), plan.covers.end(), [](const auto & cover) {
+        return cover.backend == "CPU";
+    }));
+
+    for (const char * invalid : {
+            partial_qkv_file.path(), one_active_qkv_file.path(), negative_qkv_file.path(),
+            one_active_attn_out_file.path(), negative_attn_out_file.path() }) {
+        CHECK(!llama_backend_policy_load(invalid, false, false));
+        CHECK(llama_backend_policy_match_attn_out_shards(0, true, attn_out));
+        CHECK(attn_out.splits[0].size == 0);
+    }
+
+    // Runtime profiles keep the stable three-key schema while changing from
+    // the root 3-way topology to each 2-way processor pair. Residency is the
+    // positive interval union across every routed topology.
+    CHECK(llama_backend_policy_load(routed_zero_file.path(), false, false));
+    CHECK(llama_backend_policy_match_attn_qkv_shards_for_profile(
+            "root-fallback", 0, true, qkv));
+    CHECK(qkv.splits[0].q_size == 1024);
+    CHECK(qkv.splits[1].q_size == 1024);
+    CHECK(qkv.splits[2].q_size == 1024);
+    CHECK(llama_backend_policy_match_attn_qkv_shards_for_profile(
+            "cpu-gpu", 0, true, qkv));
+    CHECK(qkv.splits[0].q_size == 1024 && qkv.splits[2].q_size == 0);
+    CHECK(llama_backend_policy_match_attn_out_shards_for_profile(
+            "gpu-npu", 0, true, attn_out));
+    CHECK(attn_out.splits[0].size == 0 && attn_out.splits[2].size == 2048);
+    CHECK(llama_backend_policy_match_attn_out_shards_for_profile(
+            "cpu-npu", 0, true, attn_out));
+    CHECK(attn_out.splits[0].size == 1024 && attn_out.splits[1].size == 0);
+    CHECK(llama_backend_policy_match_attn_out_shards_for_profile(
+            "cpu-gpu", 0, true, attn_out));
+    CHECK(attn_out.splits[0].size == 1024 && attn_out.splits[2].size == 0);
+
+    CHECK(llama_backend_policy_build_attn_qkv_residency_plan(
+            0, LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_Q, plan));
+    CHECK(plan.covers.size() == 3);
+    const auto q_cover = [&](const char * backend) {
+        return std::find_if(plan.covers.begin(), plan.covers.end(), [&](const auto & cover) {
+            return cover.backend == backend;
+        });
+    };
+    const auto q_cpu = q_cover("CPU");
+    const auto q_gpu = q_cover("OpenCL");
+    const auto q_npu = q_cover("HTP0-REPACK");
+    CHECK(q_cpu != plan.covers.end() && q_cpu->start == 0 && q_cpu->size == 1024);
+    CHECK(q_gpu != plan.covers.end() && q_gpu->start == 0 && q_gpu->size == 3072);
+    CHECK(q_npu != plan.covers.end() && q_npu->start == 1024 && q_npu->size == 2048);
+
+    CHECK(llama_backend_policy_build_attn_out_residency_plan(0, plan));
+    CHECK(plan.covers.size() == 3);
+    const auto wo_cover = [&](const char * backend) {
+        return std::find_if(plan.covers.begin(), plan.covers.end(), [&](const auto & cover) {
+            return cover.backend == backend;
+        });
+    };
+    const auto wo_cpu = wo_cover("CPU");
+    const auto wo_gpu = wo_cover("OpenCL");
+    const auto wo_npu = wo_cover("HTP0-REPACK");
+    CHECK(wo_cpu != plan.covers.end() && wo_cpu->start == 0 && wo_cpu->size == 1024);
+    CHECK(wo_gpu != plan.covers.end() && wo_gpu->start == 0 && wo_gpu->size == 3072);
+    CHECK(wo_npu != plan.covers.end() && wo_npu->start == 1024 && wo_npu->size == 2048);
+
+    llama_backend_policy_clear();
     return true;
 }
 
@@ -2106,7 +2557,15 @@ int main() {
             llama_backend_policy_clear();
             return 1;
         }
+        if (!test_zero_ffn_shards_policy()) {
+            llama_backend_policy_clear();
+            return 1;
+        }
         if (!test_attn_qkv_shards_policy()) {
+            llama_backend_policy_clear();
+            return 1;
+        }
+        if (!test_zero_attention_shards_policy()) {
             llama_backend_policy_clear();
             return 1;
         }

@@ -1271,6 +1271,35 @@ bool llm_graph_context::build_qkv_shards(
         return false;
     }
 
+    // v1 zero-shard support excludes a processor only when that processor is
+    // inactive for all three projections.  Projection-local zero shards would
+    // produce different lane sets for Q, K, and V and require a different
+    // scheduler contract, so reject them before looking up any resident cover.
+    if (policy.splits.size() != 3) {
+        LLAMA_LOG_WARN(
+                "backend_policy: attn_qkv_shards layer %d must declare three layout lanes; falling back\n",
+                il);
+        return false;
+    }
+    size_t active_lane_count = 0;
+    for (const auto & split : policy.splits) {
+        const bool all_zero = split.q_size == 0 && split.k_size == 0 && split.v_size == 0;
+        const bool all_positive = split.q_size > 0 && split.k_size > 0 && split.v_size > 0;
+        if (!all_zero && !all_positive) {
+            LLAMA_LOG_WARN(
+                    "backend_policy: attn_qkv_shards layer %d lane %s must be active for all of Q/K/V or zero for all; falling back\n",
+                    il, split.id.c_str());
+            return false;
+        }
+        active_lane_count += all_positive ? 1 : 0;
+    }
+    if (active_lane_count < 2 || active_lane_count > 3) {
+        LLAMA_LOG_WARN(
+                "backend_policy: attn_qkv_shards layer %d requires 2 or 3 active lanes, got %zu; falling back\n",
+                il, active_lane_count);
+        return false;
+    }
+
     if (n_tokens > 1024) {
         const auto is_htp_name = [](std::string name) {
             std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) {
@@ -1280,7 +1309,9 @@ bool llm_graph_context::build_qkv_shards(
                 name.find("hexagon") != std::string::npos;
         };
         if (std::any_of(policy.splits.begin(), policy.splits.end(), [&](const auto & split) {
-                    return is_htp_name(split.backend);
+                    const bool active =
+                        split.q_size > 0 && split.k_size > 0 && split.v_size > 0;
+                    return active && is_htp_name(split.backend);
                 })) {
             LLAMA_LOG_DEBUG(
                     "backend_policy: attn_qkv_shards layer %d has n_tokens=%" PRId64
@@ -1301,8 +1332,11 @@ bool llm_graph_context::build_qkv_shards(
     };
 
     std::vector<qkv_lane> lanes;
-    lanes.reserve(policy.splits.size());
+    lanes.reserve(active_lane_count);
     for (const auto & split : policy.splits) {
+        if (split.q_size == 0) {
+            continue;
+        }
         qkv_lane lane;
         lane.split = split;
         lane.wq = model->get_backend_policy_resident_cover(
@@ -1363,7 +1397,7 @@ bool llm_graph_context::build_qkv_shards(
         return covered == expected;
     };
 
-    if (lanes.size() != 3 ||
+    if (lanes.size() < 2 || lanes.size() > 3 ||
             !validate_projection('q', n_embd_q) ||
             !validate_projection('k', n_embd_kv) ||
             !validate_projection('v', n_embd_kv)) {
@@ -1402,8 +1436,8 @@ bool llm_graph_context::build_qkv_shards(
     };
 
     // Emit all three projection shards for one backend before moving to the
-    // next lane.  The scheduler therefore sees exactly three pure composite
-    // branch splits instead of nine competing calls into three contexts.
+    // next lane. The scheduler therefore sees one pure composite split per
+    // active processor rather than independent competing projection calls.
     std::unordered_set<ggml_backend_t> lane_backends;
     for (auto & lane : lanes) {
         lane.q = make_shard(lane, 'q');
@@ -1440,7 +1474,8 @@ bool llm_graph_context::build_qkv_shards(
             return lhs.first < rhs.first;
         });
 
-        GGML_ASSERT(parts.size() == 3);
+        GGML_ASSERT(parts.size() == lanes.size());
+        GGML_ASSERT(parts.size() >= 2 && parts.size() <= 3);
         auto concat_stage = [&](ggml_tensor * lhs, ggml_tensor * rhs, int stage) {
             ggml_tensor * result = ggml_concat(ctx0, lhs, rhs, 0);
             const std::string name = tagged_name(
@@ -1449,6 +1484,10 @@ bool llm_graph_context::build_qkv_shards(
             cb_route(result, name.c_str(), il, policy.assemble_backend.c_str());
             return result;
         };
+
+        if (parts.size() == 2) {
+            return concat_stage(parts[0].second, parts[1].second, 0);
+        }
 
         // Both legal binary trees preserve [0, 1, 2] output order.  Since the
         // middle shard is present in either inner CONCAT, comparing the two
@@ -1576,6 +1615,15 @@ bool llm_graph_context::build_attn_out_shards(
     std::vector<attn_out_lane> lanes;
     lanes.reserve(policy.splits.size());
     for (const auto & split : policy.splits) {
+        if (split.size < 0) {
+            valid = false;
+            continue;
+        }
+        // A zero-width lane has no weight, input slice, or executable branch.
+        // Exclude it before resident-cover lookup and graph construction.
+        if (split.size == 0) {
+            continue;
+        }
         attn_out_lane lane;
         lane.split = split;
         lanes.push_back(std::move(lane));
@@ -1588,6 +1636,7 @@ bool llm_graph_context::build_attn_out_shards(
     const int cover_axis = output_axis ? 1 : 0;
     int64_t covered = 0;
     std::unordered_set<std::string> lane_ids;
+    valid = valid && lanes.size() >= 2 && lanes.size() <= 3;
     for (auto & lane : lanes) {
         const auto & split = lane.split;
         valid = valid && !split.id.empty() && !split.backend.empty() &&
@@ -1596,6 +1645,7 @@ bool llm_graph_context::build_attn_out_shards(
             split.start % policy.head_dim == 0 && split.size % policy.head_dim == 0 &&
             (output_axis ||
                 (split.start % block_size == 0 && split.size % block_size == 0)) &&
+            split.size <= partition_width &&
             split.start <= partition_width - split.size;
         if (!valid) {
             break;
@@ -1619,7 +1669,7 @@ bool llm_graph_context::build_attn_out_shards(
     valid = valid && covered == partition_width;
     if (!valid) {
         GGML_ABORT(
-                "backend_policy: attn_out_shards layer %d matched policy but has an invalid shape or incomplete three-lane W_O axis-%d cover",
+                "backend_policy: attn_out_shards layer %d matched policy but has an invalid shape or incomplete 2/3-lane W_O axis-%d cover",
                 il, cover_axis);
     }
 
@@ -1725,7 +1775,7 @@ bool llm_graph_context::build_attn_out_shards(
                     il, split.id.c_str());
         }
 
-        // Finish one lane before emitting the next so the scheduler sees three
+        // Finish one lane before emitting the next so the scheduler sees
         // consecutive, pure projection branches (or CONT+projection branches
         // for the input-axis compatibility path).
         ggml_build_forward_expand(gf, lane.projection);
@@ -1735,7 +1785,7 @@ bool llm_graph_context::build_attn_out_shards(
         partials.push_back(lane.projection);
     }
 
-    GGML_ASSERT(partials.size() == 3);
+    GGML_ASSERT(partials.size() >= 2 && partials.size() <= 3);
     ggml_tensor * acc = nullptr;
     if (output_axis) {
         auto concat_stage = [&](ggml_tensor * lhs, ggml_tensor * rhs) {
@@ -1745,14 +1795,18 @@ bool llm_graph_context::build_attn_out_shards(
             return result;
         };
 
-        // Lanes are ordered by global output start.  Choose the association
-        // with the smaller inner tensor while preserving [0, 1, 2] order.
-        if (ggml_nbytes(partials.front()) <= ggml_nbytes(partials.back())) {
-            ggml_tensor * inner = concat_stage(partials[0], partials[1]);
-            acc = concat_stage(inner, partials[2]);
+        if (partials.size() == 2) {
+            acc = concat_stage(partials[0], partials[1]);
         } else {
-            ggml_tensor * inner = concat_stage(partials[1], partials[2]);
-            acc = concat_stage(partials[0], inner);
+            // Lanes are ordered by global output start. Choose the association
+            // with the smaller inner tensor while preserving [0, 1, 2] order.
+            if (ggml_nbytes(partials.front()) <= ggml_nbytes(partials.back())) {
+                ggml_tensor * inner = concat_stage(partials[0], partials[1]);
+                acc = concat_stage(inner, partials[2]);
+            } else {
+                ggml_tensor * inner = concat_stage(partials[1], partials[2]);
+                acc = concat_stage(partials[0], inner);
+            }
         }
     } else {
         // Input-axis partials overlap, so preserve their existing fixed ADD
@@ -1835,10 +1889,28 @@ ggml_tensor * llm_graph_context::build_ffn(
         const int64_t n_ff = up->ne[1];
         const int64_t align = std::max<int64_t>(1, ffn_policy.align);
         bool valid = gate->ne[1] == n_ff && down->ne[0] == n_ff;
-        std::vector<llama_backend_policy_ffn_split> splits = ffn_policy.splits;
+        std::vector<llama_backend_policy_ffn_split> splits;
+        splits.reserve(ffn_policy.splits.size());
+        for (const auto & split : ffn_policy.splits) {
+            if (split.size < 0) {
+                valid = false;
+                continue;
+            }
+            // Do not ask the residency layer for an empty interval and do not
+            // materialize zero-sized REGION ops. The remaining active branches
+            // still have to form one exact partition below. Preserve the
+            // existing single-lane FFN behavior; only groups with two or more
+            // branches are collected by the parallel scheduler.
+            if (split.size == 0) {
+                continue;
+            }
+            splits.push_back(split);
+        }
         std::sort(splits.begin(), splits.end(), [](const auto & a, const auto & b) {
             return a.start < b.start;
         });
+
+        valid = valid && !splits.empty();
 
         int64_t covered = 0;
         for (const auto & split : splits) {
@@ -1962,7 +2034,7 @@ ggml_tensor * llm_graph_context::build_ffn(
                 branch_outs.push_back(branch);
             }
 
-            if (valid && !branch_outs.empty()) {
+            if (valid && !branch_outs.empty() && branch_outs.size() == exec_splits.size()) {
                 ggml_tensor * acc = reduce_branches(branch_outs);
                 cb_parallel(acc, ("ffn_parallel_out" + route_suffix).c_str(),
                         ffn_policy.reduce_backend.empty() ? nullptr : ffn_policy.reduce_backend.c_str());
