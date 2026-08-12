@@ -872,10 +872,11 @@ struct llm_graph_context {
                      bool   parallel_projection_names = false) const;
 
     // Split each separate Q/K/V projection along its output/head axis across
-    // three policy lanes.  The lanes are emitted backend-major so one backend
-    // executes its Q, K, and V shards serially while the three backends run in
-    // parallel.  The returned tensors are canonical full Q/K/V values; RoPE
-    // and every KV-cache operation remain outside this helper.
+    // up to three policy lanes. The lanes are emitted backend-major so one
+    // backend executes its Q, K, and V shards serially while multiple active
+    // backends run in parallel. A single active lane bypasses CONCAT assembly.
+    // The returned tensors are canonical full Q/K/V values; RoPE and every
+    // KV-cache operation remain outside this helper.
     bool build_qkv_shards(
         const llama_layer & layer,
               ggml_tensor * cur,
@@ -892,7 +893,8 @@ struct llm_graph_context {
     // Split W_O along the policy-selected axis. Input-axis lanes receive
     // compact attention slices and produce full-width partials for ADD;
     // output-axis lanes share the full input and produce disjoint slices for
-    // CONCAT. Scale and bias are applied once after either join.
+    // CONCAT. A single active lane bypasses the join; scale and bias are
+    // applied once after either the projection or join.
     bool build_attn_out_shards(
               ggml_tensor * wo,
               ggml_tensor * wo_b,

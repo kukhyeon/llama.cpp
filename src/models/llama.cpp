@@ -667,12 +667,32 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                         ctx0, canonical_outputs.k, n_embd_head, n_head_kv, n_tokens);
                 qkv.v = ggml_reshape_3d(
                         ctx0, canonical_outputs.v, n_embd_head, n_head_kv, n_tokens);
+
+                // The routed terminals are complete 2D projections. A sole
+                // active lane with no post-op remains on that lane backend;
+                // the following RESHAPE is metadata-only and must preserve
+                // that placement. Multi-lane joins and real scale/bias/clamp
+                // operations are owned by assemble_backend as before.
+                const auto reshape_backend = [&](ggml_tensor * scale, ggml_tensor * bias) -> const std::string & {
+                    const llama_backend_policy_attn_qkv_shard * sole_lane = nullptr;
+                    size_t active_lanes = 0;
+                    for (const auto & split : canonical_policy.splits) {
+                        if (split.q_size > 0) {
+                            sole_lane = &split;
+                            ++active_lanes;
+                        }
+                    }
+                    return active_lanes == 1 && scale == nullptr && bias == nullptr &&
+                            hparams.f_clamp_kqv <= 0.0f
+                        ? sole_lane->backend
+                        : canonical_policy.assemble_backend;
+                };
                 cb(qkv.q, "attn_qkv_join.q.reshape", il,
-                        canonical_policy.assemble_backend.c_str());
+                        reshape_backend(model.layers[il].wq_s, model.layers[il].wq_b).c_str());
                 cb(qkv.k, "attn_qkv_join.k.reshape", il,
-                        canonical_policy.assemble_backend.c_str());
+                        reshape_backend(model.layers[il].wk_s, model.layers[il].wk_b).c_str());
                 cb(qkv.v, "attn_qkv_join.v.reshape", il,
-                        canonical_policy.assemble_backend.c_str());
+                        reshape_backend(model.layers[il].wv_s, model.layers[il].wv_b).c_str());
                 sharded_qkv = true;
             } else {
                 sharded_qkv =
