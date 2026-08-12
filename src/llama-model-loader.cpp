@@ -1686,8 +1686,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         if (llama_backend_policy_match_attn_qkv_shards(tn.bid, true, attn_qkv_policy)) {
             if (t_meta == nullptr ||
                     !llama_backend_policy_build_attn_qkv_residency_plan(
-                        tn.bid, attn_qkv_projection, attn_qkv_residency_plan) ||
-                    attn_qkv_residency_plan.covers.size() < 3) {
+                            tn.bid, attn_qkv_projection, attn_qkv_residency_plan) ||
+                    attn_qkv_residency_plan.covers.empty()) {
                 throw std::runtime_error(format(
                         "backend_policy: failed to build complete attn_qkv_shards residency for layer %d tensor %s",
                         tn.bid, tn.str().c_str()));
@@ -1746,7 +1746,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             if (t_meta == nullptr ||
                     !llama_backend_policy_build_attn_out_residency_plan(
                             tn.bid, attn_out_residency_plan) ||
-                    attn_out_residency_plan.covers.size() != 3) {
+                    attn_out_residency_plan.covers.empty()) {
                 throw std::runtime_error(format(
                         "backend_policy: failed to build complete attn_out_shards residency for layer %d",
                         tn.bid));
@@ -1872,7 +1872,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     if (attn_out_layer_enabled) {
         // The full source remains resident for decode and the feature-off
-        // graph, but all three independently packed lane covers on the chosen
+        // graph, but all active independently packed lane covers on the chosen
         // W_O axis are mandatory when preparation is requested.
         const int attn_out_axis = attn_out_policy.partition_axis == "output" ? 1 : 0;
         if (!create_residency_covers(

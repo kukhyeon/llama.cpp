@@ -937,6 +937,7 @@ struct attn_out_deferred_sync_fixture {
     ggml_cgraph * graph = nullptr;
     ggml_tensor * input = nullptr;
     ggml_tensor * output = nullptr;
+    int lane_count = 0;
 
     ~attn_out_deferred_sync_fixture() {
         ggml_backend_sched_free(sched);
@@ -952,7 +953,7 @@ struct attn_out_deferred_sync_fixture {
         ggml_free(ctx);
     }
 
-    bool build(bool join_on_gpu = true) {
+    bool build(bool join_on_gpu = true, int requested_lane_count = 3) {
         constexpr size_t graph_size = 96;
         const ggml_init_params params = {
             /* .mem_size   = */ 192 * ggml_tensor_overhead() +
@@ -977,9 +978,11 @@ struct attn_out_deferred_sync_fixture {
                 GGML_BACKEND_DEVICE_TYPE_GPU,
                 &control);
         if (ctx == nullptr || cpu_backend == nullptr ||
-                npu_backend == nullptr || gpu_backend == nullptr) {
+                npu_backend == nullptr || gpu_backend == nullptr ||
+                requested_lane_count < 2 || requested_lane_count > 3) {
             return false;
         }
+        lane_count = requested_lane_count;
 
         // The scheduler requires the CPU fallback to be the final backend.
         ggml_backend_t backends[] = { gpu_backend, npu_backend, cpu_backend };
@@ -1000,11 +1003,15 @@ struct attn_out_deferred_sync_fixture {
         ggml_set_name(input, "attn-out-deferred-source");
 
         graph = ggml_new_graph_custom(ctx, graph_size, false);
-        ggml_backend_t lane_backends[] = { cpu_backend, npu_backend, gpu_backend };
-        static const char * lane_names[] = { "cpu", "npu", "gpu" };
+        ggml_backend_t three_way_backends[] = { cpu_backend, npu_backend, gpu_backend };
+        ggml_backend_t two_way_backends[] = { cpu_backend, gpu_backend };
+        static const char * three_way_names[] = { "cpu", "npu", "gpu" };
+        static const char * two_way_names[] = { "cpu", "gpu" };
+        ggml_backend_t * lane_backends = lane_count == 3 ? three_way_backends : two_way_backends;
+        const char ** lane_names = lane_count == 3 ? three_way_names : two_way_names;
         std::vector<ggml_tensor *> projections;
-        projections.reserve(3);
-        for (int lane = 0; lane < 3; ++lane) {
+        projections.reserve((size_t) lane_count);
+        for (int lane = 0; lane < lane_count; ++lane) {
             ggml_tensor * projection = ggml_scale(ctx, input, (float) lane + 2.0f);
             const std::string name =
                 "attn_out_shard." + std::string(lane_names[lane]) + ".proj-0";
@@ -1015,14 +1022,16 @@ struct attn_out_deferred_sync_fixture {
         }
 
         ggml_backend_t join_backend = join_on_gpu ? gpu_backend : npu_backend;
-        ggml_tensor * inner = ggml_concat(ctx, projections[0], projections[1], 0);
-        ggml_set_name(inner, "attn_out_parallel_concat-deferred-0");
-        ggml_backend_sched_set_tensor_backend(sched, inner, join_backend);
-        ggml_tensor * joined = ggml_concat(ctx, inner, projections[2], 0);
-        // Both CONCAT nodes belong to the same transformer layer, as in the
-        // production output-axis W_O builder's minimum-inner association.
+        ggml_tensor * joined = ggml_concat(ctx, projections[0], projections[1], 0);
         ggml_set_name(joined, "attn_out_parallel_concat-deferred-0");
         ggml_backend_sched_set_tensor_backend(sched, joined, join_backend);
+        if (lane_count == 3) {
+            joined = ggml_concat(ctx, joined, projections[2], 0);
+            // Both CONCAT nodes belong to the same transformer layer, as in the
+            // production output-axis W_O builder's minimum-inner association.
+            ggml_set_name(joined, "attn_out_parallel_concat-deferred-0");
+            ggml_backend_sched_set_tensor_backend(sched, joined, join_backend);
+        }
 
         // A consumer on a different backend forces the deferred CONCAT itself
         // to complete before its result is copied out of OpenCL.
@@ -1037,7 +1046,6 @@ struct attn_out_deferred_sync_fixture {
     }
 
     bool compute_and_check(const char * scenario) {
-        constexpr int lane_count = 3;
         constexpr int lane_width = 2;
         constexpr int rows = 2;
         const float values[lane_width * rows] = {
@@ -1052,8 +1060,8 @@ struct attn_out_deferred_sync_fixture {
             return false;
         }
 
-        float result[lane_count * lane_width * rows] = {};
-        ggml_backend_tensor_get(output, result, 0, sizeof(result));
+        std::vector<float> result((size_t) lane_count * lane_width * rows);
+        ggml_backend_tensor_get(output, result.data(), 0, result.size() * sizeof(result[0]));
         for (int row = 0; row < rows; ++row) {
             for (int lane = 0; lane < lane_count; ++lane) {
                 for (int col = 0; col < lane_width; ++col) {
@@ -1214,7 +1222,8 @@ static bool read_trace(
 static bool check_attn_out_group_timing_mode(
         const std::string & path,
         const char * scenario,
-        const char * expected_mode) {
+        const char * expected_mode,
+        int expected_grouped_rows = 3) {
     std::vector<trace_row> rows;
     if (!read_trace(path, scenario, &rows)) {
         return false;
@@ -1237,8 +1246,8 @@ static bool check_attn_out_group_timing_mode(
             return false;
         }
     }
-    return check(grouped_rows == 3, scenario,
-        "expected exactly three traced attn_out group rows");
+    return check(grouped_rows == expected_grouped_rows, scenario,
+        "unexpected number of traced attn_out group rows");
 }
 
 static bool run_exact_qvk_group_case() {
@@ -1403,8 +1412,8 @@ static bool run_exact_qkv_shard_lane_group_case() {
     return true;
 }
 
-static bool run_incomplete_qkv_shard_lane_case() {
-    const char * scenario = "incomplete-qkv-shard-lane-non-group";
+static bool run_two_way_qkv_shard_lane_group_case() {
+    const char * scenario = "two-way-qkv-shard-lane-group";
     temporary_trace_file trace_file(scenario);
     qkv_shard_fixture fixture;
     if (!check(fixture.build(2), scenario, "fixture setup failed") ||
@@ -1427,32 +1436,35 @@ static bool run_incomplete_qkv_shard_lane_case() {
     if (!read_trace(trace_file.path(), scenario, &rows)) {
         return false;
     }
+    std::vector<trace_row> grouped;
     for (const trace_row & row : rows) {
-        if (!check(!row.is_parallel_group, scenario, "incomplete lane set was collected as a group")) {
-            return false;
+        if (row.is_parallel_group) {
+            grouped.push_back(row);
         }
     }
+    if (!check(grouped.size() == 2, scenario, "expected exactly two grouped composite lane rows")) {
+        return false;
+    }
 
-    int lane_split_ids[2] = { -1, -1 };
+    const int group_id = grouped[0].group_id;
     for (int lane = 0; lane < 2; ++lane) {
         const std::string expected_lane = "lane" + std::to_string(lane);
         const std::string expected_first =
             "attn_qkv_shard." + expected_lane + ".q.proj-0";
         const std::string expected_last =
             "attn_qkv_shard." + expected_lane + ".v.proj-0";
-        const auto it = std::find_if(rows.begin(), rows.end(), [&](const trace_row & row) {
-            return row.first_node == expected_first && row.last_node == expected_last;
-        });
-        if (!check(it != rows.end(), scenario, "composite lane row was not traced") ||
-                !check(it->node_count == 3, scenario, "incomplete lane split was not pure")) {
+        const trace_row & row = grouped[lane];
+        if (!check(row.parallel_kind == "attn_qkv_shard", scenario, "parallel group kind mismatch") ||
+                !check(row.parallel_branch == expected_lane, scenario, "parallel lane order mismatch") ||
+                !check(row.timing_mode == "serial_fallback", scenario, "single-backend lanes were not serialized") ||
+                !check(row.group_id == group_id && group_id >= 0, scenario, "parallel group id mismatch") ||
+                !check(row.node_count == 3, scenario, "Q/K/V nodes did not remain in one lane split") ||
+                !check(row.first_node == expected_first, scenario, "lane split first node mismatch") ||
+                !check(row.last_node == expected_last, scenario, "lane split last node mismatch")) {
             return false;
         }
-        lane_split_ids[lane] = it->split_id;
     }
-    return check(
-        lane_split_ids[0] != lane_split_ids[1],
-        scenario,
-        "incomplete lanes shared a split");
+    return true;
 }
 
 static bool run_exact_attn_out_shard_lane_group_case() {
@@ -1520,8 +1532,8 @@ static bool run_exact_attn_out_shard_lane_group_case() {
     return true;
 }
 
-static bool run_incomplete_attn_out_shard_lane_case() {
-    const char * scenario = "incomplete-attn-out-shard-lane-non-group";
+static bool run_two_way_attn_out_shard_lane_group_case() {
+    const char * scenario = "two-way-attn-out-shard-lane-group";
     temporary_trace_file trace_file(scenario);
     attn_out_shard_fixture fixture;
     if (!check(fixture.build(2), scenario, "fixture setup failed")) {
@@ -1546,13 +1558,17 @@ static bool run_incomplete_attn_out_shard_lane_case() {
     if (!read_trace(trace_file.path(), scenario, &rows)) {
         return false;
     }
+    std::vector<trace_row> grouped;
     for (const trace_row & row : rows) {
-        if (!check(!row.is_parallel_group, scenario, "incomplete W_O lane set was collected as a group")) {
-            return false;
+        if (row.is_parallel_group) {
+            grouped.push_back(row);
         }
     }
+    if (!check(grouped.size() == 2, scenario, "expected exactly two grouped W_O lane rows")) {
+        return false;
+    }
 
-    int lane_split_ids[2] = { -1, -1 };
+    const int group_id = grouped[0].group_id;
     for (int lane = 0; lane < 2; ++lane) {
         const std::string expected_lane = "lane" + std::to_string(lane);
         const std::string expected_first =
@@ -1560,20 +1576,19 @@ static bool run_incomplete_attn_out_shard_lane_case() {
         const std::string expected_last =
             "attn_out_shard." + expected_lane + ".proj-0";
         const int expected_node_count = 2;
-        const auto it = std::find_if(rows.begin(), rows.end(), [&](const trace_row & row) {
-            return row.first_node == expected_first && row.last_node == expected_last;
-        });
-        if (!check(it != rows.end(), scenario, "isolated W_O lane row was not traced") ||
-                !check(it->node_count == expected_node_count, scenario,
-                    "incomplete W_O executable lane split was not pure")) {
+        const trace_row & row = grouped[lane];
+        if (!check(row.parallel_kind == "attn_out_shard", scenario, "parallel group kind mismatch") ||
+                !check(row.parallel_branch == expected_lane, scenario, "parallel lane order mismatch") ||
+                !check(row.timing_mode == "serial_fallback", scenario, "single-backend lanes were not serialized") ||
+                !check(row.group_id == group_id && group_id >= 0, scenario, "parallel group id mismatch") ||
+                !check(row.node_count == expected_node_count, scenario,
+                    "W_O executable input/projection did not remain in one lane split") ||
+                !check(row.first_node == expected_first, scenario, "lane split first node mismatch") ||
+                !check(row.last_node == expected_last, scenario, "lane split last node mismatch")) {
             return false;
         }
-        lane_split_ids[lane] = it->split_id;
     }
-    return check(
-        lane_split_ids[0] != lane_split_ids[1],
-        scenario,
-        "incomplete W_O lanes shared a split");
+    return true;
 }
 
 static bool run_exact_attn_out_output_axis_shard_lane_group_case() {
@@ -1729,6 +1744,50 @@ static bool run_attn_out_output_axis_deferred_sync_case() {
             "CPU branch did not observe GPU async submission");
 }
 
+static bool run_attn_out_output_axis_two_way_deferred_sync_case() {
+    const char * scenario = "attn-out-output-axis-two-way-deferred-sync";
+    temporary_trace_file trace_file(scenario);
+    attn_out_deferred_sync_fixture fixture;
+    if (!check(fixture.build(true, 2), scenario, "fixture setup failed")) {
+        return false;
+    }
+
+    const int n_splits = ggml_backend_sched_get_n_splits(fixture.sched);
+    if (!check(n_splits == 4, scenario,
+                "expected CPU/GPU lanes, OpenCL CONCAT, and CPU consumer splits")) {
+        std::fprintf(stderr, "  got %d splits, expected 4\n", n_splits);
+        return false;
+    }
+    {
+        scheduler_trace_capture capture(trace_file.path(), 110);
+        if (!fixture.compute_and_check(scenario)) {
+            return false;
+        }
+        capture.finish();
+    }
+    if (!check_attn_out_group_timing_mode(
+                trace_file.path(), scenario, "persistent_deferred_sync", 2)) {
+        return false;
+    }
+
+    const deferred_sync_control & control = fixture.control;
+    return check(
+                control.gpu_branch_async_calls.load(std::memory_order_relaxed) == 1,
+                scenario, "GPU branch was not submitted asynchronously") &&
+        check(
+                control.gpu_async_flush_calls.load(std::memory_order_relaxed) == 1,
+                scenario, "two-way GPU branch did not flush its deferred command queue") &&
+        check(
+                control.gpu_branch_sync_before_cpu_complete.load(std::memory_order_relaxed) == 0,
+                scenario, "two-way GPU branch synchronized before the CPU sibling completed") &&
+        check(
+                control.gpu_branch_sync_after_cpu_complete.load(std::memory_order_relaxed) == 1,
+                scenario, "two-way GPU branch was not synchronized at the CONCAT boundary") &&
+        check(
+                control.cpu_wait_timeouts.load(std::memory_order_relaxed) == 0,
+                scenario, "CPU branch did not observe two-way GPU async submission");
+}
+
 static bool run_attn_out_deferred_sync_backend_guard_case() {
     const char * scenario = "attn-out-deferred-sync-backend-guard";
     temporary_trace_file trace_file(scenario);
@@ -1832,10 +1891,11 @@ int main() {
 
     try {
         const bool ok = run_exact_qvk_group_case() && run_incomplete_qv_case() &&
-            run_exact_qkv_shard_lane_group_case() && run_incomplete_qkv_shard_lane_case() &&
-            run_exact_attn_out_shard_lane_group_case() && run_incomplete_attn_out_shard_lane_case() &&
+            run_exact_qkv_shard_lane_group_case() && run_two_way_qkv_shard_lane_group_case() &&
+            run_exact_attn_out_shard_lane_group_case() && run_two_way_attn_out_shard_lane_group_case() &&
             run_exact_attn_out_output_axis_shard_lane_group_case() &&
             run_attn_out_output_axis_deferred_sync_case() &&
+            run_attn_out_output_axis_two_way_deferred_sync_case() &&
             run_attn_out_deferred_sync_backend_guard_case();
         if (ok) {
             std::puts("scheduler parallel-group tests passed");

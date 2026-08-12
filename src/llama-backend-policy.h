@@ -19,6 +19,8 @@ struct llama_backend_policy_match {
 struct llama_backend_policy_ffn_split {
     std::string id;
     int64_t start = 0;
+    // A zero size keeps the processor in the policy layout but disables its
+    // weight cover and executable branch for this effective policy.
     int64_t size = 0;
     std::string backend;
 };
@@ -38,6 +40,8 @@ struct llama_backend_policy_ffn_parallel {
 struct llama_backend_policy_attn_qkv_shard {
     std::string id;
     std::string backend;
+    // A processor lane is inactive only when all three sizes are zero.
+    // Projection-local zeros are intentionally not supported.
     int64_t q_start = 0;
     int64_t q_size = 0;
     int64_t k_start = 0;
@@ -66,6 +70,7 @@ enum llama_backend_policy_attn_qkv_projection {
 struct llama_backend_policy_attn_out_shard {
     std::string id;
     int64_t start = 0;
+    // A zero size is an inactive shard lane; reduce_backend remains unchanged.
     int64_t size = 0;
     std::string backend;
 };

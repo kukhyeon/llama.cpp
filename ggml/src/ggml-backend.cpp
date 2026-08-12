@@ -5542,25 +5542,25 @@ static int ggml_backend_sched_collect_parallel_ffn_group(
     }
 
     if (first.kind == "attn_qkv_shard") {
-        // Duplicate lanes terminate the scan above, so exactly three entries
-        // here also means exactly three unique composite lane splits.
-        if (infos->size() != 3) {
+        // Duplicate lanes terminate the scan above, so two or three entries
+        // here also means two or three unique composite lane splits.
+        if (infos->size() < 2 || infos->size() > 3) {
             infos->clear();
             return 0;
         }
-        return 3;
+        return (int) infos->size();
     }
 
     if (first.kind == "attn_out_shard") {
         // W_O may be an input-axis partition followed by ADD reduction or an
         // output-axis partition followed by CONCAT assembly. Either layout is
-        // safe to launch only when all three unique lanes were isolated as
-        // consecutive branch splits.
-        if (infos->size() != 3) {
+        // safe to launch when all two or three active unique lanes were isolated
+        // as consecutive branch splits.
+        if (infos->size() < 2 || infos->size() > 3) {
             infos->clear();
             return 0;
         }
-        return 3;
+        return (int) infos->size();
     }
 
     return infos->size() >= 2 || allow_single ? (int) infos->size() : 0;
@@ -5577,7 +5577,8 @@ static int ggml_backend_sched_attn_out_deferred_sync_branch(
     GGML_ASSERT(sched != nullptr);
     GGML_ASSERT(splits != nullptr);
 
-    if (!sched->attn_out_defer_opencl_sync || run_group_serially || group_size != 3 ||
+    if (!sched->attn_out_defer_opencl_sync || run_group_serially ||
+            group_size < 2 || group_size > 3 ||
             (int) infos.size() != group_size || infos[0].kind != "attn_out_shard") {
         return -1;
     }

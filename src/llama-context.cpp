@@ -566,18 +566,47 @@ llama_context::llama_context(
         }
         backends.emplace_back(backend_cpu);
 
-        // Static W_O sharding is intentionally strict: every policy name must
-        // resolve to one initialized context backend, and the three lanes must
-        // resolve to three different execution devices. Textually different
-        // aliases such as HTP0 and HTP0-REPACK still name the same executor.
+        // W_O sharding is intentionally strict: every active policy lane must
+        // resolve to one initialized context backend, and active lanes must
+        // resolve to different execution devices. Textually different aliases
+        // such as HTP0 and HTP0-REPACK still name the same executor. A zero-size
+        // lane is inactive and therefore does not require a context backend.
         if (cparams.attn_out_shards) {
-            llama_backend_policy_attn_out_shards policy;
-            bool has_matching_layer = false;
+            std::vector<llama_backend_policy_attn_out_shards> policies;
             const ggml_tensor * post_join_scale = nullptr;
             const ggml_tensor * post_join_bias  = nullptr;
+
+            const auto same_topology = [](const auto & lhs, const auto & rhs) {
+                if (lhs.partition_axis != rhs.partition_axis ||
+                        lhs.head_dim != rhs.head_dim ||
+                        lhs.reduce_backend != rhs.reduce_backend ||
+                        lhs.splits.size() != rhs.splits.size()) {
+                    return false;
+                }
+                for (size_t i = 0; i < lhs.splits.size(); ++i) {
+                    const auto & a = lhs.splits[i];
+                    const auto & b = rhs.splits[i];
+                    if (a.id != b.id || a.start != b.start || a.size != b.size ||
+                            a.backend != b.backend) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+            const auto append_policy = [&](const llama_backend_policy_attn_out_shards & policy) {
+                const auto duplicate = std::find_if(
+                        policies.begin(), policies.end(), [&](const auto & candidate) {
+                            return same_topology(candidate, policy);
+                        });
+                if (duplicate == policies.end()) {
+                    policies.push_back(policy);
+                }
+            };
+
+            llama_backend_policy_attn_out_shards policy;
             for (uint32_t il = 0; il < hparams.n_layer; ++il) {
                 if (llama_backend_policy_match_attn_out_shards((int) il, true, policy)) {
-                    has_matching_layer = true;
+                    append_policy(policy);
                     if (post_join_scale == nullptr) {
                         post_join_scale = model.layers[il].wo_s;
                     }
@@ -587,36 +616,60 @@ llama_context::llama_context(
                 }
             }
 
-            if (has_matching_layer) {
-                if (policy.splits.size() != 3) {
-                    throw std::runtime_error(
-                            "attn_out_shards matched layer does not contain exactly three lanes");
-                }
-
-                auto resolve_backend = [&](const std::string & name, const char * role) {
-                    ggml_backend_t resolved = nullptr;
-                    for (const auto & backend : backends) {
-                        ggml_backend_t candidate = backend.get();
-                        if (!llama_backend_policy_backend_matches(candidate, name)) {
-                            continue;
+            // Runtime routes may activate a backend that is zero-sized in the
+            // root topology. Validate every distinct prepared topology now so
+            // graph construction cannot discover a missing backend later.
+            llama_backend_policy_runtime_routes routes;
+            if (llama_backend_policy_resolve_runtime_routes(true, routes) &&
+                    std::find(
+                        routes.candidate_kinds.begin(), routes.candidate_kinds.end(),
+                        "attn_out_block") != routes.candidate_kinds.end()) {
+                for (const std::string & profile : routes.profiles) {
+                    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                        if (llama_backend_policy_match_attn_out_shards_for_profile(
+                                    profile.c_str(), (int) il, true, policy)) {
+                            append_policy(policy);
+                            break;
                         }
-                        if (resolved != nullptr && resolved != candidate) {
-                            throw std::runtime_error(format(
-                                    "attn_out_shards %s backend '%s' is ambiguous across initialized backends",
-                                    role, name.c_str()));
-                        }
-                        resolved = candidate;
                     }
-                    if (resolved == nullptr) {
+                }
+            }
+
+            auto resolve_backend = [&](const std::string & name, const char * role) {
+                ggml_backend_t resolved = nullptr;
+                for (const auto & backend : backends) {
+                    ggml_backend_t candidate = backend.get();
+                    if (!llama_backend_policy_backend_matches(candidate, name)) {
+                        continue;
+                    }
+                    if (resolved != nullptr && resolved != candidate) {
                         throw std::runtime_error(format(
-                                "attn_out_shards %s backend '%s' is not initialized in this context",
+                                "attn_out_shards %s backend '%s' is ambiguous across initialized backends",
                                 role, name.c_str()));
                     }
-                    return resolved;
-                };
+                    resolved = candidate;
+                }
+                if (resolved == nullptr) {
+                    throw std::runtime_error(format(
+                            "attn_out_shards %s backend '%s' is not initialized in this context",
+                            role, name.c_str()));
+                }
+                return resolved;
+            };
 
+            for (const auto & candidate_policy : policies) {
+                std::vector<const llama_backend_policy_attn_out_shard *> active_splits;
+                active_splits.reserve(candidate_policy.splits.size());
                 std::unordered_set<ggml_backend_dev_t> lane_devices;
-                for (const auto & split : policy.splits) {
+                for (const auto & split : candidate_policy.splits) {
+                    if (split.size < 0) {
+                        throw std::runtime_error(format(
+                                "attn_out_shards lane '%s' has a negative shard size",
+                                split.id.c_str()));
+                    }
+                    if (split.size == 0) {
+                        continue;
+                    }
                     ggml_backend_t lane_backend = resolve_backend(split.backend, "lane");
                     ggml_backend_dev_t lane_dev = ggml_backend_get_device(lane_backend);
                     if (lane_dev == nullptr || !lane_devices.insert(lane_dev).second) {
@@ -624,13 +677,22 @@ llama_context::llama_context(
                                 "attn_out_shards lane '%s' backend '%s' aliases another lane's execution device",
                                 split.id.c_str(), split.backend.c_str()));
                     }
+                    active_splits.push_back(&split);
                 }
+                if (active_splits.size() < 2 || active_splits.size() > 3) {
+                    throw std::runtime_error(format(
+                            "attn_out_shards topology must contain 2 or 3 active lanes; got %zu",
+                            active_splits.size()));
+                }
+                std::sort(active_splits.begin(), active_splits.end(), [](const auto * lhs, const auto * rhs) {
+                    return lhs->start < rhs->start;
+                });
 
                 ggml_backend_t reduce_backend =
-                    resolve_backend(policy.reduce_backend, "reduce");
+                    resolve_backend(candidate_policy.reduce_backend, "reduce");
 
                 const ggml_init_params validation_params = {
-                    /*.mem_size   =*/ 12 * ggml_tensor_overhead(),
+                    /*.mem_size   =*/ 16 * ggml_tensor_overhead(),
                     /*.mem_buffer =*/ nullptr,
                     /*.no_alloc   =*/ true,
                 };
@@ -639,36 +701,44 @@ llama_context::llama_context(
                     throw std::runtime_error("failed to create attn_out_shards join validation context");
                 }
                 ggml_tensor * joined = nullptr;
-                const bool output_axis = policy.partition_axis == "output";
-                bool join_supported = false;
+                const bool output_axis = candidate_policy.partition_axis == "output";
+                std::vector<ggml_tensor *> joins;
                 if (output_axis) {
-                    ggml_tensor * lane0 = ggml_new_tensor_2d(
-                            validation_ctx, GGML_TYPE_F32, policy.splits[0].size, 2);
-                    ggml_tensor * lane1 = ggml_new_tensor_2d(
-                            validation_ctx, GGML_TYPE_F32, policy.splits[1].size, 2);
-                    ggml_tensor * lane2 = ggml_new_tensor_2d(
-                            validation_ctx, GGML_TYPE_F32, policy.splits[2].size, 2);
-                    ggml_tensor * inner = nullptr;
-                    // Mirror build_attn_out_shards(): validate the exact
-                    // minimum-inner association that the runtime graph uses.
-                    if (ggml_nbytes(lane0) <= ggml_nbytes(lane2)) {
-                        inner = ggml_concat(validation_ctx, lane0, lane1, 0);
-                        joined = ggml_concat(validation_ctx, inner, lane2, 0);
-                    } else {
-                        inner = ggml_concat(validation_ctx, lane1, lane2, 0);
-                        joined = ggml_concat(validation_ctx, lane0, inner, 0);
+                    std::vector<ggml_tensor *> lanes;
+                    lanes.reserve(active_splits.size());
+                    for (const auto * split : active_splits) {
+                        lanes.push_back(ggml_new_tensor_2d(
+                                validation_ctx, GGML_TYPE_F32, split->size, 2));
                     }
-                    join_supported =
-                        ggml_backend_supports_op(reduce_backend, inner) &&
-                        ggml_backend_supports_op(reduce_backend, joined);
+                    if (lanes.size() == 2) {
+                        joined = ggml_concat(validation_ctx, lanes[0], lanes[1], 0);
+                        joins.push_back(joined);
+                    } else if (ggml_nbytes(lanes.front()) <= ggml_nbytes(lanes.back())) {
+                        ggml_tensor * inner = ggml_concat(validation_ctx, lanes[0], lanes[1], 0);
+                        joined = ggml_concat(validation_ctx, inner, lanes[2], 0);
+                        joins = { inner, joined };
+                    } else {
+                        ggml_tensor * inner = ggml_concat(validation_ctx, lanes[1], lanes[2], 0);
+                        joined = ggml_concat(validation_ctx, lanes[0], inner, 0);
+                        joins = { inner, joined };
+                    }
                 } else {
-                    ggml_tensor * lhs = ggml_new_tensor_2d(
-                            validation_ctx, GGML_TYPE_F32, hparams.n_embd, 2);
-                    ggml_tensor * rhs = ggml_new_tensor_2d(
-                            validation_ctx, GGML_TYPE_F32, hparams.n_embd, 2);
-                    joined = ggml_add(validation_ctx, lhs, rhs);
-                    join_supported = ggml_backend_supports_op(reduce_backend, joined);
+                    std::vector<ggml_tensor *> partials;
+                    partials.reserve(active_splits.size());
+                    for (size_t i = 0; i < active_splits.size(); ++i) {
+                        partials.push_back(ggml_new_tensor_2d(
+                                validation_ctx, GGML_TYPE_F32, hparams.n_embd, 2));
+                    }
+                    joined = partials.back();
+                    for (size_t i = partials.size() - 1; i > 0; --i) {
+                        joined = ggml_add(validation_ctx, partials[i - 1], joined);
+                        joins.push_back(joined);
+                    }
                 }
+                const bool join_supported = std::all_of(
+                        joins.begin(), joins.end(), [&](const ggml_tensor * join) {
+                            return ggml_backend_supports_op(reduce_backend, join);
+                        });
                 ggml_tensor * scale = post_join_scale != nullptr
                     ? ggml_new_tensor_4d(
                             validation_ctx, post_join_scale->type,
@@ -695,17 +765,17 @@ llama_context::llama_context(
                 if (!join_supported) {
                     throw std::runtime_error(format(
                             "attn_out_shards reduce backend '%s' does not support the required F32 %s",
-                            policy.reduce_backend.c_str(), output_axis ? "CONCAT" : "ADD"));
+                            candidate_policy.reduce_backend.c_str(), output_axis ? "CONCAT" : "ADD"));
                 }
                 if (!scale_supported) {
                     throw std::runtime_error(format(
                             "attn_out_shards reduce backend '%s' does not support the required F32 MUL for wo_s",
-                            policy.reduce_backend.c_str()));
+                            candidate_policy.reduce_backend.c_str()));
                 }
                 if (!bias_supported) {
                     throw std::runtime_error(format(
                             "attn_out_shards reduce backend '%s' does not support the required F32 ADD for wo_b",
-                            policy.reduce_backend.c_str()));
+                            candidate_policy.reduce_backend.c_str()));
                 }
             }
         }
