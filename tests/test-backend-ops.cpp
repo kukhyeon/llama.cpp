@@ -5390,6 +5390,99 @@ struct test_concat : public test_case {
     }
 };
 
+// Two logical binary CONCAT nodes which OpenCL may execute as one three-input
+// kernel. Keep both associations covered because the attention partition
+// builder chooses the smaller adjacent pair as its inner result.
+struct test_concat3_tree : public test_case {
+    const std::array<int64_t, 3> widths;
+    const int64_t rows;
+    const bool left_associated;
+
+    std::string vars() override {
+        return VARS_TO_STR3(widths, rows, left_associated);
+    }
+
+    bool run_whole_graph() override {
+        return true;
+    }
+
+    test_concat3_tree(
+            std::array<int64_t, 3> widths,
+            int64_t rows,
+            bool left_associated)
+        : widths(widths), rows(rows), left_associated(left_associated) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, widths[0], rows);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, widths[1], rows);
+        ggml_tensor * c = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, widths[2], rows);
+        ggml_set_name(a, "concat3_a");
+        ggml_set_name(b, "concat3_b");
+        ggml_set_name(c, "concat3_c");
+
+        ggml_tensor * inner;
+        ggml_tensor * out;
+        if (left_associated) {
+            inner = ggml_concat(ctx, a, b, 0);
+            out = ggml_concat(ctx, inner, c, 0);
+        } else {
+            inner = ggml_concat(ctx, b, c, 0);
+            out = ggml_concat(ctx, a, inner, 0);
+        }
+        ggml_set_name(inner, "concat3_inner");
+        ggml_set_name(out, "concat3_out");
+        return out;
+    }
+};
+
+// Fusion must be rejected when the inner CONCAT has another consumer.  If an
+// implementation skips the inner materialization in this graph, the second
+// outer CONCAT observes stale scratch data and the final ADD exposes it.
+struct test_concat3_shared_inner : public test_case {
+    std::string vars() override {
+        return "shared_inner";
+    }
+
+    bool run_whole_graph() override {
+        return true;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3, 7);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 5, 7);
+        ggml_tensor * c = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 11, 7);
+        ggml_tensor * d = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 11, 7);
+        ggml_tensor * inner = ggml_concat(ctx, a, b, 0);
+        ggml_tensor * out0 = ggml_concat(ctx, inner, c, 0);
+        ggml_tensor * out1 = ggml_concat(ctx, inner, d, 0);
+        ggml_set_name(inner, "concat3_shared_inner");
+        ggml_set_name(out0, "concat3_shared_out0");
+        ggml_set_name(out1, "concat3_shared_out1");
+        return ggml_add(ctx, out0, out1);
+    }
+};
+
+// concat(inner, inner) has only one graph consumer but references the inner
+// result twice.  It is not a three-leaf tree and must stay on the ordinary
+// binary CONCAT path.
+struct test_concat3_duplicate_inner : public test_case {
+    std::string vars() override {
+        return "duplicate_inner";
+    }
+
+    bool run_whole_graph() override {
+        return true;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3, 7);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 5, 7);
+        ggml_tensor * inner = ggml_concat(ctx, a, b, 0);
+        ggml_set_name(inner, "concat3_duplicate_inner");
+        return ggml_concat(ctx, inner, inner, 0);
+    }
+};
+
 // GGML_OP_ARGSORT
 struct test_argsort : public test_case {
     const ggml_type type;
@@ -8644,6 +8737,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_concat(GGML_TYPE_I32, {11, 12, 13, 14}, 7, dim, v));
         }
     }
+    test_cases.emplace_back(new test_concat3_tree({ 128, 384, 2560 }, 256, true));
+    test_cases.emplace_back(new test_concat3_tree({ 2560, 384, 128 }, 1, false));
+    test_cases.emplace_back(new test_concat3_shared_inner());
+    test_cases.emplace_back(new test_concat3_duplicate_inner());
 
     for (ggml_sort_order order : {GGML_SORT_ORDER_ASC, GGML_SORT_ORDER_DESC}) {
         for (uint32_t i = 4; i <= 1024*1024; i *= 2) {

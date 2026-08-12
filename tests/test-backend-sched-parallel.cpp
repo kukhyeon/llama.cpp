@@ -866,16 +866,14 @@ struct attn_out_output_axis_shard_fixture {
 
         // Match the output-axis W_O graph: each branch produces a disjoint
         // output range and the canonical result is assembled without a sum.
-        ggml_tensor * joined = projections.back();
-        for (size_t i = projections.size() - 1; i > 0; --i) {
-            joined = ggml_concat(ctx, projections[i - 1], joined, 0);
-            const std::string name =
-                "attn_out_parallel_concat-" + std::to_string(i - 1);
-            ggml_set_name(joined, name.c_str());
-            // The real policy may choose OpenCL for both the last lane and
-            // CONCAT. Reusing this backend pins the equivalent split boundary.
-            ggml_backend_sched_set_tensor_backend(sched, joined, backend);
-        }
+        ggml_tensor * inner = ggml_concat(ctx, projections[0], projections[1], 0);
+        ggml_set_name(inner, "attn_out_parallel_concat-1");
+        ggml_backend_sched_set_tensor_backend(sched, inner, backend);
+        ggml_tensor * joined = ggml_concat(ctx, inner, projections[2], 0);
+        ggml_set_name(joined, "attn_out_parallel_concat-0");
+        // The real policy may choose OpenCL for both the last lane and
+        // CONCAT. Reusing this backend pins the equivalent split boundary.
+        ggml_backend_sched_set_tensor_backend(sched, joined, backend);
         ggml_set_output(joined);
         ggml_build_forward_expand(graph, joined);
         output = joined;
@@ -1017,14 +1015,14 @@ struct attn_out_deferred_sync_fixture {
         }
 
         ggml_backend_t join_backend = join_on_gpu ? gpu_backend : npu_backend;
-        ggml_tensor * joined = projections.back();
-        for (size_t i = projections.size() - 1; i > 0; --i) {
-            joined = ggml_concat(ctx, projections[i - 1], joined, 0);
-            // Both CONCAT nodes belong to the same transformer layer, as in
-            // the production output-axis W_O builder.
-            ggml_set_name(joined, "attn_out_parallel_concat-deferred-0");
-            ggml_backend_sched_set_tensor_backend(sched, joined, join_backend);
-        }
+        ggml_tensor * inner = ggml_concat(ctx, projections[0], projections[1], 0);
+        ggml_set_name(inner, "attn_out_parallel_concat-deferred-0");
+        ggml_backend_sched_set_tensor_backend(sched, inner, join_backend);
+        ggml_tensor * joined = ggml_concat(ctx, inner, projections[2], 0);
+        // Both CONCAT nodes belong to the same transformer layer, as in the
+        // production output-axis W_O builder's minimum-inner association.
+        ggml_set_name(joined, "attn_out_parallel_concat-deferred-0");
+        ggml_backend_sched_set_tensor_backend(sched, joined, join_backend);
 
         // A consumer on a different backend forces the deferred CONCAT itself
         // to complete before its result is copied out of OpenCL.

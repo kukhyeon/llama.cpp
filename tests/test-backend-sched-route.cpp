@@ -1,6 +1,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
+#include "../ggml/src/ggml-backend-impl.h"
 
 #include <algorithm>
 #include <chrono>
@@ -8,6 +9,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -244,6 +246,248 @@ static bool check(bool condition, const char * scenario, const char * detail) {
         return false;
     }
     return true;
+}
+
+struct queued_commit_control {
+    int async_copy_calls = 0;
+    int flush_calls = 0;
+    int synchronize_calls = 0;
+    int fail_async_copy_call = 0;
+};
+
+struct queued_commit_backend_context {
+    ggml_backend_t inner = nullptr;
+    ggml_backend_t wrapper = nullptr;
+    ggml_backend_dev_t device = nullptr;
+    queued_commit_control * control = nullptr;
+    std::vector<std::pair<const ggml_tensor *, ggml_tensor *>> pending_copies;
+};
+
+static queued_commit_backend_context * queued_commit_backend_ctx(ggml_backend_t backend) {
+    return static_cast<queued_commit_backend_context *>(backend->context);
+}
+
+static queued_commit_backend_context * queued_commit_device_ctx(ggml_backend_dev_t device) {
+    return static_cast<queued_commit_backend_context *>(device->context);
+}
+
+static const char * queued_commit_backend_name(ggml_backend_t) {
+    return "QueuedCommitTest";
+}
+
+static void queued_commit_backend_free(ggml_backend_t backend) {
+    queued_commit_backend_context * ctx = queued_commit_backend_ctx(backend);
+    ggml_backend_free(ctx->inner);
+    delete ctx->device;
+    delete ctx;
+    delete backend;
+}
+
+static bool queued_commit_backend_copy_async(
+        ggml_backend_t backend_src,
+        ggml_backend_t backend_dst,
+        const ggml_tensor * src,
+        ggml_tensor * dst) {
+    if (backend_src != backend_dst || src == nullptr || dst == nullptr ||
+            src->data == nullptr || dst->data == nullptr ||
+            ggml_nbytes(src) != ggml_nbytes(dst)) {
+        return false;
+    }
+
+    queued_commit_backend_context * ctx = queued_commit_backend_ctx(backend_dst);
+    queued_commit_control * control = ctx->control;
+    ++control->async_copy_calls;
+    if (control->fail_async_copy_call == control->async_copy_calls) {
+        return false;
+    }
+
+    ctx->pending_copies.emplace_back(src, dst);
+    return true;
+}
+
+static void queued_commit_backend_drain(queued_commit_backend_context * ctx) {
+    for (const auto & copy : ctx->pending_copies) {
+        std::memcpy(copy.second->data, copy.first->data, ggml_nbytes(copy.first));
+    }
+    ctx->pending_copies.clear();
+}
+
+static void queued_commit_backend_synchronize(ggml_backend_t backend) {
+    queued_commit_backend_context * ctx = queued_commit_backend_ctx(backend);
+    ++ctx->control->synchronize_calls;
+    queued_commit_backend_drain(ctx);
+    ggml_backend_synchronize(ctx->inner);
+}
+
+static enum ggml_status queued_commit_backend_graph_compute(
+        ggml_backend_t backend, ggml_cgraph * graph) {
+    return ggml_backend_graph_compute_async(
+            queued_commit_backend_ctx(backend)->inner, graph);
+}
+
+static const ggml_backend_i queued_commit_backend_iface = {
+    /* .get_name                = */ queued_commit_backend_name,
+    /* .free                    = */ queued_commit_backend_free,
+    /* .set_tensor_async        = */ nullptr,
+    /* .get_tensor_async        = */ nullptr,
+    /* .set_tensor_2d_async     = */ nullptr,
+    /* .get_tensor_2d_async     = */ nullptr,
+    /* .cpy_tensor_async        = */ queued_commit_backend_copy_async,
+    /* .synchronize             = */ queued_commit_backend_synchronize,
+    /* .graph_plan_create       = */ nullptr,
+    /* .graph_plan_free         = */ nullptr,
+    /* .graph_plan_update       = */ nullptr,
+    /* .graph_plan_compute      = */ nullptr,
+    /* .graph_compute           = */ queued_commit_backend_graph_compute,
+    /* .event_record            = */ nullptr,
+    /* .event_wait              = */ nullptr,
+    /* .graph_optimize          = */ nullptr,
+};
+
+static const char * queued_commit_device_name(ggml_backend_dev_t) {
+    return "QueuedCommitTest";
+}
+
+static const char * queued_commit_device_description(ggml_backend_dev_t) {
+    return "CPU-backed queued route commit test device";
+}
+
+static void queued_commit_device_memory(
+        ggml_backend_dev_t device, size_t * free_memory, size_t * total_memory) {
+    const queued_commit_backend_context * ctx = queued_commit_device_ctx(device);
+    ggml_backend_dev_memory(
+            ggml_backend_get_device(ctx->inner), free_memory, total_memory);
+}
+
+static enum ggml_backend_dev_type queued_commit_device_type(ggml_backend_dev_t) {
+    return GGML_BACKEND_DEVICE_TYPE_CPU;
+}
+
+static void queued_commit_device_props(
+        ggml_backend_dev_t device, ggml_backend_dev_props * props) {
+    const queued_commit_backend_context * ctx = queued_commit_device_ctx(device);
+    ggml_backend_dev_get_props(ggml_backend_get_device(ctx->inner), props);
+    props->name = "QueuedCommitTest";
+    props->description = "CPU-backed queued route commit test device";
+    props->caps.async = true;
+    props->caps.events = false;
+}
+
+static ggml_backend_t queued_commit_device_init(ggml_backend_dev_t, const char *) {
+    return nullptr;
+}
+
+static ggml_backend_buffer_type_t queued_commit_device_buffer_type(
+        ggml_backend_dev_t device) {
+    return ggml_backend_get_default_buffer_type(queued_commit_device_ctx(device)->inner);
+}
+
+static ggml_backend_buffer_type_t queued_commit_device_host_buffer_type(
+        ggml_backend_dev_t device) {
+    return ggml_backend_get_default_buffer_type(queued_commit_device_ctx(device)->inner);
+}
+
+static bool queued_commit_device_supports_op(
+        ggml_backend_dev_t device, const ggml_tensor * op) {
+    const queued_commit_backend_context * ctx = queued_commit_device_ctx(device);
+    return ggml_backend_dev_supports_op(ggml_backend_get_device(ctx->inner), op);
+}
+
+static bool queued_commit_device_supports_buft(
+        ggml_backend_dev_t device, ggml_backend_buffer_type_t buft) {
+    const queued_commit_backend_context * ctx = queued_commit_device_ctx(device);
+    return ggml_backend_dev_supports_buft(ggml_backend_get_device(ctx->inner), buft);
+}
+
+static bool queued_commit_device_offload_op(ggml_backend_dev_t, const ggml_tensor *) {
+    return false;
+}
+
+static void queued_commit_backend_flush(ggml_backend_t backend) {
+    queued_commit_backend_context * ctx = queued_commit_backend_ctx(backend);
+    ++ctx->control->flush_calls;
+    queued_commit_backend_drain(ctx);
+}
+
+static const char * queued_commit_registry_name(ggml_backend_reg_t) {
+    return "QueuedCommitTest";
+}
+
+static size_t queued_commit_registry_device_count(ggml_backend_reg_t) {
+    return 0;
+}
+
+static ggml_backend_dev_t queued_commit_registry_device(ggml_backend_reg_t, size_t) {
+    return nullptr;
+}
+
+static void * queued_commit_registry_proc_address(ggml_backend_reg_t, const char * name) {
+    if (std::strcmp(name, "ggml_backend_async_flush") == 0) {
+        return reinterpret_cast<void *>(queued_commit_backend_flush);
+    }
+    return nullptr;
+}
+
+static const ggml_backend_reg_i queued_commit_registry_iface = {
+    /* .get_name         = */ queued_commit_registry_name,
+    /* .get_device_count = */ queued_commit_registry_device_count,
+    /* .get_device       = */ queued_commit_registry_device,
+    /* .get_proc_address = */ queued_commit_registry_proc_address,
+};
+
+static ggml_backend_reg queued_commit_registry = {
+    /* .api_version = */ GGML_BACKEND_API_VERSION,
+    /* .iface       = */ queued_commit_registry_iface,
+    /* .context     = */ nullptr,
+};
+
+static const ggml_backend_device_i queued_commit_device_iface = {
+    /* .get_name             = */ queued_commit_device_name,
+    /* .get_description      = */ queued_commit_device_description,
+    /* .get_memory           = */ queued_commit_device_memory,
+    /* .get_type             = */ queued_commit_device_type,
+    /* .get_props            = */ queued_commit_device_props,
+    /* .init_backend         = */ queued_commit_device_init,
+    /* .get_buffer_type      = */ queued_commit_device_buffer_type,
+    /* .get_host_buffer_type = */ queued_commit_device_host_buffer_type,
+    /* .buffer_from_host_ptr = */ nullptr,
+    /* .supports_op          = */ queued_commit_device_supports_op,
+    /* .supports_buft        = */ queued_commit_device_supports_buft,
+    /* .offload_op           = */ queued_commit_device_offload_op,
+    /* .event_new            = */ nullptr,
+    /* .event_free           = */ nullptr,
+    /* .event_synchronize    = */ nullptr,
+};
+
+static ggml_guid_t queued_commit_backend_guid() {
+    static ggml_guid guid = {
+        0xd9, 0x30, 0xae, 0x0c, 0x21, 0x9a, 0x4c, 0x31,
+        0xb7, 0x84, 0xe8, 0x3c, 0xe6, 0x9d, 0x7a, 0x55,
+    };
+    return &guid;
+}
+
+static ggml_backend_t make_queued_commit_backend(queued_commit_control * control) {
+    auto * ctx = new queued_commit_backend_context;
+    ctx->inner = ggml_backend_cpu_init();
+    ctx->control = control;
+    if (ctx->inner == nullptr) {
+        delete ctx;
+        return nullptr;
+    }
+
+    ctx->device = new ggml_backend_device {
+        /* .iface   = */ queued_commit_device_iface,
+        /* .reg     = */ &queued_commit_registry,
+        /* .context = */ ctx,
+    };
+    ctx->wrapper = new ggml_backend {
+        /* .guid    = */ queued_commit_backend_guid(),
+        /* .iface   = */ queued_commit_backend_iface,
+        /* .device  = */ ctx->device,
+        /* .context = */ ctx,
+    };
+    return ctx->wrapper;
 }
 
 class route_trace_capture {
@@ -1182,6 +1426,173 @@ static bool run_multi_output_bundle_case() {
     return ok;
 }
 
+static bool run_queued_multi_output_commit_case() {
+    constexpr int n_outputs = 3;
+
+    auto run_one = [](const char * scenario, int fail_async_copy_call) {
+        const size_t graph_size = 64;
+        const ggml_init_params params = {
+            /* .mem_size   = */ 128 * ggml_tensor_overhead() +
+                                  ggml_graph_overhead_custom(graph_size, false),
+            /* .mem_buffer = */ nullptr,
+            /* .no_alloc   = */ true,
+        };
+
+        queued_commit_control control;
+        control.fail_async_copy_call = fail_async_copy_call;
+        ggml_context * ctx = ggml_init(params);
+        ggml_backend_t backend = make_queued_commit_backend(&control);
+        ggml_backend_t backends[] = { backend };
+        ggml_backend_sched_t sched = ctx != nullptr && backend != nullptr
+            ? ggml_backend_sched_new(backends, nullptr, 1, 128, false, true)
+            : nullptr;
+        auto cleanup = [&]() {
+            ggml_backend_sched_free(sched);
+            ggml_backend_free(backend);
+            ggml_free(ctx);
+        };
+        if (!check(ctx != nullptr && sched != nullptr, scenario, "backend setup failed")) {
+            cleanup();
+            return false;
+        }
+
+        ggml_tensor * x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+        ggml_tensor * y = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+        ggml_set_input(x);
+        ggml_set_input(y);
+        ggml_set_name(x, "queued-route-x");
+        ggml_set_name(y, "queued-route-y");
+
+        ggml_cgraph * graph = ggml_new_graph_custom(ctx, graph_size, false);
+        ggml_tensor * canonical_outputs[n_outputs] = {
+            ggml_add(ctx, x, y),
+            ggml_mul(ctx, x, y),
+            ggml_sub(ctx, x, y),
+        };
+        ggml_tensor * alternate_outputs[n_outputs] = {
+            ggml_mul(ctx, x, y),
+            ggml_add(ctx, x, y),
+            ggml_sub(ctx, y, x),
+        };
+        for (int output_index = 0; output_index < n_outputs; ++output_index) {
+            const std::string canonical_name =
+                "queued-route-canonical-" + std::to_string(output_index);
+            const std::string alternate_name =
+                "queued-route-alternate-" + std::to_string(output_index);
+            ggml_set_name(canonical_outputs[output_index], canonical_name.c_str());
+            ggml_set_name(alternate_outputs[output_index], alternate_name.c_str());
+            ggml_backend_sched_set_tensor_backend(
+                    sched, canonical_outputs[output_index], backend);
+            ggml_backend_sched_set_tensor_backend(
+                    sched, alternate_outputs[output_index], backend);
+            ggml_build_forward_expand(graph, canonical_outputs[output_index]);
+        }
+        for (ggml_tensor * alternate_output : alternate_outputs) {
+            ggml_build_forward_expand(graph, alternate_output);
+        }
+
+        ggml_tensor * outputs[n_outputs] = {};
+        for (int output_index = 0; output_index < n_outputs; ++output_index) {
+            outputs[output_index] =
+                ggml_scale(ctx, canonical_outputs[output_index], 1.0f);
+            const std::string output_name =
+                "queued-route-output-" + std::to_string(output_index);
+            ggml_set_name(outputs[output_index], output_name.c_str());
+            ggml_set_output(outputs[output_index]);
+            ggml_backend_sched_set_tensor_backend(sched, outputs[output_index], backend);
+            ggml_build_forward_expand(graph, outputs[output_index]);
+        }
+
+        bool setup_ok =
+            ggml_backend_sched_register_route_subgraph_bundle(
+                    sched,
+                    canonical_outputs[0], canonical_outputs,
+                    canonical_outputs[0], canonical_outputs,
+                    n_outputs, 0, 0) &&
+            ggml_backend_sched_register_route_subgraph_bundle(
+                    sched,
+                    canonical_outputs[0], canonical_outputs,
+                    alternate_outputs[0], alternate_outputs,
+                    n_outputs, 1, 0);
+        ggml_backend_sched_layer_checkpoint_set_plan_id(sched, 1);
+        setup_ok = setup_ok && ggml_backend_sched_alloc_graph(sched, graph);
+        if (!check(setup_ok, scenario, "queued route preparation failed")) {
+            cleanup();
+            return false;
+        }
+
+        const float x_data[4] = { 1.0f, 2.0f, 3.0f, 4.0f };
+        const float y_data[4] = { 5.0f, 6.0f, 7.0f, 8.0f };
+        ggml_backend_tensor_set(x, x_data, 0, sizeof(x_data));
+        ggml_backend_tensor_set(y, y_data, 0, sizeof(y_data));
+        bool ok = check(
+                ggml_backend_sched_graph_compute_async(sched, graph) ==
+                    GGML_STATUS_SUCCESS,
+                scenario, "async graph compute failed");
+
+        const int expected_async_copies = fail_async_copy_call == 0
+            ? n_outputs : fail_async_copy_call;
+        const int expected_flushes = fail_async_copy_call == 0 ? 1 : 0;
+        // A later callback rejection drains the partially queued bundle once;
+        // the blocking fallback recognizes that the same producer backend has
+        // already been synchronized and does not wait on it again.
+        const int expected_internal_syncs = fail_async_copy_call == 0 ? 0 : 1;
+        if (control.async_copy_calls != expected_async_copies ||
+                control.flush_calls != expected_flushes ||
+                control.synchronize_calls != expected_internal_syncs) {
+            std::fprintf(stderr,
+                    "  async-copy/flush/synchronize=%d/%d/%d, expected %d/%d/%d\n",
+                    control.async_copy_calls,
+                    control.flush_calls,
+                    control.synchronize_calls,
+                    expected_async_copies,
+                    expected_flushes,
+                    expected_internal_syncs);
+        }
+        ok =
+            check(control.async_copy_calls == expected_async_copies,
+                scenario, "unexpected async-copy callback count") &&
+            check(control.flush_calls == expected_flushes,
+                scenario, "unexpected queued-commit flush count") &&
+            check(control.synchronize_calls == expected_internal_syncs,
+                scenario, "queued commit used an unexpected blocking wait") && ok;
+
+        for (int output_index = 0; ok && output_index < n_outputs; ++output_index) {
+            float actual[4] = {};
+            ggml_backend_tensor_get(outputs[output_index], actual, 0, sizeof(actual));
+            for (int i = 0; i < 4; ++i) {
+                const float expected = output_index == 0
+                    ? x_data[i] * y_data[i]
+                    : output_index == 1
+                        ? x_data[i] + y_data[i]
+                        : y_data[i] - x_data[i];
+                ok = check(std::fabs(actual[i] - expected) < 1e-5f,
+                        scenario, "downstream observed a mixed route bundle") && ok;
+            }
+        }
+
+        ggml_backend_sched_route_candidate_stats stats = {};
+        ggml_backend_sched_get_route_candidate_stats(sched, &stats);
+        ok =
+            check(stats.alternate_selected == 1,
+                scenario, "alternate bundle was not selected") &&
+            check(stats.canonical_commits == 1,
+                scenario, "alternate bundle was not committed") && ok;
+
+        // Account separately for the caller-requested final synchronization;
+        // it must not be confused with a host wait inside the fast path.
+        ggml_backend_sched_synchronize(sched);
+        ok = check(control.synchronize_calls == expected_internal_syncs + 1,
+                scenario, "final scheduler synchronization count mismatch") && ok;
+
+        cleanup();
+        return ok;
+    };
+
+    return run_one("queued-multi-output-commit", 0) &&
+        run_one("queued-multi-output-partial-failure", 2);
+}
+
 static bool run_qkv_composite_lane_bundle_case() {
     const char * scenario = "qkv-composite-lane-route-bundle";
     constexpr int n_lanes = 3;
@@ -1626,6 +2037,7 @@ int main() {
     ok = run_subgraph_layer_switch_case() && ok;
     ok = run_multi_consumer_commit_case() && ok;
     ok = run_multi_output_bundle_case() && ok;
+    ok = run_queued_multi_output_commit_case() && ok;
     ok = run_qkv_composite_lane_bundle_case() && ok;
     ok = run_attn_out_fork_join_subgraph_case() && ok;
     ok = run_alternate_terminal_lifetime_case() && ok;

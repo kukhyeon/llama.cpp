@@ -648,8 +648,16 @@ llama_context::llama_context(
                             validation_ctx, GGML_TYPE_F32, policy.splits[1].size, 2);
                     ggml_tensor * lane2 = ggml_new_tensor_2d(
                             validation_ctx, GGML_TYPE_F32, policy.splits[2].size, 2);
-                    ggml_tensor * inner = ggml_concat(validation_ctx, lane1, lane2, 0);
-                    joined = ggml_concat(validation_ctx, lane0, inner, 0);
+                    ggml_tensor * inner = nullptr;
+                    // Mirror build_attn_out_shards(): validate the exact
+                    // minimum-inner association that the runtime graph uses.
+                    if (ggml_nbytes(lane0) <= ggml_nbytes(lane2)) {
+                        inner = ggml_concat(validation_ctx, lane0, lane1, 0);
+                        joined = ggml_concat(validation_ctx, inner, lane2, 0);
+                    } else {
+                        inner = ggml_concat(validation_ctx, lane1, lane2, 0);
+                        joined = ggml_concat(validation_ctx, lane0, inner, 0);
+                    }
                     join_supported =
                         ggml_backend_supports_op(reduce_backend, inner) &&
                         ggml_backend_supports_op(reduce_backend, joined);
