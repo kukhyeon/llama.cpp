@@ -912,9 +912,9 @@ llama_backend_policy_attn_qkv_shards parse_attn_qkv_shards(
                 out.splits.begin(), out.splits.end(), [&](const auto & split) {
                     return split.*size_member > 0;
                 });
-        if (active_splits < 2 || active_splits > 3) {
+        if (active_splits < 1 || active_splits > 3) {
             throw std::runtime_error(
-                    projection_source + " must contain 2 or 3 positive processor lanes");
+                    projection_source + " must contain 1 to 3 positive processor lanes");
         }
     };
 
@@ -1095,9 +1095,9 @@ llama_backend_policy_attn_out_shards parse_attn_out_shards(
             out.splits.begin(), out.splits.end(), [](const auto & split) {
                 return split.size > 0;
             });
-    if (active_splits < 2 || active_splits > 3) {
+    if (active_splits < 1 || active_splits > 3) {
         throw std::runtime_error(
-                source + ".split_sizes must contain 2 or 3 positive processor lanes");
+                source + ".split_sizes must contain 1, 2, or 3 positive processor lanes");
     }
 
     return out;
@@ -1967,7 +1967,7 @@ void parse_runtime_routes(const json & root, policy_state & state) {
                     LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_V,
                     root_v_width)) {
             throw std::runtime_error(
-                    "runtime_routes attn_qkv_block root policy must contain complete Q/K/V partitions with 2 or 3 active lanes");
+                    "runtime_routes attn_qkv_block root policy must contain complete Q/K/V partitions with 1 to 3 active lanes");
         }
 
         for (const std::string & profile_name : routes.profiles) {
@@ -2002,7 +2002,7 @@ void parse_runtime_routes(const json & root, policy_state & state) {
         int64_t root_width = 0;
         if (!attn_out_policy_width(state.attn_out_shards, root_width)) {
             throw std::runtime_error(
-                    "runtime_routes attn_out_block root policy must contain a complete partition with 2 or 3 active lanes");
+                    "runtime_routes attn_out_block root policy must contain a complete partition with 1, 2, or 3 active lanes");
         }
         for (const std::string & profile_name : routes.profiles) {
             const auto * policy = effective_attn_out_policy_for_profile(state, profile_name);
@@ -2013,7 +2013,7 @@ void parse_runtime_routes(const json & root, policy_state & state) {
                     profile_width != root_width) {
                 throw std::runtime_error(
                         "runtime_routes attn_out_block profile '" + profile_name +
-                        "' requires an enabled output-axis split with 2 or 3 active lanes and the root partition width");
+                        "' requires an enabled output-axis split with 1, 2, or 3 active lanes and the root partition width");
             }
         }
     }

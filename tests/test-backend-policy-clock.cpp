@@ -280,6 +280,26 @@ bool test_zero_ffn_shards_policy() {
 }
 )JSON";
 
+    static constexpr char one_active_policy[] = R"JSON(
+{
+  "enabled": true,
+  "ffn_parallel": {
+    "enabled": true,
+    "phase": "all",
+    "layer_range": [0, 0],
+    "align": 64,
+    "reduce_backend": "CPU",
+    "reduce_threads": 4,
+    "split_layout": [
+      { "id": "npu", "backend": "HTP0-REPACK" },
+      { "id": "gpu", "backend": "OpenCL" },
+      { "id": "cpu", "backend": "CPU_REPACK" }
+    ],
+    "split_sizes": { "npu": 512, "gpu": 0, "cpu": 0 }
+  }
+}
+)JSON";
+
     static constexpr char negative_policy[] = R"JSON(
 {
   "enabled": true,
@@ -303,6 +323,8 @@ bool test_zero_ffn_shards_policy() {
             "test-backend-policy-zero-ffn-explicit.json", explicit_policy);
     temporary_policy_file all_zero_file(
             "test-backend-policy-zero-ffn-all-zero.json", all_zero_policy);
+    temporary_policy_file one_active_file(
+            "test-backend-policy-zero-ffn-one-active.json", one_active_policy);
     temporary_policy_file negative_file(
             "test-backend-policy-zero-ffn-negative.json", negative_policy);
 
@@ -331,6 +353,18 @@ bool test_zero_ffn_shards_policy() {
     CHECK(llama_backend_policy_build_ffn_residency_plan(0, plan));
     CHECK(plan.covers.size() == 2);
 
+    CHECK(llama_backend_policy_load(one_active_file.path(), false, false));
+    CHECK(llama_backend_policy_match_ffn_parallel(0, true, policy));
+    CHECK(policy.splits.size() == 3);
+    CHECK(policy.splits[0].id == "npu" && policy.splits[0].start == 0 && policy.splits[0].size == 512);
+    CHECK(policy.splits[1].size == 0 && policy.splits[2].size == 0);
+    CHECK(policy.reduce_backend == "CPU" && policy.reduce_threads == 4);
+    CHECK(llama_backend_policy_ffn_parallel_reduce_threads() == 0);
+    CHECK(llama_backend_policy_build_ffn_residency_plan(0, plan));
+    CHECK(plan.covers.size() == 1);
+    CHECK(plan.covers[0].backend == "HTP0-REPACK");
+    CHECK(plan.covers[0].start == 0 && plan.covers[0].size == 512);
+
     CHECK(!llama_backend_policy_load(all_zero_file.path(), false, false));
     CHECK(!llama_backend_policy_load(negative_file.path(), false, false));
 
@@ -341,6 +375,17 @@ bool test_zero_ffn_shards_policy() {
         CHECK(policy.source == "LLAMA_FFN_PARALLEL_SPLITS");
         CHECK(policy.splits.size() == 3);
         CHECK(policy.splits[2].size == 0 && policy.splits[2].start == 512);
+    }
+
+    {
+        scoped_environment env_splits(
+                "LLAMA_FFN_PARALLEL_SPLITS", "HTP0-REPACK:512,OpenCL:0,CPU_REPACK:0");
+        CHECK(llama_backend_policy_match_ffn_parallel(0, true, policy));
+        CHECK(policy.splits.size() == 3);
+        CHECK(policy.splits[0].backend == "HTP0-REPACK" && policy.splits[0].size == 512);
+        CHECK(policy.splits[1].size == 0 && policy.splits[2].size == 0);
+        // With no sibling branch there is no reduction worker pool to tune.
+        CHECK(llama_backend_policy_ffn_parallel_reduce_threads() == 0);
     }
 
     llama_backend_policy_clear();
@@ -631,6 +676,15 @@ bool test_zero_attention_shards_policy() {
       "attn_out_shards": {
         "split_sizes": { "cpu": 1024, "gpu": 0, "npu": 2048 }
       }
+    },
+    "npu-only-qkv": {
+      "attn_qkv_shards": {
+        "split_sizes": {
+          "q": { "cpu": 0, "gpu": 0, "npu": 3072 },
+          "k": { "cpu": 0, "gpu": 0, "npu": 1024 },
+          "v": { "cpu": 0, "gpu": 0, "npu": 1024 }
+        }
+      }
     }
   },
   "runtime_routes": {
@@ -638,7 +692,7 @@ bool test_zero_attention_shards_policy() {
     "mode": "fixed",
     "phase": "prefill",
     "initial_profile": "root-fallback",
-    "profiles": ["root-fallback", "cpu-gpu", "gpu-npu", "cpu-npu"],
+    "profiles": ["root-fallback", "cpu-gpu", "gpu-npu", "cpu-npu", "npu-only-qkv"],
     "transitions": "complete",
     "candidate_kinds": ["attn_qkv_block", "attn_out_block"],
     "boundary": { "node": "l_out", "backend": "auto", "granularity": "layer" },
@@ -686,6 +740,20 @@ bool test_zero_attention_shards_policy() {
         return cover.backend == "CPU";
     }));
 
+    // A single whole Q/K/V lane is a complete projection path, not an empty
+    // partition. Residency should contain only that processor's full cover.
+    CHECK(llama_backend_policy_load(one_active_qkv_file.path(), false, false));
+    CHECK(llama_backend_policy_match_attn_qkv_shards(0, true, qkv));
+    CHECK(qkv.splits[0].q_size == 0 && qkv.splits[1].q_size == 0);
+    CHECK(qkv.splits[2].q_start == 0 && qkv.splits[2].q_size == 2048);
+    CHECK(qkv.splits[2].k_start == 0 && qkv.splits[2].k_size == 768);
+    CHECK(qkv.splits[2].v_start == 0 && qkv.splits[2].v_size == 768);
+    CHECK(llama_backend_policy_build_attn_qkv_residency_plan(
+            0, LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_Q, plan));
+    CHECK(plan.covers.size() == 1);
+    CHECK(plan.covers[0].backend == "HTP0-REPACK");
+    CHECK(plan.covers[0].start == 0 && plan.covers[0].size == 2048);
+
     CHECK(llama_backend_policy_load(attn_out_file.path(), false, false));
     llama_backend_policy_attn_out_shards attn_out;
     CHECK(llama_backend_policy_match_attn_out_shards(0, true, attn_out));
@@ -699,9 +767,21 @@ bool test_zero_attention_shards_policy() {
         return cover.backend == "CPU";
     }));
 
+    // One full-width W_O lane is likewise a complete projection path. No
+    // inactive processor should acquire a resident cover merely because the
+    // stable policy schema still declares all three lane ids.
+    CHECK(llama_backend_policy_load(one_active_attn_out_file.path(), false, false));
+    CHECK(llama_backend_policy_match_attn_out_shards(0, true, attn_out));
+    CHECK(attn_out.splits[0].size == 0 && attn_out.splits[1].size == 0);
+    CHECK(attn_out.splits[2].start == 0 && attn_out.splits[2].size == 2048);
+    CHECK(llama_backend_policy_build_attn_out_residency_plan(0, plan));
+    CHECK(plan.covers.size() == 1);
+    CHECK(plan.covers[0].backend == "HTP0-REPACK");
+    CHECK(plan.covers[0].start == 0 && plan.covers[0].size == 2048);
+
     for (const char * invalid : {
-            partial_qkv_file.path(), one_active_qkv_file.path(), negative_qkv_file.path(),
-            one_active_attn_out_file.path(), negative_attn_out_file.path() }) {
+            partial_qkv_file.path(), negative_qkv_file.path(),
+            negative_attn_out_file.path() }) {
         CHECK(!llama_backend_policy_load(invalid, false, false));
         CHECK(llama_backend_policy_match_attn_out_shards(0, true, attn_out));
         CHECK(attn_out.splits[0].size == 0);
@@ -719,6 +799,11 @@ bool test_zero_attention_shards_policy() {
     CHECK(llama_backend_policy_match_attn_qkv_shards_for_profile(
             "cpu-gpu", 0, true, qkv));
     CHECK(qkv.splits[0].q_size == 1024 && qkv.splits[2].q_size == 0);
+    CHECK(llama_backend_policy_match_attn_qkv_shards_for_profile(
+            "npu-only-qkv", 0, true, qkv));
+    CHECK(qkv.splits[0].q_size == 0 && qkv.splits[1].q_size == 0);
+    CHECK(qkv.splits[2].q_start == 0 && qkv.splits[2].q_size == 3072);
+    CHECK(qkv.splits[2].k_start == 0 && qkv.splits[2].k_size == 1024);
     CHECK(llama_backend_policy_match_attn_out_shards_for_profile(
             "gpu-npu", 0, true, attn_out));
     CHECK(attn_out.splits[0].size == 0 && attn_out.splits[2].size == 2048);
@@ -742,7 +827,7 @@ bool test_zero_attention_shards_policy() {
     const auto q_npu = q_cover("HTP0-REPACK");
     CHECK(q_cpu != plan.covers.end() && q_cpu->start == 0 && q_cpu->size == 1024);
     CHECK(q_gpu != plan.covers.end() && q_gpu->start == 0 && q_gpu->size == 3072);
-    CHECK(q_npu != plan.covers.end() && q_npu->start == 1024 && q_npu->size == 2048);
+    CHECK(q_npu != plan.covers.end() && q_npu->start == 0 && q_npu->size == 3072);
 
     CHECK(llama_backend_policy_build_attn_out_residency_plan(0, plan));
     CHECK(plan.covers.size() == 3);

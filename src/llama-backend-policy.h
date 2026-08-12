@@ -70,7 +70,8 @@ enum llama_backend_policy_attn_qkv_projection {
 struct llama_backend_policy_attn_out_shard {
     std::string id;
     int64_t start = 0;
-    // A zero size is an inactive shard lane; reduce_backend remains unchanged.
+    // A zero size is an inactive shard lane. With one full-cover active lane,
+    // reduce_backend is used only if a post-projection scale/bias exists.
     int64_t size = 0;
     std::string backend;
 };
@@ -78,7 +79,9 @@ struct llama_backend_policy_attn_out_shard {
 // Static policy for splitting either axis of the Llama attention output
 // projection. Input-axis lanes produce full-width partial outputs which are
 // reduced; output-axis lanes consume the full input and produce disjoint
-// output ranges which are assembled on reduce_backend. Policies authored
+// output ranges which are assembled on reduce_backend. A single active lane
+// bypasses the identity ADD/CONCAT and stays on its execution backend unless a
+// scale or bias creates real reduce-stage work. Policies authored
 // before partition_axis was introduced retain the original input-axis path.
 struct llama_backend_policy_attn_out_shards {
     bool enabled = false;

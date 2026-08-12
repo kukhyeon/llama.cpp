@@ -1684,7 +1684,7 @@ static bool run_qkv_composite_lane_bundle_case() {
             }
             start += sizes[lane];
         }
-        GGML_ASSERT(active_lanes.size() >= 2 && active_lanes.size() <= 3);
+        GGML_ASSERT(!active_lanes.empty() && active_lanes.size() <= 3);
         GGML_ASSERT(start == output_width);
 
         // Assemble Q, K, and V independently after every active lane's
@@ -1695,7 +1695,12 @@ static bool run_qkv_composite_lane_bundle_case() {
                 "attn_qkv_join." + std::string(projection_names[projection]) +
                 "." + tag;
             ggml_tensor * output = nullptr;
-            if (active_lanes.size() == 2) {
+            if (active_lanes.size() == 1) {
+                // Production QKV single-lane routing uses the three REGION
+                // matmuls directly as its terminal bundle. No identity CONCAT
+                // or fake assemble-backend node belongs on this path.
+                output = variant.lane_nodes[active_lanes[0]][projection];
+            } else if (active_lanes.size() == 2) {
                 output = ggml_concat(
                         ctx,
                         variant.lane_nodes[active_lanes[0]][projection],
@@ -1715,8 +1720,15 @@ static bool run_qkv_composite_lane_bundle_case() {
                         inner,
                         0);
             }
-            ggml_set_name(output, (prefix + ".concat0-0").c_str());
-            ggml_backend_sched_set_tensor_backend(sched, output, backends[0]);
+            if (active_lanes.size() == 1) {
+                // Match production: the REGION tensor remains on its lane
+                // backend, but its routed terminal name no longer advertises
+                // an incomplete parallel branch.
+                ggml_set_name(output, (prefix + ".output2d-0").c_str());
+            } else {
+                ggml_set_name(output, (prefix + ".concat0-0").c_str());
+                ggml_backend_sched_set_tensor_backend(sched, output, backends[0]);
+            }
             ggml_build_forward_expand(graph, output);
             variant.outputs[projection] = output;
         }
@@ -1724,7 +1736,7 @@ static bool run_qkv_composite_lane_bundle_case() {
     };
 
     const int canonical_sizes[n_lanes] = { 4, 4, 4 };
-    const int alternate_sizes[n_lanes] = { 0, 4, 8 };
+    const int alternate_sizes[n_lanes] = { 0, 0, 12 };
     const composite_variant canonical = build_variant("canonical", 0, canonical_sizes);
     const composite_variant alternate = build_variant("alternate", 9, alternate_sizes);
 
@@ -1814,8 +1826,8 @@ static bool run_qkv_composite_lane_bundle_case() {
     ok =
         check(stats.registered_mappings == 2, scenario, "mapping count mismatch") &&
         check(stats.prepared_groups == 1, scenario, "prepared group count mismatch") &&
-        check(stats.prepared_candidate_splits == 7,
-            scenario, "three-way/two-way QKV candidate split count mismatch") &&
+        check(stats.prepared_candidate_splits == 5,
+            scenario, "three-way/single-lane QKV candidate split count mismatch") &&
         check(stats.groups_executed == 1, scenario, "route group count mismatch") &&
         check(stats.canonical_selected == 0, scenario, "canonical route unexpectedly selected") &&
         check(stats.alternate_selected == 1, scenario, "alternate route was not selected") &&
@@ -1825,43 +1837,36 @@ static bool run_qkv_composite_lane_bundle_case() {
 
     std::vector<route_trace_row> trace_rows;
     ok = read_route_trace(trace.path(), scenario, &trace_rows) && ok;
-    std::vector<route_trace_row> grouped_rows;
+    std::vector<route_trace_row> selected_rows;
     bool canonical_range_was_traced = false;
     for (const route_trace_row & row : trace_rows) {
         canonical_range_was_traced = canonical_range_was_traced ||
             row.first_node.find("attn_qkv_shard.canonical-") != std::string::npos ||
             row.last_node.find("attn_qkv_shard.canonical-") != std::string::npos;
-        if (row.is_parallel_group && row.parallel_kind == "attn_qkv_shard") {
-            grouped_rows.push_back(row);
+        if (row.first_node.find("attn_qkv_join.q.alternate.output2d") != std::string::npos ||
+                row.last_node.find("attn_qkv_join.v.alternate.output2d") != std::string::npos) {
+            selected_rows.push_back(row);
         }
     }
     ok =
         check(!canonical_range_was_traced,
             scenario, "inactive canonical lane range appeared in execution trace") &&
-        check(grouped_rows.size() == 2,
-            scenario, "selected alternate did not execute one two-lane QKV group") && ok;
-    if (grouped_rows.size() == 2) {
-        const int group_id = grouped_rows[0].group_id;
-        for (int row_index = 0; row_index < 2; ++row_index) {
-            const int lane = row_index + 1;
-            const route_trace_row & row = grouped_rows[row_index];
-            const std::string branch = "alternate-lane" + std::to_string(lane);
-            const std::string expected_first =
-                "attn_qkv_shard." + branch + ".q.proj-0";
-            const std::string expected_last =
-                "attn_qkv_shard." + branch + ".v.proj-0";
-            ok =
-                check(row.group_id == group_id && group_id >= 0,
-                    scenario, "composite lanes did not share one group id") &&
-                check(row.parallel_branch == branch,
-                    scenario, "alternate composite lane order mismatch") &&
-                check(row.node_count == n_outputs,
-                    scenario, "Q/K/V did not remain in one backend-major lane split") &&
-                check(row.first_node == expected_first,
-                    scenario, "composite lane did not begin with Q") &&
-                check(row.last_node == expected_last,
-                    scenario, "composite lane did not end with V") && ok;
-        }
+        check(selected_rows.size() == 1,
+            scenario, "selected single-lane QKV route did not remain one scheduler split") && ok;
+    if (selected_rows.size() == 1) {
+        const route_trace_row & row = selected_rows.front();
+        ok =
+            check(!row.is_parallel_group,
+                scenario, "single QKV lane entered the parallel worker path") &&
+            check(row.node_count == n_outputs,
+                scenario, "single-lane Q/K/V did not remain one backend-major split") &&
+            check(row.first_node == "attn_qkv_join.q.alternate.output2d-0",
+                scenario, "single-lane QKV split did not begin with Q") &&
+            check(row.last_node == "attn_qkv_join.v.alternate.output2d-0",
+                scenario, "single-lane QKV split did not end with V") &&
+            check(row.first_node.find("concat") == std::string::npos &&
+                    row.last_node.find("concat") == std::string::npos,
+                scenario, "single-lane QKV route manufactured a CONCAT") && ok;
     }
 
     cleanup();
@@ -1944,25 +1949,40 @@ static bool run_attn_out_fork_join_subgraph_case() {
             start += sizes[lane];
         }
 
-        GGML_ASSERT(active_lanes.size() >= 2 && active_lanes.size() <= 3);
-        ggml_tensor * joined = ggml_concat(ctx, active_lanes[0], active_lanes[1], 0);
-        ggml_set_name(joined, (std::string("attn-out-inner-") + tag).c_str());
-        ggml_backend_sched_set_tensor_backend(sched, joined, lane0_backend);
-        if (active_lanes.size() == 3) {
-            joined = ggml_concat(ctx, joined, active_lanes[2], 0);
+        GGML_ASSERT(!active_lanes.empty() && active_lanes.size() <= 3);
+        ggml_tensor * joined = active_lanes.front();
+        if (active_lanes.size() >= 2) {
+            joined = ggml_concat(ctx, active_lanes[0], active_lanes[1], 0);
+            ggml_set_name(joined, (std::string("attn-out-inner-") + tag).c_str());
+            ggml_backend_sched_set_tensor_backend(sched, joined, lane0_backend);
+            if (active_lanes.size() == 3) {
+                joined = ggml_concat(ctx, joined, active_lanes[2], 0);
+            }
         }
-        ggml_set_name(joined, (std::string("attn-out-joined-") + tag).c_str());
-        ggml_backend_sched_set_tensor_backend(sched, joined, lane0_backend);
+        // Mirror the production single-lane path: the complete projection is
+        // renamed to the canonical terminal and remains on its lane backend,
+        // rather than retaining an attn_out_shard branch name or acquiring a
+        // synthetic CONCAT on reduce_backend.
+        ggml_set_name(joined, (std::string(active_lanes.size() == 1
+                ? "attn-out-terminal-" : "attn-out-joined-") + tag).c_str());
+        if (active_lanes.size() > 1) {
+            ggml_backend_sched_set_tensor_backend(sched, joined, lane0_backend);
+        }
         ggml_build_forward_expand(graph, joined);
         return fork_join_variant { active_lanes.front(), joined };
     };
 
     const int canonical_sizes[3] = { 2, 2, 2 };
     const int alternate_sizes[3] = { 0, 2, 4 };
+    const int single_sizes[3] = { 0, 0, 6 };
     const fork_join_variant canonical = build_variant(
             canonical_sizes, "r0000000000000000", backends[0], backends[1]);
     const fork_join_variant alternate = build_variant(
             alternate_sizes, "r0000000000000001", backends[1], backends[0]);
+    const fork_join_variant single = build_variant(
+            single_sizes, "r0000000000000002", backends[1], backends[0]);
+    const bool single_terminal_kept_lane_backend =
+        ggml_backend_sched_get_tensor_backend(sched, single.output) == backends[1];
 
     ggml_tensor * output = ggml_scale(ctx, canonical.output, 1.0f);
     ggml_set_name(output, "attn-out-route-output");
@@ -1976,7 +1996,10 @@ static bool run_attn_out_fork_join_subgraph_case() {
                 canonical.first, canonical.output, 0, 0) &&
         ggml_backend_sched_register_route_subgraph(
                 sched, canonical.first, canonical.output,
-                alternate.first, alternate.output, 1, 0);
+                alternate.first, alternate.output, 1, 0) &&
+        ggml_backend_sched_register_route_subgraph(
+                sched, canonical.first, canonical.output,
+                single.first, single.output, 2, 0);
     ggml_backend_sched_layer_checkpoint_set_plan_id(sched, 1);
     setup_ok = setup_ok && ggml_backend_sched_alloc_graph(sched, graph);
     if (!check(setup_ok, scenario, "fork/join route preparation failed")) {
@@ -2030,6 +2053,44 @@ static bool run_attn_out_fork_join_subgraph_case() {
     }
     ok = check(grouped_rows.size() == 2, scenario,
             "selected two-way W_O route did not execute one two-lane group") && ok;
+
+    // Reuse the allocated graph with the one-lane route selected. A complete
+    // single projection must still commit into the canonical route output, but
+    // it must not be collected as a parallel group or execute a join node.
+    ggml_backend_sched_reset_route_candidate_stats(sched);
+    ggml_backend_sched_layer_checkpoint_set_plan_id(sched, 2);
+    route_trace_capture single_trace("attn-out-single-lane-subgraph");
+    if (!check(single_trace.start(203), scenario, "failed to start single-lane scheduler trace")) {
+        cleanup();
+        return false;
+    }
+    ok = check(
+            ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS,
+            scenario, "single-lane graph compute failed") && ok;
+    single_trace.finish();
+    if (ok) {
+        ggml_backend_tensor_get(output, actual, 0, sizeof(actual));
+        for (int i = 0; i < 6; ++i) {
+            ok = check(std::fabs(actual[i] - expected[i]) < 1e-5f,
+                    scenario, "single-lane route output mismatch") && ok;
+        }
+    }
+    ggml_backend_sched_get_route_candidate_stats(sched, &stats);
+    ok =
+        check(stats.groups_executed == 1, scenario, "unexpected single-lane route group count") &&
+        check(stats.alternate_selected == 1, scenario, "single-lane route was not selected") &&
+        check(stats.canonical_commits == 1, scenario, "single-lane output was not committed") &&
+        check(single_terminal_kept_lane_backend,
+            scenario, "single-lane terminal moved off its execution backend") && ok;
+
+    trace_rows.clear();
+    ok = read_route_trace(single_trace.path(), scenario, &trace_rows) && ok;
+    const bool single_has_group = std::any_of(
+            trace_rows.begin(), trace_rows.end(), [](const route_trace_row & row) {
+                return row.is_parallel_group && row.parallel_kind == "attn_out_shard";
+            });
+    ok = check(!single_has_group, scenario,
+            "single-lane W_O was incorrectly collected as a parallel group") && ok;
 
     cleanup();
     return ok;

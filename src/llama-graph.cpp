@@ -1293,9 +1293,9 @@ bool llm_graph_context::build_qkv_shards(
         }
         active_lane_count += all_positive ? 1 : 0;
     }
-    if (active_lane_count < 2 || active_lane_count > 3) {
+    if (active_lane_count < 1 || active_lane_count > 3) {
         LLAMA_LOG_WARN(
-                "backend_policy: attn_qkv_shards layer %d requires 2 or 3 active lanes, got %zu; falling back\n",
+                "backend_policy: attn_qkv_shards layer %d requires 1 to 3 active lanes, got %zu; falling back\n",
                 il, active_lane_count);
         return false;
     }
@@ -1397,7 +1397,7 @@ bool llm_graph_context::build_qkv_shards(
         return covered == expected;
     };
 
-    if (lanes.size() < 2 || lanes.size() > 3 ||
+    if (lanes.empty() || lanes.size() > 3 ||
             !validate_projection('q', n_embd_q) ||
             !validate_projection('k', n_embd_kv) ||
             !validate_projection('v', n_embd_kv)) {
@@ -1475,7 +1475,7 @@ bool llm_graph_context::build_qkv_shards(
         });
 
         GGML_ASSERT(parts.size() == lanes.size());
-        GGML_ASSERT(parts.size() >= 2 && parts.size() <= 3);
+        GGML_ASSERT(!parts.empty() && parts.size() <= 3);
         auto concat_stage = [&](ggml_tensor * lhs, ggml_tensor * rhs, int stage) {
             ggml_tensor * result = ggml_concat(ctx0, lhs, rhs, 0);
             const std::string name = tagged_name(
@@ -1484,6 +1484,14 @@ bool llm_graph_context::build_qkv_shards(
             cb_route(result, name.c_str(), il, policy.assemble_backend.c_str());
             return result;
         };
+
+        // A single active processor already produced the complete projection.
+        // Keep that REGION matmul as the terminal instead of manufacturing an
+        // identity CONCAT/copy on assemble_backend. This is both the cheapest
+        // static path and a valid routed terminal for canonical bundle commit.
+        if (parts.size() == 1) {
+            return parts[0].second;
+        }
 
         if (parts.size() == 2) {
             return concat_stage(parts[0].second, parts[1].second, 0);
@@ -1512,6 +1520,7 @@ bool llm_graph_context::build_qkv_shards(
     auto finish_projection = [&](ggml_tensor * value, ggml_tensor * scale, ggml_tensor * bias,
                                  char projection, int64_t heads) {
         const std::string prefix = std::string("attn_qkv_join.") + projection;
+        ggml_tensor * const shard_output = value;
         if (scale != nullptr) {
             value = ggml_mul(ctx0, value, scale);
             cb_route(value, tagged_name(prefix + ".scale").c_str(), il, policy.assemble_backend.c_str());
@@ -1524,16 +1533,28 @@ bool llm_graph_context::build_qkv_shards(
             value = ggml_clamp(ctx0, value, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
             cb_route(value, tagged_name(prefix + ".clamp").c_str(), il, policy.assemble_backend.c_str());
         }
+        const std::string & terminal_backend =
+            value == shard_output && lanes.size() == 1
+                ? lanes.front().split.backend
+                : policy.assemble_backend;
         if (!reshape_outputs) {
             // Runtime routing commits these three non-view 2D terminals as one
             // atomic bundle. Canonical reshapes, RoPE, and KV-cache side
             // effects are built once by the caller after all variants.
+            // With one lane and no post-op, value is also the backend-owned
+            // REGION node. Give it a stable route-terminal name while keeping
+            // it on the lane backend; there is no assembly operation to move.
+            // Renaming also keeps the completed singleton out of the parallel
+            // branch detector, so it follows the ordinary scheduler path.
             cb_route(value, tagged_name(prefix + ".output2d").c_str(), il,
-                    policy.assemble_backend.c_str());
+                    terminal_backend.c_str());
             return value;
         }
         value = ggml_reshape_3d(ctx0, value, n_embd_head, heads, n_tokens);
-        cb(value, tagged_name(prefix + ".reshape").c_str(), il, policy.assemble_backend.c_str());
+        // RESHAPE is metadata-only. When no join or post-op exists, keep its
+        // view on the sole lane backend instead of introducing a synthetic
+        // assemble-backend handoff on the static single-processor path.
+        cb(value, tagged_name(prefix + ".reshape").c_str(), il, terminal_backend.c_str());
         return value;
     };
 
@@ -1636,7 +1657,7 @@ bool llm_graph_context::build_attn_out_shards(
     const int cover_axis = output_axis ? 1 : 0;
     int64_t covered = 0;
     std::unordered_set<std::string> lane_ids;
-    valid = valid && lanes.size() >= 2 && lanes.size() <= 3;
+    valid = valid && !lanes.empty() && lanes.size() <= 3;
     for (auto & lane : lanes) {
         const auto & split = lane.split;
         valid = valid && !split.id.empty() && !split.backend.empty() &&
@@ -1669,7 +1690,7 @@ bool llm_graph_context::build_attn_out_shards(
     valid = valid && covered == partition_width;
     if (!valid) {
         GGML_ABORT(
-                "backend_policy: attn_out_shards layer %d matched policy but has an invalid shape or incomplete 2/3-lane W_O axis-%d cover",
+                "backend_policy: attn_out_shards layer %d matched policy but has an invalid shape or incomplete 1/2/3-lane W_O axis-%d cover",
                 il, cover_axis);
     }
 
@@ -1785,9 +1806,16 @@ bool llm_graph_context::build_attn_out_shards(
         partials.push_back(lane.projection);
     }
 
-    GGML_ASSERT(partials.size() >= 2 && partials.size() <= 3);
+    GGML_ASSERT(!partials.empty() && partials.size() <= 3);
     ggml_tensor * acc = nullptr;
-    if (output_axis) {
+    if (partials.size() == 1) {
+        // A single active lane covers the complete selected weight axis, so
+        // its projection is already the canonical full-width W_O result. Do
+        // not manufacture an identity CONCAT/ADD merely to preserve the
+        // multi-lane shape: that would add a transfer and a scheduler join to
+        // the exact path that is intended to avoid partition overhead.
+        acc = partials.front();
+    } else if (output_axis) {
         auto concat_stage = [&](ggml_tensor * lhs, ggml_tensor * rhs) {
             ggml_tensor * result = ggml_concat(ctx0, lhs, rhs, 0);
             cb_route(result, tagged_name("attn_out_parallel_concat").c_str(),
@@ -1832,7 +1860,17 @@ bool llm_graph_context::build_attn_out_shards(
     // This helper owns both the canonical final name and the strict reduction
     // placement. Calling the ordinary callback again in a caller could allow a
     // generic ops policy to overwrite reduce_backend on this same tensor.
-    cb_route(acc, tagged_name(final_name).c_str(), il, policy.reduce_backend.c_str());
+    // Without a join or post-projection op, reduce_backend has no work to own.
+    // Keep a single-lane terminal on its execution backend (notably for an
+    // NPU-only W_O), while still assigning scale/bias and all multi-lane joins
+    // to the explicitly configured reduce backend. Renaming the projection to
+    // the canonical final name also prevents the scheduler from treating the
+    // lone operation as an incomplete parallel group.
+    const std::string & terminal_backend =
+        partials.size() == 1 && wo_s == nullptr && wo_b == nullptr
+            ? lanes.front().split.backend
+            : policy.reduce_backend;
+    cb_route(acc, tagged_name(final_name).c_str(), il, terminal_backend.c_str());
     out = acc;
     return true;
 }
@@ -2036,8 +2074,19 @@ ggml_tensor * llm_graph_context::build_ffn(
 
             if (valid && !branch_outs.empty() && branch_outs.size() == exec_splits.size()) {
                 ggml_tensor * acc = reduce_branches(branch_outs);
+                // A single active shard already is the complete FFN result.
+                // There is no reduction operation for reduce_backend to own;
+                // rebinding the same down-projection tensor here would move
+                // execution away from its resident lane weight (and can make
+                // an NPU-only profile execute ffn_down on CPU). Keep the lane
+                // backend authoritative unless an actual ADD was created.
+                const char * terminal_backend = branch_outs.size() == 1
+                    ? exec_splits.front().backend.c_str()
+                    : ffn_policy.reduce_backend.empty()
+                        ? nullptr
+                        : ffn_policy.reduce_backend.c_str();
                 cb_parallel(acc, ("ffn_parallel_out" + route_suffix).c_str(),
-                        ffn_policy.reduce_backend.empty() ? nullptr : ffn_policy.reduce_backend.c_str());
+                        terminal_backend);
                 return acc;
             }
         } else {

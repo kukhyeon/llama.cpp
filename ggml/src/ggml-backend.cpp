@@ -5543,7 +5543,9 @@ static int ggml_backend_sched_collect_parallel_ffn_group(
 
     if (first.kind == "attn_qkv_shard") {
         // Duplicate lanes terminate the scan above, so two or three entries
-        // here also means two or three unique composite lane splits.
+        // here also means two or three unique composite lane splits. A
+        // one-lane QKV topology deliberately stays on the ordinary split path:
+        // there is no sibling work to dispatch through the parallel workers.
         if (infos->size() < 2 || infos->size() > 3) {
             infos->clear();
             return 0;

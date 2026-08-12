@@ -679,17 +679,24 @@ llama_context::llama_context(
                     }
                     active_splits.push_back(&split);
                 }
-                if (active_splits.size() < 2 || active_splits.size() > 3) {
+                if (active_splits.empty() || active_splits.size() > 3) {
                     throw std::runtime_error(format(
-                            "attn_out_shards topology must contain 2 or 3 active lanes; got %zu",
+                            "attn_out_shards topology must contain 1, 2, or 3 active lanes; got %zu",
                             active_splits.size()));
                 }
                 std::sort(active_splits.begin(), active_splits.end(), [](const auto * lhs, const auto * rhs) {
                     return lhs->start < rhs->start;
                 });
 
-                ggml_backend_t reduce_backend =
-                    resolve_backend(candidate_policy.reduce_backend, "reduce");
+                // A single full-cover projection with no scale or bias has no
+                // reduce-stage operation. Its terminal remains on the lane
+                // backend, so an otherwise-unused reduce_backend must not be a
+                // context preflight dependency.
+                const bool needs_reduce_backend = active_splits.size() > 1 ||
+                    post_join_scale != nullptr || post_join_bias != nullptr;
+                ggml_backend_t reduce_backend = needs_reduce_backend
+                    ? resolve_backend(candidate_policy.reduce_backend, "reduce")
+                    : nullptr;
 
                 const ggml_init_params validation_params = {
                     /*.mem_size   =*/ 16 * ggml_tensor_overhead(),
@@ -703,7 +710,12 @@ llama_context::llama_context(
                 ggml_tensor * joined = nullptr;
                 const bool output_axis = candidate_policy.partition_axis == "output";
                 std::vector<ggml_tensor *> joins;
-                if (output_axis) {
+                if (active_splits.size() == 1) {
+                    joined = ggml_new_tensor_2d(
+                            validation_ctx, GGML_TYPE_F32,
+                            output_axis ? active_splits.front()->size : hparams.n_embd,
+                            2);
+                } else if (output_axis) {
                     std::vector<ggml_tensor *> lanes;
                     lanes.reserve(active_splits.size());
                     for (const auto * split : active_splits) {
@@ -737,7 +749,8 @@ llama_context::llama_context(
                 }
                 const bool join_supported = std::all_of(
                         joins.begin(), joins.end(), [&](const ggml_tensor * join) {
-                            return ggml_backend_supports_op(reduce_backend, join);
+                            return reduce_backend != nullptr &&
+                                ggml_backend_supports_op(reduce_backend, join);
                         });
                 ggml_tensor * scale = post_join_scale != nullptr
                     ? ggml_new_tensor_4d(
@@ -749,7 +762,8 @@ llama_context::llama_context(
                     ? ggml_mul(validation_ctx, joined, scale)
                     : nullptr;
                 const bool scale_supported = product == nullptr ||
-                    ggml_backend_supports_op(reduce_backend, product);
+                    (reduce_backend != nullptr &&
+                     ggml_backend_supports_op(reduce_backend, product));
                 ggml_tensor * bias = post_join_bias != nullptr
                     ? ggml_new_tensor_4d(
                             validation_ctx, post_join_bias->type,
@@ -760,7 +774,8 @@ llama_context::llama_context(
                     ? ggml_add(validation_ctx, joined, bias)
                     : nullptr;
                 const bool bias_supported = biased == nullptr ||
-                    ggml_backend_supports_op(reduce_backend, biased);
+                    (reduce_backend != nullptr &&
+                     ggml_backend_supports_op(reduce_backend, biased));
                 ggml_free(validation_ctx);
                 if (!join_supported) {
                     throw std::runtime_error(format(
