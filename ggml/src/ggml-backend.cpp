@@ -6626,6 +6626,8 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
             ggml_backend_t canonical_backends[GGML_SCHED_MAX_BACKENDS] = {};
             int n_variant_backends = 0;
             int n_canonical_backends = 0;
+            int queued_backend_id = -1;
+            bool same_backend_bundle = true;
             auto append_backend = [](ggml_backend_t * backends, int * n_backends,
                                      ggml_backend_t backend) {
                 if (std::find(backends, backends + *n_backends, backend) ==
@@ -6640,44 +6642,102 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                 const int canonical_backend_id = tensor_backend_id(canonical_outputs[output_index]);
                 GGML_ASSERT(variant_backend_id >= 0 && variant_backend_id < sched->n_backends);
                 GGML_ASSERT(canonical_backend_id >= 0 && canonical_backend_id < sched->n_backends);
+                if (variant_backend_id != canonical_backend_id ||
+                        (queued_backend_id >= 0 && queued_backend_id != variant_backend_id)) {
+                    same_backend_bundle = false;
+                }
+                if (queued_backend_id < 0) {
+                    queued_backend_id = variant_backend_id;
+                }
                 append_backend(variant_backends, &n_variant_backends,
                         sched->backends[variant_backend_id]);
                 append_backend(canonical_backends, &n_canonical_backends,
                         sched->backends[canonical_backend_id]);
             }
 
-            const int64_t wait_t0_us = ggml_time_us();
-            for (int backend_index = 0;
-                    backend_index < n_variant_backends; ++backend_index) {
-                ggml_backend_synchronize(variant_backends[backend_index]);
+            int64_t wait_us = 0;
+            int64_t copy_us = 0;
+            bool queued_commit = false;
+            bool queued_backend_drained = false;
+            ggml_backend_t queued_backend = nullptr;
+            if (same_backend_bundle && queued_backend_id >= 0) {
+                queued_backend = sched->backends[queued_backend_id];
+                same_backend_bundle = queued_backend->iface.cpy_tensor_async != nullptr &&
+                    sched->async_flush_fns[queued_backend_id] != nullptr;
             }
-            // The canonical allocation may reuse storage whose previous user
-            // was submitted asynchronously on the canonical backend. A direct
-            // blocking tensor copy is not guaranteed to be ordered behind that
-            // backend queue, so wait for the destination as well before
-            // overwriting it. This is the correctness-first baseline until the
-            // canonical commit becomes a location-aware queued/zero-copy path.
-            for (int backend_index = 0;
-                    backend_index < n_canonical_backends; ++backend_index) {
-                ggml_backend_t backend = canonical_backends[backend_index];
-                if (std::find(variant_backends,
-                            variant_backends + n_variant_backends, backend) ==
-                        variant_backends + n_variant_backends) {
-                    ggml_backend_synchronize(backend);
+
+            if (same_backend_bundle) {
+                const int64_t copy_t0_us = ggml_time_us();
+                queued_commit = true;
+                size_t n_queued_outputs = 0;
+                for (size_t output_index = 0;
+                        output_index < variant_outputs.size(); ++output_index) {
+                    if (!queued_backend->iface.cpy_tensor_async(
+                                queued_backend,
+                                queued_backend,
+                                variant_outputs[output_index],
+                                canonical_outputs[output_index])) {
+                        queued_commit = false;
+                        break;
+                    }
+                    ++n_queued_outputs;
                 }
+                if (queued_commit) {
+                    // The backend queue is in order: every variant producer is
+                    // already ahead of these copies, and downstream consumers
+                    // are submitted only after the complete bundle.  One flush
+                    // starts the whole Q/K/V or W_O commit without a host wait.
+                    sched->async_flush_fns[queued_backend_id](queued_backend);
+                } else if (n_queued_outputs > 0) {
+                    // A backend callback may reject a later pair after earlier
+                    // pairs were queued. Drain that partial work, then replay
+                    // the complete bundle through the blocking fallback so no
+                    // consumer can observe a mixed profile.
+                    const int64_t wait_t0_us = ggml_time_us();
+                    ggml_backend_synchronize(queued_backend);
+                    wait_us += ggml_time_us() - wait_t0_us;
+                    queued_backend_drained = true;
+                }
+                // On the queued path this is host enqueue/flush time, not the
+                // device-side copy duration. The latter remains ordered in the
+                // backend queue and is intentionally not waited here.
+                copy_us += ggml_time_us() - copy_t0_us;
             }
-            const int64_t wait_t1_us = ggml_time_us();
-            const int64_t copy_t0_us = wait_t1_us;
-            // No downstream split is submitted until every pair has been
-            // copied, so consumers can never observe a mixed Q/K/V profile.
-            for (size_t output_index = 0;
-                    output_index < variant_outputs.size(); ++output_index) {
-                ggml_backend_tensor_copy(
-                        variant_outputs[output_index], canonical_outputs[output_index]);
+
+            if (!queued_commit) {
+                const int64_t wait_t0_us = ggml_time_us();
+                for (int backend_index = 0;
+                        backend_index < n_variant_backends; ++backend_index) {
+                    if (!queued_backend_drained ||
+                            variant_backends[backend_index] != queued_backend) {
+                        ggml_backend_synchronize(variant_backends[backend_index]);
+                    }
+                }
+                // A blocking copy is not guaranteed to be ordered behind a
+                // distinct destination queue, so wait for canonical storage
+                // users before overwriting it on the fallback path.
+                for (int backend_index = 0;
+                        backend_index < n_canonical_backends; ++backend_index) {
+                    ggml_backend_t backend = canonical_backends[backend_index];
+                    if ((!queued_backend_drained || backend != queued_backend) &&
+                            std::find(variant_backends,
+                                variant_backends + n_variant_backends, backend) ==
+                            variant_backends + n_variant_backends) {
+                        ggml_backend_synchronize(backend);
+                    }
+                }
+                wait_us += ggml_time_us() - wait_t0_us;
+
+                const int64_t copy_t0_us = ggml_time_us();
+                // No downstream split is submitted until every pair has been
+                // copied, so consumers can never observe a mixed Q/K/V profile.
+                for (size_t output_index = 0;
+                        output_index < variant_outputs.size(); ++output_index) {
+                    ggml_backend_tensor_copy(
+                            variant_outputs[output_index], canonical_outputs[output_index]);
+                }
+                copy_us += ggml_time_us() - copy_t0_us;
             }
-            const int64_t copy_t1_us = ggml_time_us();
-            const int64_t wait_us = wait_t1_us - wait_t0_us;
-            const int64_t copy_us = copy_t1_us - copy_t0_us;
 
             if (trace_io_times != nullptr) {
                 trace_io_times->wait_us += wait_us;
@@ -7160,12 +7220,6 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                 }
             }
 
-            for (int i = 0; i < ffn_group_size; ++i) {
-                struct ggml_backend_sched_split * group_split = &splits[split_id + i];
-                prof_add(group_split->graph, group_buckets[i], dt_us[i]);
-                record_split_event(group_split);
-            }
-
             if constexpr (UseRouteCandidates) {
                 const int last_group_split_id = split_id + ffn_group_size - 1;
                 if (route_group_index >= 0 &&
@@ -7177,6 +7231,16 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                             route_variant_index,
                             trace_enabled ? &io_times[ffn_group_size - 1] : nullptr);
                 }
+            }
+
+            // A route terminal is not ready until its optional queued
+            // canonical commit has been submitted. Record backend events only
+            // after that command so event-capable backends cannot publish the
+            // pre-commit producer as the completed route output.
+            for (int i = 0; i < ffn_group_size; ++i) {
+                struct ggml_backend_sched_split * group_split = &splits[split_id + i];
+                prof_add(group_split->graph, group_buckets[i], dt_us[i]);
+                record_split_event(group_split);
             }
 
             const int64_t copy_us = copy_t1_us - copy_t0_us;

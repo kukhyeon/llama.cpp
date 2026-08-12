@@ -2611,8 +2611,10 @@ static bool ggml_thread_apply_priority(int32_t prio) {
     return true;
 }
 
-#elif defined(__gnu_linux__)
-// TODO: this may not work on BSD, to be verified
+#elif defined(__gnu_linux__) || defined(__ANDROID__)
+// Android Clang targets do not define __gnu_linux__.  Include Android
+// explicitly so the sched_setaffinity path below is not compiled as the
+// unsupported no-op, without changing the behavior of other Linux libcs.
 
 static bool ggml_thread_apply_affinity(const bool * mask) {
     cpu_set_t cpuset;

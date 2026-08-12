@@ -1440,18 +1440,28 @@ bool llm_graph_context::build_qkv_shards(
             return lhs.first < rhs.first;
         });
 
-        // Right-associated concatenation keeps every branch node before the
-        // canonical join even if this helper is later used without the eager
-        // branch expansion above.
-        ggml_tensor * result = parts.back().second;
-        for (size_t i = parts.size() - 1; i > 0; --i) {
-            result = ggml_concat(ctx0, parts[i - 1].second, result, 0);
+        GGML_ASSERT(parts.size() == 3);
+        auto concat_stage = [&](ggml_tensor * lhs, ggml_tensor * rhs, int stage) {
+            ggml_tensor * result = ggml_concat(ctx0, lhs, rhs, 0);
             const std::string name = tagged_name(
                     std::string("attn_qkv_join.") + projection +
-                    ".concat" + std::to_string(i - 1));
+                    ".concat" + std::to_string(stage));
             cb_route(result, name.c_str(), il, policy.assemble_backend.c_str());
+            return result;
+        };
+
+        // Both legal binary trees preserve [0, 1, 2] output order.  Since the
+        // middle shard is present in either inner CONCAT, comparing the two
+        // endpoint sizes selects the smaller intermediate allocation and
+        // avoids re-reading/re-writing the larger pair in the final CONCAT.
+        // Keep concat1 as the inner node and concat0 as the canonical output so
+        // route terminals and existing trace names remain stable.
+        if (ggml_nbytes(parts.front().second) <= ggml_nbytes(parts.back().second)) {
+            ggml_tensor * inner = concat_stage(parts[0].second, parts[1].second, 1);
+            return concat_stage(inner, parts[2].second, 0);
         }
-        return result;
+        ggml_tensor * inner = concat_stage(parts[1].second, parts[2].second, 1);
+        return concat_stage(parts[0].second, inner, 0);
     };
 
     ggml_tensor * Qcur = assemble('q');
@@ -1725,20 +1735,34 @@ bool llm_graph_context::build_attn_out_shards(
         partials.push_back(lane.projection);
     }
 
-    // Both joins are right-associated and lanes are already ordered by global
-    // start. Input-axis partials overlap and therefore use a fixed ADD order;
-    // output-axis partials are disjoint and are concatenated along ne[0].
-    ggml_tensor * acc = partials.back();
-    for (size_t i = partials.size() - 1; i > 0; --i) {
-        acc = output_axis
-            ? ggml_concat(ctx0, partials[i - 1], acc, 0)
-            : ggml_add(ctx0, partials[i - 1], acc);
-        cb_route(
-                acc,
-                tagged_name(output_axis
-                    ? "attn_out_parallel_concat"
-                    : "attn_out_parallel_sum").c_str(),
-                il, policy.reduce_backend.c_str());
+    GGML_ASSERT(partials.size() == 3);
+    ggml_tensor * acc = nullptr;
+    if (output_axis) {
+        auto concat_stage = [&](ggml_tensor * lhs, ggml_tensor * rhs) {
+            ggml_tensor * result = ggml_concat(ctx0, lhs, rhs, 0);
+            cb_route(result, tagged_name("attn_out_parallel_concat").c_str(),
+                    il, policy.reduce_backend.c_str());
+            return result;
+        };
+
+        // Lanes are ordered by global output start.  Choose the association
+        // with the smaller inner tensor while preserving [0, 1, 2] order.
+        if (ggml_nbytes(partials.front()) <= ggml_nbytes(partials.back())) {
+            ggml_tensor * inner = concat_stage(partials[0], partials[1]);
+            acc = concat_stage(inner, partials[2]);
+        } else {
+            ggml_tensor * inner = concat_stage(partials[1], partials[2]);
+            acc = concat_stage(partials[0], inner);
+        }
+    } else {
+        // Input-axis partials overlap, so preserve their existing fixed ADD
+        // order.  Only disjoint output-axis CONCAT assembly is optimized.
+        acc = partials.back();
+        for (size_t i = partials.size() - 1; i > 0; --i) {
+            acc = ggml_add(ctx0, partials[i - 1], acc);
+            cb_route(acc, tagged_name("attn_out_parallel_sum").c_str(),
+                    il, policy.reduce_backend.c_str());
+        }
     }
     if (wo_s != nullptr) {
         acc = ggml_mul(ctx0, acc, wo_s);
