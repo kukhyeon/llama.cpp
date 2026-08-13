@@ -1426,6 +1426,153 @@ static bool run_multi_output_bundle_case() {
     return ok;
 }
 
+static bool run_explicit_range_end_bundle_case() {
+    const char * scenario = "explicit-range-end-qkv-bundle";
+    constexpr int n_outputs = 3;
+    const size_t graph_size = 64;
+    const ggml_init_params params = {
+        /* .mem_size   = */ 128 * ggml_tensor_overhead() +
+                              ggml_graph_overhead_custom(graph_size, false),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+
+    ggml_context * ctx = ggml_init(params);
+    ggml_backend_t backends[2] = {
+        ggml_backend_cpu_init(),
+        ggml_backend_cpu_init(),
+    };
+    ggml_backend_sched_t sched = backends[0] != nullptr && backends[1] != nullptr
+        ? ggml_backend_sched_new(backends, nullptr, 2, 128, false, true)
+        : nullptr;
+    auto cleanup = [&]() {
+        ggml_backend_sched_free(sched);
+        ggml_backend_free(backends[0]);
+        ggml_backend_free(backends[1]);
+        ggml_free(ctx);
+    };
+    if (!check(ctx != nullptr && sched != nullptr, scenario, "backend setup failed")) {
+        cleanup();
+        return false;
+    }
+
+    ggml_tensor * x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+    ggml_tensor * y = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+    ggml_set_input(x);
+    ggml_set_input(y);
+    ggml_set_name(x, "range-end-qkv-x");
+    ggml_set_name(y, "range-end-qkv-y");
+    ggml_backend_sched_set_tensor_backend(sched, x, backends[0]);
+    ggml_backend_sched_set_tensor_backend(sched, y, backends[0]);
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, graph_size, false);
+    struct qkv_variant {
+        ggml_tensor * first = nullptr;
+        ggml_tensor * range_end = nullptr;
+        ggml_tensor * outputs[n_outputs] = {};
+    };
+    auto build_variant = [&](const char * tag, ggml_backend_t backend, bool alternate) {
+        qkv_variant variant;
+
+        // Deliberately build Q, then V, and finish with a two-node K path.
+        // The semantic output bundle remains {Q, K, V}, so outputs[2] is not
+        // the graph range endpoint. Projection-local QKV assembly has this
+        // shape when (for example) V is a single GPU result while K finishes
+        // later in a CPU/NPU join.
+        ggml_tensor * q = alternate ? ggml_mul(ctx, x, y) : ggml_add(ctx, x, y);
+        ggml_tensor * v = alternate ? ggml_add(ctx, x, y) : ggml_sub(ctx, x, y);
+        ggml_tensor * k_partial = alternate ? ggml_sub(ctx, y, x) : ggml_sub(ctx, x, y);
+        ggml_tensor * k = ggml_scale(ctx, k_partial, alternate ? 0.5f : 2.0f);
+
+        ggml_set_name(q, ("range-end-qkv-" + std::string(tag) + "-q").c_str());
+        ggml_set_name(v, ("range-end-qkv-" + std::string(tag) + "-v").c_str());
+        ggml_set_name(k_partial,
+                ("range-end-qkv-" + std::string(tag) + "-k-partial").c_str());
+        ggml_set_name(k, ("range-end-qkv-" + std::string(tag) + "-k-join").c_str());
+
+        for (ggml_tensor * node : { q, v, k_partial, k }) {
+            ggml_backend_sched_set_tensor_backend(sched, node, backend);
+            ggml_build_forward_expand(graph, node);
+        }
+
+        variant.first = q;
+        variant.range_end = k;
+        variant.outputs[0] = q;
+        variant.outputs[1] = k;
+        variant.outputs[2] = v;
+        return variant;
+    };
+
+    const qkv_variant canonical = build_variant("canonical", backends[0], false);
+    const qkv_variant alternate = build_variant("alternate", backends[1], true);
+
+    ggml_tensor * downstream[n_outputs] = {};
+    for (int output_index = 0; output_index < n_outputs; ++output_index) {
+        downstream[output_index] =
+            ggml_scale(ctx, canonical.outputs[output_index], 1.0f);
+        const std::string name =
+            "range-end-qkv-downstream-" + std::to_string(output_index);
+        ggml_set_name(downstream[output_index], name.c_str());
+        ggml_set_output(downstream[output_index]);
+        ggml_backend_sched_set_tensor_backend(sched, downstream[output_index], backends[0]);
+        ggml_build_forward_expand(graph, downstream[output_index]);
+    }
+
+    bool setup_ok =
+        ggml_backend_sched_register_route_subgraph_bundle_range(
+                sched,
+                canonical.first, canonical.range_end, canonical.outputs,
+                canonical.first, canonical.range_end, canonical.outputs,
+                n_outputs, 0, 0) &&
+        ggml_backend_sched_register_route_subgraph_bundle_range(
+                sched,
+                canonical.first, canonical.range_end, canonical.outputs,
+                alternate.first, alternate.range_end, alternate.outputs,
+                n_outputs, 1, 0);
+    ggml_backend_sched_layer_checkpoint_set_plan_id(sched, 1);
+    setup_ok = setup_ok && ggml_backend_sched_alloc_graph(sched, graph);
+    if (!check(setup_ok, scenario, "explicit range-end route preparation failed")) {
+        cleanup();
+        return false;
+    }
+
+    const float x_data[4] = { 1.0f, 2.0f, 3.0f, 4.0f };
+    const float y_data[4] = { 5.0f, 6.0f, 7.0f, 8.0f };
+    ggml_backend_tensor_set(x, x_data, 0, sizeof(x_data));
+    ggml_backend_tensor_set(y, y_data, 0, sizeof(y_data));
+    bool ok = check(
+            ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS,
+            scenario, "graph compute failed");
+    for (int output_index = 0; ok && output_index < n_outputs; ++output_index) {
+        float actual[4] = {};
+        ggml_backend_tensor_get(downstream[output_index], actual, 0, sizeof(actual));
+        for (int i = 0; i < 4; ++i) {
+            const float expected = output_index == 0 ? x_data[i] * y_data[i] :
+                output_index == 1 ? 0.5f * (y_data[i] - x_data[i]) :
+                x_data[i] + y_data[i];
+            if (!check(std::fabs(actual[i] - expected) < 1e-5f,
+                        scenario, "explicit range-end bundle output mismatch")) {
+                std::fprintf(stderr,
+                        "  output %d index %d: got %.6f, expected %.6f\n",
+                        output_index, i, actual[i], expected);
+                ok = false;
+                break;
+            }
+        }
+    }
+
+    ggml_backend_sched_route_candidate_stats stats = {};
+    ggml_backend_sched_get_route_candidate_stats(sched, &stats);
+    ok =
+        check(stats.registered_mappings == 2, scenario, "mapping count mismatch") &&
+        check(stats.groups_executed == 1, scenario, "route group count mismatch") &&
+        check(stats.alternate_selected == 1, scenario, "alternate route was not selected") &&
+        check(stats.canonical_commits == 1, scenario, "QKV bundle was not committed") && ok;
+
+    cleanup();
+    return ok;
+}
+
 static bool run_queued_multi_output_commit_case() {
     constexpr int n_outputs = 3;
 
@@ -2172,6 +2319,7 @@ int main() {
     ok = run_subgraph_layer_switch_case() && ok;
     ok = run_multi_consumer_commit_case() && ok;
     ok = run_multi_output_bundle_case() && ok;
+    ok = run_explicit_range_end_bundle_case() && ok;
     ok = run_queued_multi_output_commit_case() && ok;
     ok = run_qkv_composite_lane_bundle_case() && ok;
     ok = run_attn_out_fork_join_subgraph_case() && ok;

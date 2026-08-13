@@ -545,7 +545,8 @@ public:
 using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il, const char * backend_hint)>;
 using llm_graph_route_subgraph_cb = std::function<void(
         const char * kind, const char * profile, int il,
-        ggml_tensor * first, const std::vector<ggml_tensor *> & outputs)>;
+        ggml_tensor * first, ggml_tensor * last,
+        const std::vector<ggml_tensor *> & outputs)>;
 
 class llm_graph_result;
 
@@ -872,9 +873,11 @@ struct llm_graph_context {
                      bool   parallel_projection_names = false) const;
 
     // Split each separate Q/K/V projection along its output/head axis across
-    // up to three policy lanes. The lanes are emitted backend-major so one
-    // backend executes its Q, K, and V shards serially while multiple active
-    // backends run in parallel. A single active lane bypasses CONCAT assembly.
+    // up to three policy lanes. With lane_activity=per_projection, Q, K, and V
+    // may choose independent active-lane sets. Lanes are emitted backend-major
+    // so one backend executes its present projection shards serially while
+    // multiple active backends run in parallel. A projection with one active
+    // lane bypasses CONCAT assembly.
     // The returned tensors are canonical full Q/K/V values; RoPE and every
     // KV-cache operation remain outside this helper.
     bool build_qkv_shards(
@@ -888,6 +891,7 @@ struct llm_graph_context {
         const llama_backend_policy_attn_qkv_shards * policy_override = nullptr,
              const char * route_tag = nullptr,
             ggml_tensor ** out_first = nullptr,
+            ggml_tensor ** out_last = nullptr,
                      bool reshape_outputs = true) const;
 
     // Split W_O along the policy-selected axis. Input-axis lanes receive

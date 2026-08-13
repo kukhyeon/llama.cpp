@@ -2878,8 +2878,10 @@ bool llama_context::runtime_route_prepare_graph(
 
     struct route_registration {
         ggml_tensor * canonical_first;
+        ggml_tensor * canonical_last;
         std::vector<ggml_tensor *> canonical_outputs;
         ggml_tensor * variant_first;
+        ggml_tensor * variant_last;
         std::vector<ggml_tensor *> variant_outputs;
         uint64_t plan_id;
         int layer;
@@ -2927,32 +2929,27 @@ bool llama_context::runtime_route_prepare_graph(
     std::vector<bool> prebuilt_subgraph_nodes((size_t) original_n_nodes, false);
     for (const auto & subgraph : runtime_route_subgraphs) {
         const auto first_it = original_node_indices.find(subgraph.first);
-        const auto output_it = subgraph.outputs.empty()
-            ? original_node_indices.end()
-            : original_node_indices.find(subgraph.outputs.back());
+        const auto last_it = original_node_indices.find(subgraph.last);
         if (first_it == original_node_indices.end() ||
-                output_it == original_node_indices.end() ||
-                output_it->second < first_it->second) {
+                last_it == original_node_indices.end() ||
+                last_it->second < first_it->second) {
             LLAMA_LOG_ERROR(
                     "runtime_routes: prebuilt %s subgraph %s layer %d is missing or reversed\n",
                     subgraph.kind.c_str(), subgraph.profile.c_str(), subgraph.layer);
             return false;
         }
-        int previous_output_index = first_it->second - 1;
         for (ggml_tensor * output : subgraph.outputs) {
             const auto terminal_it = original_node_indices.find(output);
             if (terminal_it == original_node_indices.end() ||
                     terminal_it->second < first_it->second ||
-                    terminal_it->second < previous_output_index ||
-                    terminal_it->second > output_it->second) {
+                    terminal_it->second > last_it->second) {
                 LLAMA_LOG_ERROR(
-                        "runtime_routes: prebuilt %s subgraph %s layer %d has invalid terminal ordering\n",
+                        "runtime_routes: prebuilt %s subgraph %s layer %d has an output outside its range\n",
                         subgraph.kind.c_str(), subgraph.profile.c_str(), subgraph.layer);
                 return false;
             }
-            previous_output_index = terminal_it->second;
         }
-        for (int i = first_it->second; i <= output_it->second; ++i) {
+        for (int i = first_it->second; i <= last_it->second; ++i) {
             prebuilt_subgraph_nodes[(size_t) i] = true;
         }
     }
@@ -3235,7 +3232,8 @@ bool llama_context::runtime_route_prepare_graph(
                 }
             }
             registrations.push_back({
-                    canonical, { canonical }, variant, { variant },
+                    canonical, canonical, { canonical },
+                    variant, variant, { variant },
                     choice.plan_id, meta.layer, false });
         }
     }
@@ -3308,8 +3306,8 @@ bool llama_context::runtime_route_prepare_graph(
                         return false;
                     }
                     registrations.push_back({
-                            canonical->first, canonical->outputs,
-                            variant->first, variant->outputs,
+                            canonical->first, canonical->last, canonical->outputs,
+                            variant->first, variant->last, variant->outputs,
                             plan_ids.at(profile), layer, true });
                     ++supported_matches.at(profile);
                 }
@@ -3391,10 +3389,10 @@ bool llama_context::runtime_route_prepare_graph(
 
     for (const auto & registration : registrations) {
         const bool registered = registration.subgraph
-            ? ggml_backend_sched_register_route_subgraph_bundle(
-                    sched.get(), registration.canonical_first,
+            ? ggml_backend_sched_register_route_subgraph_bundle_range(
+                    sched.get(), registration.canonical_first, registration.canonical_last,
                     registration.canonical_outputs.data(),
-                    registration.variant_first,
+                    registration.variant_first, registration.variant_last,
                     registration.variant_outputs.data(),
                     (int) registration.canonical_outputs.size(),
                     registration.plan_id, registration.layer)
@@ -3815,15 +3813,16 @@ llm_graph_params llama_context::graph_params(
         /*.cb          =*/ graph_get_cb(),
         /*.route_subgraph_cb =*/ [this](
                 const char * kind, const char * profile, int il,
-                ggml_tensor * first, const std::vector<ggml_tensor *> & outputs) {
+                ggml_tensor * first, ggml_tensor * last,
+                const std::vector<ggml_tensor *> & outputs) {
             if (!runtime_route_collect_metadata || kind == nullptr || profile == nullptr ||
-                    first == nullptr || outputs.empty() || il < 0 ||
+                    first == nullptr || last == nullptr || outputs.empty() || il < 0 ||
                     std::any_of(outputs.begin(), outputs.end(), [](ggml_tensor * output) {
                         return output == nullptr;
                     })) {
                 return;
             }
-            runtime_route_subgraphs.push_back({ kind, profile, il, first, outputs });
+            runtime_route_subgraphs.push_back({ kind, profile, il, first, last, outputs });
         },
         /*.res         =*/ res,
     };

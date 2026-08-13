@@ -540,7 +540,8 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
 
                 if (route_subgraph_cb_func) {
                     route_subgraph_cb_func(
-                            "weighted_norm", profile.c_str(), il, first, { weighted });
+                            "weighted_norm", profile.c_str(), il,
+                            first, weighted, { weighted });
                 }
                 if (profile == runtime_routes.initial_profile) {
                     canonical_norm = weighted;
@@ -570,6 +571,7 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                 struct prepared_qkv_topology {
                     llama_backend_policy_attn_qkv_shards policy;
                     ggml_tensor * first = nullptr;
+                    ggml_tensor * last = nullptr;
                     llm_graph_qkv outputs = {};
                 };
                 std::vector<prepared_qkv_topology> prepared;
@@ -579,6 +581,7 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                     if (lhs.enabled != rhs.enabled || lhs.phase != rhs.phase ||
                             lhs.layer_start != rhs.layer_start || lhs.layer_end != rhs.layer_end ||
                             lhs.head_dim != rhs.head_dim ||
+                            lhs.lane_activity != rhs.lane_activity ||
                             lhs.assemble_backend != rhs.assemble_backend ||
                             lhs.splits.size() != rhs.splits.size()) {
                         return false;
@@ -624,14 +627,15 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                                     model.layers[il], cur,
                                     n_embd_head, n_head, n_head_kv, il,
                                     topology.outputs, &topology.policy,
-                                    route_tag, &topology.first, false)) {
+                                    route_tag, &topology.first, &topology.last, false)) {
                             GGML_ABORT(
                                     "runtime_routes: failed to build profile %s layer %d QKV shard subgraph",
                                     profile.c_str(), il);
                         }
                         // Alternate terminals have no ordinary downstream
-                        // consumer. Expand all three explicitly and keep V as
-                        // the final node delimiting this contiguous variant.
+                        // consumer. Expand all three explicitly; topology.last
+                        // records the actual range end independently of the
+                        // semantic {Q,K,V} bundle order.
                         ggml_build_forward_expand(gf, topology.outputs.q);
                         ggml_build_forward_expand(gf, topology.outputs.k);
                         ggml_build_forward_expand(gf, topology.outputs.v);
@@ -642,7 +646,7 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                     if (route_subgraph_cb_func) {
                         route_subgraph_cb_func(
                                 "attn_qkv_block", profile.c_str(), il,
-                                existing->first,
+                                existing->first, existing->last,
                                 { existing->outputs.q, existing->outputs.k, existing->outputs.v });
                     }
                     if (profile == runtime_routes.initial_profile) {
@@ -673,11 +677,14 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                 // the following RESHAPE is metadata-only and must preserve
                 // that placement. Multi-lane joins and real scale/bias/clamp
                 // operations are owned by assemble_backend as before.
-                const auto reshape_backend = [&](ggml_tensor * scale, ggml_tensor * bias) -> const std::string & {
+                const auto reshape_backend = [&](char projection,
+                        ggml_tensor * scale, ggml_tensor * bias) -> const std::string & {
                     const llama_backend_policy_attn_qkv_shard * sole_lane = nullptr;
                     size_t active_lanes = 0;
                     for (const auto & split : canonical_policy.splits) {
-                        if (split.q_size > 0) {
+                        const int64_t size = projection == 'q' ? split.q_size :
+                            projection == 'k' ? split.k_size : split.v_size;
+                        if (size > 0) {
                             sole_lane = &split;
                             ++active_lanes;
                         }
@@ -688,11 +695,11 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                         : canonical_policy.assemble_backend;
                 };
                 cb(qkv.q, "attn_qkv_join.q.reshape", il,
-                        reshape_backend(model.layers[il].wq_s, model.layers[il].wq_b).c_str());
+                        reshape_backend('q', model.layers[il].wq_s, model.layers[il].wq_b).c_str());
                 cb(qkv.k, "attn_qkv_join.k.reshape", il,
-                        reshape_backend(model.layers[il].wk_s, model.layers[il].wk_b).c_str());
+                        reshape_backend('k', model.layers[il].wk_s, model.layers[il].wk_b).c_str());
                 cb(qkv.v, "attn_qkv_join.v.reshape", il,
-                        reshape_backend(model.layers[il].wv_s, model.layers[il].wv_b).c_str());
+                        reshape_backend('v', model.layers[il].wv_s, model.layers[il].wv_b).c_str());
                 sharded_qkv = true;
             } else {
                 sharded_qkv =
@@ -827,7 +834,7 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                     if (route_subgraph_cb_func) {
                         route_subgraph_cb_func(
                                 "attn_out_block", profile.c_str(), il,
-                                existing->first, { existing->output });
+                                existing->first, existing->output, { existing->output });
                     }
                     if (profile == runtime_routes.initial_profile) {
                         canonical_out = existing->output;
@@ -915,7 +922,8 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
 
                     if (route_subgraph_cb_func) {
                         route_subgraph_cb_func(
-                                "ffn_block", profile.c_str(), il, first, { route_out });
+                                "ffn_block", profile.c_str(), il,
+                                first, route_out, { route_out });
                     }
                     if (profile == runtime_routes.initial_profile) {
                         canonical_out = route_out;

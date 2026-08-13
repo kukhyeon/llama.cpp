@@ -282,6 +282,7 @@ private:
         std::string profile;
         int layer = -1;
         ggml_tensor * first = nullptr;
+        ggml_tensor * last = nullptr;
         std::vector<ggml_tensor *> outputs;
     };
 

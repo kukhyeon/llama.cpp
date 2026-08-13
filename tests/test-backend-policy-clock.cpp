@@ -537,6 +537,54 @@ bool test_zero_attention_shards_policy() {
 }
 )JSON";
 
+    // Projection-local activity is opt-in. This GPU4-oriented topology keeps
+    // the three processor lanes in the stable policy order while assigning
+    // each projection independently: NPU owns Q, CPU/NPU split K, and GPU
+    // owns V. Zero entries must neither consume a projection interval nor
+    // acquire a resident weight cover.
+    static constexpr char per_projection_qkv_policy[] = R"JSON(
+{
+  "enabled": true,
+  "attn_qkv_shards": {
+    "enabled": true,
+    "phase": "prefill",
+    "head_dim": 128,
+    "assemble_backend": "OpenCL",
+    "lane_activity": "per_projection",
+    "split_layout": [
+      { "id": "cpu", "backend": "CPU", "align": 128 },
+      { "id": "gpu", "backend": "OpenCL", "align": 128 },
+      { "id": "npu", "backend": "HTP0-REPACK", "align": 256 }
+    ],
+    "split_sizes": {
+      "q": { "cpu": 0,   "gpu": 0,    "npu": 3072 },
+      "k": { "cpu": 256, "gpu": 0,    "npu": 768  },
+      "v": { "cpu": 0,   "gpu": 1024, "npu": 0    }
+    }
+  }
+}
+)JSON";
+
+    static constexpr char invalid_qkv_lane_activity_policy[] = R"JSON(
+{
+  "enabled": true,
+  "attn_qkv_shards": {
+    "enabled": true,
+    "lane_activity": "projection_local",
+    "split_layout": [
+      { "id": "cpu", "backend": "CPU", "align": 128 },
+      { "id": "gpu", "backend": "OpenCL", "align": 128 },
+      { "id": "npu", "backend": "HTP0-REPACK", "align": 256 }
+    ],
+    "split_sizes": {
+      "q": { "cpu": 0,   "gpu": 0,    "npu": 3072 },
+      "k": { "cpu": 256, "gpu": 0,    "npu": 768  },
+      "v": { "cpu": 0,   "gpu": 1024, "npu": 0    }
+    }
+  }
+}
+)JSON";
+
     static constexpr char one_active_qkv_policy[] = R"JSON(
 {
   "enabled": true,
@@ -708,6 +756,11 @@ bool test_zero_attention_shards_policy() {
             "test-backend-policy-zero-attn-out.json", attn_out_policy);
     temporary_policy_file partial_qkv_file(
             "test-backend-policy-zero-attn-qkv-partial.json", partial_qkv_zero_policy);
+    temporary_policy_file per_projection_qkv_file(
+            "test-backend-policy-attn-qkv-per-projection.json", per_projection_qkv_policy);
+    temporary_policy_file invalid_qkv_lane_activity_file(
+            "test-backend-policy-attn-qkv-invalid-lane-activity.json",
+            invalid_qkv_lane_activity_policy);
     temporary_policy_file one_active_qkv_file(
             "test-backend-policy-zero-attn-qkv-one-active.json", one_active_qkv_policy);
     temporary_policy_file negative_qkv_file(
@@ -739,6 +792,47 @@ bool test_zero_attention_shards_policy() {
     CHECK(std::none_of(plan.covers.begin(), plan.covers.end(), [](const auto & cover) {
         return cover.backend == "CPU";
     }));
+
+    // The opt-in projection-local topology has different active processor
+    // masks for Q, K, and V. Starts are accumulated independently per
+    // projection, so inactive CPU/GPU Q lanes do not shift the NPU Q cover,
+    // and the inactive GPU K lane does not leave a gap before the NPU shard.
+    CHECK(llama_backend_policy_load(per_projection_qkv_file.path(), false, false));
+    CHECK(llama_backend_policy_match_attn_qkv_shards(0, true, qkv));
+    CHECK(qkv.lane_activity == "per_projection");
+    CHECK(qkv.splits.size() == 3);
+    CHECK(qkv.splits[0].id == "cpu");
+    CHECK(qkv.splits[0].q_start == 0 && qkv.splits[0].q_size == 0);
+    CHECK(qkv.splits[0].k_start == 0 && qkv.splits[0].k_size == 256);
+    CHECK(qkv.splits[0].v_start == 0 && qkv.splits[0].v_size == 0);
+    CHECK(qkv.splits[1].id == "gpu");
+    CHECK(qkv.splits[1].q_start == 0 && qkv.splits[1].q_size == 0);
+    CHECK(qkv.splits[1].k_start == 256 && qkv.splits[1].k_size == 0);
+    CHECK(qkv.splits[1].v_start == 0 && qkv.splits[1].v_size == 1024);
+    CHECK(qkv.splits[2].id == "npu");
+    CHECK(qkv.splits[2].q_start == 0 && qkv.splits[2].q_size == 3072);
+    CHECK(qkv.splits[2].k_start == 256 && qkv.splits[2].k_size == 768);
+    CHECK(qkv.splits[2].v_start == 1024 && qkv.splits[2].v_size == 0);
+
+    CHECK(llama_backend_policy_build_attn_qkv_residency_plan(
+            0, LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_Q, plan));
+    CHECK(plan.covers.size() == 1);
+    CHECK(plan.covers[0].backend == "HTP0-REPACK");
+    CHECK(plan.covers[0].start == 0 && plan.covers[0].size == 3072);
+
+    CHECK(llama_backend_policy_build_attn_qkv_residency_plan(
+            0, LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_K, plan));
+    CHECK(plan.covers.size() == 2);
+    CHECK(plan.covers[0].backend == "CPU");
+    CHECK(plan.covers[0].start == 0 && plan.covers[0].size == 256);
+    CHECK(plan.covers[1].backend == "HTP0-REPACK");
+    CHECK(plan.covers[1].start == 256 && plan.covers[1].size == 768);
+
+    CHECK(llama_backend_policy_build_attn_qkv_residency_plan(
+            0, LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_V, plan));
+    CHECK(plan.covers.size() == 1);
+    CHECK(plan.covers[0].backend == "OpenCL");
+    CHECK(plan.covers[0].start == 0 && plan.covers[0].size == 1024);
 
     // A single whole Q/K/V lane is a complete projection path, not an empty
     // partition. Residency should contain only that processor's full cover.
@@ -781,7 +875,7 @@ bool test_zero_attention_shards_policy() {
 
     for (const char * invalid : {
             partial_qkv_file.path(), negative_qkv_file.path(),
-            negative_attn_out_file.path() }) {
+            negative_attn_out_file.path(), invalid_qkv_lane_activity_file.path() }) {
         CHECK(!llama_backend_policy_load(invalid, false, false));
         CHECK(llama_backend_policy_match_attn_out_shards(0, true, attn_out));
         CHECK(attn_out.splits[0].size == 0);

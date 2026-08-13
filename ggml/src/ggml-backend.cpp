@@ -4005,7 +4005,8 @@ static bool ggml_backend_sched_route_tensor_registered(
         return false;
     }
     for (const auto & registration : state->registrations) {
-        if (registration.canonical_first == tensor || registration.variant_first == tensor ||
+        if (registration.canonical_first == tensor || registration.canonical == tensor ||
+                registration.variant_first == tensor || registration.variant == tensor ||
                 std::find(registration.canonical_outputs.begin(),
                     registration.canonical_outputs.end(), tensor) !=
                     registration.canonical_outputs.end() ||
@@ -4080,11 +4081,11 @@ static bool ggml_backend_sched_prepare_route_candidate_graph(
                 registration.variant_first == nullptr || variant == nullptr ||
                 registration.canonical_outputs.empty() ||
                 registration.canonical_outputs.size() != registration.variant_outputs.size() ||
-                registration.canonical_outputs.back() != canonical ||
-                registration.variant_outputs.back() != variant ||
                 registration.layer < 0 ||
                 ggml_is_view_op(registration.canonical_first->op) ||
-                ggml_is_view_op(registration.variant_first->op)) {
+                ggml_is_view_op(canonical->op) ||
+                ggml_is_view_op(registration.variant_first->op) ||
+                ggml_is_view_op(variant->op)) {
             GGML_LOG_ERROR("%s: invalid route-candidate registration\n", __func__);
             return false;
         }
@@ -4222,8 +4223,9 @@ static bool ggml_backend_sched_prepare_route_candidate_graph(
         const auto & group = state->groups[group_index];
         for (const auto & variant : group.variants) {
             std::vector<const struct ggml_tensor *> registered_tensors;
-            registered_tensors.reserve(variant.outputs.size() + 1);
+            registered_tensors.reserve(variant.outputs.size() + 2);
             registered_tensors.push_back(variant.first);
+            registered_tensors.push_back(variant.tensor);
             for (const struct ggml_tensor * output : variant.outputs) {
                 registered_tensors.push_back(output);
             }
@@ -4253,25 +4255,16 @@ static bool ggml_backend_sched_prepare_route_candidate_graph(
                         __func__, variant.first->name, variant.tensor->name);
                 return false;
             }
-            int previous_output_index = variant.node_start - 1;
             for (const struct ggml_tensor * output : variant.outputs) {
                 const int output_node_index = graph_node_index(output);
                 if (output_node_index < variant.node_start ||
-                        output_node_index > variant.node_end ||
-                        output_node_index <= previous_output_index) {
+                        output_node_index > variant.node_end) {
                     GGML_LOG_ERROR(
-                            "%s: route output %s is outside or out of order in range %s -> %s\n",
+                            "%s: route output %s is outside range %s -> %s\n",
                             __func__, output != nullptr ? output->name : "",
                             variant.first->name, variant.tensor->name);
                     return false;
                 }
-                previous_output_index = output_node_index;
-            }
-            if (previous_output_index != variant.node_end) {
-                GGML_LOG_ERROR(
-                        "%s: final route output must delimit range %s -> %s\n",
-                        __func__, variant.first->name, variant.tensor->name);
-                return false;
             }
             for (int node_index = variant.node_start; node_index <= variant.node_end; ++node_index) {
                 if (ggml_is_view_op(graph->nodes[node_index]->op)) {
@@ -8021,8 +8014,10 @@ void ggml_backend_sched_reset_layer_checkpoint_stats(ggml_backend_sched_t sched)
 static bool ggml_backend_sched_register_route_candidate_impl(
         ggml_backend_sched_t sched,
         struct ggml_tensor * canonical_first,
+        struct ggml_tensor * canonical_last,
         struct ggml_tensor * const * canonical_outputs,
         struct ggml_tensor * variant_first,
+        struct ggml_tensor * variant_last,
         struct ggml_tensor * const * variant_outputs,
         int n_outputs,
         uint64_t plan_id,
@@ -8034,8 +8029,8 @@ static bool ggml_backend_sched_register_route_candidate_impl(
         GGML_LOG_ERROR("%s: route output bundle must not be empty\n", __func__);
         return false;
     }
-    struct ggml_tensor * canonical = canonical_outputs[n_outputs - 1];
-    struct ggml_tensor * variant = variant_outputs[n_outputs - 1];
+    struct ggml_tensor * canonical = canonical_last;
+    struct ggml_tensor * variant = variant_last;
 
     if (sched->is_alloc) {
         GGML_LOG_ERROR("%s: route candidates must be registered before graph allocation\n", __func__);
@@ -8100,7 +8095,9 @@ static bool ggml_backend_sched_register_route_candidate_impl(
                 std::find(variant_outputs, variant_outputs + n_outputs,
                     checkpoint.boundary) != variant_outputs + n_outputs;
             if (checkpoint.boundary == canonical_first ||
-                    checkpoint.boundary == variant_first || is_output) {
+                    checkpoint.boundary == canonical_last ||
+                    checkpoint.boundary == variant_first ||
+                    checkpoint.boundary == variant_last || is_output) {
                 GGML_LOG_ERROR(
                         "%s: route candidate %s is already a checkpoint boundary\n",
                         __func__, checkpoint.boundary->name);
@@ -8165,7 +8162,8 @@ bool ggml_backend_sched_register_route_candidate(
     struct ggml_tensor * canonical_outputs[] = { canonical };
     struct ggml_tensor * variant_outputs[] = { variant };
     return ggml_backend_sched_register_route_candidate_impl(
-            sched, canonical, canonical_outputs, variant, variant_outputs,
+            sched, canonical, canonical, canonical_outputs,
+            variant, variant, variant_outputs,
             1, plan_id, layer, false);
 }
 
@@ -8180,8 +8178,8 @@ bool ggml_backend_sched_register_route_subgraph(
     struct ggml_tensor * canonical_outputs[] = { canonical_output };
     struct ggml_tensor * variant_outputs[] = { variant_output };
     return ggml_backend_sched_register_route_candidate_impl(
-            sched, canonical_first, canonical_outputs,
-            variant_first, variant_outputs,
+            sched, canonical_first, canonical_output, canonical_outputs,
+            variant_first, variant_output, variant_outputs,
             1, plan_id, layer, true);
 }
 
@@ -8194,9 +8192,31 @@ bool ggml_backend_sched_register_route_subgraph_bundle(
         int n_outputs,
         uint64_t plan_id,
         int layer) {
+    if (n_outputs <= 0 || canonical_outputs == nullptr || variant_outputs == nullptr) {
+        GGML_LOG_ERROR("%s: route output bundle must not be empty\n", __func__);
+        return false;
+    }
+    return ggml_backend_sched_register_route_subgraph_bundle_range(
+            sched,
+            canonical_first, canonical_outputs[n_outputs - 1], canonical_outputs,
+            variant_first, variant_outputs[n_outputs - 1], variant_outputs,
+            n_outputs, plan_id, layer);
+}
+
+bool ggml_backend_sched_register_route_subgraph_bundle_range(
+        ggml_backend_sched_t sched,
+        struct ggml_tensor * canonical_first,
+        struct ggml_tensor * canonical_last,
+        struct ggml_tensor * const * canonical_outputs,
+        struct ggml_tensor * variant_first,
+        struct ggml_tensor * variant_last,
+        struct ggml_tensor * const * variant_outputs,
+        int n_outputs,
+        uint64_t plan_id,
+        int layer) {
     return ggml_backend_sched_register_route_candidate_impl(
-            sched, canonical_first, canonical_outputs,
-            variant_first, variant_outputs,
+            sched, canonical_first, canonical_last, canonical_outputs,
+            variant_first, variant_last, variant_outputs,
             n_outputs, plan_id, layer, true);
 }
 

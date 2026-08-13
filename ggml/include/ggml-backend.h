@@ -491,7 +491,9 @@ extern "C" {
     // element of each output array delimits its corresponding graph range;
     // every earlier output must also be a node inside that range. Canonical
     // consumers must appear after all variant ranges. This is intended for
-    // multi-result layer-local segments such as Q/K/V projections.
+    // multi-result layer-local segments such as Q/K/V projections. Use the
+    // explicit-range form below when semantic output order differs from graph
+    // order.
     //
     // The scheduler copies every selected alternate output to its matching
     // canonical output before any downstream node is submitted. Output pairs
@@ -501,6 +503,21 @@ extern "C" {
             struct ggml_tensor * canonical_first,
             struct ggml_tensor * const * canonical_outputs,
             struct ggml_tensor * variant_first,
+            struct ggml_tensor * const * variant_outputs,
+            int n_outputs,
+            uint64_t plan_id,
+            int layer);
+    // Explicit-range form of ggml_backend_sched_register_route_subgraph_bundle.
+    // canonical_last and variant_last delimit the inclusive graph ranges and
+    // need not be the last (or any) element of their output bundles. Bundle
+    // order is purely semantic: each output only has to lie inside its range.
+    GGML_API bool ggml_backend_sched_register_route_subgraph_bundle_range(
+            ggml_backend_sched_t sched,
+            struct ggml_tensor * canonical_first,
+            struct ggml_tensor * canonical_last,
+            struct ggml_tensor * const * canonical_outputs,
+            struct ggml_tensor * variant_first,
+            struct ggml_tensor * variant_last,
             struct ggml_tensor * const * variant_outputs,
             int n_outputs,
             uint64_t plan_id,

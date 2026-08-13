@@ -605,6 +605,28 @@ struct qkv_shard_fixture {
     }
 
     bool build(int lane_count) {
+        std::vector<std::string> lane_ids;
+        std::vector<std::vector<std::string>> lane_projections;
+        for (int lane = 0; lane < lane_count; ++lane) {
+            lane_ids.push_back("lane" + std::to_string(lane));
+            lane_projections.push_back({ "q", "k", "v" });
+        }
+        return build(lane_ids, lane_projections);
+    }
+
+    bool build_projection_local() {
+        // GPU4-oriented asymmetric topology:
+        //   CPU: K256, GPU: V1024, NPU: Q3072 then K768.
+        // Tensor widths are intentionally tiny in this scheduler-only test;
+        // the node membership and ordering model the real processor bundles.
+        return build(
+                { "cpu", "gpu", "npu" },
+                { { "k" }, { "v" }, { "q", "k" } });
+    }
+
+    bool build(
+            const std::vector<std::string> & lane_ids,
+            const std::vector<std::vector<std::string>> & lane_projections) {
         constexpr size_t graph_size = 64;
         const ggml_init_params params = {
             /* .mem_size   = */ 128 * ggml_tensor_overhead() +
@@ -618,7 +640,8 @@ struct qkv_shard_fixture {
         sched = backend != nullptr
             ? ggml_backend_sched_new(backends, nullptr, 1, 128, false, true)
             : nullptr;
-        if (ctx == nullptr || sched == nullptr || lane_count <= 0) {
+        if (ctx == nullptr || sched == nullptr || lane_ids.empty() ||
+                lane_ids.size() > 3 || lane_ids.size() != lane_projections.size()) {
             return false;
         }
 
@@ -628,19 +651,24 @@ struct qkv_shard_fixture {
 
         graph = ggml_new_graph_custom(ctx, graph_size, false);
         std::vector<ggml_tensor *> branch_nodes;
-        static const char * projections[] = { "q", "k", "v" };
         float scale = 1.0f;
-        for (int lane = 0; lane < lane_count; ++lane) {
-            for (const char * projection : projections) {
+        for (size_t lane = 0; lane < lane_ids.size(); ++lane) {
+            if (lane_projections[lane].empty()) {
+                return false;
+            }
+            for (const std::string & projection : lane_projections[lane]) {
                 ggml_tensor * node = ggml_scale(ctx, input, scale++);
                 const std::string name =
-                    "attn_qkv_shard.lane" + std::to_string(lane) + "." +
+                    "attn_qkv_shard." + lane_ids[lane] + "." +
                     projection + ".proj-0";
                 ggml_set_name(node, name.c_str());
                 ggml_build_forward_expand(graph, node);
                 ggml_backend_sched_set_tensor_backend(sched, node, backend);
                 branch_nodes.push_back(node);
             }
+        }
+        if (branch_nodes.empty()) {
+            return false;
         }
 
         ggml_tensor * joined = branch_nodes[0];
@@ -1467,6 +1495,76 @@ static bool run_two_way_qkv_shard_lane_group_case() {
     return true;
 }
 
+static bool run_projection_local_qkv_shard_lane_group_case() {
+    const char * scenario = "projection-local-qkv-shard-lane-group";
+    temporary_trace_file trace_file(scenario);
+    qkv_shard_fixture fixture;
+    if (!check(fixture.build_projection_local(), scenario, "fixture setup failed") ||
+            !check(
+                ggml_backend_sched_get_n_splits(fixture.sched) == 4,
+                scenario,
+                "variable-length CPU/GPU/NPU bundles were not isolated from the join")) {
+        return false;
+    }
+
+    {
+        scheduler_trace_capture capture(trace_file.path(), 111);
+        if (!fixture.compute_and_check(10.0f, scenario)) {
+            return false;
+        }
+        capture.finish();
+    }
+
+    std::vector<trace_row> rows;
+    if (!read_trace(trace_file.path(), scenario, &rows)) {
+        return false;
+    }
+    std::vector<trace_row> grouped;
+    for (const trace_row & row : rows) {
+        if (row.is_parallel_group) {
+            grouped.push_back(row);
+        }
+    }
+    if (!check(grouped.size() == 3, scenario,
+                "expected three grouped projection-local processor bundles")) {
+        return false;
+    }
+
+    struct expected_lane_trace {
+        const char * lane;
+        int node_count;
+        const char * first;
+        const char * last;
+    };
+    static const expected_lane_trace expected[] = {
+        { "cpu", 1, "attn_qkv_shard.cpu.k.proj-0", "attn_qkv_shard.cpu.k.proj-0" },
+        { "gpu", 1, "attn_qkv_shard.gpu.v.proj-0", "attn_qkv_shard.gpu.v.proj-0" },
+        { "npu", 2, "attn_qkv_shard.npu.q.proj-0", "attn_qkv_shard.npu.k.proj-0" },
+    };
+    const int group_id = grouped[0].group_id;
+    for (size_t lane = 0; lane < grouped.size(); ++lane) {
+        const trace_row & row = grouped[lane];
+        const expected_lane_trace & want = expected[lane];
+        if (!check(row.parallel_kind == "attn_qkv_shard", scenario,
+                    "parallel group kind mismatch") ||
+                !check(row.parallel_branch == want.lane, scenario,
+                    "projection-local lane order mismatch") ||
+                !check(row.timing_mode == "serial_fallback", scenario,
+                    "single-backend bundles were not serialized") ||
+                !check(row.group_id == group_id && group_id >= 0, scenario,
+                    "parallel group id mismatch") ||
+                !check(row.node_count == want.node_count, scenario,
+                    "projection-local bundle node count mismatch") ||
+                !check(row.first_node == want.first, scenario,
+                    "projection-local bundle first node mismatch") ||
+                !check(row.last_node == want.last, scenario,
+                    "projection-local bundle last node mismatch")) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool run_exact_attn_out_shard_lane_group_case() {
     const char * scenario = "exact-attn-out-shard-lane-group";
     temporary_trace_file trace_file(scenario);
@@ -1892,6 +1990,7 @@ int main() {
     try {
         const bool ok = run_exact_qvk_group_case() && run_incomplete_qv_case() &&
             run_exact_qkv_shard_lane_group_case() && run_two_way_qkv_shard_lane_group_case() &&
+            run_projection_local_qkv_shard_lane_group_case() &&
             run_exact_attn_out_shard_lane_group_case() && run_two_way_attn_out_shard_lane_group_case() &&
             run_exact_attn_out_output_axis_shard_lane_group_case() &&
             run_attn_out_output_axis_deferred_sync_case() &&

@@ -1235,10 +1235,14 @@ bool llm_graph_context::build_qkv_shards(
         const llama_backend_policy_attn_qkv_shards * policy_override,
              const char * route_tag,
             ggml_tensor ** out_first,
+            ggml_tensor ** out_last,
                      bool reshape_outputs) const {
     out = {};
     if (out_first != nullptr) {
         *out_first = nullptr;
+    }
+    if (out_last != nullptr) {
+        *out_last = nullptr;
     }
 
     llama_backend_policy_attn_qkv_shards policy;
@@ -1271,10 +1275,6 @@ bool llm_graph_context::build_qkv_shards(
         return false;
     }
 
-    // v1 zero-shard support excludes a processor only when that processor is
-    // inactive for all three projections.  Projection-local zero shards would
-    // produce different lane sets for Q, K, and V and require a different
-    // scheduler contract, so reject them before looking up any resident cover.
     if (policy.splits.size() != 3) {
         LLAMA_LOG_WARN(
                 "backend_policy: attn_qkv_shards layer %d must declare three layout lanes; falling back\n",
@@ -1285,13 +1285,20 @@ bool llm_graph_context::build_qkv_shards(
     for (const auto & split : policy.splits) {
         const bool all_zero = split.q_size == 0 && split.k_size == 0 && split.v_size == 0;
         const bool all_positive = split.q_size > 0 && split.k_size > 0 && split.v_size > 0;
-        if (!all_zero && !all_positive) {
+        if (policy.lane_activity == "whole_qkv" && !all_zero && !all_positive) {
             LLAMA_LOG_WARN(
                     "backend_policy: attn_qkv_shards layer %d lane %s must be active for all of Q/K/V or zero for all; falling back\n",
                     il, split.id.c_str());
             return false;
         }
-        active_lane_count += all_positive ? 1 : 0;
+        if (policy.lane_activity != "whole_qkv" &&
+                policy.lane_activity != "per_projection") {
+            LLAMA_LOG_WARN(
+                    "backend_policy: attn_qkv_shards layer %d has invalid lane_activity %s; falling back\n",
+                    il, policy.lane_activity.c_str());
+            return false;
+        }
+        active_lane_count += all_zero ? 0 : 1;
     }
     if (active_lane_count < 1 || active_lane_count > 3) {
         LLAMA_LOG_WARN(
@@ -1310,7 +1317,7 @@ bool llm_graph_context::build_qkv_shards(
         };
         if (std::any_of(policy.splits.begin(), policy.splits.end(), [&](const auto & split) {
                     const bool active =
-                        split.q_size > 0 && split.k_size > 0 && split.v_size > 0;
+                        split.q_size > 0 || split.k_size > 0 || split.v_size > 0;
                     return active && is_htp_name(split.backend);
                 })) {
             LLAMA_LOG_DEBUG(
@@ -1334,21 +1341,31 @@ bool llm_graph_context::build_qkv_shards(
     std::vector<qkv_lane> lanes;
     lanes.reserve(active_lane_count);
     for (const auto & split : policy.splits) {
-        if (split.q_size == 0) {
+        if (split.q_size == 0 && split.k_size == 0 && split.v_size == 0) {
             continue;
         }
         qkv_lane lane;
         lane.split = split;
-        lane.wq = model->get_backend_policy_resident_cover(
-                layer.wq, split.backend, 1, split.q_start, split.q_size);
-        lane.wk = model->get_backend_policy_resident_cover(
-                layer.wk, split.backend, 1, split.k_start, split.k_size);
-        lane.wv = model->get_backend_policy_resident_cover(
-                layer.wv, split.backend, 1, split.v_start, split.v_size);
-        if (lane.wq.tensor == nullptr || lane.wk.tensor == nullptr || lane.wv.tensor == nullptr) {
+        if (split.q_size > 0) {
+            lane.wq = model->get_backend_policy_resident_cover(
+                    layer.wq, split.backend, 1, split.q_start, split.q_size);
+        }
+        if (split.k_size > 0) {
+            lane.wk = model->get_backend_policy_resident_cover(
+                    layer.wk, split.backend, 1, split.k_start, split.k_size);
+        }
+        if (split.v_size > 0) {
+            lane.wv = model->get_backend_policy_resident_cover(
+                    layer.wv, split.backend, 1, split.v_start, split.v_size);
+        }
+        const bool missing_cover =
+            (split.q_size > 0 && lane.wq.tensor == nullptr) ||
+            (split.k_size > 0 && lane.wk.tensor == nullptr) ||
+            (split.v_size > 0 && lane.wv.tensor == nullptr);
+        if (missing_cover) {
             LLAMA_LOG_WARN(
-                    "backend_policy: attn_qkv_shards layer %d lane %s is missing Q/K/V "
-                    "axis-1 cover weights for %s; falling back\n",
+                    "backend_policy: attn_qkv_shards layer %d lane %s is missing an active "
+                    "Q/K/V axis-1 cover weight for %s; falling back\n",
                     il, split.id.c_str(), split.backend.c_str());
             return false;
         }
@@ -1360,9 +1377,9 @@ bool llm_graph_context::build_qkv_shards(
                 cover.tensor->ne[1] == cover.cover_size &&
                 cover.tensor->ne[2] == 1 && cover.tensor->ne[3] == 1;
         };
-        if (!valid_cover(lane.wq, layer.wq, split.q_size) ||
-                !valid_cover(lane.wk, layer.wk, split.k_size) ||
-                !valid_cover(lane.wv, layer.wv, split.v_size)) {
+        if ((split.q_size > 0 && !valid_cover(lane.wq, layer.wq, split.q_size)) ||
+                (split.k_size > 0 && !valid_cover(lane.wk, layer.wk, split.k_size)) ||
+                (split.v_size > 0 && !valid_cover(lane.wv, layer.wv, split.v_size))) {
             GGML_ABORT(
                     "backend_policy: attn_qkv_shards layer %d lane %s has an invalid Q/K/V axis-1 cover",
                     il, split.id.c_str());
@@ -1380,21 +1397,23 @@ bool llm_graph_context::build_qkv_shards(
 
     auto validate_projection = [&](char projection, int64_t expected) {
         int64_t covered = 0;
-        for (const auto & lane : lanes) {
+        size_t active_parts = 0;
+        for (const auto & split : policy.splits) {
             int64_t start = 0;
             int64_t size = 0;
             switch (projection) {
-                case 'q': start = lane.split.q_start; size = lane.split.q_size; break;
-                case 'k': start = lane.split.k_start; size = lane.split.k_size; break;
-                case 'v': start = lane.split.v_start; size = lane.split.v_size; break;
+                case 'q': start = split.q_start; size = split.q_size; break;
+                case 'k': start = split.k_start; size = split.k_size; break;
+                case 'v': start = split.v_start; size = split.v_size; break;
                 default: GGML_ABORT("invalid QKV projection selector");
             }
-            if (start != covered || size <= 0 || start % n_embd_head != 0 || size % n_embd_head != 0) {
+            if (start != covered || size < 0 || start % n_embd_head != 0 || size % n_embd_head != 0) {
                 return false;
             }
             covered += size;
+            active_parts += size > 0 ? 1 : 0;
         }
-        return covered == expected;
+        return active_parts >= 1 && active_parts <= 3 && covered == expected;
     };
 
     if (lanes.empty() || lanes.size() > 3 ||
@@ -1425,6 +1444,7 @@ bool llm_graph_context::build_qkv_shards(
             case 'v': weight = lane.wv.tensor; local_start = lane.wv.local_start; size = lane.split.v_size; break;
             default: GGML_ABORT("invalid QKV projection selector");
         }
+        GGML_ASSERT(weight != nullptr && size > 0);
 
         ggml_tensor * shard = ggml_mul_mat_src0_region(
                 ctx0, weight, cur,
@@ -1435,27 +1455,51 @@ bool llm_graph_context::build_qkv_shards(
         return shard;
     };
 
-    // Emit all three projection shards for one backend before moving to the
-    // next lane. The scheduler therefore sees one pure composite split per
-    // active processor rather than independent competing projection calls.
+    // Emit every present projection shard for one backend before moving to the
+    // next lane. The scheduler therefore sees one variable-length composite
+    // split per active processor rather than competing same-backend calls.
     std::unordered_set<ggml_backend_t> lane_backends;
     for (auto & lane : lanes) {
-        lane.q = make_shard(lane, 'q');
+        ggml_tensor * lane_first = nullptr;
+        ggml_tensor * lane_last = nullptr;
+        const auto emit = [&](char projection, int64_t size, ggml_tensor *& result) {
+            if (size == 0) {
+                return;
+            }
+            result = make_shard(lane, projection);
+            ggml_build_forward_expand(gf, result);
+            lane_first = lane_first != nullptr ? lane_first : result;
+            lane_last = result;
+            if (out_first != nullptr && *out_first == nullptr) {
+                *out_first = result;
+            }
+        };
+        emit('q', lane.split.q_size, lane.q);
+        emit('k', lane.split.k_size, lane.k);
+        emit('v', lane.split.v_size, lane.v);
+        GGML_ASSERT(lane_first != nullptr && lane_last != nullptr);
+
         ggml_backend_t lane_backend = sched != nullptr
-            ? ggml_backend_sched_get_tensor_backend(sched, lane.q)
+            ? ggml_backend_sched_get_tensor_backend(sched, lane_first)
             : nullptr;
         if (lane_backend == nullptr || !lane_backends.insert(lane_backend).second) {
             GGML_ABORT(
                     "backend_policy: attn_qkv_shards layer %d lane %s did not resolve to a unique backend",
                     il, lane.split.id.c_str());
         }
-        lane.k = make_shard(lane, 'k');
-        lane.v = make_shard(lane, 'v');
-        ggml_build_forward_expand(gf, lane.q);
-        ggml_build_forward_expand(gf, lane.k);
-        ggml_build_forward_expand(gf, lane.v);
-        if (out_first != nullptr && *out_first == nullptr) {
-            *out_first = lane.q;
+
+        for (ggml_tensor * shard : { lane.q, lane.k, lane.v }) {
+            if (shard == nullptr) {
+                continue;
+            }
+            const ggml_backend_t shard_backend = sched != nullptr
+                ? ggml_backend_sched_get_tensor_backend(sched, shard)
+                : nullptr;
+            if (shard_backend != lane_backend) {
+                GGML_ABORT(
+                        "backend_policy: attn_qkv_shards layer %d lane %s projections did not resolve to one backend",
+                        il, lane.split.id.c_str());
+            }
         }
     }
 
@@ -1464,9 +1508,24 @@ bool llm_graph_context::build_qkv_shards(
         parts.reserve(lanes.size());
         for (const auto & lane : lanes) {
             switch (projection) {
-                case 'q': parts.emplace_back(lane.split.q_start, lane.q); break;
-                case 'k': parts.emplace_back(lane.split.k_start, lane.k); break;
-                case 'v': parts.emplace_back(lane.split.v_start, lane.v); break;
+                case 'q':
+                    if (lane.split.q_size > 0) {
+                        GGML_ASSERT(lane.q != nullptr);
+                        parts.emplace_back(lane.split.q_start, lane.q);
+                    }
+                    break;
+                case 'k':
+                    if (lane.split.k_size > 0) {
+                        GGML_ASSERT(lane.k != nullptr);
+                        parts.emplace_back(lane.split.k_start, lane.k);
+                    }
+                    break;
+                case 'v':
+                    if (lane.split.v_size > 0) {
+                        GGML_ASSERT(lane.v != nullptr);
+                        parts.emplace_back(lane.split.v_start, lane.v);
+                    }
+                    break;
                 default: GGML_ABORT("invalid QKV projection selector");
             }
         }
@@ -1474,7 +1533,6 @@ bool llm_graph_context::build_qkv_shards(
             return lhs.first < rhs.first;
         });
 
-        GGML_ASSERT(parts.size() == lanes.size());
         GGML_ASSERT(!parts.empty() && parts.size() <= 3);
         auto concat_stage = [&](ggml_tensor * lhs, ggml_tensor * rhs, int stage) {
             ggml_tensor * result = ggml_concat(ctx0, lhs, rhs, 0);
@@ -1515,6 +1573,27 @@ bool llm_graph_context::build_qkv_shards(
     ggml_tensor * Kcur = assemble('k');
     ggml_tensor * Vcur = assemble('v');
 
+    const auto sole_projection_lane = [&](char projection) -> const qkv_lane * {
+        const qkv_lane * sole = nullptr;
+        for (const auto & lane : lanes) {
+            int64_t size = 0;
+            switch (projection) {
+                case 'q': size = lane.split.q_size; break;
+                case 'k': size = lane.split.k_size; break;
+                case 'v': size = lane.split.v_size; break;
+                default: GGML_ABORT("invalid QKV projection selector");
+            }
+            if (size == 0) {
+                continue;
+            }
+            if (sole != nullptr) {
+                return nullptr;
+            }
+            sole = &lane;
+        }
+        return sole;
+    };
+
     // Preserve the ordinary projection's post-matmul ordering exactly:
     // optional scale, bias, clamp, then canonical reshape.
     auto finish_projection = [&](ggml_tensor * value, ggml_tensor * scale, ggml_tensor * bias,
@@ -1534,8 +1613,8 @@ bool llm_graph_context::build_qkv_shards(
             cb_route(value, tagged_name(prefix + ".clamp").c_str(), il, policy.assemble_backend.c_str());
         }
         const std::string & terminal_backend =
-            value == shard_output && lanes.size() == 1
-                ? lanes.front().split.backend
+            value == shard_output && sole_projection_lane(projection) != nullptr
+                ? sole_projection_lane(projection)->split.backend
                 : policy.assemble_backend;
         if (!reshape_outputs) {
             // Runtime routing commits these three non-view 2D terminals as one
@@ -1546,8 +1625,14 @@ bool llm_graph_context::build_qkv_shards(
             // it on the lane backend; there is no assembly operation to move.
             // Renaming also keeps the completed singleton out of the parallel
             // branch detector, so it follows the ordinary scheduler path.
-            cb_route(value, tagged_name(prefix + ".output2d").c_str(), il,
-                    terminal_backend.c_str());
+            // With several processor branches, a projection-local singleton
+            // must retain its attn_qkv_shard name so the scheduler can still
+            // collect that processor's variable-length composite split. The
+            // route callback already carries the output tensor explicitly.
+            if (value != shard_output || lanes.size() == 1) {
+                cb_route(value, tagged_name(prefix + ".output2d").c_str(), il,
+                        terminal_backend.c_str());
+            }
             return value;
         }
         value = ggml_reshape_3d(ctx0, value, n_embd_head, heads, n_tokens);
@@ -1563,6 +1648,26 @@ bool llm_graph_context::build_qkv_shards(
     Vcur = finish_projection(Vcur, layer.wv_s, layer.wv_b, 'v', n_head_kv);
 
     out = { Qcur, Kcur, Vcur };
+
+    if (out_last != nullptr) {
+        // Route ranges need the actual final graph node, which is not
+        // necessarily V when projections use different lane masks. Expand
+        // every terminal now, then select the terminal with the greatest graph
+        // index. Later expansions by the model builder are harmless no-ops.
+        for (ggml_tensor * terminal : { Qcur, Kcur, Vcur }) {
+            ggml_build_forward_expand(gf, terminal);
+        }
+        int latest_index = -1;
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            for (ggml_tensor * terminal : { Qcur, Kcur, Vcur }) {
+                if (ggml_graph_node(gf, i) == terminal && i > latest_index) {
+                    latest_index = i;
+                    *out_last = terminal;
+                }
+            }
+        }
+        GGML_ASSERT(*out_last != nullptr);
+    }
     return true;
 }
 
