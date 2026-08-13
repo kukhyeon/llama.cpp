@@ -40,8 +40,9 @@ struct llama_backend_policy_ffn_parallel {
 struct llama_backend_policy_attn_qkv_shard {
     std::string id;
     std::string backend;
-    // A processor lane is inactive only when all three sizes are zero.
-    // Projection-local zeros are intentionally not supported.
+    // In whole_qkv mode a processor lane is inactive only when all three
+    // sizes are zero. per_projection mode permits each projection to choose
+    // its active processor lanes independently.
     int64_t q_start = 0;
     int64_t q_size = 0;
     int64_t k_start = 0;
@@ -53,6 +54,9 @@ struct llama_backend_policy_attn_qkv_shard {
 struct llama_backend_policy_attn_qkv_shards {
     bool enabled = false;
     std::string phase = "prefill";
+    // Backward-compatible default: every processor lane owns either all of
+    // Q/K/V or none of them. per_projection opts into independent lane masks.
+    std::string lane_activity = "whole_qkv";
     int layer_start = -2;
     int layer_end = -2;
     int64_t head_dim = 128;
@@ -257,7 +261,8 @@ bool llama_backend_policy_match_attn_qkv_shards(
 
 // Resolve one profile's Q/K/V output splits. Profiles may override only the
 // complete q/k/v split_sizes object; lane ids, backends, ordering, head_dim,
-// layer range, phase, and assembly backend are inherited from the root.
+// lane_activity, layer range, phase, and assembly backend are inherited from
+// the root.
 bool llama_backend_policy_match_attn_qkv_shards_for_profile(
         const char * profile_name,
         int il,

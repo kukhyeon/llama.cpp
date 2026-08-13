@@ -779,6 +779,7 @@ llama_backend_policy_attn_qkv_shards parse_attn_qkv_shards(
     llama_backend_policy_attn_qkv_shards out;
     out.enabled = root.value("enabled", false);
     out.phase = root.value("phase", std::string("prefill"));
+    out.lane_activity = root.value("lane_activity", std::string("whole_qkv"));
     out.assemble_backend = root.value("assemble_backend", std::string("CPU"));
     out.source = source;
 
@@ -790,6 +791,11 @@ llama_backend_policy_attn_qkv_shards parse_attn_qkv_shards(
         throw std::runtime_error(source + ".phase must be all, prefill, or decode");
     }
     out.phase = lower(out.phase);
+    out.lane_activity = lower(out.lane_activity);
+    if (out.lane_activity != "whole_qkv" && out.lane_activity != "per_projection") {
+        throw std::runtime_error(
+                source + ".lane_activity must be whole_qkv or per_projection");
+    }
     if (out.assemble_backend.empty()) {
         throw std::runtime_error(source + ".assemble_backend must be a non-empty string");
     }
@@ -928,19 +934,20 @@ llama_backend_policy_attn_qkv_shards parse_attn_qkv_shards(
             "v", &llama_backend_policy_attn_qkv_shard::v_start,
             &llama_backend_policy_attn_qkv_shard::v_size);
 
-    // A QKV processor lane is one composite scheduler branch. Supporting a
-    // projection-local zero would leave that branch structurally different
-    // across Q/K/V and make lane exclusion ambiguous. A lane is therefore
-    // either active for all three projections or inactive for all three.
-    for (const auto & split : out.splits) {
-        const int active_projections =
-            (split.q_size > 0 ? 1 : 0) +
-            (split.k_size > 0 ? 1 : 0) +
-            (split.v_size > 0 ? 1 : 0);
-        if (active_projections != 0 && active_projections != 3) {
-            throw std::runtime_error(
-                    source + ".split_sizes lane '" + split.id +
-                    "' must be zero or positive for Q, K, and V together");
+    if (out.lane_activity == "whole_qkv") {
+        // Preserve the original composite-lane contract unless the policy
+        // explicitly opts into projection-local activity.
+        for (const auto & split : out.splits) {
+            const int active_projections =
+                (split.q_size > 0 ? 1 : 0) +
+                (split.k_size > 0 ? 1 : 0) +
+                (split.v_size > 0 ? 1 : 0);
+            if (active_projections != 0 && active_projections != 3) {
+                throw std::runtime_error(
+                        source + ".split_sizes lane '" + split.id +
+                        "' must be zero or positive for Q, K, and V together "
+                        "when lane_activity=whole_qkv");
+            }
         }
     }
 
