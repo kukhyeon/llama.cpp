@@ -238,6 +238,10 @@ set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-downlo
 
 llama_build_and_test(test-arg-parser.cpp)
 llama_build_and_test(test-query-pacing.cpp)
+llama_build(test-battery-sync.cpp)
+target_include_directories(test-battery-sync PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-battery-sync PRIVATE dvfs)
+llama_test(test-battery-sync)
 
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks

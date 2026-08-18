@@ -147,6 +147,50 @@ int main(void) {
     argv = {"binary_name", "-m", "model.gguf", "--hardware-stats-core", "-2"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), hardware_stats_params, LLAMA_EXAMPLE_COMPLETION));
 
+    common_params battery_temp_default_params;
+    assert(battery_temp_default_params.battery_temp_sync == false);
+    assert(battery_temp_default_params.battery_temp_path.empty());
+    assert(battery_temp_default_params.battery_temp_update_count == 1);
+    assert(battery_temp_default_params.battery_temp_poll_ms == 100);
+    assert(battery_temp_default_params.battery_temp_settle_ms == 200);
+    assert(battery_temp_default_params.battery_temp_timeout_ms == 70000);
+
+    common_params battery_temp_params;
+    argv = {
+        "binary_name", "-m", "model.gguf",
+        "--battery-temp-sync", "on",
+        "--battery-temp-path", "/sys/class/power_supply/battery/temp",
+        "--battery-temp-update-count", "2",
+        "--battery-temp-poll-ms", "250",
+        "--battery-temp-settle-ms", "0",
+        "--battery-temp-timeout-ms", "90000",
+    };
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), battery_temp_params, LLAMA_EXAMPLE_COMPLETION));
+    assert(battery_temp_params.battery_temp_sync == true);
+    assert(battery_temp_params.battery_temp_path == "/sys/class/power_supply/battery/temp");
+    assert(battery_temp_params.battery_temp_update_count == 2);
+    assert(battery_temp_params.battery_temp_poll_ms == 250);
+    assert(battery_temp_params.battery_temp_settle_ms == 0);
+    assert(battery_temp_params.battery_temp_timeout_ms == 90000);
+
+    argv = {"binary_name", "-m", "model.gguf", "--battery-temp-sync", "invalid"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), battery_temp_params, LLAMA_EXAMPLE_COMPLETION));
+
+    argv = {"binary_name", "-m", "model.gguf", "--battery-temp-update-count", "0"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), battery_temp_params, LLAMA_EXAMPLE_COMPLETION));
+
+    argv = {"binary_name", "-m", "model.gguf", "--battery-temp-poll-ms", "0"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), battery_temp_params, LLAMA_EXAMPLE_COMPLETION));
+
+    argv = {"binary_name", "-m", "model.gguf", "--battery-temp-settle-ms", "-1"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), battery_temp_params, LLAMA_EXAMPLE_COMPLETION));
+
+    argv = {"binary_name", "-m", "model.gguf", "--battery-temp-timeout-ms", "0"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), battery_temp_params, LLAMA_EXAMPLE_COMPLETION));
+
+    argv = {"binary_name", "--battery-temp-sync", "on"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), battery_temp_params, LLAMA_EXAMPLE_COMMON));
+
     common_params query_period_default_params;
     assert(query_period_default_params.query_interval == 0);
 
@@ -336,6 +380,27 @@ int main(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), attn_out_shards_env_params, LLAMA_EXAMPLE_COMPLETION));
     assert(attn_out_shards_env_params.attn_out_shards == true);
     unsetenv("LLAMA_ARG_ATTN_OUT_SHARDS");
+
+    setenv("LLAMA_ARG_BATTERY_TEMP_SYNC", "on", true);
+    setenv("LLAMA_ARG_BATTERY_TEMP_PATH", "/sys/class/power_supply/battery/temp", true);
+    setenv("LLAMA_ARG_BATTERY_TEMP_UPDATE_COUNT", "2", true);
+    setenv("LLAMA_ARG_BATTERY_TEMP_POLL_MS", "250", true);
+    setenv("LLAMA_ARG_BATTERY_TEMP_SETTLE_MS", "0", true);
+    setenv("LLAMA_ARG_BATTERY_TEMP_TIMEOUT_MS", "90000", true);
+    common_params battery_temp_env_params;
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), battery_temp_env_params, LLAMA_EXAMPLE_COMPLETION));
+    assert(battery_temp_env_params.battery_temp_sync == true);
+    assert(battery_temp_env_params.battery_temp_path == "/sys/class/power_supply/battery/temp");
+    assert(battery_temp_env_params.battery_temp_update_count == 2);
+    assert(battery_temp_env_params.battery_temp_poll_ms == 250);
+    assert(battery_temp_env_params.battery_temp_settle_ms == 0);
+    assert(battery_temp_env_params.battery_temp_timeout_ms == 90000);
+    unsetenv("LLAMA_ARG_BATTERY_TEMP_SYNC");
+    unsetenv("LLAMA_ARG_BATTERY_TEMP_PATH");
+    unsetenv("LLAMA_ARG_BATTERY_TEMP_UPDATE_COUNT");
+    unsetenv("LLAMA_ARG_BATTERY_TEMP_POLL_MS");
+    unsetenv("LLAMA_ARG_BATTERY_TEMP_SETTLE_MS");
+    unsetenv("LLAMA_ARG_BATTERY_TEMP_TIMEOUT_MS");
 
     printf("test-arg-parser: test negated environment variables\n\n");
 
