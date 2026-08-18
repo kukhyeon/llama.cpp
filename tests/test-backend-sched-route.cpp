@@ -248,11 +248,25 @@ static bool check(bool condition, const char * scenario, const char * detail) {
     return true;
 }
 
+static void set_attn_out_direct_scatter_env(const char * value) {
+#if defined(_WIN32)
+    (void) _putenv_s("GGML_ATTN_OUT_DIRECT_SCATTER", value != nullptr ? value : "");
+#else
+    if (value != nullptr) {
+        (void) setenv("GGML_ATTN_OUT_DIRECT_SCATTER", value, 1);
+    } else {
+        (void) unsetenv("GGML_ATTN_OUT_DIRECT_SCATTER");
+    }
+#endif
+}
+
 struct queued_commit_control {
     int async_copy_calls = 0;
     int flush_calls = 0;
     int synchronize_calls = 0;
     int fail_async_copy_call = 0;
+    int direct_scatter_calls = 0;
+    ggml_tensor * direct_scatter_dst = nullptr;
 };
 
 struct queued_commit_backend_context {
@@ -409,6 +423,43 @@ static void queued_commit_backend_flush(ggml_backend_t backend) {
     queued_commit_backend_drain(ctx);
 }
 
+static bool queued_commit_backend_attn_out_direct_scatter(
+        ggml_backend_t backend,
+        ggml_tensor * dst,
+        const ggml_backend_attn_out_scatter_slice * slices,
+        size_t n_slices) {
+    queued_commit_backend_context * ctx = queued_commit_backend_ctx(backend);
+    ++ctx->control->direct_scatter_calls;
+    ctx->control->direct_scatter_dst = dst;
+    if (dst == nullptr || slices == nullptr || n_slices < 2 || n_slices > 3 ||
+            dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+
+    int64_t covered = 0;
+    for (size_t slice_id = 0; slice_id < n_slices; ++slice_id) {
+        const ggml_tensor * src = slices[slice_id].src;
+        if (src == nullptr || src->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(src) || src->ne[1] != dst->ne[1] ||
+                slices[slice_id].dst_offset != covered ||
+                src->ne[0] > dst->ne[0] - covered) {
+            return false;
+        }
+        std::vector<float> values((size_t) ggml_nelements(src));
+        ggml_backend_tensor_get(
+                src, values.data(), 0, values.size() * sizeof(values[0]));
+        for (int64_t row = 0; row < src->ne[1]; ++row) {
+            ggml_backend_tensor_set(
+                    dst,
+                    values.data() + row * src->ne[0],
+                    (size_t) (row * dst->ne[0] + covered) * sizeof(float),
+                    (size_t) src->ne[0] * sizeof(float));
+        }
+        covered += src->ne[0];
+    }
+    return covered == dst->ne[0];
+}
+
 static const char * queued_commit_registry_name(ggml_backend_reg_t) {
     return "QueuedCommitTest";
 }
@@ -424,6 +475,10 @@ static ggml_backend_dev_t queued_commit_registry_device(ggml_backend_reg_t, size
 static void * queued_commit_registry_proc_address(ggml_backend_reg_t, const char * name) {
     if (std::strcmp(name, "ggml_backend_async_flush") == 0) {
         return reinterpret_cast<void *>(queued_commit_backend_flush);
+    }
+    if (std::strcmp(name, "ggml_backend_attn_out_direct_scatter") == 0) {
+        return reinterpret_cast<void *>(
+                queued_commit_backend_attn_out_direct_scatter);
     }
     return nullptr;
 }
@@ -1329,6 +1384,18 @@ static bool run_multi_output_bundle_case() {
         ggml_build_forward_expand(graph, outputs[output_index]);
     }
 
+    // Step 7 consumes all three canonical slots in one common node after the
+    // selected route commits. This catches partial/non-atomic commits that a
+    // set of independent one-input consumers could otherwise miss.
+    ggml_tensor * fused_output = ggml_add4(
+            ctx,
+            canonical_outputs[0], canonical_outputs[1],
+            canonical_outputs[2], x);
+    ggml_set_name(fused_output, "route-bundle-common-add4");
+    ggml_set_output(fused_output);
+    ggml_backend_sched_set_tensor_backend(sched, fused_output, backends[0]);
+    ggml_build_forward_expand(graph, fused_output);
+
     // Reject a malformed bundle without changing the scheduler registration
     // state. All valid plan mappings below share one canonical bundle.
     ggml_tensor * wrong_layout = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 3);
@@ -1399,6 +1466,19 @@ static bool run_multi_output_bundle_case() {
                             actual[i], expected);
                     return false;
                 }
+            }
+        }
+
+        float fused_actual[4] = {};
+        ggml_backend_tensor_get(fused_output, fused_actual, 0, sizeof(fused_actual));
+        for (int i = 0; i < 4; ++i) {
+            const float q = alternate ? x_data[i] * y_data[i] : x_data[i] + y_data[i];
+            const float k = alternate ? x_data[i] + y_data[i] : x_data[i] * y_data[i];
+            const float v = alternate ? y_data[i] - x_data[i] : x_data[i] - y_data[i];
+            const float expected = (q + (k + v)) + x_data[i];
+            if (!check(std::fabs(fused_actual[i] - expected) < 1e-5f,
+                        scenario, "common ADD4 observed a partial route commit")) {
+                return false;
             }
         }
         return true;
@@ -2031,13 +2111,16 @@ static bool run_attn_out_fork_join_subgraph_case() {
     };
 
     ggml_context * ctx = ggml_init(params);
+    queued_commit_control direct_scatter_control;
     ggml_backend_t backends[2] = {
-        ggml_backend_cpu_init(),
+        make_queued_commit_backend(&direct_scatter_control),
         ggml_backend_cpu_init(),
     };
+    set_attn_out_direct_scatter_env("on");
     ggml_backend_sched_t sched = backends[0] != nullptr && backends[1] != nullptr
         ? ggml_backend_sched_new(backends, nullptr, 2, 128, false, true)
         : nullptr;
+    set_attn_out_direct_scatter_env(nullptr);
     auto cleanup = [&]() {
         ggml_backend_sched_free(sched);
         ggml_backend_free(backends[0]);
@@ -2125,7 +2208,7 @@ static bool run_attn_out_fork_join_subgraph_case() {
     const fork_join_variant canonical = build_variant(
             canonical_sizes, "r0000000000000000", backends[0], backends[1]);
     const fork_join_variant alternate = build_variant(
-            alternate_sizes, "r0000000000000001", backends[1], backends[0]);
+            alternate_sizes, "r0000000000000001", backends[0], backends[1]);
     const fork_join_variant single = build_variant(
             single_sizes, "r0000000000000002", backends[1], backends[0]);
     const bool single_terminal_kept_lane_backend =
@@ -2188,7 +2271,11 @@ static bool run_attn_out_fork_join_subgraph_case() {
         check(stats.groups_executed == 1, scenario, "unexpected route group count") &&
         check(stats.alternate_selected == 1, scenario, "alternate fork/join was not selected") &&
         check(stats.canonical_commits == 1, scenario, "alternate output was not committed") &&
-        check(stats.plan_misses == 0, scenario, "unexpected plan miss") && ok;
+        check(stats.plan_misses == 0, scenario, "unexpected plan miss") &&
+        check(direct_scatter_control.direct_scatter_calls == 1,
+            scenario, "selected W_O route did not use direct scatter") &&
+        check(direct_scatter_control.direct_scatter_dst == alternate.output,
+            scenario, "direct scatter wrote canonical storage before variant publication") && ok;
 
     std::vector<route_trace_row> trace_rows;
     ok = read_route_trace(trace.path(), scenario, &trace_rows) && ok;

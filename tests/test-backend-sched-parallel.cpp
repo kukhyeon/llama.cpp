@@ -3,6 +3,7 @@
 #include "ggml.h"
 #include "../ggml/src/ggml-backend-impl.h"
 #include "../ggml/src/ggml-impl.h"
+#include "../src/llama-graph.h"
 
 #include <algorithm>
 #include <atomic>
@@ -31,6 +32,30 @@ static bool check(bool condition, const char * scenario, const char * detail) {
     return true;
 }
 
+static void set_ffn_fused_add3_env(const char * value) {
+#if defined(_WIN32)
+    (void) _putenv_s("LLAMA_FFN_FUSED_ADD3", value != nullptr ? value : "");
+#else
+    if (value != nullptr) {
+        (void) setenv("LLAMA_FFN_FUSED_ADD3", value, 1);
+    } else {
+        (void) unsetenv("LLAMA_FFN_FUSED_ADD3");
+    }
+#endif
+}
+
+static void set_attn_out_direct_scatter_env(const char * value) {
+#if defined(_WIN32)
+    (void) _putenv_s("GGML_ATTN_OUT_DIRECT_SCATTER", value != nullptr ? value : "");
+#else
+    if (value != nullptr) {
+        (void) setenv("GGML_ATTN_OUT_DIRECT_SCATTER", value, 1);
+    } else {
+        (void) unsetenv("GGML_ATTN_OUT_DIRECT_SCATTER");
+    }
+#endif
+}
+
 enum class instrumented_backend_role {
     cpu,
     npu,
@@ -55,6 +80,8 @@ struct deferred_sync_control {
     std::atomic<int> gpu_branch_sync_after_cpu_complete { 0 };
     std::atomic<int> gpu_join_pending_syncs { 0 };
     std::atomic<int> gpu_pending_syncs { 0 };
+    std::atomic<int> attn_out_direct_scatter_calls { 0 };
+    std::atomic<bool> attn_out_direct_scatter_fail_after_first { false };
 };
 
 struct instrumented_backend_context {
@@ -319,6 +346,50 @@ static void instrumented_backend_async_flush(ggml_backend_t backend) {
     ctx->control->gpu_async_flush_calls.fetch_add(1, std::memory_order_relaxed);
 }
 
+static bool instrumented_backend_attn_out_direct_scatter(
+        ggml_backend_t backend,
+        ggml_tensor * dst,
+        const ggml_backend_attn_out_scatter_slice * slices,
+        size_t n_slices) {
+    instrumented_backend_context * ctx = instrumented_backend_ctx(backend);
+    ctx->control->attn_out_direct_scatter_calls.fetch_add(
+            1, std::memory_order_relaxed);
+    if (dst == nullptr || slices == nullptr || n_slices < 2 || n_slices > 3 ||
+            dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+
+    int64_t covered = 0;
+    for (size_t slice_id = 0; slice_id < n_slices; ++slice_id) {
+        const ggml_tensor * src = slices[slice_id].src;
+        if (src == nullptr || src->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(src) || src->ne[1] != dst->ne[1] ||
+                slices[slice_id].dst_offset != covered ||
+                src->ne[0] > dst->ne[0] - covered) {
+            return false;
+        }
+        std::vector<float> values((size_t) ggml_nelements(src));
+        ggml_backend_tensor_get(
+                src, values.data(), 0, values.size() * sizeof(values[0]));
+        for (int64_t row = 0; row < src->ne[1]; ++row) {
+            ggml_backend_tensor_set(
+                    dst,
+                    values.data() + row * src->ne[0],
+                    (size_t) (row * dst->ne[0] + covered) * sizeof(float),
+                    (size_t) src->ne[0] * sizeof(float));
+        }
+        covered += src->ne[0];
+        if (slice_id == 0 &&
+                ctx->control->attn_out_direct_scatter_fail_after_first.load(
+                    std::memory_order_relaxed)) {
+            // Exercise the scheduler's required partial-write fallback.  The
+            // ordinary outer CONCAT must overwrite this whole destination.
+            return false;
+        }
+    }
+    return covered == dst->ne[0];
+}
+
 static const char * instrumented_registry_name(ggml_backend_reg_t) {
     return "InstrumentedOpenCLTest";
 }
@@ -334,6 +405,10 @@ static ggml_backend_dev_t instrumented_registry_device(ggml_backend_reg_t, size_
 static void * instrumented_registry_proc_address(ggml_backend_reg_t, const char * name) {
     if (std::strcmp(name, "ggml_backend_async_flush") == 0) {
         return reinterpret_cast<void *>(instrumented_backend_async_flush);
+    }
+    if (std::strcmp(name, "ggml_backend_attn_out_direct_scatter") == 0) {
+        return reinterpret_cast<void *>(
+                instrumented_backend_attn_out_direct_scatter);
     }
     return nullptr;
 }
@@ -584,6 +659,187 @@ struct qkv_fixture {
                         result[i],
                         expected);
                 return false;
+            }
+        }
+        return true;
+    }
+};
+
+struct ffn_fused_add3_fixture {
+    deferred_sync_control control;
+    ggml_context * ctx = nullptr;
+    ggml_backend_t cpu_backend = nullptr;
+    ggml_backend_t gpu_backend = nullptr;
+    ggml_backend_t npu_backend = nullptr;
+    ggml_backend_sched_t sched = nullptr;
+    ggml_cgraph * graph = nullptr;
+    ggml_tensor * inputs[3] = {};
+    ggml_tensor * residual = nullptr;
+    ggml_tensor * output = nullptr;
+
+    ~ffn_fused_add3_fixture() {
+        ggml_backend_sched_free(sched);
+        if (gpu_backend != nullptr) {
+            ggml_backend_free(gpu_backend);
+        }
+        if (npu_backend != nullptr) {
+            ggml_backend_free(npu_backend);
+        }
+        if (cpu_backend != nullptr) {
+            ggml_backend_free(cpu_backend);
+        }
+        ggml_free(ctx);
+    }
+
+    bool build(bool fused_add4 = false) {
+        constexpr size_t graph_size = 32;
+        const ggml_init_params params = {
+            /* .mem_size   = */ 64 * ggml_tensor_overhead() +
+                                  ggml_graph_overhead_custom(graph_size, false),
+            /* .mem_buffer = */ nullptr,
+            /* .no_alloc   = */ true,
+        };
+        ctx = ggml_init(params);
+        cpu_backend = make_instrumented_backend(
+                instrumented_backend_role::cpu,
+                "FFNTestCPU",
+                GGML_BACKEND_DEVICE_TYPE_CPU,
+                &control);
+        gpu_backend = make_instrumented_backend(
+                instrumented_backend_role::gpu,
+                "FFNTestOpenCL",
+                GGML_BACKEND_DEVICE_TYPE_GPU,
+                &control);
+        npu_backend = make_instrumented_backend(
+                instrumented_backend_role::npu,
+                "FFNTestHTP",
+                GGML_BACKEND_DEVICE_TYPE_ACCEL,
+                &control);
+        if (cpu_backend == nullptr || gpu_backend == nullptr || npu_backend == nullptr) {
+            return false;
+        }
+        ggml_backend_t scheduler_backends[] = { gpu_backend, npu_backend, cpu_backend };
+        ggml_backend_buffer_type_t scheduler_bufts[] = {
+            ggml_backend_get_default_buffer_type(gpu_backend),
+            ggml_backend_get_default_buffer_type(npu_backend),
+            ggml_backend_get_default_buffer_type(cpu_backend),
+        };
+        sched = ggml_backend_sched_new(
+                scheduler_backends, scheduler_bufts, 3, 128, false, true);
+        if (ctx == nullptr || sched == nullptr) {
+            return false;
+        }
+
+        graph = ggml_new_graph_custom(ctx, graph_size, false);
+        static const char * branch_names[] = { "cpu", "gpu", "npu" };
+        ggml_backend_t branch_backends[] = { cpu_backend, gpu_backend, npu_backend };
+        ggml_tensor * branches[3] = {};
+        for (int lane = 0; lane < 3; ++lane) {
+            inputs[lane] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 8);
+            ggml_set_input(inputs[lane]);
+            ggml_set_name(inputs[lane],
+                    (std::string("ffn-add3-input-") + branch_names[lane]).c_str());
+            branches[lane] = ggml_dup(ctx, inputs[lane]);
+            ggml_set_name(branches[lane],
+                    (std::string("ffn_down.") + branch_names[lane] + "-0").c_str());
+            ggml_backend_sched_set_tensor_backend(sched, inputs[lane], branch_backends[lane]);
+            ggml_backend_sched_set_tensor_backend(sched, branches[lane], branch_backends[lane]);
+            ggml_build_forward_expand(graph, branches[lane]);
+        }
+
+        if (fused_add4) {
+            residual = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 8);
+            ggml_set_input(residual);
+            ggml_set_name(residual, "ffn-add4-residual");
+            ggml_backend_sched_set_tensor_backend(sched, residual, gpu_backend);
+            output = ggml_add4(
+                    ctx, branches[0], branches[1], branches[2], residual);
+            std::string fusion_backend;
+            if (!llm_graph_ffn_add4_opencl_backend(
+                        sched, residual, output, &fusion_backend) ||
+                    fusion_backend != "FFNTestOpenCL") {
+                return false;
+            }
+            ggml_tensor * cpu_candidate = ggml_add4(
+                    ctx, branches[0], branches[1], branches[2], inputs[0]);
+            if (llm_graph_ffn_add4_opencl_backend(
+                        sched, inputs[0], cpu_candidate, nullptr)) {
+                return false;
+            }
+        } else {
+            set_ffn_fused_add3_env(nullptr);
+            if (llm_graph_try_build_ffn_fused_add3(
+                        ctx, branches[0], branches[1], branches[2], "CPU") != nullptr) {
+                return false;
+            }
+            set_ffn_fused_add3_env("1");
+            if (llm_graph_try_build_ffn_fused_add3(
+                        ctx, branches[0], branches[1], branches[2], "OpenCL") != nullptr) {
+                set_ffn_fused_add3_env(nullptr);
+                return false;
+            }
+            output = llm_graph_try_build_ffn_fused_add3(
+                    ctx, branches[0], branches[1], branches[2], "CPU");
+            set_ffn_fused_add3_env(nullptr);
+        }
+        if (output == nullptr) {
+            return false;
+        }
+        ggml_set_name(output, "ffn_parallel_out-0");
+        ggml_set_output(output);
+        ggml_backend_sched_set_tensor_backend(
+                sched, output, fused_add4 ? gpu_backend : cpu_backend);
+        ggml_build_forward_expand(graph, output);
+        ggml_backend_sched_set_ffn_parallel_reduce_threads(sched, 4, 2);
+        return ggml_backend_sched_alloc_graph(sched, graph);
+    }
+
+    bool compute_and_check(const char * scenario, bool fused_add4 = false) {
+        const float values[3][8] = {
+            { 1.0e20f, -1.0e20f,  1.0f, -1.0f,  9.0f, -8.0f,  0.25f, -0.5f },
+            {-1.0e20f,  1.0e20f, -1.0f,  1.0f, -4.0f,  3.0f, -0.50f,  1.5f },
+            { 3.25f,   -2.75f,    0.5f, -0.5f,  2.0f,  1.0f,  0.75f, -2.0f },
+        };
+        for (int lane = 0; lane < 3; ++lane) {
+            ggml_backend_tensor_set(inputs[lane], values[lane], 0, sizeof(values[lane]));
+        }
+        const float residual_values[8] = {
+            0.5f, -0.25f, 1.5f, -2.0f, 0.125f, 4.0f, -0.75f, 2.25f,
+        };
+        if (fused_add4) {
+            ggml_backend_tensor_set(
+                    residual, residual_values, 0, sizeof(residual_values));
+        }
+        if (!check(
+                    ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS,
+                    scenario,
+                    "graph compute failed")) {
+            return false;
+        }
+
+        float result[8] = {};
+        ggml_backend_tensor_get(output, result, 0, sizeof(result));
+        for (int i = 0; i < 8; ++i) {
+            // This test is also built with production-style fast-math. Keep
+            // the oracle independent from compiler reassociation so it can
+            // detect a callback/kernel that changes the required ADD tree.
+            volatile float rhs = values[1][i] + values[2][i];
+            volatile float reduced = values[0][i] + rhs;
+            volatile float ordered = fused_add4
+                ? reduced + residual_values[i]
+                : reduced;
+            const float expected = ordered;
+            if (std::memcmp(&result[i], &expected, sizeof(float)) != 0) {
+                std::fprintf(
+                        stderr,
+                        "  index %d: got %.9g, expected %.9g\n",
+                        i,
+                        result[i],
+                        expected);
+                return check(false, scenario,
+                        fused_add4
+                            ? "fused ADD4 changed the reduction order"
+                            : "fused ADD3 changed the reduction order");
             }
         }
         return true;
@@ -981,7 +1237,13 @@ struct attn_out_deferred_sync_fixture {
         ggml_free(ctx);
     }
 
-    bool build(bool join_on_gpu = true, int requested_lane_count = 3) {
+    bool build(
+            bool join_on_gpu = true,
+            int requested_lane_count = 3,
+            bool direct_scatter = false,
+            bool fail_direct_scatter_after_first = false,
+            bool checkpoint_after_last_branch = false,
+            bool scheduler_parallel = false) {
         constexpr size_t graph_size = 96;
         const ggml_init_params params = {
             /* .mem_size   = */ 192 * ggml_tensor_overhead() +
@@ -1019,7 +1281,12 @@ struct attn_out_deferred_sync_fixture {
             ggml_backend_get_default_buffer_type(npu_backend),
             ggml_backend_get_default_buffer_type(cpu_backend),
         };
-        sched = ggml_backend_sched_new(backends, bufts, 3, 192, false, true);
+        control.attn_out_direct_scatter_fail_after_first.store(
+                fail_direct_scatter_after_first, std::memory_order_relaxed);
+        set_attn_out_direct_scatter_env(direct_scatter ? "on" : nullptr);
+        sched = ggml_backend_sched_new(
+                backends, bufts, 3, 192, scheduler_parallel, true);
+        set_attn_out_direct_scatter_env(nullptr);
         if (sched == nullptr) {
             return false;
         }
@@ -1068,6 +1335,24 @@ struct attn_out_deferred_sync_fixture {
         ggml_set_output(output);
         ggml_backend_sched_set_tensor_backend(sched, output, cpu_backend);
         ggml_build_forward_expand(graph, output);
+
+        if (checkpoint_after_last_branch) {
+            // Checkpoint preparation intentionally rejects named parallel
+            // branch nodes.  Temporarily remove the branch marker, then put
+            // it back before graph allocation so pass 5 resolves the stored
+            // boundary to the final branch split.  This exercises the
+            // execution-time fail-closed guard even if tensor names are
+            // finalized after policy/checkpoint preparation.
+            ggml_tensor * boundary = projections.back();
+            const std::string branch_name = boundary->name;
+            ggml_set_name(boundary, "attn-out-checkpoint-boundary-temp");
+            const bool prepared = ggml_backend_sched_prepare_layer_checkpoints(
+                    sched, graph, &boundary, 1, nullptr, nullptr, nullptr);
+            ggml_set_name(boundary, branch_name.c_str());
+            if (!prepared) {
+                return false;
+            }
+        }
 
         ggml_backend_sched_set_tensor_backend(sched, input, cpu_backend);
         return ggml_backend_sched_alloc_graph(sched, graph);
@@ -1276,6 +1561,98 @@ static bool check_attn_out_group_timing_mode(
     }
     return check(grouped_rows == expected_grouped_rows, scenario,
         "unexpected number of traced attn_out group rows");
+}
+
+static bool run_ffn_fused_case(bool fused_add4) {
+    const char * scenario = fused_add4 ? "ffn-fused-add4" : "ffn-fused-add3";
+    temporary_trace_file trace_file(scenario);
+    ffn_fused_add3_fixture fixture;
+    if (!check(fixture.build(fused_add4), scenario, "fixture setup failed") ||
+            !check(
+                fixture.output->op == (fused_add4 ? GGML_OP_ADD4 : GGML_OP_MAP_CUSTOM3),
+                scenario, "fixture did not build the requested fused operation")) {
+        return false;
+    }
+    const int n_splits = ggml_backend_sched_get_n_splits(fixture.sched);
+    if (!check(n_splits == 4, scenario,
+                "three FFN branches were not isolated from the fused join")) {
+        std::fprintf(stderr, "  got %d splits, expected 4\n", n_splits);
+        return false;
+    }
+    if (fused_add4 && !check(
+                ggml_backend_sched_get_tensor_backend(
+                    fixture.sched, fixture.output) == fixture.gpu_backend,
+                scenario,
+                "ADD4 did not retain the concrete OpenCL backend")) {
+        return false;
+    }
+
+    {
+        scheduler_trace_capture capture(trace_file.path(), 112);
+        if (!fixture.compute_and_check(scenario, fused_add4)) {
+            return false;
+        }
+        capture.finish();
+    }
+
+    std::vector<trace_row> rows;
+    if (!read_trace(trace_file.path(), scenario, &rows)) {
+        return false;
+    }
+
+    std::vector<trace_row> grouped;
+    for (const trace_row & row : rows) {
+        if (row.is_parallel_group) {
+            grouped.push_back(row);
+        }
+    }
+    if (!check(grouped.size() == 3, scenario,
+                "expected exactly three grouped FFN branch rows")) {
+        return false;
+    }
+
+    static const char * branch_names[] = { "cpu", "gpu", "npu" };
+    const int group_id = grouped.front().group_id;
+    for (int lane = 0; lane < 3; ++lane) {
+        const std::string expected_node =
+            std::string("ffn_down.") + branch_names[lane] + "-0";
+        const trace_row & row = grouped[(size_t) lane];
+        if (!check(row.parallel_kind == "ffn", scenario,
+                    "parallel group kind mismatch") ||
+                !check(row.parallel_branch == branch_names[lane], scenario,
+                    "parallel FFN branch order mismatch") ||
+                !check(row.timing_mode == "persistent_synced_wall", scenario,
+                    "three-backend FFN group did not use the persistent workers") ||
+                !check(row.group_id == group_id && group_id >= 0, scenario,
+                    "parallel group id mismatch") ||
+                !check(row.node_count == 1, scenario,
+                    "FFN branch split was not pure") ||
+                !check(row.first_node == expected_node && row.last_node == expected_node,
+                    scenario,
+                    "unexpected FFN branch split boundary")) {
+            return false;
+        }
+    }
+
+    const auto join = std::find_if(rows.begin(), rows.end(), [](const trace_row & row) {
+        return row.first_node == "ffn_parallel_out-0" &&
+            row.last_node == "ffn_parallel_out-0";
+    });
+    return check(join != rows.end(), scenario, "fused FFN join split was not traced") &&
+        check(!join->is_parallel_group, scenario,
+            "fused FFN join was included in the branch group") &&
+        check(join->split_id != grouped.back().split_id, scenario,
+            fused_add4
+                ? "last FFN branch fused with the ADD4 join"
+                : "last FFN branch fused with the ADD3 join");
+}
+
+static bool run_ffn_fused_add3_case() {
+    return run_ffn_fused_case(false);
+}
+
+static bool run_ffn_fused_add4_case() {
+    return run_ffn_fused_case(true);
 }
 
 static bool run_exact_qvk_group_case() {
@@ -1805,14 +2182,16 @@ static bool run_attn_out_output_axis_deferred_sync_case() {
     const int join_while_pending =
         control.gpu_join_submitted_while_branch_pending.load(std::memory_order_relaxed);
     const int cpu_wait_timeouts = control.cpu_wait_timeouts.load(std::memory_order_relaxed);
+    const int direct_scatter =
+        control.attn_out_direct_scatter_calls.load(std::memory_order_relaxed);
 
     if (branch_async != 1 || join_async != 1 || async_flush != 1 || early_branch_sync != 0 ||
             joined_branch_sync != 1 || join_pending_sync != 1 || pending_syncs != 2 ||
-            join_while_pending != 0 || cpu_wait_timeouts != 0) {
+            join_while_pending != 0 || cpu_wait_timeouts != 0 || direct_scatter != 0) {
         std::fprintf(
                 stderr,
                 "  async(branch/join/flush)=%d/%d/%d sync(early/at-join/join/pending)=%d/%d/%d/%d "
-                "join-while-pending=%d cpu-wait-timeouts=%d\n",
+                "join-while-pending=%d cpu-wait-timeouts=%d direct-scatter=%d\n",
                 branch_async,
                 join_async,
                 async_flush,
@@ -1821,7 +2200,8 @@ static bool run_attn_out_output_axis_deferred_sync_case() {
                 join_pending_sync,
                 pending_syncs,
                 join_while_pending,
-                cpu_wait_timeouts);
+                cpu_wait_timeouts,
+                direct_scatter);
     }
 
     return check(branch_async == 1, scenario, "GPU branch was not submitted asynchronously") &&
@@ -1839,7 +2219,9 @@ static bool run_attn_out_output_axis_deferred_sync_case() {
         check(join_while_pending == 0, scenario,
             "OpenCL CONCAT was submitted before the pending GPU branch completed") &&
         check(cpu_wait_timeouts == 0, scenario,
-            "CPU branch did not observe GPU async submission");
+            "CPU branch did not observe GPU async submission") &&
+        check(direct_scatter == 0, scenario,
+            "default-off direct scatter unexpectedly replaced CONCAT");
 }
 
 static bool run_attn_out_output_axis_two_way_deferred_sync_case() {
@@ -1884,6 +2266,119 @@ static bool run_attn_out_output_axis_two_way_deferred_sync_case() {
         check(
                 control.cpu_wait_timeouts.load(std::memory_order_relaxed) == 0,
                 scenario, "CPU branch did not observe two-way GPU async submission");
+}
+
+static bool run_attn_out_direct_scatter_case(bool fail_after_first) {
+    const char * scenario = fail_after_first
+        ? "attn-out-direct-scatter-partial-fallback"
+        : "attn-out-direct-scatter";
+    temporary_trace_file trace_file(scenario);
+    attn_out_deferred_sync_fixture fixture;
+    if (!check(
+                fixture.build(true, 3, true, fail_after_first),
+                scenario,
+                "fixture setup failed")) {
+        return false;
+    }
+
+    {
+        scheduler_trace_capture capture(
+                trace_file.path(), fail_after_first ? 114 : 113);
+        if (!fixture.compute_and_check(scenario)) {
+            return false;
+        }
+        capture.finish();
+    }
+
+    const deferred_sync_control & control = fixture.control;
+    const int scatter_calls =
+        control.attn_out_direct_scatter_calls.load(std::memory_order_relaxed);
+    const int join_calls =
+        control.gpu_join_async_calls.load(std::memory_order_relaxed);
+    if (!check(scatter_calls == 1, scenario,
+                "direct-scatter proc was not called exactly once") ||
+            !check(join_calls == (fail_after_first ? 1 : 0), scenario,
+                fail_after_first
+                    ? "partial scatter was not overwritten by the original CONCAT"
+                    : "accepted direct scatter still executed CONCAT")) {
+        return false;
+    }
+
+    std::vector<trace_row> rows;
+    if (!read_trace(trace_file.path(), scenario, &rows)) {
+        return false;
+    }
+    const auto join = std::find_if(rows.begin(), rows.end(), [](const trace_row & row) {
+        return row.first_node == "attn_out_parallel_concat-deferred-0" &&
+            row.last_node == "attn_out_parallel_concat-deferred-0";
+    });
+    if (!check(join != rows.end(), scenario,
+                "CONCAT/direct-scatter join row was not traced")) {
+        return false;
+    }
+    return check(
+            fail_after_first
+                ? join->timing_mode != "attn_out_direct_scatter"
+                : join->timing_mode == "attn_out_direct_scatter",
+            scenario,
+            fail_after_first
+                ? "partial failure was published as direct scatter"
+                : "accepted direct scatter was not identified in the trace");
+}
+
+static bool run_attn_out_direct_scatter_checkpoint_fallback_case() {
+    const char * scenario = "attn-out-direct-scatter-checkpoint-fallback";
+    attn_out_deferred_sync_fixture fixture;
+    if (!check(
+                fixture.build(true, 3, true, false, true),
+                scenario,
+                "fixture setup failed") ||
+            !fixture.compute_and_check(scenario)) {
+        return false;
+    }
+
+    ggml_backend_sched_layer_checkpoint_stats checkpoint_stats = {};
+    ggml_backend_sched_get_layer_checkpoint_stats(
+            fixture.sched, &checkpoint_stats);
+    const deferred_sync_control & control = fixture.control;
+    return check(
+                control.attn_out_direct_scatter_calls.load(
+                    std::memory_order_relaxed) == 0,
+                scenario,
+                "direct scatter crossed the final branch checkpoint") &&
+        check(
+                control.gpu_join_async_calls.load(
+                    std::memory_order_relaxed) == 1,
+                scenario,
+                "checkpoint fallback did not execute the original CONCAT") &&
+        check(
+                checkpoint_stats.checkpoint_hits == 1,
+                scenario,
+                "final branch checkpoint was not reached");
+}
+
+static bool run_attn_out_direct_scatter_multi_copy_fallback_case() {
+    const char * scenario = "attn-out-direct-scatter-multi-copy-fallback";
+    attn_out_deferred_sync_fixture fixture;
+    if (!check(
+                fixture.build(true, 3, true, false, false, true),
+                scenario,
+                "fixture setup failed") ||
+            !fixture.compute_and_check(scenario)) {
+        return false;
+    }
+
+    const deferred_sync_control & control = fixture.control;
+    return check(
+                control.attn_out_direct_scatter_calls.load(
+                    std::memory_order_relaxed) == 0,
+                scenario,
+                "direct scatter ran without copy-slot destination ownership") &&
+        check(
+                control.gpu_join_async_calls.load(
+                    std::memory_order_relaxed) == 1,
+                scenario,
+                "multi-copy fallback did not execute the original CONCAT");
 }
 
 static bool run_attn_out_deferred_sync_backend_guard_case() {
@@ -1988,13 +2483,18 @@ int main() {
     ggml_backend_sched_profile_set_phase(GGML_BACKEND_SCHED_PROFILE_PREFILL);
 
     try {
-        const bool ok = run_exact_qvk_group_case() && run_incomplete_qv_case() &&
+        const bool ok = run_ffn_fused_add3_case() && run_ffn_fused_add4_case() &&
+            run_exact_qvk_group_case() && run_incomplete_qv_case() &&
             run_exact_qkv_shard_lane_group_case() && run_two_way_qkv_shard_lane_group_case() &&
             run_projection_local_qkv_shard_lane_group_case() &&
             run_exact_attn_out_shard_lane_group_case() && run_two_way_attn_out_shard_lane_group_case() &&
             run_exact_attn_out_output_axis_shard_lane_group_case() &&
             run_attn_out_output_axis_deferred_sync_case() &&
             run_attn_out_output_axis_two_way_deferred_sync_case() &&
+            run_attn_out_direct_scatter_case(false) &&
+            run_attn_out_direct_scatter_case(true) &&
+            run_attn_out_direct_scatter_checkpoint_fallback_case() &&
+            run_attn_out_direct_scatter_multi_copy_fallback_case() &&
             run_attn_out_deferred_sync_backend_guard_case();
         if (ok) {
             std::puts("scheduler parallel-group tests passed");

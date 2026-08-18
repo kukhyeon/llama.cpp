@@ -789,12 +789,35 @@ struct ggml_backend_sched_split {
     bool has_attn_out_parallel_concat;
     int attn_out_parallel_concat_layer;
     int attn_out_parallel_concat_branches;
+    bool has_attn_out_direct_scatter;
+    struct ggml_tensor * attn_out_direct_scatter_dst;
+    struct ggml_tensor * attn_out_direct_scatter_srcs[3];
+    int64_t attn_out_direct_scatter_offsets[3];
+    struct ggml_tensor * attn_out_direct_scatter_join_nodes[2];
+    int attn_out_direct_scatter_slices;
+    int attn_out_direct_scatter_join_count;
     bool contains_transformer_layer;
     struct ggml_tensor * inputs[GGML_SCHED_MAX_SPLIT_INPUTS];
     int n_inputs;
     // graph view of this split
     struct ggml_cgraph graph;
 };
+
+static void ggml_backend_sched_clear_attn_out_direct_scatter(
+        struct ggml_backend_sched_split * split) {
+    GGML_ASSERT(split != nullptr);
+    split->has_attn_out_direct_scatter = false;
+    split->attn_out_direct_scatter_dst = nullptr;
+    split->attn_out_direct_scatter_slices = 0;
+    split->attn_out_direct_scatter_join_count = 0;
+    for (int i = 0; i < 3; ++i) {
+        split->attn_out_direct_scatter_srcs[i] = nullptr;
+        split->attn_out_direct_scatter_offsets[i] = 0;
+    }
+    for (int i = 0; i < 2; ++i) {
+        split->attn_out_direct_scatter_join_nodes[i] = nullptr;
+    }
+}
 
 struct ggml_backend_sched_ffn_executor;
 
@@ -903,8 +926,41 @@ struct ggml_backend_sched_route_candidate_state {
     }
 };
 
+struct ggml_backend_sched_qkv_lazy_opencl_slot {
+    int backend_id = -1;
+    ggml_backend_buffer_t buffer = nullptr;
+    ggml_backend_event_t event = nullptr;
+    size_t capacity = 0;
+    uint64_t batch_id = 0;
+    bool in_flight = false;
+};
+
+struct ggml_backend_sched_qkv_lazy_opencl_pending {
+    bool active = false;
+    int backend_id = -1;
+    int consumer_split_id = -1;
+    uint64_t batch_id = 0;
+    std::vector<int> input_slots;
+
+    void clear() {
+        active = false;
+        backend_id = -1;
+        consumer_split_id = -1;
+        batch_id = 0;
+        input_slots.clear();
+    }
+};
+
+struct ggml_backend_sched_qkv_lazy_opencl_state {
+    uint64_t next_batch_id = 1;
+    std::vector<ggml_backend_sched_qkv_lazy_opencl_slot> slots;
+    ggml_backend_sched_qkv_lazy_opencl_pending pending;
+};
+
 using ggml_backend_cpu_prewake_hold_t = bool (*)(ggml_backend_t backend, uint32_t hold_us);
 using ggml_backend_async_flush_t = void (*)(ggml_backend_t backend);
+using ggml_backend_async_staging_buffer_type_t =
+    ggml_backend_buffer_type_t (*)(ggml_backend_t backend);
 
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
@@ -958,13 +1014,20 @@ struct ggml_backend_sched {
     int64_t cpu_graph_last_end_us[GGML_SCHED_MAX_BACKENDS];
     ggml_backend_cpu_prewake_hold_t cpu_graph_prewake_hold_fns[GGML_SCHED_MAX_BACKENDS];
     ggml_backend_async_flush_t async_flush_fns[GGML_SCHED_MAX_BACKENDS];
+    ggml_backend_async_staging_buffer_type_t async_staging_buft_fns[GGML_SCHED_MAX_BACKENDS];
+    ggml_backend_attn_out_direct_scatter_t attn_out_direct_scatter_fns[GGML_SCHED_MAX_BACKENDS];
     bool attn_out_defer_opencl_sync;
+    bool attn_out_direct_scatter;
+    bool qkv_lazy_opencl_sync;
+    bool ffn_add4_lazy_opencl_sync;
+    bool ffn_prefetch_reduce_inputs;
 
     // Non-trivial worker state is owned separately because this scheduler is
     // allocated with calloc/free.
     ggml_backend_sched_ffn_executor * ffn_device_executor;
     ggml_backend_sched_layer_checkpoint_state * layer_checkpoints;
     ggml_backend_sched_route_candidate_state * route_candidates;
+    ggml_backend_sched_qkv_lazy_opencl_state * qkv_lazy_opencl;
 
     char * context_buffer;
     size_t context_buffer_size;
@@ -1010,6 +1073,75 @@ static ggml_backend_sched_route_candidate_state * ggml_backend_sched_ensure_rout
         GGML_LOG_ERROR("%s: failed to allocate route candidate state\n", __func__);
     }
     return sched->route_candidates;
+}
+
+static ggml_backend_sched_qkv_lazy_opencl_state *
+ggml_backend_sched_ensure_qkv_lazy_opencl_state(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched != nullptr);
+    if (sched->qkv_lazy_opencl != nullptr) {
+        return sched->qkv_lazy_opencl;
+    }
+    try {
+        sched->qkv_lazy_opencl = new ggml_backend_sched_qkv_lazy_opencl_state();
+    } catch (const std::exception & error) {
+        GGML_LOG_ERROR("%s: failed to allocate lazy OpenCL state: %s\n", __func__, error.what());
+    } catch (...) {
+        GGML_LOG_ERROR("%s: failed to allocate lazy OpenCL state\n", __func__);
+    }
+    return sched->qkv_lazy_opencl;
+}
+
+static void ggml_backend_sched_qkv_lazy_opencl_note_synchronized(
+        ggml_backend_sched_t sched) {
+    if (sched == nullptr || sched->qkv_lazy_opencl == nullptr) {
+        return;
+    }
+
+    sched->qkv_lazy_opencl->pending.clear();
+    for (auto & slot : sched->qkv_lazy_opencl->slots) {
+        slot.in_flight = false;
+    }
+}
+
+static void ggml_backend_sched_qkv_lazy_opencl_drain(ggml_backend_sched_t sched) {
+    if (sched == nullptr || sched->qkv_lazy_opencl == nullptr) {
+        return;
+    }
+
+    bool synchronize_backend[GGML_SCHED_MAX_BACKENDS] = {};
+    const auto & state = *sched->qkv_lazy_opencl;
+    if (state.pending.active &&
+            state.pending.backend_id >= 0 && state.pending.backend_id < sched->n_backends) {
+        synchronize_backend[state.pending.backend_id] = true;
+    }
+    for (const auto & slot : state.slots) {
+        if (slot.in_flight && slot.backend_id >= 0 && slot.backend_id < sched->n_backends) {
+            synchronize_backend[slot.backend_id] = true;
+        }
+    }
+
+    for (int backend_id = 0; backend_id < sched->n_backends; ++backend_id) {
+        if (synchronize_backend[backend_id]) {
+            ggml_backend_synchronize(sched->backends[backend_id]);
+        }
+    }
+    ggml_backend_sched_qkv_lazy_opencl_note_synchronized(sched);
+}
+
+static void ggml_backend_sched_qkv_lazy_opencl_free_state(ggml_backend_sched_t sched) {
+    if (sched == nullptr || sched->qkv_lazy_opencl == nullptr) {
+        return;
+    }
+
+    ggml_backend_sched_qkv_lazy_opencl_drain(sched);
+    for (auto & slot : sched->qkv_lazy_opencl->slots) {
+        ggml_backend_event_free(slot.event);
+        ggml_backend_buffer_free(slot.buffer);
+        slot.event = nullptr;
+        slot.buffer = nullptr;
+    }
+    delete sched->qkv_lazy_opencl;
+    sched->qkv_lazy_opencl = nullptr;
 }
 
 using ggml_backend_sched_ffn_job_fn = void (*)(void *);
@@ -1405,6 +1537,81 @@ static bool ggml_backend_sched_attn_out_defer_opencl_sync_enabled() {
     return false;
 }
 
+static bool ggml_backend_sched_attn_out_direct_scatter_enabled() {
+    const char * value = getenv("GGML_ATTN_OUT_DIRECT_SCATTER");
+    if (value == nullptr || value[0] == '\0') {
+        return false;
+    }
+    if (strcmp(value, "1") == 0 || strcmp(value, "on") == 0 || strcmp(value, "ON") == 0 ||
+            strcmp(value, "true") == 0 || strcmp(value, "TRUE") == 0 ||
+            strcmp(value, "yes") == 0 || strcmp(value, "YES") == 0) {
+        return true;
+    }
+    if (strcmp(value, "0") == 0 || strcmp(value, "off") == 0 || strcmp(value, "OFF") == 0 ||
+            strcmp(value, "false") == 0 || strcmp(value, "FALSE") == 0 ||
+            strcmp(value, "no") == 0 || strcmp(value, "NO") == 0) {
+        return false;
+    }
+
+    GGML_LOG_WARN(
+            "%s: invalid GGML_ATTN_OUT_DIRECT_SCATTER='%s'; using the original CONCAT path\n",
+            __func__, value);
+    return false;
+}
+
+static bool ggml_backend_sched_qkv_lazy_opencl_sync_enabled() {
+    const char * value = getenv("GGML_QKV_LAZY_OPENCL_SYNC");
+    if (value == nullptr || value[0] == '\0') {
+        return false;
+    }
+    if (strcmp(value, "1") == 0 || strcmp(value, "on") == 0 || strcmp(value, "ON") == 0 ||
+            strcmp(value, "true") == 0 || strcmp(value, "TRUE") == 0 ||
+            strcmp(value, "yes") == 0 || strcmp(value, "YES") == 0) {
+        return true;
+    }
+    if (strcmp(value, "0") == 0 || strcmp(value, "off") == 0 || strcmp(value, "OFF") == 0 ||
+            strcmp(value, "false") == 0 || strcmp(value, "FALSE") == 0 ||
+            strcmp(value, "no") == 0 || strcmp(value, "NO") == 0) {
+        return false;
+    }
+
+    GGML_LOG_WARN(
+            "%s: invalid GGML_QKV_LAZY_OPENCL_SYNC='%s'; using legacy full synchronization\n",
+            __func__, value);
+    return false;
+}
+
+static bool ggml_backend_sched_ffn_prefetch_reduce_inputs_enabled() {
+    const char * value = getenv("GGML_FFN_PREFETCH_REDUCE_INPUTS");
+    if (value == nullptr || value[0] == '\0') {
+        return false;
+    }
+    if (strcmp(value, "1") == 0 || strcmp(value, "on") == 0 || strcmp(value, "ON") == 0 ||
+            strcmp(value, "true") == 0 || strcmp(value, "TRUE") == 0 ||
+            strcmp(value, "yes") == 0 || strcmp(value, "YES") == 0) {
+        return true;
+    }
+    if (strcmp(value, "0") == 0 || strcmp(value, "off") == 0 || strcmp(value, "OFF") == 0 ||
+            strcmp(value, "false") == 0 || strcmp(value, "FALSE") == 0 ||
+            strcmp(value, "no") == 0 || strcmp(value, "NO") == 0) {
+        return false;
+    }
+
+    GGML_LOG_WARN(
+            "%s: invalid GGML_FFN_PREFETCH_REDUCE_INPUTS='%s'; using legacy reduce copies\n",
+            __func__, value);
+    return false;
+}
+
+static bool ggml_backend_sched_ffn_add4_lazy_opencl_sync_enabled() {
+    // The graph builder emits the OpenCL-resident fused consumer only under
+    // this explicit llama-level opt-in. The scheduler still requires the
+    // backend's targeted async upload/event capabilities, which are exposed
+    // only when GGML_OPENCL_ASYNC_EVENTS=1.
+    const char * value = getenv("LLAMA_FFN_FUSED_ADD4");
+    return value != nullptr && atoi(value) != 0;
+}
+
 static int ggml_backend_sched_ffn_worker_cpu(const char * env_name, int fallback_cpu) {
     GGML_ASSERT(env_name != nullptr);
 
@@ -1473,6 +1680,76 @@ static uint32_t ggml_backend_sched_cpu_graph_prewake_idle_us() {
             60000000UL);
 }
 
+struct ggml_backend_sched_ffn_prefetch_copy {
+    const struct ggml_tensor * src = nullptr;
+    struct ggml_tensor * dst = nullptr;
+};
+
+// Each branch record is written only by the worker executing that branch and
+// is read by the scheduler only after the matching ticket wait/thread join.
+// Keeping the copy list fixed-size makes the opt-in path allocation-free.
+struct alignas(64) ggml_backend_sched_ffn_prefetch_branch {
+    ggml_backend_sched_ffn_prefetch_copy copies[GGML_SCHED_MAX_SPLIT_INPUTS];
+    int n_copies = 0;
+    bool active = false;
+    bool attempted = false;
+    bool succeeded = false;
+    int64_t copy_us = 0;
+};
+
+struct ggml_backend_sched_ffn_prefetch_plan {
+    bool active = false;
+    int reduce_split_id = -1;
+    int reduce_backend_id = -1;
+    int reduce_n_inputs = 0;
+    int input_owner[GGML_SCHED_MAX_SPLIT_INPUTS] = {};
+    ggml_backend_sched_ffn_prefetch_branch branches[GGML_SCHED_MAX_BACKENDS];
+};
+
+struct ggml_backend_sched_ffn_prefetch_pending {
+    bool active = false;
+    int reduce_split_id = -1;
+    int reduce_backend_id = -1;
+    int reduce_n_inputs = 0;
+    bool input_ready[GGML_SCHED_MAX_SPLIT_INPUTS] = {};
+
+    void clear() {
+        active = false;
+        reduce_split_id = -1;
+        reduce_backend_id = -1;
+        reduce_n_inputs = 0;
+        memset(input_ready, 0, sizeof(input_ready));
+    }
+};
+
+static void ggml_backend_sched_run_ffn_prefetch_copies(
+        ggml_backend_sched_ffn_prefetch_branch * branch,
+        const char * backend_name) noexcept {
+    GGML_ASSERT(branch != nullptr);
+    GGML_ASSERT(branch->active);
+
+    branch->attempted = true;
+    branch->succeeded = false;
+    const int64_t t0_us = ggml_time_us();
+    try {
+        for (int copy_id = 0; copy_id < branch->n_copies; ++copy_id) {
+            const auto & copy = branch->copies[copy_id];
+            GGML_ASSERT(copy.src != nullptr && copy.dst != nullptr);
+            ggml_backend_tensor_copy(copy.src, copy.dst);
+        }
+        branch->succeeded = true;
+    } catch (const std::exception & error) {
+        GGML_LOG_ERROR(
+                "%s: backend %s threw while prefetching FFN reduce inputs: %s\n",
+                __func__, backend_name != nullptr ? backend_name : "", error.what());
+    } catch (...) {
+        GGML_LOG_ERROR(
+                "%s: backend %s threw while prefetching FFN reduce inputs\n",
+                __func__, backend_name != nullptr ? backend_name : "");
+    }
+    branch->copy_us = ggml_time_us() - t0_us;
+}
+
 struct ggml_backend_sched_ffn_device_job {
     ggml_backend_t backend = nullptr;
     struct ggml_cgraph * graph = nullptr;
@@ -1480,6 +1757,7 @@ struct ggml_backend_sched_ffn_device_job {
     int64_t * dt_us = nullptr;
     ggml_backend_sched_ffn_worker_timeline * timeline = nullptr;
     ggml_backend_async_flush_t flush_after_submit = nullptr;
+    ggml_backend_sched_ffn_prefetch_branch * prefetch = nullptr;
     bool sync_after = true;
 };
 
@@ -1496,6 +1774,7 @@ static void ggml_backend_sched_run_ffn_device_job(void * context) {
         job->timeline->backend_begin_us = t0_us;
     }
     enum ggml_status status = GGML_STATUS_FAILED;
+    int64_t compute_t1_us = t0_us;
     try {
         status = ggml_backend_graph_compute_async(job->backend, job->graph);
         if (job->timeline != nullptr) {
@@ -1524,21 +1803,31 @@ static void ggml_backend_sched_run_ffn_device_job(void * context) {
                 }
             }
         }
+        compute_t1_us = ggml_time_us();
+        if (status == GGML_STATUS_SUCCESS && job->prefetch != nullptr) {
+            // The source backend has completed above. Snapshot its branch
+            // result directly into the already-idle CPU reduce copy while
+            // slower sibling branches are still running.
+            ggml_backend_sched_run_ffn_prefetch_copies(
+                    job->prefetch, ggml_backend_name(job->backend));
+        }
     } catch (const std::exception & error) {
+        compute_t1_us = ggml_time_us();
         status = GGML_STATUS_FAILED;
         GGML_LOG_ERROR(
                 "%s: backend %s threw while executing a persistent FFN job: %s\n",
                 __func__, ggml_backend_name(job->backend), error.what());
     } catch (...) {
+        compute_t1_us = ggml_time_us();
         status = GGML_STATUS_FAILED;
         GGML_LOG_ERROR(
                 "%s: backend %s threw while executing a persistent FFN job\n",
                 __func__, ggml_backend_name(job->backend));
     }
-    const int64_t t1_us = ggml_time_us();
-
     *job->status = status;
-    *job->dt_us = t1_us - t0_us;
+    // Keep prefetch transfer time in the branch I/O bucket rather than
+    // inflating raw backend compute/synchronize time.
+    *job->dt_us = compute_t1_us - t0_us;
 }
 
 //
@@ -3970,13 +4259,65 @@ static bool ggml_backend_sched_collect_parallel_join_info(
 
 static bool ggml_backend_sched_collect_parallel_reduce_info(
         const struct ggml_tensor * node, ggml_backend_sched_parallel_reduce_info * info) {
-    return ggml_backend_sched_collect_parallel_join_info(node, GGML_OP_ADD, info);
+    if (node != nullptr && node->op == GGML_OP_ADD) {
+        return ggml_backend_sched_collect_parallel_join_info(node, GGML_OP_ADD, info);
+    }
+
+    // The opt-in fused FFN forms replace a two-node ADD tree with either a
+    // MAP_CUSTOM3 reduction or ADD4 reduce+residual. Treat only their exact,
+    // homogeneous three-branch shape as a join; arbitrary custom callbacks or
+    // ADD4 nodes must never acquire parallel scheduling semantics.
+    if (node == nullptr ||
+            (node->op != GGML_OP_MAP_CUSTOM3 && node->op != GGML_OP_ADD4)) {
+        return false;
+    }
+
+    // ADD4's fourth source is the residual, never another FFN branch. Requiring
+    // that distinction keeps the join classifier fail-closed for general
+    // four-input pointwise use.
+    if (node->op == GGML_OP_ADD4 &&
+            ggml_backend_sched_parse_parallel_branch_node(
+                node->src[3], nullptr, nullptr, nullptr)) {
+        return false;
+    }
+
+    ggml_backend_sched_parallel_reduce_info source_info[3];
+    for (int i = 0; i < 3; ++i) {
+        std::string source_branch;
+        if (!ggml_backend_sched_parse_parallel_branch_node(
+                    node->src[i],
+                    &source_info[i].kind,
+                    &source_branch,
+                    &source_info[i].layer)) {
+            return false;
+        }
+        source_info[i].branches.push_back(std::move(source_branch));
+        if (source_info[i].kind != "ffn" ||
+                (i > 0 && (source_info[i].kind != source_info[0].kind ||
+                           source_info[i].layer != source_info[0].layer))) {
+            return false;
+        }
+        for (int j = 0; j < i; ++j) {
+            if (source_info[i].branches.front() == source_info[j].branches.front()) {
+                return false;
+            }
+        }
+    }
+
+    info->kind = std::move(source_info[0].kind);
+    info->layer = source_info[0].layer;
+    info->branches.clear();
+    info->branches.reserve(3);
+    for (auto & source : source_info) {
+        info->branches.push_back(std::move(source.branches.front()));
+    }
+    return true;
 }
 
 static bool ggml_backend_sched_is_parallel_reduce_node(const struct ggml_tensor * node) {
     ggml_backend_sched_parallel_reduce_info info;
-    return node != nullptr && node->op == GGML_OP_ADD &&
-        ggml_backend_sched_collect_parallel_reduce_info(node, &info) && info.branches.size() >= 2;
+    return ggml_backend_sched_collect_parallel_reduce_info(node, &info) &&
+        info.branches.size() >= 2;
 }
 
 static bool ggml_backend_sched_is_parallel_concat_node(const struct ggml_tensor * node) {
@@ -3993,9 +4334,95 @@ static bool ggml_backend_sched_is_parallel_join_node(const struct ggml_tensor * 
 
 static bool ggml_backend_sched_is_ffn_parallel_reduce_node(const struct ggml_tensor * node) {
     ggml_backend_sched_parallel_reduce_info info;
-    return node != nullptr && node->op == GGML_OP_ADD &&
-        ggml_backend_sched_collect_parallel_reduce_info(node, &info) &&
+    return ggml_backend_sched_collect_parallel_reduce_info(node, &info) &&
         info.kind == "ffn" && info.branches.size() >= 2;
+}
+
+struct ggml_backend_sched_attn_out_direct_scatter_candidate {
+    int layer = -1;
+    std::vector<struct ggml_tensor *> srcs;
+    std::vector<int64_t> offsets;
+    std::vector<struct ggml_tensor *> join_nodes;
+    std::vector<std::string> branches;
+};
+
+static bool ggml_backend_sched_collect_attn_out_direct_scatter_tree(
+        struct ggml_tensor * node,
+        ggml_backend_sched_attn_out_direct_scatter_candidate * candidate) {
+    GGML_ASSERT(candidate != nullptr);
+
+    std::string kind;
+    std::string branch;
+    int layer = -1;
+    if (ggml_backend_sched_parse_parallel_branch_node(
+                node, &kind, &branch, &layer)) {
+        if (kind != "attn_out_shard" || node == nullptr ||
+                node->type != GGML_TYPE_F32 || node->view_src != nullptr ||
+                !ggml_is_contiguous(node) || node->ne[0] <= 0 ||
+                node->ne[1] <= 0 || node->ne[2] != 1 || node->ne[3] != 1 ||
+                std::find(candidate->branches.begin(), candidate->branches.end(), branch) !=
+                    candidate->branches.end()) {
+            return false;
+        }
+        if (candidate->layer >= 0 && candidate->layer != layer) {
+            return false;
+        }
+        candidate->layer = layer;
+        candidate->branches.push_back(std::move(branch));
+        candidate->srcs.push_back(node);
+        return candidate->srcs.size() <= 3;
+    }
+
+    if (node == nullptr || node->op != GGML_OP_CONCAT ||
+            ggml_get_op_params_i32(node, 0) != 0 ||
+            node->type != GGML_TYPE_F32 || node->view_src != nullptr ||
+            !ggml_is_contiguous(node) || node->ne[0] <= 0 ||
+            node->ne[1] <= 0 || node->ne[2] != 1 || node->ne[3] != 1 ||
+            node->src[0] == nullptr || node->src[1] == nullptr) {
+        return false;
+    }
+
+    if (!ggml_backend_sched_collect_attn_out_direct_scatter_tree(
+                node->src[0], candidate) ||
+            !ggml_backend_sched_collect_attn_out_direct_scatter_tree(
+                node->src[1], candidate)) {
+        return false;
+    }
+    candidate->join_nodes.push_back(node);
+    return candidate->join_nodes.size() <= 2;
+}
+
+static bool ggml_backend_sched_classify_attn_out_direct_scatter(
+        struct ggml_tensor * node,
+        ggml_backend_sched_attn_out_direct_scatter_candidate * candidate) {
+    GGML_ASSERT(candidate != nullptr);
+    *candidate = {};
+
+    if (node == nullptr || node->op != GGML_OP_CONCAT ||
+            !ggml_backend_sched_collect_attn_out_direct_scatter_tree(node, candidate) ||
+            candidate->srcs.size() < 2 || candidate->srcs.size() > 3 ||
+            candidate->join_nodes.size() + 1 != candidate->srcs.size()) {
+        *candidate = {};
+        return false;
+    }
+
+    int64_t covered = 0;
+    candidate->offsets.reserve(candidate->srcs.size());
+    for (const struct ggml_tensor * src : candidate->srcs) {
+        if (src->ne[1] != node->ne[1] || src->ne[2] != node->ne[2] ||
+                src->ne[3] != node->ne[3] ||
+                src->ne[0] > node->ne[0] - covered) {
+            *candidate = {};
+            return false;
+        }
+        candidate->offsets.push_back(covered);
+        covered += src->ne[0];
+    }
+    if (covered != node->ne[0]) {
+        *candidate = {};
+        return false;
+    }
+    return true;
 }
 
 static bool ggml_backend_sched_route_tensor_registered(
@@ -4771,6 +5198,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         split->has_attn_out_parallel_concat = false;
         split->attn_out_parallel_concat_layer = -1;
         split->attn_out_parallel_concat_branches = 0;
+        ggml_backend_sched_clear_attn_out_direct_scatter(split);
         int cur_backend_id = split->backend_id;
         int pending_checkpoint_index = -1;
         size_t next_checkpoint = 0;
@@ -4790,24 +5218,38 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         std::vector<std::string> parallel_join_kinds(graph->n_nodes);
         std::vector<int> parallel_join_layers(graph->n_nodes, -1);
         std::vector<int> parallel_join_branch_counts(graph->n_nodes, 0);
+        std::vector<ggml_backend_sched_attn_out_direct_scatter_candidate>
+            attn_out_direct_scatter_candidates;
+        if (sched->attn_out_direct_scatter) {
+            attn_out_direct_scatter_candidates.resize((size_t) graph->n_nodes);
+        }
         for (int j = 0; j < graph->n_nodes; ++j) {
-            const struct ggml_tensor * node = graph->nodes[j];
-            // Classify one homogeneous ADD-reduction or CONCAT-assembly tree.
-            // FFN's CPU thread override remains ADD-only, while either join op
-            // must be kept out of the final branch split.
+            struct ggml_tensor * node = graph->nodes[j];
+            // Classify one homogeneous ADD reduction (including the exact
+            // fused ADD3/ADD4 forms) or CONCAT assembly tree. FFN's CPU thread
+            // override applies when the selected backend is CPU, while every
+            // join must be kept out of the final branch split.
             ggml_backend_sched_parallel_reduce_info join_info;
-            const bool has_supported_join_op = node != nullptr &&
-                (node->op == GGML_OP_ADD || node->op == GGML_OP_CONCAT);
-            const bool is_parallel_join = has_supported_join_op &&
-                ggml_backend_sched_collect_parallel_join_info(node, node->op, &join_info) &&
+            const bool is_add_reduce = node != nullptr &&
+                (node->op == GGML_OP_ADD || node->op == GGML_OP_MAP_CUSTOM3 ||
+                 node->op == GGML_OP_ADD4) &&
+                ggml_backend_sched_collect_parallel_reduce_info(node, &join_info) &&
                 join_info.branches.size() >= 2;
+            const bool is_concat_join = node != nullptr && node->op == GGML_OP_CONCAT &&
+                ggml_backend_sched_collect_parallel_join_info(
+                    node, GGML_OP_CONCAT, &join_info) &&
+                join_info.branches.size() >= 2;
+            const bool is_parallel_join = is_add_reduce || is_concat_join;
             parallel_join_nodes[j] = is_parallel_join;
-            ffn_parallel_reduce_nodes[j] = is_parallel_join && node->op == GGML_OP_ADD &&
-                join_info.kind == "ffn";
+            ffn_parallel_reduce_nodes[j] = is_add_reduce && join_info.kind == "ffn";
             if (is_parallel_join) {
                 parallel_join_kinds[j] = join_info.kind;
                 parallel_join_layers[j] = join_info.layer;
                 parallel_join_branch_counts[j] = (int) join_info.branches.size();
+            }
+            if (sched->attn_out_direct_scatter) {
+                (void) ggml_backend_sched_classify_attn_out_direct_scatter(
+                        node, &attn_out_direct_scatter_candidates[(size_t) j]);
             }
             std::string kind;
             std::string branch;
@@ -5027,6 +5469,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 split->has_attn_out_parallel_concat = false;
                 split->attn_out_parallel_concat_layer = -1;
                 split->attn_out_parallel_concat_branches = 0;
+                ggml_backend_sched_clear_attn_out_direct_scatter(split);
                 cur_backend_id = node_backend_id;
                 cur_split_has_parallel_branch = false;
                 cur_split_needs_parallel_branch_isolation = false;
@@ -5061,6 +5504,37 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 split->has_attn_out_parallel_concat = true;
                 split->attn_out_parallel_concat_layer = parallel_join_layers[i];
                 split->attn_out_parallel_concat_branches = parallel_join_branch_counts[i];
+            }
+            // Keep only a terminal, pure output-axis CONCAT candidate.  A
+            // later executable node (for example W_O scale/bias) clears this
+            // metadata, so the optimization can never skip post-processing.
+            ggml_backend_sched_clear_attn_out_direct_scatter(split);
+            if (sched->attn_out_direct_scatter &&
+                    !attn_out_direct_scatter_candidates[(size_t) i].srcs.empty()) {
+                const auto & scatter_candidate =
+                    attn_out_direct_scatter_candidates[(size_t) i];
+                GGML_ASSERT(scatter_candidate.srcs.size() <= 3);
+                GGML_ASSERT(scatter_candidate.join_nodes.size() <= 2);
+                split->has_attn_out_direct_scatter = true;
+                split->attn_out_direct_scatter_dst = node;
+                split->attn_out_direct_scatter_slices =
+                    (int) scatter_candidate.srcs.size();
+                split->attn_out_direct_scatter_join_count =
+                    (int) scatter_candidate.join_nodes.size();
+                for (int scatter_id = 0;
+                        scatter_id < split->attn_out_direct_scatter_slices;
+                        ++scatter_id) {
+                    split->attn_out_direct_scatter_srcs[scatter_id] =
+                        scatter_candidate.srcs[(size_t) scatter_id];
+                    split->attn_out_direct_scatter_offsets[scatter_id] =
+                        scatter_candidate.offsets[(size_t) scatter_id];
+                }
+                for (int join_id = 0;
+                        join_id < split->attn_out_direct_scatter_join_count;
+                        ++join_id) {
+                    split->attn_out_direct_scatter_join_nodes[join_id] =
+                        scatter_candidate.join_nodes[(size_t) join_id];
+                }
             }
             cur_route_group = node_route_group;
             cur_route_variant = node_route_variant;
@@ -5606,6 +6080,320 @@ static int ggml_backend_sched_attn_out_deferred_sync_branch(
     return deferred_branch;
 }
 
+static bool ggml_backend_sched_qkv_lazy_tensor_matches_group_node(
+        const struct ggml_tensor * tensor,
+        const struct ggml_tensor * node) {
+    const struct ggml_tensor * cursor = tensor;
+    for (int depth = 0; cursor != nullptr && depth < 16; ++depth) {
+        if (cursor == node) {
+            return true;
+        }
+        if (cursor->view_src != nullptr) {
+            cursor = cursor->view_src;
+        } else if (ggml_is_view_op(cursor->op)) {
+            cursor = cursor->src[0];
+        } else {
+            break;
+        }
+    }
+    return false;
+}
+
+static int ggml_backend_sched_qkv_lazy_group_tensor_owner(
+        const struct ggml_backend_sched_split * splits,
+        int split_id,
+        int group_size,
+        const struct ggml_tensor * tensor) {
+    for (int branch = 0; branch < group_size; ++branch) {
+        const struct ggml_cgraph & graph = splits[split_id + branch].graph;
+        for (int node_id = 0; node_id < graph.n_nodes; ++node_id) {
+            if (ggml_backend_sched_qkv_lazy_tensor_matches_group_node(
+                        tensor, graph.nodes[node_id])) {
+                return branch;
+            }
+        }
+    }
+    return -1;
+}
+
+static bool ggml_backend_sched_qkv_lazy_consumer_reads_group(
+        const struct ggml_backend_sched_split * splits,
+        int split_id,
+        int group_size,
+        const struct ggml_backend_sched_split * consumer) {
+    for (int input_id = 0; input_id < consumer->n_inputs; ++input_id) {
+        if (ggml_backend_sched_qkv_lazy_group_tensor_owner(
+                    splits, split_id, group_size, consumer->inputs[input_id]) >= 0) {
+            return true;
+        }
+    }
+    for (int node_id = 0; node_id < consumer->graph.n_nodes; ++node_id) {
+        const struct ggml_tensor * node = consumer->graph.nodes[node_id];
+        for (int src_id = 0; src_id < GGML_MAX_SRC; ++src_id) {
+            if (node->src[src_id] != nullptr &&
+                    ggml_backend_sched_qkv_lazy_group_tensor_owner(
+                        splits, split_id, group_size, node->src[src_id]) >= 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool ggml_backend_sched_qkv_lazy_backend_compatible(
+        const ggml_backend_sched_t sched,
+        int backend_id,
+        const char ** reason) {
+    GGML_ASSERT(reason != nullptr);
+    if (backend_id < 0 || backend_id >= sched->n_backends) {
+        *reason = "invalid consumer backend";
+        return false;
+    }
+
+    ggml_backend_t backend = sched->backends[backend_id];
+    ggml_backend_dev_t device = ggml_backend_get_device(backend);
+    if (device == nullptr || sched->async_flush_fns[backend_id] == nullptr) {
+        *reason = "consumer has no async flush";
+        return false;
+    }
+
+    if (sched->async_staging_buft_fns[backend_id] == nullptr ||
+            backend->iface.set_tensor_async == nullptr ||
+            backend->iface.event_record == nullptr ||
+            device->iface.event_new == nullptr ||
+            device->iface.event_synchronize == nullptr) {
+        *reason = "consumer lacks async upload/event/host-staging capabilities";
+        return false;
+    }
+    if (sched->async_staging_buft_fns[backend_id](backend) == nullptr) {
+        *reason = "consumer host staging buffer type unavailable";
+        return false;
+    }
+    return true;
+}
+
+static int ggml_backend_sched_qkv_lazy_acquire_staging_slot(
+        ggml_backend_sched_t sched,
+        int backend_id,
+        size_t size,
+        uint64_t batch_id,
+        const char ** reason) {
+    GGML_ASSERT(sched != nullptr);
+    GGML_ASSERT(sched->qkv_lazy_opencl != nullptr);
+    GGML_ASSERT(reason != nullptr);
+
+    auto & state = *sched->qkv_lazy_opencl;
+    int slot_id = -1;
+    for (size_t i = 0; i < state.slots.size(); ++i) {
+        auto & slot = state.slots[i];
+        if (slot.backend_id == backend_id && slot.batch_id != batch_id &&
+                slot.capacity >= size) {
+            slot_id = (int) i;
+            break;
+        }
+    }
+    if (slot_id < 0) {
+        for (size_t i = 0; i < state.slots.size(); ++i) {
+            auto & slot = state.slots[i];
+            if (slot.backend_id == backend_id && slot.batch_id != batch_id) {
+                slot_id = (int) i;
+                break;
+            }
+        }
+    }
+    if (slot_id < 0) {
+        try {
+            state.slots.emplace_back();
+        } catch (const std::exception & error) {
+            GGML_LOG_ERROR("%s: failed to grow QKV staging ring: %s\n", __func__, error.what());
+            *reason = "staging ring allocation failed";
+            return -1;
+        } catch (...) {
+            *reason = "staging ring allocation failed";
+            return -1;
+        }
+        slot_id = (int) state.slots.size() - 1;
+        state.slots[slot_id].backend_id = backend_id;
+    }
+
+    auto & slot = state.slots[slot_id];
+    if (slot.in_flight) {
+        ggml_backend_event_synchronize(slot.event);
+        slot.in_flight = false;
+    }
+
+    if (slot.event == nullptr) {
+        slot.event = ggml_backend_event_new(ggml_backend_get_device(sched->backends[backend_id]));
+        if (slot.event == nullptr) {
+            *reason = "staging completion event allocation failed";
+            return -1;
+        }
+    }
+    if (slot.buffer == nullptr || slot.capacity < size) {
+        ggml_backend_buffer_free(slot.buffer);
+        slot.buffer = nullptr;
+        slot.capacity = 0;
+        ggml_backend_buffer_type_t host_buft =
+            sched->async_staging_buft_fns[backend_id](sched->backends[backend_id]);
+        if (host_buft == nullptr) {
+            *reason = "staging buffer type became unavailable";
+            return -1;
+        }
+        slot.buffer = ggml_backend_buft_alloc_buffer(host_buft, std::max<size_t>(size, 1));
+        if (slot.buffer == nullptr || ggml_backend_buffer_get_base(slot.buffer) == nullptr) {
+            ggml_backend_buffer_free(slot.buffer);
+            slot.buffer = nullptr;
+            *reason = "staging buffer allocation failed";
+            return -1;
+        }
+        slot.capacity = std::max<size_t>(size, 1);
+    }
+    slot.batch_id = batch_id;
+    return slot_id;
+}
+
+static int ggml_backend_sched_lazy_opencl_deferred_sync_branch(
+        ggml_backend_sched_t sched,
+        const struct ggml_backend_sched_split * splits,
+        int n_splits,
+        int split_id,
+        int group_size,
+        int consumer_split_id,
+        const std::vector<ggml_backend_sched_ffn_branch_info> & infos,
+        bool run_group_serially,
+        bool route_requires_commit,
+        uint64_t * batch_id,
+        std::vector<int> * input_slots,
+        const char ** reason) {
+    GGML_ASSERT(sched != nullptr);
+    GGML_ASSERT(splits != nullptr);
+    GGML_ASSERT(batch_id != nullptr);
+    GGML_ASSERT(input_slots != nullptr);
+    GGML_ASSERT(reason != nullptr);
+    *batch_id = 0;
+    input_slots->clear();
+
+    const bool qkv_topology = (int) infos.size() == group_size && !infos.empty() &&
+        (infos[0].kind == "attn_qkv" || infos[0].kind == "attn_qkv_shard");
+    const bool ffn_topology = (int) infos.size() == group_size && !infos.empty() &&
+        infos[0].kind == "ffn";
+    const bool qkv_requested = sched->qkv_lazy_opencl_sync && qkv_topology;
+    const bool ffn_add4_requested =
+        sched->ffn_add4_lazy_opencl_sync && ffn_topology;
+    if (!qkv_requested && !ffn_add4_requested) {
+        *reason = "feature/group kind disabled";
+        return -1;
+    }
+    if (run_group_serially || group_size < 2 || group_size > 3 ||
+            (int) infos.size() != group_size) {
+        *reason = "group is not an eligible parallel lazy-OpenCL topology";
+        return -1;
+    }
+    if (ffn_add4_requested && group_size != 3) {
+        *reason = "fused ADD4 requires exactly three FFN branches";
+        return -1;
+    }
+    if (route_requires_commit) {
+        *reason = ffn_add4_requested
+            ? "selected FFN route requires a cross-backend atomic canonical commit"
+            : "selected route requires alternate-to-canonical commit";
+        return -1;
+    }
+    if (splits[split_id + group_size - 1].checkpoint_index_after >= 0) {
+        *reason = "layer callback/checkpoint separates the group from its consumer";
+        return -1;
+    }
+
+    if (consumer_split_id < split_id + group_size || consumer_split_id >= n_splits) {
+        *reason = "parallel group has no immediate consumer split";
+        return -1;
+    }
+    const struct ggml_backend_sched_split * consumer = &splits[consumer_split_id];
+    if (ffn_add4_requested &&
+            (consumer->graph.n_nodes <= 0 ||
+             consumer->graph.nodes[0]->op != GGML_OP_ADD4 ||
+             !consumer->is_ffn_parallel_reduce)) {
+        *reason = "next FFN consumer is not the fused ADD4 reduce";
+        return -1;
+    }
+    if (!ggml_backend_sched_qkv_lazy_consumer_reads_group(
+                splits, split_id, group_size, consumer)) {
+        *reason = "next split is not an actual parallel-group consumer";
+        return -1;
+    }
+
+    int deferred_branch = -1;
+    for (int branch = 0; branch < group_size; ++branch) {
+        if (splits[split_id + branch].backend_id != consumer->backend_id) {
+            continue;
+        }
+        if (deferred_branch >= 0) {
+            *reason = "multiple parallel branches share the consumer backend";
+            return -1;
+        }
+        deferred_branch = branch;
+    }
+    if (deferred_branch < 0) {
+        *reason = "no parallel branch shares the next consumer backend";
+        return -1;
+    }
+    if (!ggml_backend_sched_qkv_lazy_backend_compatible(
+                sched, consumer->backend_id, reason)) {
+        return -1;
+    }
+
+    for (int input_id = 0; input_id < consumer->n_inputs; ++input_id) {
+        struct ggml_tensor * input = consumer->inputs[input_id];
+        const int owner = ggml_backend_sched_qkv_lazy_group_tensor_owner(
+                splits, split_id, group_size, input);
+        if (owner < 0 || owner == deferred_branch) {
+            *reason = owner < 0
+                ? "consumer has a foreign cross-backend input"
+                : "deferred branch requires a cross-backend copy";
+            return -1;
+        }
+        if ((input->flags & GGML_TENSOR_FLAG_INPUT) != 0 ||
+                !ggml_is_contiguous(input)) {
+            *reason = "source is not a snapshot-safe contiguous partial";
+            return -1;
+        }
+        const struct ggml_tensor * input_cpy =
+            tensor_copy(input, consumer->backend_id, sched->cur_copy);
+        if (input_cpy == nullptr || !ggml_are_same_layout(input, input_cpy)) {
+            *reason = "consumer copy layout is unavailable";
+            return -1;
+        }
+    }
+
+    ggml_backend_sched_qkv_lazy_opencl_state * state =
+        ggml_backend_sched_ensure_qkv_lazy_opencl_state(sched);
+    if (state == nullptr) {
+        *reason = "lazy OpenCL state allocation failed";
+        return -1;
+    }
+    uint64_t next_batch_id = state->next_batch_id++;
+    if (next_batch_id == 0) {
+        next_batch_id = state->next_batch_id++;
+    }
+    input_slots->reserve((size_t) consumer->n_inputs);
+    for (int input_id = 0; input_id < consumer->n_inputs; ++input_id) {
+        const int slot_id = ggml_backend_sched_qkv_lazy_acquire_staging_slot(
+                sched,
+                consumer->backend_id,
+                ggml_nbytes(consumer->inputs[input_id]),
+                next_batch_id,
+                reason);
+        if (slot_id < 0) {
+            input_slots->clear();
+            return -1;
+        }
+        input_slots->push_back(slot_id);
+    }
+    *batch_id = next_batch_id;
+    *reason = "eligible";
+    return deferred_branch;
+}
+
 struct ggml_backend_sched_trace_io_times {
     int64_t copy_us = 0;
     int64_t wait_us = 0;
@@ -6054,6 +6842,11 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
+    // Prefetch copies are blocking and finish before their branch completion
+    // is published, so only the immediately following reduce split needs a
+    // descriptor. Keeping this state per graph run also makes query reuse and
+    // graph failure/reset behavior default-safe.
+    ggml_backend_sched_ffn_prefetch_pending ffn_prefetch_pending;
 
     auto prof_add = [&](const ggml_cgraph & graph, ggml_sched_profile_backend_kind split_bucket, int64_t dt_us) {
         if (!ggml_sched_profile_enabled()) {
@@ -6153,7 +6946,13 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
             struct ggml_backend_sched_split * split,
             ggml_backend_sched_trace_io_times * trace_io_times,
             int64_t * cpu_idle_before_us,
-            bool * cpu_prewake_requested) {
+            bool * cpu_prewake_requested,
+            bool lazy_opencl_consumer,
+            bool ffn_prefetch_consumer,
+            int * prefetched_inputs_out) {
+        if (prefetched_inputs_out != nullptr) {
+            *prefetched_inputs_out = 0;
+        }
         if (cpu_idle_before_us != nullptr) {
             *cpu_idle_before_us = -1;
         }
@@ -6203,10 +7002,70 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
         const int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
 
+        ggml_backend_sched_qkv_lazy_opencl_pending * lazy_pending = nullptr;
+        if (lazy_opencl_consumer && sched->qkv_lazy_opencl != nullptr) {
+            lazy_pending = &sched->qkv_lazy_opencl->pending;
+            if (!lazy_pending->active || lazy_pending->backend_id != split_backend_id ||
+                    lazy_pending->input_slots.size() != (size_t) split->n_inputs) {
+                GGML_LOG_DEBUG(
+                        "sched: lazy OpenCL fallback before consumer: pending metadata mismatch\n");
+                ggml_backend_sched_qkv_lazy_opencl_drain(sched);
+                lazy_pending = nullptr;
+            }
+        }
+
+        std::vector<int> lazy_slots_to_record;
+        if (lazy_pending != nullptr) {
+            lazy_slots_to_record.reserve((size_t) split->n_inputs);
+        }
+
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+            if (ffn_prefetch_consumer && ffn_prefetch_pending.active &&
+                    ffn_prefetch_pending.input_ready[input_id]) {
+                if (prefetched_inputs_out != nullptr) {
+                    (*prefetched_inputs_out)++;
+                }
+                continue;
+            }
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+
+            if (lazy_pending != nullptr) {
+                const int slot_id = lazy_pending->input_slots[input_id];
+                if (slot_id < 0 || slot_id >= (int) sched->qkv_lazy_opencl->slots.size()) {
+                    GGML_LOG_DEBUG(
+                            "sched: lazy OpenCL fallback before consumer: invalid staging slot\n");
+                    ggml_backend_sched_qkv_lazy_opencl_drain(sched);
+                    lazy_pending = nullptr;
+                } else {
+                    auto & slot = sched->qkv_lazy_opencl->slots[slot_id];
+                    void * staging = ggml_backend_buffer_get_base(slot.buffer);
+                    const size_t size = ggml_nbytes(input);
+                    if (slot.backend_id != split_backend_id ||
+                            slot.batch_id != lazy_pending->batch_id ||
+                            slot.capacity < size || staging == nullptr) {
+                        GGML_LOG_DEBUG(
+                                "sched: lazy OpenCL fallback before consumer: stale staging slot\n");
+                        ggml_backend_sched_qkv_lazy_opencl_drain(sched);
+                        lazy_pending = nullptr;
+                    } else {
+                        const int64_t t0_us = ggml_sched_profile_time_us();
+                        // All non-deferred parallel workers have completed at
+                        // this point. Snapshot their result before returning
+                        // scratch ownership to the graph allocator, then keep
+                        // the host slot alive until the queued upload event.
+                        ggml_backend_tensor_get(input, staging, 0, size);
+                        ggml_backend_tensor_set_async(
+                                split_backend, input_cpy, staging, 0, size);
+                        const int64_t t1_us = ggml_sched_profile_time_us();
+                        add_copy_us(t1_us - t0_us);
+                        lazy_slots_to_record.push_back(slot_id);
+                        GGML_UNUSED(input_backend);
+                        continue;
+                    }
+                }
+            }
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
@@ -6398,9 +7257,182 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
             }
         }
 
+        if (lazy_pending != nullptr) {
+            for (int slot_id : lazy_slots_to_record) {
+                auto & slot = sched->qkv_lazy_opencl->slots[slot_id];
+                ggml_backend_event_record(slot.event, split_backend);
+                slot.in_flight = true;
+            }
+            // The consumer graph is submitted immediately after this copy
+            // phase on the same backend instance (therefore the same context
+            // and in-order stream). Only the host-side pending descriptor can
+            // be released here; staging slots remain event-protected.
+            lazy_pending->clear();
+        }
+
+        if (ffn_prefetch_consumer) {
+            // A prepared destination may only be consumed once. All mismatch
+            // and partial-failure cases enter this function with the flag
+            // false and therefore retain the complete legacy copy path.
+            ffn_prefetch_pending.clear();
+        }
+
         // Covers input-less CPU graphs and refreshes requests when the final
         // copy itself consumed a substantial part of the bounded hold.
         request_cpu_prewake();
+    };
+
+    auto prepare_ffn_prefetch = [&] (
+            int group_split_id,
+            int group_size,
+            const std::vector<ggml_backend_sched_ffn_branch_info> & infos,
+            bool run_group_serially,
+            int route_group_index,
+            int route_variant_index,
+            int active_split_end,
+            ggml_backend_sched_ffn_prefetch_plan * plan,
+            const char ** reason) {
+        GGML_ASSERT(plan != nullptr && reason != nullptr);
+        *plan = {};
+        for (int input_id = 0; input_id < GGML_SCHED_MAX_SPLIT_INPUTS; ++input_id) {
+            plan->input_owner[input_id] = -1;
+        }
+
+        if (!sched->ffn_prefetch_reduce_inputs) {
+            *reason = "feature disabled";
+            return false;
+        }
+        if (sched->n_copies != 1) {
+            *reason = "scheduler has multiple in-flight copy slots";
+            return false;
+        }
+        if (sched->callback_eval != nullptr) {
+            *reason = "evaluation callback is active";
+            return false;
+        }
+        if (run_group_serially || group_size < 2 || group_size > GGML_SCHED_MAX_BACKENDS ||
+                infos.empty() || infos[0].kind != "ffn") {
+            *reason = "group is not an eligible parallel FFN topology";
+            return false;
+        }
+        if (splits[group_split_id + group_size - 1].checkpoint_index_after >= 0) {
+            *reason = "layer checkpoint separates FFN branches from reduce";
+            return false;
+        }
+
+        const int reduce_split_id = group_split_id + group_size;
+        if (reduce_split_id < 0 || reduce_split_id >= sched->n_splits ||
+                reduce_split_id >= active_split_end) {
+            *reason = "FFN group has no immediate reduce split";
+            return false;
+        }
+        if (route_group_index >= 0) {
+            if constexpr (UseRouteCandidates) {
+                if (route_variant_index < 0 ||
+                        sched->route_candidates->split_to_group[reduce_split_id] !=
+                            route_group_index ||
+                        sched->route_candidates->split_to_variant[reduce_split_id] !=
+                            route_variant_index) {
+                    *reason = "immediate reduce is outside the selected route variant";
+                    return false;
+                }
+            } else {
+                *reason = "route metadata is unavailable";
+                return false;
+            }
+        }
+        struct ggml_backend_sched_split * reduce = &splits[reduce_split_id];
+        ggml_backend_t reduce_backend = sched->backends[reduce->backend_id];
+        ggml_backend_dev_t reduce_device = ggml_backend_get_device(reduce_backend);
+        if (!reduce->is_ffn_parallel_reduce || reduce->n_inputs <= 0 ||
+                reduce->n_inputs > GGML_SCHED_MAX_SPLIT_INPUTS ||
+                reduce_device == nullptr ||
+                ggml_backend_dev_type(reduce_device) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            *reason = "immediate consumer is not a bounded CPU FFN reduce";
+            return false;
+        }
+
+        bool has_remote_copy = false;
+        for (int input_id = 0; input_id < reduce->n_inputs; ++input_id) {
+            struct ggml_tensor * input = reduce->inputs[input_id];
+            const int owner = ggml_backend_sched_qkv_lazy_group_tensor_owner(
+                    splits, group_split_id, group_size, input);
+            if (owner < 0 || owner >= group_size) {
+                *reason = "reduce has a foreign or ambiguous input";
+                return false;
+            }
+
+            const int owner_backend_id = splits[group_split_id + owner].backend_id;
+            ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
+            if (input_backend != sched->backends[owner_backend_id]) {
+                *reason = "reduce input allocation does not match its branch owner";
+                return false;
+            }
+            ggml_backend_dev_t owner_device = ggml_backend_get_device(input_backend);
+            if (owner_device == nullptr ||
+                    ggml_backend_dev_type(owner_device) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                *reason = "reduce copy is not owned by a synchronized device branch";
+                return false;
+            }
+
+            struct ggml_tensor * dst = tensor_copy(
+                    input, reduce->backend_id, sched->cur_copy);
+            if (dst == nullptr || dst == input || input->buffer == nullptr ||
+                    dst->buffer == nullptr) {
+                *reason = "reduce destination copy tensor is missing or unallocated";
+                return false;
+            }
+            if (!ggml_are_same_layout(input, dst) ||
+                    !ggml_is_contiguous(input) || !ggml_is_contiguous(dst)) {
+                *reason = "reduce source/destination layout is not copy-compatible";
+                return false;
+            }
+            if (!ggml_backend_buffer_is_host(dst->buffer)) {
+                *reason = "reduce destination copy is not host-accessible";
+                return false;
+            }
+            if (!ggml_backend_supports_buft(
+                        reduce_backend, ggml_backend_buffer_get_type(dst->buffer))) {
+                *reason = "reduce destination copy buffer is unsupported by the CPU backend";
+                return false;
+            }
+
+            auto & branch = plan->branches[owner];
+            if (branch.n_copies >= GGML_SCHED_MAX_SPLIT_INPUTS) {
+                *reason = "branch prefetch list exceeds fixed capacity";
+                return false;
+            }
+            branch.copies[branch.n_copies++] = { input, dst };
+            branch.active = true;
+            plan->input_owner[input_id] = owner;
+            has_remote_copy = true;
+        }
+
+        // A valid FFN reduce consumes every remote branch exactly once (or as
+        // one of several inputs owned by that branch). Requiring all remote
+        // branches to participate prevents a future graph naming/layout
+        // change from silently publishing an incomplete pending descriptor.
+        for (int branch_id = 0; branch_id < group_size; ++branch_id) {
+            ggml_backend_dev_t device = ggml_backend_get_device(sched->backends[
+                    splits[group_split_id + branch_id].backend_id]);
+            if (device != nullptr &&
+                    ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_CPU &&
+                    !plan->branches[branch_id].active) {
+                *reason = "a remote FFN branch is not consumed by the reduce split";
+                return false;
+            }
+        }
+        if (!has_remote_copy) {
+            *reason = "reduce has no remote branch copies to overlap";
+            return false;
+        }
+
+        plan->active = true;
+        plan->reduce_split_id = reduce_split_id;
+        plan->reduce_backend_id = reduce->backend_id;
+        plan->reduce_n_inputs = reduce->n_inputs;
+        *reason = "eligible";
+        return true;
     };
 
     auto ffn_reduce_set_n_threads = [&](struct ggml_backend_sched_split * split) -> ggml_backend_set_n_threads_t {
@@ -6750,6 +7782,172 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
         }
     };
 
+    auto try_attn_out_direct_scatter = [&]
+            (int split_id,
+             int group_size,
+             int scan_end,
+             const std::vector<ggml_backend_sched_ffn_branch_info> & infos,
+             int route_group_index,
+             int route_variant_index,
+             ggml_backend_sched_trace_io_times * trace_io_times,
+             int * join_split_id_out) {
+        GGML_ASSERT(join_split_id_out != nullptr);
+        *join_split_id_out = -1;
+        if (!sched->attn_out_direct_scatter || sched->n_copies != 1 ||
+                group_size < 2 || group_size > 3 ||
+                (int) infos.size() != group_size ||
+                infos.empty() || infos[0].kind != "attn_out_shard") {
+            // Direct placement currently targets one physical output tensor.
+            // A pipelined scheduler rotates copy slots, so it needs explicit
+            // per-slot destination ownership before this can be enabled.
+            return false;
+        }
+
+        const int last_branch_split_id = split_id + group_size - 1;
+        const int join_split_id = split_id + group_size;
+        if (join_split_id >= scan_end ||
+                splits[last_branch_split_id].checkpoint_index_after >= 0) {
+            // A layer callback is a publication boundary.  Never enqueue the
+            // replacement join before that callback has observed and possibly
+            // changed the active route plan.
+            return false;
+        }
+        struct ggml_backend_sched_split * join_split = &splits[join_split_id];
+        const int join_backend_id = join_split->backend_id;
+        if (!join_split->has_attn_out_direct_scatter ||
+                !join_split->has_attn_out_parallel_concat ||
+                join_split->attn_out_parallel_concat_layer != infos[0].layer ||
+                join_split->attn_out_parallel_concat_branches != group_size ||
+                join_split->attn_out_direct_scatter_slices != group_size ||
+                join_split->attn_out_direct_scatter_join_count != group_size - 1 ||
+                join_split->checkpoint_index_after >= 0 ||
+                join_backend_id < 0 || join_backend_id >= sched->n_backends ||
+                sched->attn_out_direct_scatter_fns[join_backend_id] == nullptr ||
+                sched->async_flush_fns[join_backend_id] == nullptr ||
+                tensor_backend_id(join_split->attn_out_direct_scatter_dst) !=
+                    join_backend_id) {
+            return false;
+        }
+
+        // The skipped split must consist exactly of the CONCAT tree recorded
+        // before pass 5 rewrote foreign sources to copy tensors.  This rejects
+        // scale/bias suffixes and unrelated same-backend work.
+        int compute_nodes = 0;
+        struct ggml_tensor * last_compute_node = nullptr;
+        for (int node_id = 0; node_id < join_split->graph.n_nodes; ++node_id) {
+            struct ggml_tensor * node = join_split->graph.nodes[node_id];
+            if (ggml_is_view_op(node->op)) {
+                continue;
+            }
+            ++compute_nodes;
+            last_compute_node = node;
+            if (std::find(
+                        join_split->attn_out_direct_scatter_join_nodes,
+                        join_split->attn_out_direct_scatter_join_nodes +
+                            join_split->attn_out_direct_scatter_join_count,
+                        node) ==
+                    join_split->attn_out_direct_scatter_join_nodes +
+                        join_split->attn_out_direct_scatter_join_count) {
+                return false;
+            }
+        }
+        if (compute_nodes != join_split->attn_out_direct_scatter_join_count ||
+                last_compute_node != join_split->attn_out_direct_scatter_dst) {
+            return false;
+        }
+
+        bool branch_seen[3] = {};
+        ggml_backend_attn_out_scatter_slice slices[3] = {};
+        for (int slice_id = 0; slice_id < group_size; ++slice_id) {
+            struct ggml_tensor * src =
+                join_split->attn_out_direct_scatter_srcs[slice_id];
+            const int owner = ggml_backend_sched_qkv_lazy_group_tensor_owner(
+                    splits, split_id, group_size, src);
+            if (owner < 0 || owner >= group_size || branch_seen[owner]) {
+                return false;
+            }
+            branch_seen[owner] = true;
+            slices[slice_id] = {
+                /* .src        = */ src,
+                /* .dst_offset = */
+                    join_split->attn_out_direct_scatter_offsets[slice_id],
+            };
+        }
+
+        if constexpr (UseRouteCandidates) {
+            const int join_route_group =
+                sched->route_candidates->split_to_group[join_split_id];
+            const int join_route_variant =
+                sched->route_candidates->split_to_variant[join_split_id];
+            if (join_route_group != route_group_index ||
+                    join_route_variant != route_variant_index) {
+                return false;
+            }
+            if (route_group_index >= 0) {
+                const auto & route_variant =
+                    sched->route_candidates->groups[route_group_index]
+                        .variants[route_variant_index];
+                // Route publication is atomic only when the shadow CONCAT is
+                // the selected variant terminal.  The canonical commit (if
+                // needed) is issued immediately after all slices succeed.
+                if (join_split_id + 1 != route_variant.split_end) {
+                    return false;
+                }
+            }
+        } else {
+            GGML_UNUSED(route_group_index);
+            GGML_UNUSED(route_variant_index);
+        }
+
+        const int64_t scatter_t0_us = ggml_time_us();
+        bool accepted = false;
+        try {
+            accepted = sched->attn_out_direct_scatter_fns[join_backend_id](
+                    sched->backends[join_backend_id],
+                    join_split->attn_out_direct_scatter_dst,
+                    slices,
+                    (size_t) group_size);
+            if (accepted) {
+                // The proc accepts the complete batch or rejects it.  One
+                // flush after acceptance starts every queued device slice;
+                // consumers are submitted only after this point.
+                sched->async_flush_fns[join_backend_id](
+                        sched->backends[join_backend_id]);
+            }
+        } catch (const std::exception & error) {
+            GGML_LOG_WARN(
+                    "%s: attention-output direct scatter layer %d threw: %s; using CONCAT\n",
+                    __func__, infos[0].layer, error.what());
+            accepted = false;
+        } catch (...) {
+            GGML_LOG_WARN(
+                    "%s: attention-output direct scatter layer %d threw; using CONCAT\n",
+                    __func__, infos[0].layer);
+            accepted = false;
+        }
+        const int64_t scatter_us = ggml_time_us() - scatter_t0_us;
+        if (trace_io_times != nullptr) {
+            trace_io_times->copy_us += scatter_us;
+        }
+        ggml_sched_profile_add_copy_us(scatter_us);
+
+        if (!accepted) {
+            // A backend is allowed to reject after partially enqueuing.  Do
+            // not publish or skip anything: the ordinary join split runs next
+            // on the same destination stream and overwrites the full tensor.
+            GGML_LOG_DEBUG(
+                    "sched: attention-output direct scatter layer %d rejected; using full CONCAT overwrite\n",
+                    infos[0].layer);
+            return false;
+        }
+
+        *join_split_id_out = join_split_id;
+        GGML_LOG_DEBUG(
+                "sched: attention-output direct scatter layer %d accepted (%d slices, %.3f ms host)\n",
+                infos[0].layer, group_size, (double) scatter_us / 1000.0);
+        return true;
+    };
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
 
@@ -6791,6 +7989,47 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                         route_group.variants[route_variant_index].tensor->name,
                         route_variant_index == route_group.canonical_variant_index
                             ? "canonical" : "alternate");
+            }
+        }
+
+        bool lazy_opencl_consumer = false;
+        if (sched->qkv_lazy_opencl != nullptr &&
+                sched->qkv_lazy_opencl->pending.active) {
+            const auto & pending = sched->qkv_lazy_opencl->pending;
+            if (pending.consumer_split_id == split_id &&
+                    pending.backend_id == split->backend_id) {
+                lazy_opencl_consumer = true;
+            } else {
+                GGML_LOG_DEBUG(
+                        "sched: lazy OpenCL fallback before split %d: "
+                        "expected consumer split %d backend %d\n",
+                        split_id, pending.consumer_split_id, pending.backend_id);
+                ggml_backend_sched_qkv_lazy_opencl_drain(sched);
+            }
+        }
+
+        bool ffn_prefetch_consumer = false;
+        if (ffn_prefetch_pending.active) {
+            bool all_inputs_ready =
+                ffn_prefetch_pending.reduce_n_inputs == split->n_inputs;
+            for (int input_id = 0;
+                    all_inputs_ready && input_id < split->n_inputs;
+                    ++input_id) {
+                all_inputs_ready = ffn_prefetch_pending.input_ready[input_id];
+            }
+            if (ffn_prefetch_pending.reduce_split_id == split_id &&
+                    ffn_prefetch_pending.reduce_backend_id == split->backend_id &&
+                    split->is_ffn_parallel_reduce && all_inputs_ready) {
+                ffn_prefetch_consumer = true;
+            } else {
+                GGML_LOG_DEBUG(
+                        "sched: FFN reduce-input prefetch fallback before split %d: "
+                        "expected reduce split %d backend %d with %d ready inputs\n",
+                        split_id,
+                        ffn_prefetch_pending.reduce_split_id,
+                        ffn_prefetch_pending.reduce_backend_id,
+                        ffn_prefetch_pending.reduce_n_inputs);
+                ffn_prefetch_pending.clear();
             }
         }
 
@@ -6841,7 +8080,7 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                 }
             }
             const bool run_group_serially = !group_backends_unique || cpu_branch_count > 1;
-            const int deferred_sync_i = ggml_backend_sched_attn_out_deferred_sync_branch(
+            const int attn_out_deferred_sync_i = ggml_backend_sched_attn_out_deferred_sync_branch(
                     sched,
                     splits,
                     ffn_scan_end,
@@ -6849,6 +8088,96 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                     ffn_group_size,
                     ffn_group_infos,
                     run_group_serially);
+
+            int lazy_consumer_split_id = split_id + ffn_group_size;
+            bool route_requires_commit = false;
+            if constexpr (UseRouteCandidates) {
+                if (route_group_index >= 0) {
+                    const auto & route_group =
+                        sched->route_candidates->groups[route_group_index];
+                    route_requires_commit =
+                        route_selected_variant_index != route_group.canonical_variant_index;
+                    const auto & selected_variant =
+                        route_group.variants[route_selected_variant_index];
+                    if (!route_requires_commit &&
+                            lazy_consumer_split_id >= selected_variant.split_end) {
+                        // Skip inactive alternate ranges when the canonical
+                        // terminal is also the selected route terminal.
+                        for (const auto & variant : route_group.variants) {
+                            lazy_consumer_split_id = std::max(
+                                    lazy_consumer_split_id, variant.split_end);
+                        }
+                    }
+                }
+            }
+            uint64_t lazy_opencl_batch_id = 0;
+            std::vector<int> lazy_opencl_input_slots;
+            const char * lazy_opencl_reason = "not checked";
+            const int lazy_opencl_deferred_sync_i =
+                ggml_backend_sched_lazy_opencl_deferred_sync_branch(
+                        sched,
+                        splits,
+                        sched->n_splits,
+                        split_id,
+                        ffn_group_size,
+                        lazy_consumer_split_id,
+                        ffn_group_infos,
+                        run_group_serially,
+                        route_requires_commit,
+                        &lazy_opencl_batch_id,
+                        &lazy_opencl_input_slots,
+                        &lazy_opencl_reason);
+            const bool lazy_opencl = lazy_opencl_deferred_sync_i >= 0;
+            const bool qkv_lazy_opencl = lazy_opencl && !ffn_group_infos.empty() &&
+                (ffn_group_infos[0].kind == "attn_qkv" ||
+                 ffn_group_infos[0].kind == "attn_qkv_shard");
+            const bool ffn_add4_lazy_opencl = lazy_opencl &&
+                !ffn_group_infos.empty() && ffn_group_infos[0].kind == "ffn";
+            const int deferred_sync_i = lazy_opencl
+                ? lazy_opencl_deferred_sync_i
+                : attn_out_deferred_sync_i;
+            if (sched->qkv_lazy_opencl_sync && !ffn_group_infos.empty() &&
+                    (ffn_group_infos[0].kind == "attn_qkv" ||
+                     ffn_group_infos[0].kind == "attn_qkv_shard")) {
+                if (qkv_lazy_opencl) {
+                    GGML_LOG_DEBUG(
+                            "sched: QKV lazy OpenCL layer %d group split %d: "
+                            "eligible, consumer split %d\n",
+                            ffn_group_infos[0].layer, split_id, lazy_consumer_split_id);
+                } else {
+                    GGML_LOG_DEBUG(
+                            "sched: QKV lazy OpenCL layer %d group split %d fallback: %s\n",
+                            ffn_group_infos[0].layer, split_id, lazy_opencl_reason);
+                }
+            }
+            if (sched->ffn_add4_lazy_opencl_sync && !ffn_group_infos.empty() &&
+                    ffn_group_infos[0].kind == "ffn") {
+                if (ffn_add4_lazy_opencl) {
+                    GGML_LOG_DEBUG(
+                            "sched: FFN ADD4 lazy OpenCL layer %d group split %d: "
+                            "eligible, consumer split %d\n",
+                            ffn_group_infos[0].layer, split_id,
+                            lazy_consumer_split_id);
+                } else {
+                    GGML_LOG_DEBUG(
+                            "sched: FFN ADD4 lazy OpenCL layer %d group split %d fallback: %s\n",
+                            ffn_group_infos[0].layer, split_id,
+                            lazy_opencl_reason);
+                }
+            }
+
+            ggml_backend_sched_ffn_prefetch_plan ffn_prefetch_plan;
+            const char * ffn_prefetch_reason = "not checked";
+            (void) prepare_ffn_prefetch(
+                    split_id,
+                    ffn_group_size,
+                    ffn_group_infos,
+                    run_group_serially,
+                    route_group_index,
+                    route_variant_index,
+                    ffn_scan_end,
+                    &ffn_prefetch_plan,
+                    &ffn_prefetch_reason);
 
             const int64_t group_t0_us = ggml_time_us();
             const int64_t copy_t0_us = group_t0_us;
@@ -6867,7 +8196,55 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                         &splits[split_id + i],
                         trace_io_times,
                         &cpu_idle_before_us[i],
-                        &cpu_prewake_requested[i]);
+                        &cpu_prewake_requested[i],
+                        false,
+                        false,
+                        nullptr);
+            }
+
+            if (ffn_prefetch_plan.active) {
+                // n_copies == 1 means the next CPU reduce will overwrite the
+                // same copy tensors used by the previous query. Drain that
+                // destination once before any branch worker starts writing;
+                // each source worker can then copy independently after its
+                // own backend synchronize.
+                const int64_t wait_t0_us = ggml_sched_profile_time_us();
+                try {
+                    ggml_backend_synchronize(sched->backends[
+                            ffn_prefetch_plan.reduce_backend_id]);
+                } catch (const std::exception & error) {
+                    ffn_prefetch_plan.active = false;
+                    ffn_prefetch_reason = "CPU reduce destination synchronize failed";
+                    GGML_LOG_ERROR(
+                            "%s: FFN prefetch destination backend %s threw: %s\n",
+                            __func__,
+                            ggml_backend_name(sched->backends[
+                                ffn_prefetch_plan.reduce_backend_id]),
+                            error.what());
+                } catch (...) {
+                    ffn_prefetch_plan.active = false;
+                    ffn_prefetch_reason = "CPU reduce destination synchronize failed";
+                    GGML_LOG_ERROR(
+                            "%s: FFN prefetch destination backend %s threw\n",
+                            __func__,
+                            ggml_backend_name(sched->backends[
+                                ffn_prefetch_plan.reduce_backend_id]));
+                }
+                const int64_t wait_us =
+                    ggml_sched_profile_time_us() - wait_t0_us;
+                ggml_sched_profile_add_wait_us(wait_us);
+                if (trace_enabled) {
+                    io_times[0].wait_us += wait_us;
+                }
+            }
+            if (sched->ffn_prefetch_reduce_inputs && !ffn_group_infos.empty() &&
+                    ffn_group_infos[0].kind == "ffn") {
+                GGML_LOG_DEBUG(
+                        "sched: FFN reduce-input prefetch layer %d group split %d %s: %s\n",
+                        ffn_group_infos[0].layer,
+                        split_id,
+                        ffn_prefetch_plan.active ? "eligible" : "fallback",
+                        ffn_prefetch_reason);
             }
             const int64_t copy_t1_us = ggml_time_us();
 
@@ -6964,6 +8341,11 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                         device_jobs[i].flush_after_submit = i == deferred_sync_i
                             ? sched->async_flush_fns[device_split->backend_id]
                             : nullptr;
+                        device_jobs[i].prefetch =
+                            ffn_prefetch_plan.active &&
+                            ffn_prefetch_plan.branches[i].active
+                                ? &ffn_prefetch_plan.branches[i]
+                                : nullptr;
                         device_jobs[i].sync_after = i != deferred_sync_i;
                         const bool submitted = sched->ffn_device_executor->submit(
                                 device_split->backend_id,
@@ -7032,6 +8414,14 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                                         i == deferred_sync_i
                                             ? sched->async_flush_fns[splits[split_id + i].backend_id]
                                             : nullptr);
+                                if (status[i] == GGML_STATUS_SUCCESS &&
+                                        ffn_prefetch_plan.active &&
+                                        ffn_prefetch_plan.branches[i].active) {
+                                    ggml_backend_sched_run_ffn_prefetch_copies(
+                                            &ffn_prefetch_plan.branches[i],
+                                            ggml_backend_name(sched->backends[
+                                                splits[split_id + i].backend_id]));
+                                }
                             } catch (const std::exception & error) {
                                 status[i] = GGML_STATUS_FAILED;
                                 GGML_LOG_ERROR(
@@ -7084,6 +8474,14 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                             main_i == deferred_sync_i
                                 ? sched->async_flush_fns[splits[split_id + main_i].backend_id]
                                 : nullptr);
+                    if (status[main_i] == GGML_STATUS_SUCCESS &&
+                            ffn_prefetch_plan.active &&
+                            ffn_prefetch_plan.branches[main_i].active) {
+                        ggml_backend_sched_run_ffn_prefetch_copies(
+                                &ffn_prefetch_plan.branches[main_i],
+                                ggml_backend_name(sched->backends[
+                                    splits[split_id + main_i].backend_id]));
+                    }
                 } catch (const std::exception & error) {
                     status[main_i] = GGML_STATUS_FAILED;
                     GGML_LOG_ERROR(
@@ -7142,56 +8540,89 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                     ggml_backend_sched_ffn_worker_timeline * deferred_timeline =
                         group_timelines != nullptr ? &group_timelines[deferred_sync_i] : nullptr;
                     deferred_submit_us = dt_us[deferred_sync_i];
-                    const int64_t sync_begin_us = ggml_time_us();
-                    if (deferred_timeline != nullptr) {
-                        deferred_timeline->sync_begin_us = sync_begin_us;
-                        deferred_timeline->sync_tid = ggml_backend_sched_current_tid();
-                        deferred_timeline->sync_cpu = ggml_backend_sched_current_cpu();
+                    if (!lazy_opencl) {
+                        const int64_t sync_begin_us = ggml_time_us();
+                        if (deferred_timeline != nullptr) {
+                            deferred_timeline->sync_begin_us = sync_begin_us;
+                            deferred_timeline->sync_tid = ggml_backend_sched_current_tid();
+                            deferred_timeline->sync_cpu = ggml_backend_sched_current_cpu();
+                        }
+                        try {
+                            // All worker submission tickets have been collected, so
+                            // the scheduler can safely re-enter this backend. Drain
+                            // it once here before the OpenCL CONCAT split rather than
+                            // blocking its worker immediately after the short W_O op.
+                            ggml_backend_synchronize(deferred_backend);
+                        } catch (const std::exception & error) {
+                            status[deferred_sync_i] = GGML_STATUS_FAILED;
+                            GGML_LOG_ERROR(
+                                    "%s: deferred %s synchronize for backend %s, layer %d threw an exception: %s\n",
+                                    __func__,
+                                    ffn_group_infos[deferred_sync_i].kind.c_str(),
+                                    ggml_backend_name(deferred_backend),
+                                    ffn_group_infos[deferred_sync_i].layer,
+                                    error.what());
+                        } catch (...) {
+                            status[deferred_sync_i] = GGML_STATUS_FAILED;
+                            GGML_LOG_ERROR(
+                                    "%s: deferred %s synchronize for backend %s, layer %d threw an exception\n",
+                                    __func__,
+                                    ffn_group_infos[deferred_sync_i].kind.c_str(),
+                                    ggml_backend_name(deferred_backend),
+                                    ffn_group_infos[deferred_sync_i].layer);
+                        }
+                        const int64_t sync_end_us = ggml_time_us();
+                        if (deferred_timeline != nullptr) {
+                            deferred_timeline->sync_end_us = sync_end_us;
+                        }
+                        deferred_sync_wait_us = sync_end_us - sync_begin_us;
+                        // Keep this value as host-active time only: async submission
+                        // plus the later join-boundary wait. The interval between
+                        // them is sibling CPU/NPU work and must not be reported as
+                        // GPU compute time.
+                        dt_us[deferred_sync_i] += deferred_sync_wait_us;
                     }
-                    try {
-                        // All worker submission tickets have been collected, so
-                        // the scheduler can safely re-enter this backend. Drain
-                        // it once here before the OpenCL CONCAT split rather than
-                        // blocking its worker immediately after the short W_O op.
-                        ggml_backend_synchronize(deferred_backend);
-                    } catch (const std::exception & error) {
-                        status[deferred_sync_i] = GGML_STATUS_FAILED;
-                        GGML_LOG_ERROR(
-                                "%s: deferred %s synchronize for backend %s, layer %d threw an exception: %s\n",
-                                __func__,
-                                ffn_group_infos[deferred_sync_i].kind.c_str(),
-                                ggml_backend_name(deferred_backend),
-                                ffn_group_infos[deferred_sync_i].layer,
-                                error.what());
-                    } catch (...) {
-                        status[deferred_sync_i] = GGML_STATUS_FAILED;
-                        GGML_LOG_ERROR(
-                                "%s: deferred %s synchronize for backend %s, layer %d threw an exception\n",
-                                __func__,
-                                ffn_group_infos[deferred_sync_i].kind.c_str(),
-                                ggml_backend_name(deferred_backend),
-                                ffn_group_infos[deferred_sync_i].layer);
+                }
+            }
+
+            int64_t ffn_prefetch_copy_us = 0;
+            bool ffn_prefetch_succeeded = ffn_prefetch_plan.active;
+            if (ffn_prefetch_plan.active) {
+                for (int i = 0; i < ffn_group_size; ++i) {
+                    const auto & branch = ffn_prefetch_plan.branches[i];
+                    if (!branch.active) {
+                        continue;
                     }
-                    const int64_t sync_end_us = ggml_time_us();
-                    if (deferred_timeline != nullptr) {
-                        deferred_timeline->sync_end_us = sync_end_us;
+                    ffn_prefetch_succeeded = ffn_prefetch_succeeded &&
+                        status[i] == GGML_STATUS_SUCCESS &&
+                        branch.attempted && branch.succeeded;
+                    ffn_prefetch_copy_us += branch.copy_us;
+                    ggml_sched_profile_add_copy_us(branch.copy_us);
+                    if (trace_enabled) {
+                        io_times[i].copy_us += branch.copy_us;
                     }
-                    deferred_sync_wait_us = sync_end_us - sync_begin_us;
-                    // Keep this value as host-active time only: async submission
-                    // plus the later join-boundary wait. The interval between
-                    // them is sibling CPU/NPU work and must not be reported as
-                    // GPU compute time.
-                    dt_us[deferred_sync_i] += deferred_sync_wait_us;
                 }
             }
             const int64_t compute_t1_us = ggml_time_us();
             const int64_t group_t1_us = compute_t1_us;
             const char * group_timing_mode = run_group_serially
                 ? "serial_fallback"
+                : qkv_lazy_opencl
+                    ? use_persistent_device_workers
+                        ? "persistent_qkv_lazy_opencl"
+                        : "qkv_lazy_opencl"
+                : ffn_add4_lazy_opencl
+                    ? use_persistent_device_workers
+                        ? "persistent_ffn_add4_lazy_opencl"
+                        : "ffn_add4_lazy_opencl"
                 : deferred_sync_i >= 0
                     ? use_persistent_device_workers
                         ? "persistent_deferred_sync"
                         : "deferred_sync"
+                : ffn_prefetch_succeeded
+                    ? use_persistent_device_workers
+                        ? "persistent_prefetch_reduce"
+                        : "prefetch_reduce"
                     : use_persistent_device_workers ? "persistent_synced_wall" : "synced_wall";
 
             if (worker_trace_graph_id >= 0) {
@@ -7212,20 +8643,76 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
 
             for (int i = 0; i < ffn_group_size; ++i) {
                 if (status[i] != GGML_STATUS_SUCCESS) {
+                    if (lazy_opencl) {
+                        // The lazy descriptor is published only after every
+                        // branch succeeds. An error before that point still
+                        // leaves the flushed device branch in flight.
+                        ggml_backend_synchronize(sched->backends[
+                                splits[split_id + lazy_opencl_deferred_sync_i].backend_id]);
+                    }
                     return status[i];
                 }
             }
 
+            if (ffn_prefetch_succeeded) {
+                GGML_ASSERT(!ffn_prefetch_pending.active);
+                ffn_prefetch_pending.active = true;
+                ffn_prefetch_pending.reduce_split_id =
+                    ffn_prefetch_plan.reduce_split_id;
+                ffn_prefetch_pending.reduce_backend_id =
+                    ffn_prefetch_plan.reduce_backend_id;
+                ffn_prefetch_pending.reduce_n_inputs =
+                    ffn_prefetch_plan.reduce_n_inputs;
+                for (int input_id = 0;
+                        input_id < ffn_prefetch_plan.reduce_n_inputs;
+                        ++input_id) {
+                    const int owner = ffn_prefetch_plan.input_owner[input_id];
+                    GGML_ASSERT(owner >= 0 && owner < ffn_group_size);
+                    ffn_prefetch_pending.input_ready[input_id] =
+                        ffn_prefetch_plan.branches[owner].succeeded;
+                }
+            } else if (ffn_prefetch_plan.active) {
+                GGML_LOG_DEBUG(
+                        "sched: FFN reduce-input prefetch layer %d group split %d failed; "
+                        "next reduce will use the complete legacy copy path\n",
+                        ffn_group_infos[0].layer, split_id);
+            }
+
+            ggml_backend_sched_trace_io_times direct_scatter_io = {};
+            int direct_scatter_join_split_id = -1;
+            const bool attn_out_direct_scatter = try_attn_out_direct_scatter(
+                    split_id,
+                    ffn_group_size,
+                    ffn_scan_end,
+                    ffn_group_infos,
+                    route_group_index,
+                    route_variant_index,
+                    trace_enabled ? &direct_scatter_io : nullptr,
+                    &direct_scatter_join_split_id);
+            if (!attn_out_direct_scatter && trace_enabled &&
+                    direct_scatter_io.copy_us > 0) {
+                // Account a rejected/partial attempt on the final branch row;
+                // the following ordinary CONCAT row accounts its own complete
+                // overwrite separately.
+                io_times[ffn_group_size - 1].copy_us +=
+                    direct_scatter_io.copy_us;
+            }
+
             if constexpr (UseRouteCandidates) {
-                const int last_group_split_id = split_id + ffn_group_size - 1;
-                if (route_group_index >= 0 &&
-                        last_group_split_id + 1 ==
-                            sched->route_candidates->groups[route_group_index]
-                                .variants[route_variant_index].split_end) {
+                const int completed_split_id = attn_out_direct_scatter
+                    ? direct_scatter_join_split_id
+                    : split_id + ffn_group_size - 1;
+                if (route_group_index >= 0 && completed_split_id + 1 ==
+                        sched->route_candidates->groups[route_group_index]
+                            .variants[route_variant_index].split_end) {
                     commit_route_alternate(
                             route_group_index,
                             route_variant_index,
-                            trace_enabled ? &io_times[ffn_group_size - 1] : nullptr);
+                            trace_enabled
+                                ? attn_out_direct_scatter
+                                    ? &direct_scatter_io
+                                    : &io_times[ffn_group_size - 1]
+                                : nullptr);
                 }
             }
 
@@ -7237,6 +8724,27 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                 struct ggml_backend_sched_split * group_split = &splits[split_id + i];
                 prof_add(group_split->graph, group_buckets[i], dt_us[i]);
                 record_split_event(group_split);
+            }
+            if (attn_out_direct_scatter) {
+                struct ggml_backend_sched_split * join_split =
+                    &splits[direct_scatter_join_split_id];
+                ggml_sched_profile_note_layers(
+                        join_split->graph,
+                        ggml_sched_profile_backend_bucket(
+                            sched->backends[join_split->backend_id]));
+                record_split_event(join_split);
+            }
+
+            if (lazy_opencl) {
+                GGML_ASSERT(sched->qkv_lazy_opencl != nullptr);
+                auto & pending = sched->qkv_lazy_opencl->pending;
+                GGML_ASSERT(!pending.active);
+                pending.active = true;
+                pending.backend_id = splits[
+                        split_id + lazy_opencl_deferred_sync_i].backend_id;
+                pending.consumer_split_id = lazy_consumer_split_id;
+                pending.batch_id = lazy_opencl_batch_id;
+                pending.input_slots = std::move(lazy_opencl_input_slots);
             }
 
             const int64_t copy_us = copy_t1_us - copy_t0_us;
@@ -7269,14 +8777,24 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                 branch_list += "] ";
                 char branch_ms[64];
                 if (i == deferred_sync_i) {
-                    snprintf(
-                            branch_ms,
-                            sizeof(branch_ms),
-                            "submit %.3f + join-sync %.3f",
-                            (double) std::max<int64_t>(deferred_submit_us, 0) / 1000.0,
-                            (double) std::max<int64_t>(deferred_sync_wait_us, 0) / 1000.0);
+                    if (lazy_opencl) {
+                        snprintf(
+                                branch_ms,
+                                sizeof(branch_ms),
+                                "submit %.3f ms + lazy-consumer queued",
+                                (double) std::max<int64_t>(deferred_submit_us, 0) / 1000.0);
+                    } else {
+                        snprintf(
+                                branch_ms,
+                                sizeof(branch_ms),
+                                "submit %.3f + join-sync %.3f",
+                                (double) std::max<int64_t>(deferred_submit_us, 0) / 1000.0,
+                                (double) std::max<int64_t>(deferred_sync_wait_us, 0) / 1000.0);
+                    }
                     branch_list += branch_ms;
-                    branch_list += " ms (device wall n/a)";
+                    branch_list += lazy_opencl
+                        ? " (device wall n/a)"
+                        : " ms (device wall n/a)";
                 } else {
                     snprintf(branch_ms, sizeof(branch_ms), "%.3f", (double) dt_us[i] / 1000.0);
                     branch_list += branch_ms;
@@ -7291,17 +8809,7 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
 
             if (deferred_sync_i >= 0) {
                 GGML_LOG_DEBUG(
-                        "sched: parallel %s group layer %d splits %s: %s, compute_wall %.3f ms, group_wall %.3f ms, copy %.3f ms, speedup/overlap/balance n/a (deferred device wall)\n",
-                        ffn_group_infos[0].kind.c_str(),
-                        ffn_group_infos[0].layer,
-                        split_list.c_str(),
-                        branch_list.c_str(),
-                        (double) compute_wall_us / 1000.0,
-                        (double) group_wall_us / 1000.0,
-                        (double) copy_us / 1000.0);
-            } else {
-                GGML_LOG_DEBUG(
-                        "sched: parallel %s group layer %d splits %s: %s, compute_wall %.3f ms, group_wall %.3f ms, copy %.3f ms, speedup %.2fx, overlap %.1f%%, balance %.1f%%\n",
+                        "sched: parallel %s group layer %d splits %s: %s, compute_wall %.3f ms, group_wall %.3f ms, copy_in %.3f ms, prefetch_copy %.3f ms, speedup/overlap/balance n/a (deferred device wall)\n",
                         ffn_group_infos[0].kind.c_str(),
                         ffn_group_infos[0].layer,
                         split_list.c_str(),
@@ -7309,6 +8817,18 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                         (double) compute_wall_us / 1000.0,
                         (double) group_wall_us / 1000.0,
                         (double) copy_us / 1000.0,
+                        (double) ffn_prefetch_copy_us / 1000.0);
+            } else {
+                GGML_LOG_DEBUG(
+                        "sched: parallel %s group layer %d splits %s: %s, compute_wall %.3f ms, group_wall %.3f ms, copy_in %.3f ms, prefetch_copy %.3f ms, speedup %.2fx, overlap %.1f%%, balance %.1f%%\n",
+                        ffn_group_infos[0].kind.c_str(),
+                        ffn_group_infos[0].layer,
+                        split_list.c_str(),
+                        branch_list.c_str(),
+                        (double) compute_wall_us / 1000.0,
+                        (double) group_wall_us / 1000.0,
+                        (double) copy_us / 1000.0,
+                        (double) ffn_prefetch_copy_us / 1000.0,
                         speedup,
                         overlap,
                         balance);
@@ -7334,6 +8854,27 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                             cpu_idle_before_us[i],
                             cpu_prewake_requested[i]);
                 }
+                if (attn_out_direct_scatter) {
+                    struct ggml_backend_sched_split * join_split =
+                        &splits[direct_scatter_join_split_id];
+                    ggml_backend_sched_trace_append_split(
+                            sched,
+                            trace_graph_id,
+                            direct_scatter_join_split_id,
+                            join_split,
+                            direct_scatter_io,
+                            direct_scatter_io.copy_us + direct_scatter_io.wait_us,
+                            -1,
+                            false,
+                            "",
+                            "",
+                            -1,
+                            -1,
+                            direct_scatter_io.copy_us,
+                            "attn_out_direct_scatter",
+                            -1,
+                            false);
+                }
             }
 
             if constexpr (UseLayerCheckpoints) {
@@ -7348,7 +8889,8 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                     }
                 }
             }
-            split_id += ffn_group_size - 1;
+            split_id += ffn_group_size - 1 +
+                (attn_out_direct_scatter ? 1 : 0);
             continue;
         }
 
@@ -7359,16 +8901,21 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
 
         int64_t cpu_idle_before_us = -1;
         bool cpu_prewake_requested = false;
+        int prefetched_input_count = 0;
         copy_split_inputs(
                 split,
                 trace_enabled ? &io_times : nullptr,
                 &cpu_idle_before_us,
-                &cpu_prewake_requested);
+                &cpu_prewake_requested,
+                lazy_opencl_consumer,
+                ffn_prefetch_consumer,
+                &prefetched_input_count);
 
         if (!sched->callback_eval) {
             int64_t dt_us = 0;
             enum ggml_status ec = compute_split_no_callback(split, &dt_us, false, nullptr);
             if (ec != GGML_STATUS_SUCCESS) {
+                ggml_backend_sched_qkv_lazy_opencl_drain(sched);
                 return ec;
             }
             if constexpr (UseRouteCandidates) {
@@ -7400,7 +8947,11 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                         -1,
                         -1,
                         io_times.copy_us,
-                        split_is_cpu ? "sync_wall" : "async_submit",
+                        split_is_cpu
+                            ? prefetched_input_count > 0
+                                ? "sync_wall_prefetched_inputs"
+                                : "sync_wall"
+                            : "async_submit",
                         cpu_idle_before_us,
                         cpu_prewake_requested);
             }
@@ -7410,6 +8961,7 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                     &cpu_idle_before_us,
                     &cpu_prewake_requested);
             if (ec != GGML_STATUS_SUCCESS) {
+                ggml_backend_sched_qkv_lazy_opencl_drain(sched);
                 return ec;
             }
             record_split_event(split);
@@ -7447,6 +8999,18 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
         }
     }
 
+    if (sched->qkv_lazy_opencl != nullptr &&
+            sched->qkv_lazy_opencl->pending.active) {
+        GGML_LOG_DEBUG(
+                "sched: lazy OpenCL fallback at graph end: consumer was not submitted\n");
+        ggml_backend_sched_qkv_lazy_opencl_drain(sched);
+    }
+    if (ffn_prefetch_pending.active) {
+        GGML_LOG_DEBUG(
+                "sched: FFN reduce-input prefetch fallback at graph end: "
+                "the immediate reduce split was not submitted\n");
+        ffn_prefetch_pending.clear();
+    }
     return GGML_STATUS_SUCCESS;
 }
 
@@ -7501,6 +9065,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
             "GGML_FFN_NPU_WORKER_CPU", sched->ffn_device_worker_cpu);
     sched->attn_out_defer_opencl_sync =
         ggml_backend_sched_attn_out_defer_opencl_sync_enabled();
+    sched->attn_out_direct_scatter =
+        ggml_backend_sched_attn_out_direct_scatter_enabled();
+    sched->qkv_lazy_opencl_sync =
+        ggml_backend_sched_qkv_lazy_opencl_sync_enabled();
+    sched->ffn_add4_lazy_opencl_sync =
+        ggml_backend_sched_ffn_add4_lazy_opencl_sync_enabled();
+    sched->ffn_prefetch_reduce_inputs =
+        ggml_backend_sched_ffn_prefetch_reduce_inputs_enabled();
     sched->cpu_graph_prewake_hold_us = ggml_backend_sched_cpu_graph_prewake_hold_us();
     sched->cpu_graph_prewake_idle_us = sched->cpu_graph_prewake_hold_us > 0
         ? ggml_backend_sched_cpu_graph_prewake_idle_us()
@@ -7547,6 +9119,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
         if (reg != nullptr) {
             sched->async_flush_fns[b] = (ggml_backend_async_flush_t)
                 ggml_backend_reg_get_proc_address(reg, "ggml_backend_async_flush");
+            sched->async_staging_buft_fns[b] =
+                (ggml_backend_async_staging_buffer_type_t)
+                ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_async_staging_buffer_type");
+            sched->attn_out_direct_scatter_fns[b] =
+                (ggml_backend_attn_out_direct_scatter_t)
+                ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_attn_out_direct_scatter");
             async_flush_backend_count += sched->async_flush_fns[b] != nullptr ? 1 : 0;
         }
 
@@ -7576,6 +9156,43 @@ ggml_backend_sched_t ggml_backend_sched_new(
                 sched->attn_out_defer_opencl_sync ? "enabled" : "disabled",
                 async_flush_backend_count,
                 async_flush_backend_count == 1 ? "" : "s");
+        GGML_LOG_INFO(
+                "%s: QKV lazy OpenCL synchronization %s; async upload/events must also be enabled by the backend\n",
+                __func__, sched->qkv_lazy_opencl_sync ? "enabled" : "disabled");
+        GGML_LOG_INFO(
+                "%s: FFN ADD4 lazy OpenCL synchronization %s; async upload/events must also be enabled by the backend\n",
+                __func__, sched->ffn_add4_lazy_opencl_sync ? "enabled" : "disabled");
+    }
+    if (sched->attn_out_direct_scatter) {
+        int compatible_backends = 0;
+        for (int b = 0; b < n_backends; ++b) {
+            compatible_backends +=
+                sched->attn_out_direct_scatter_fns[b] != nullptr &&
+                sched->async_flush_fns[b] != nullptr ? 1 : 0;
+        }
+        if (compatible_backends == 0) {
+            GGML_LOG_WARN(
+                    "%s: attention-output direct scatter requested, but no compatible backend was found; using CONCAT\n",
+                    __func__);
+        } else {
+            GGML_LOG_INFO(
+                    "%s: attention-output direct scatter enabled (%d compatible backend%s)\n",
+                    __func__, compatible_backends,
+                    compatible_backends == 1 ? "" : "s");
+        }
+    }
+
+    if (sched->ffn_prefetch_reduce_inputs) {
+        if (sched->n_copies != 1) {
+            GGML_LOG_WARN(
+                    "%s: FFN reduce-input prefetch requested with %d scheduler copy slots; "
+                    "using legacy reduce copies\n",
+                    __func__, sched->n_copies);
+        } else {
+            GGML_LOG_INFO(
+                    "%s: FFN reduce-input prefetch enabled for eligible CPU reduce groups\n",
+                    __func__);
+        }
     }
 
     if (sched->cpu_graph_prewake_hold_us > 0) {
@@ -7660,6 +9277,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     // buffers they may reference.
     delete sched->ffn_device_executor;
     sched->ffn_device_executor = nullptr;
+    ggml_backend_sched_qkv_lazy_opencl_free_state(sched);
     delete sched->layer_checkpoints;
     sched->layer_checkpoints = nullptr;
     delete sched->route_candidates;
@@ -7688,6 +9306,9 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
 
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    // Reset may invalidate copy tensors and graph-owned scratch. Do not retain
+    // a lazy producer or staging upload across that ownership boundary.
+    ggml_backend_sched_qkv_lazy_opencl_drain(sched);
     if (sched->layer_checkpoints != nullptr) {
         sched->layer_checkpoints->clear_configuration();
     }
@@ -7750,6 +9371,8 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     GGML_ASSERT(sched);
     GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
     GGML_ASSERT(!sched->is_alloc);
+
+    ggml_backend_sched_qkv_lazy_opencl_drain(sched);
 
     sched->cur_copy = sched->next_copy;
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
@@ -7823,6 +9446,7 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
     for (int i = 0; i < sched->n_backends; i++) {
         ggml_backend_synchronize(sched->backends[i]);
     }
+    ggml_backend_sched_qkv_lazy_opencl_note_synchronized(sched);
     if (!sched->is_alloc) {
         // if the graph is not already allocated, always use copy 0 after a synchronization
         // this ensures that during generation the same copy is used every time,

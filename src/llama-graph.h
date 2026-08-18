@@ -11,6 +11,7 @@
 #include <set>
 #include <functional>
 #include <map>
+#include <string>
 
 struct ggml_cgraph;
 struct ggml_context;
@@ -30,6 +31,34 @@ class llama_kv_cache_iswa_context;
 class llama_memory_recurrent_context;
 class llama_memory_hybrid_context;
 class llama_memory_hybrid_iswa_context;
+
+// Internal graph helper used by the three-lane FFN reduction and its focused
+// regression test. Returns nullptr unless the opt-in is enabled and all inputs
+// satisfy the narrow CPU F32/contiguous contract.
+ggml_tensor * llm_graph_try_build_ffn_fused_add3(
+        ggml_context * ctx,
+        ggml_tensor * a,
+        ggml_tensor * b,
+        ggml_tensor * c,
+        const char * reduce_backend);
+
+// Default-off ADD4 fusion controls and the pure topology preflight used by
+// runtime-route graph construction. Runtime fusion is safe only when every
+// profile exposes the same three logical branch slots and reduce backend.
+bool llm_graph_ffn_fused_add4_enabled();
+bool llm_graph_ffn_add4_policies_eligible(
+        const std::vector<llama_backend_policy_ffn_parallel> & policies,
+        int64_t n_ff,
+        int64_t weight_block_size);
+
+// Resolve the fused reduce+residual target from the residual tensor's concrete
+// scheduler placement. Step 7 is OpenCL-only: CPU ADD4 remains available as a
+// standalone primitive, but never enables this graph optimization.
+bool llm_graph_ffn_add4_opencl_backend(
+        ggml_backend_sched_t sched,
+        ggml_tensor * residual,
+        ggml_tensor * candidate,
+        std::string * backend_name);
 
 // certain models (typically multi-modal) can produce different types of graphs
 enum llm_graph_type {
@@ -927,7 +956,10 @@ struct llm_graph_context {
        llm_ffn_gate_type   type_gate,
                      int   il,
         const llama_backend_policy_ffn_parallel * policy_override = nullptr,
-             const char * route_tag = nullptr) const;
+             const char * route_tag = nullptr,
+            ggml_tensor * residual = nullptr,
+                    bool * out_residual_fused = nullptr,
+        std::vector<ggml_tensor *> * out_parallel_partials = nullptr) const;
 
     // build MoE FFN without bias tensors
     ggml_tensor * build_moe_ffn(
