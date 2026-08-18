@@ -1468,6 +1468,68 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.hardware_stats_core = value;
         }
     ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
+        {"--battery-temp-sync"}, "on|off",
+        "wait for battery temperature updates before the first JSON query (default: off)",
+        [](common_params & params, const std::string & value) {
+            const std::string normalized = common_arg_lower(value);
+            if (is_truthy(normalized)) {
+                params.battery_temp_sync = true;
+            } else if (is_falsey(normalized)) {
+                params.battery_temp_sync = false;
+            } else {
+                throw std::invalid_argument(
+                    string_format("error: unknown value for --battery-temp-sync: '%s'\n", value.c_str()));
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_BATTERY_TEMP_SYNC"));
+    add_opt(common_arg(
+        {"--battery-temp-path"}, "PATH",
+        "battery temperature sysfs path (default: auto-detect)",
+        [](common_params & params, const std::string & value) {
+            params.battery_temp_path = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_BATTERY_TEMP_PATH"));
+    add_opt(common_arg(
+        {"--battery-temp-update-count"}, "N",
+        "number of battery temperature updates to observe before inference (default: 1)",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("error: --battery-temp-update-count must be positive");
+            }
+            params.battery_temp_update_count = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_BATTERY_TEMP_UPDATE_COUNT"));
+    add_opt(common_arg(
+        {"--battery-temp-poll-ms"}, "N",
+        "battery temperature polling interval in milliseconds (default: 100)",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("error: --battery-temp-poll-ms must be positive");
+            }
+            params.battery_temp_poll_ms = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_BATTERY_TEMP_POLL_MS"));
+    add_opt(common_arg(
+        {"--battery-temp-settle-ms"}, "N",
+        "delay after the final battery temperature update in milliseconds (default: 200)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: --battery-temp-settle-ms must be non-negative");
+            }
+            params.battery_temp_settle_ms = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_BATTERY_TEMP_SETTLE_MS"));
+    add_opt(common_arg(
+        {"--battery-temp-timeout-ms"}, "N",
+        "total battery temperature gate timeout, including settle delay, in milliseconds (default: 70000)",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("error: --battery-temp-timeout-ms must be positive");
+            }
+            params.battery_temp_timeout_ms = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_BATTERY_TEMP_TIMEOUT_MS"));
 
     add_opt(common_arg(
         {"-h", "--help", "--usage"},

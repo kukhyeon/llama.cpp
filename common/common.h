@@ -758,6 +758,12 @@ struct common_params {
     std::string output_dir = "";
     bool hardware_stats = true;
     int hardware_stats_core = -1;
+    bool battery_temp_sync = false;
+    std::string battery_temp_path = "";
+    int battery_temp_update_count = 1;
+    int battery_temp_poll_ms = 100;
+    int battery_temp_settle_ms = 200;
+    int battery_temp_timeout_ms = 70000;
     std::string output_path_hard = "";
     std::string output_path_infer = "";
 

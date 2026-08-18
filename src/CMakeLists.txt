@@ -47,6 +47,8 @@ add_library(llama
             )
 
 add_library(dvfs
+            hard/battery-sync.cpp
+            hard/battery-sync.h
             hard/device.cpp
             hard/device.h
             hard/dvfs.cpp
