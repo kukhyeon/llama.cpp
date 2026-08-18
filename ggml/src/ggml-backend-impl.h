@@ -146,6 +146,23 @@ extern "C" {
         void * context;
     };
 
+    // Optional backend-registry extension used by the scheduler's opt-in
+    // attention-output direct-scatter path.  Each source is a complete,
+    // contiguous output-axis lane and dst_offset is expressed in elements of
+    // dst's innermost dimension.  Implementations must either accept the
+    // complete batch (possibly after partially enqueuing it) or return false;
+    // the scheduler then executes the original full CONCAT as a safe fallback.
+    struct ggml_backend_attn_out_scatter_slice {
+        const struct ggml_tensor * src;
+        int64_t dst_offset;
+    };
+
+    typedef bool (*ggml_backend_attn_out_direct_scatter_t)(
+            ggml_backend_t backend,
+            struct ggml_tensor * dst,
+            const struct ggml_backend_attn_out_scatter_slice * slices,
+            size_t n_slices);
+
     // CPU node trace fast path: ggml-cpu records only raw timestamps while
     // workers are active, then submits the whole graph after its final
     // barrier. This keeps CSV formatting and the global trace mutex out of

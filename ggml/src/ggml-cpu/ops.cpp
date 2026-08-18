@@ -698,6 +698,59 @@ void ggml_compute_forward_add(
     }
 }
 
+// ggml_compute_forward_add4
+
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((optimize("no-associative-math")))
+#endif
+void ggml_compute_forward_add4(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+#if defined(__clang__)
+#pragma clang fp reassociate(off)
+#endif
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * src2 = dst->src[2];
+    const ggml_tensor * src3 = dst->src[3];
+
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(src2->type == GGML_TYPE_F32);
+    GGML_ASSERT(src3->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(dst, src0));
+    GGML_ASSERT(ggml_are_same_shape(dst, src1));
+    GGML_ASSERT(ggml_are_same_shape(dst, src2));
+    GGML_ASSERT(ggml_are_same_shape(dst, src3));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_is_contiguous(src0));
+    GGML_ASSERT(ggml_is_contiguous(src1));
+    GGML_ASSERT(ggml_is_contiguous(src2));
+    GGML_ASSERT(ggml_is_contiguous(src3));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+    const int64_t n = ggml_nelements(dst);
+    const int64_t dr = (n + nth - 1) / nth;
+    const int64_t i0 = dr * ith;
+    const int64_t i1 = MIN(i0 + dr, n);
+
+    float * dst_data = (float *) dst->data;
+    const float * src0_data = (const float *) src0->data;
+    const float * src1_data = (const float *) src1->data;
+    const float * src2_data = (const float *) src2->data;
+    const float * src3_data = (const float *) src3->data;
+
+    for (int64_t i = i0; i < i1; ++i) {
+        // Keep these intermediates separate: FFN reduction compatibility
+        // requires the same rounding order as (src0 + (src1 + src2)) + src3.
+        const float src12 = src1_data[i] + src2_data[i];
+        const float src012 = src0_data[i] + src12;
+        dst_data[i] = src012 + src3_data[i];
+    }
+}
+
 // ggml_compute_forward_add_id
 
 static void ggml_compute_forward_add_id_f32(

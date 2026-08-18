@@ -453,6 +453,21 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     }
 
     switch (op->op) {
+        case GGML_OP_ADD4:
+            return op->type == GGML_TYPE_F32 &&
+                op->src[0] != nullptr && op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1] != nullptr && op->src[1]->type == GGML_TYPE_F32 &&
+                op->src[2] != nullptr && op->src[2]->type == GGML_TYPE_F32 &&
+                op->src[3] != nullptr && op->src[3]->type == GGML_TYPE_F32 &&
+                ggml_are_same_shape(op->src[0], op->src[1]) &&
+                ggml_are_same_shape(op->src[0], op->src[2]) &&
+                ggml_are_same_shape(op->src[0], op->src[3]) &&
+                ggml_are_same_shape(op, op->src[0]) &&
+                ggml_is_contiguous(op) &&
+                ggml_is_contiguous(op->src[0]) &&
+                ggml_is_contiguous(op->src[1]) &&
+                ggml_is_contiguous(op->src[2]) &&
+                ggml_is_contiguous(op->src[3]);
         case GGML_OP_CPY:
         case GGML_OP_SET_ROWS:
             return

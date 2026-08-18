@@ -587,6 +587,10 @@ extern "C" {
         // Appended to preserve the numeric values of all existing operations.
         GGML_OP_MUL_MAT_SRC0_REGION,
 
+        // Four-input F32 sum with a fixed reduction order.
+        // Appended to preserve the numeric values of all existing operations.
+        GGML_OP_ADD4,
+
         GGML_OP_COUNT,
     };
 
@@ -893,6 +897,16 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
+
+    // CPU/OpenCL forward op. All inputs must be same-shape contiguous F32.
+    // The elementwise floating-point order is exactly (a + (b + c)) + d.
+    // Backward graph construction is intentionally unsupported.
+    GGML_API struct ggml_tensor * ggml_add4(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * c,
+            struct ggml_tensor  * d);
 
     GGML_API struct ggml_tensor * ggml_add_inplace(
             struct ggml_context * ctx,

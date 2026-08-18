@@ -1080,9 +1080,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 
     "MUL_MAT_SRC0_REGION",
+    "ADD4",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1192,9 +1193,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 
     "X[k0:k1,o0:o1]*Y",
+    "(x+(y+z))+w",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -2041,6 +2043,35 @@ struct ggml_tensor * ggml_add(
         struct ggml_tensor  * a,
         struct ggml_tensor  * b) {
     return ggml_add_impl(ctx, a, b, false);
+}
+
+struct ggml_tensor * ggml_add4(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * c,
+        struct ggml_tensor  * d) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(b->type == GGML_TYPE_F32);
+    GGML_ASSERT(c->type == GGML_TYPE_F32);
+    GGML_ASSERT(d->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(a, b));
+    GGML_ASSERT(ggml_are_same_shape(a, c));
+    GGML_ASSERT(ggml_are_same_shape(a, d));
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(ggml_is_contiguous(b));
+    GGML_ASSERT(ggml_is_contiguous(c));
+    GGML_ASSERT(ggml_is_contiguous(d));
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+
+    result->op     = GGML_OP_ADD4;
+    result->src[0] = a;
+    result->src[1] = b;
+    result->src[2] = c;
+    result->src[3] = d;
+
+    return result;
 }
 
 struct ggml_tensor * ggml_add_inplace(
@@ -6940,6 +6971,9 @@ static void ggml_compute_backward(
                     GGML_ABORT("unsupported glu op for backward pass: %s", ggml_glu_op_name(ggml_get_glu_op(tensor)));
                 } //break;
             }
+        } break;
+        case GGML_OP_ADD4: {
+            GGML_ABORT("%s: GGML_OP_ADD4 is forward-only\n", __func__);
         } break;
         case GGML_OP_NONE: {
             // noop
