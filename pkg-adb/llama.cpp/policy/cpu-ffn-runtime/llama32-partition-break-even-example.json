@@ -1,0 +1,497 @@
+{
+  "version": 1,
+  "enabled": true,
+  "devices": {
+    "fallback_priority": [
+      "OpenCL",
+      "HTP0",
+      "CPU"
+    ]
+  },
+  "ffn_clock_switch": {
+    "enabled": false
+  },
+  "ffn_parallel": {
+    "enabled": true,
+    "phase": "prefill",
+    "layer_range": [
+      0,
+      27
+    ],
+    "align": 64,
+    "reduce_backend": "CPU",
+    "reduce_threads": 2,
+    "split_layout": [
+      {
+        "id": "npu",
+        "backend": "HTP0-REPACK"
+      },
+      {
+        "id": "gpu",
+        "backend": "OpenCL"
+      },
+      {
+        "id": "cpu",
+        "backend": "CPU_REPACK"
+      }
+    ],
+    "split_sizes": {
+      "npu": 0,
+      "gpu": 8192,
+      "cpu": 0
+    }
+  },
+  "attn_qkv_shards": {
+    "enabled": true,
+    "phase": "prefill",
+    "layer_range": [
+      0,
+      27
+    ],
+    "head_dim": 128,
+    "assemble_backend": "OpenCL",
+    "split_layout": [
+      {
+        "id": "cpu",
+        "backend": "CPU",
+        "align": 128
+      },
+      {
+        "id": "gpu",
+        "backend": "OpenCL",
+        "align": 128
+      },
+      {
+        "id": "npu",
+        "backend": "HTP0-REPACK",
+        "align": 256
+      }
+    ],
+    "split_sizes": {
+      "q": {
+        "cpu": 0,
+        "gpu": 3072,
+        "npu": 0
+      },
+      "k": {
+        "cpu": 0,
+        "gpu": 1024,
+        "npu": 0
+      },
+      "v": {
+        "cpu": 0,
+        "gpu": 1024,
+        "npu": 0
+      }
+    }
+  },
+  "attn_out_shards": {
+    "enabled": true,
+    "phase": "prefill",
+    "partition_axis": "output",
+    "layer_range": [
+      0,
+      27
+    ],
+    "head_dim": 128,
+    "reduce_backend": "OpenCL",
+    "split_layout": [
+      {
+        "id": "cpu",
+        "backend": "CPU",
+        "align": 128
+      },
+      {
+        "id": "gpu",
+        "backend": "OpenCL",
+        "align": 128
+      },
+      {
+        "id": "npu",
+        "backend": "HTP0-REPACK",
+        "align": 256
+      }
+    ],
+    "split_sizes": {
+      "cpu": 0,
+      "gpu": 3072,
+      "npu": 0
+    }
+  },
+  "profile_defaults": {
+    "ffn_parallel": {
+      "enabled": true,
+      "phase": "prefill",
+      "layer_range": [
+        0,
+        27
+      ],
+      "align": 64,
+      "reduce_backend": "CPU",
+      "reduce_threads": 2,
+      "split_layout": [
+        {
+          "id": "npu",
+          "backend": "HTP0-REPACK"
+        },
+        {
+          "id": "gpu",
+          "backend": "OpenCL"
+        },
+        {
+          "id": "cpu",
+          "backend": "CPU_REPACK"
+        }
+      ]
+    },
+    "ops": {
+      "enabled": true,
+      "rules": [
+        {
+          "name": "attn_rms_norm",
+          "op": "RMS_NORM",
+          "phase": "prefill",
+          "layer_range": [
+            0,
+            27
+          ],
+          "backend": "OpenCL"
+        },
+        {
+          "name": "attn_norm",
+          "op": "MUL",
+          "phase": "prefill",
+          "layer_range": [
+            0,
+            27
+          ],
+          "backend": "OpenCL"
+        },
+        {
+          "name": "ffn_rms_norm",
+          "op": "RMS_NORM",
+          "phase": "prefill",
+          "layer_range": [
+            0,
+            27
+          ],
+          "backend": "HTP0"
+        },
+        {
+          "name": "ffn_norm",
+          "op": "MUL",
+          "phase": "prefill",
+          "layer_range": [
+            0,
+            27
+          ],
+          "backend": "HTP0-REPACK"
+        },
+        {
+          "name": "ffn_inp",
+          "op": "ADD",
+          "phase": "prefill",
+          "layer_range": [
+            0,
+            27
+          ],
+          "backend": "OpenCL"
+        }
+      ]
+    }
+  },
+  "profiles": {
+    "p15-g15-gpu14-ubatch-lt128-gpu-only": {
+      "clock_point": {
+        "prime": {
+          "index": 15,
+          "khz": 4473600
+        },
+        "gold": {
+          "index": 15,
+          "khz": 3532800
+        },
+        "gpu": {
+          "index": 14,
+          "hz": 1200000000
+        }
+      },
+      "applicability": {
+        "input_tokens": [
+          1,
+          2147483647
+        ],
+        "ubatch_tokens": [
+          1,
+          127
+        ]
+      },
+      "ffn_parallel": {
+        "split_sizes": {
+          "npu": 0,
+          "gpu": 8192,
+          "cpu": 0
+        }
+      },
+      "attn_qkv_shards": {
+        "split_sizes": {
+          "q": {
+            "cpu": 0,
+            "gpu": 3072,
+            "npu": 0
+          },
+          "k": {
+            "cpu": 0,
+            "gpu": 1024,
+            "npu": 0
+          },
+          "v": {
+            "cpu": 0,
+            "gpu": 1024,
+            "npu": 0
+          }
+        }
+      },
+      "attn_out_shards": {
+        "split_sizes": {
+          "cpu": 0,
+          "gpu": 3072,
+          "npu": 0
+        }
+      },
+      "ops": {
+        "rules": [
+          {
+            "name": "attn_rms_norm",
+            "op": "RMS_NORM",
+            "phase": "prefill",
+            "layer_range": [
+              0,
+              27
+            ],
+            "backend": "OpenCL"
+          },
+          {
+            "name": "attn_norm",
+            "op": "MUL",
+            "phase": "prefill",
+            "layer_range": [
+              0,
+              27
+            ],
+            "backend": "OpenCL"
+          },
+          {
+            "name": "ffn_rms_norm",
+            "op": "RMS_NORM",
+            "phase": "prefill",
+            "layer_range": [
+              0,
+              27
+            ],
+            "backend": "OpenCL"
+          },
+          {
+            "name": "ffn_norm",
+            "op": "MUL",
+            "phase": "prefill",
+            "layer_range": [
+              0,
+              27
+            ],
+            "backend": "OpenCL"
+          },
+          {
+            "name": "ffn_inp",
+            "op": "ADD",
+            "phase": "prefill",
+            "layer_range": [
+              0,
+              27
+            ],
+            "backend": "OpenCL"
+          }
+        ]
+      }
+    },
+    "p15-g15-gpu14-ubatch-ge128-partition": {
+      "clock_point": {
+        "prime": {
+          "index": 15,
+          "khz": 4473600
+        },
+        "gold": {
+          "index": 15,
+          "khz": 3532800
+        },
+        "gpu": {
+          "index": 14,
+          "hz": 1200000000
+        }
+      },
+      "applicability": {
+        "input_tokens": [
+          1,
+          2147483647
+        ],
+        "ubatch_tokens": [
+          128,
+          2147483647
+        ]
+      },
+      "ffn_parallel": {
+        "split_sizes": {
+          "npu": 3584,
+          "gpu": 3008,
+          "cpu": 1600
+        }
+      },
+      "attn_qkv_shards": {
+        "split_sizes": {
+          "q": {
+            "cpu": 128,
+            "gpu": 384,
+            "npu": 2560
+          },
+          "k": {
+            "cpu": 256,
+            "gpu": 512,
+            "npu": 256
+          },
+          "v": {
+            "cpu": 256,
+            "gpu": 512,
+            "npu": 256
+          }
+        }
+      },
+      "attn_out_shards": {
+        "split_sizes": {
+          "cpu": 256,
+          "gpu": 1024,
+          "npu": 1792
+        }
+      }
+    }
+  },
+  "runtime_routes": {
+    "enabled": true,
+    "mode": "clock",
+    "phase": "prefill",
+    "initial_profile": "p15-g15-gpu14-ubatch-lt128-gpu-only",
+    "profiles": [
+      "p15-g15-gpu14-ubatch-lt128-gpu-only",
+      "p15-g15-gpu14-ubatch-ge128-partition"
+    ],
+    "transitions": "complete",
+    "candidate_kinds": [
+      "weightless_stateless",
+      "weighted_norm",
+      "ffn_block",
+      "attn_qkv_block",
+      "attn_out_block"
+    ],
+    "boundary": {
+      "node": "l_out",
+      "backend": "auto",
+      "granularity": "layer"
+    },
+    "output_mode": "canonical",
+    "min_dwell_layers": 1,
+    "strict": true
+  },
+  "weights": {
+    "enabled": true,
+    "default": "CPU_REPACK",
+    "rules": [
+      {
+        "tensor": "token_embd.weight",
+        "backend": "CPU"
+      },
+      {
+        "pattern": "^blk\\.[0-9]+\\.attn_(q|k|v|output)\\.weight$",
+        "backend": "OpenCL"
+      },
+      {
+        "tensor": "rope_freqs.weight",
+        "backend": "OpenCL"
+      },
+      {
+        "pattern": "^blk\\.[0-9]+\\.attn_norm\\.weight$",
+        "backend": "OpenCL"
+      },
+      {
+        "pattern": "^blk\\.[0-9]+\\.ffn_norm\\.weight$",
+        "backend": "HTP0-REPACK"
+      }
+    ]
+  },
+  "residency": {
+    "enabled": true,
+    "rules": [
+      {
+        "pattern": "^blk\\.[0-9]+\\.(attn|ffn)_norm\\.weight$",
+        "copies": [
+          "CPU",
+          "OpenCL",
+          "HTP0-REPACK"
+        ]
+      }
+    ]
+  },
+  "ops": {
+    "enabled": true,
+    "rules": [
+      {
+        "name": "attn_rms_norm",
+        "op": "RMS_NORM",
+        "phase": "prefill",
+        "layer_range": [
+          0,
+          27
+        ],
+        "backend": "OpenCL"
+      },
+      {
+        "name": "attn_norm",
+        "op": "MUL",
+        "phase": "prefill",
+        "layer_range": [
+          0,
+          27
+        ],
+        "backend": "OpenCL"
+      },
+      {
+        "name": "ffn_rms_norm",
+        "op": "RMS_NORM",
+        "phase": "prefill",
+        "layer_range": [
+          0,
+          27
+        ],
+        "backend": "OpenCL"
+      },
+      {
+        "name": "ffn_norm",
+        "op": "MUL",
+        "phase": "prefill",
+        "layer_range": [
+          0,
+          27
+        ],
+        "backend": "OpenCL"
+      },
+      {
+        "name": "ffn_inp",
+        "op": "ADD",
+        "phase": "prefill",
+        "layer_range": [
+          0,
+          27
+        ],
+        "backend": "OpenCL"
+      }
+    ]
+  }
+}
