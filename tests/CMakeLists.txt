@@ -203,6 +203,8 @@ llama_build_and_test(test-log.cpp)
 llama_build(test-backend-policy-clock.cpp)
 target_include_directories(test-backend-policy-clock PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_test(test-backend-policy-clock)
+llama_build_and_test(test-add4.cpp)
+target_include_directories(test-add4 PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build_and_test(
     test-peg-parser.cpp
     peg-parser/simple-tokenize.cpp
@@ -249,6 +251,9 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
 endif()
 llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)
+llama_build_and_test(test-backend-events.cpp)
+llama_build_and_test(test-backend-sched-qkv-lazy.cpp)
+llama_build_and_test(test-backend-sched-ffn-prefetch.cpp)
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")

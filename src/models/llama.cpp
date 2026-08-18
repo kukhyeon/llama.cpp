@@ -865,11 +865,57 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
         }
         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
         cb(ffn_inp, "ffn_inp", il);
+        bool ffn_residual_fused = false;
+        std::string ffn_fusion_backend;
 
         // feed-forward network (non-MoE)
         if (model.layers[il].ffn_gate_inp == nullptr) {
             if (runtime_ffn_routes) {
                 ggml_tensor * canonical_out = nullptr;
+                std::vector<ggml_tensor *> canonical_partials;
+
+                // A route may expose the FFN partials directly only when all
+                // candidates have the same three logical output slots. This
+                // all-profile preflight prevents a clock switch from changing
+                // the arity/order consumed by the common ADD4 node.
+                std::vector<llama_backend_policy_ffn_parallel> add4_policies;
+                bool runtime_add4_bundle = llm_graph_ffn_fused_add4_enabled() &&
+                    sched != nullptr && ffn_inp->type == GGML_TYPE_F32 &&
+                    ggml_is_contiguous(ffn_inp) &&
+                    model.layers[il].ffn_up_b == nullptr && model.layers[il].ffn_up_s == nullptr &&
+                    model.layers[il].ffn_gate_b == nullptr && model.layers[il].ffn_gate_s == nullptr &&
+                    model.layers[il].ffn_down_b == nullptr && model.layers[il].ffn_down_s == nullptr &&
+                    (loras == nullptr || loras->empty());
+                if (runtime_add4_bundle) {
+                    add4_policies.reserve(runtime_route_profiles.size());
+                    for (const std::string & profile : runtime_route_profiles) {
+                        llama_backend_policy_ffn_parallel policy;
+                        if (!llama_backend_policy_match_ffn_parallel_for_profile(
+                                    profile.c_str(), il, true, policy)) {
+                            runtime_add4_bundle = false;
+                            break;
+                        }
+                        add4_policies.push_back(std::move(policy));
+                    }
+                }
+
+                runtime_add4_bundle = runtime_add4_bundle &&
+                    llm_graph_ffn_add4_policies_eligible(
+                            add4_policies,
+                            model.layers[il].ffn_up->ne[1],
+                            ggml_blck_size(model.layers[il].ffn_up->type));
+
+                // Probe the selected reduce backend before changing any route
+                // terminal into a three-output bundle. Unsupported backends
+                // retain the original reduced route output and residual ADD.
+                std::string add4_fusion_backend;
+                if (runtime_add4_bundle) {
+                    ggml_tensor * probe = ggml_add4(
+                            ctx0, ffn_inp, ffn_inp, ffn_inp, ffn_inp);
+                    runtime_add4_bundle = llm_graph_ffn_add4_opencl_backend(
+                            sched, ffn_inp, probe, &add4_fusion_backend);
+                }
+
                 for (const std::string & profile : runtime_route_profiles) {
                     llama_backend_policy_ffn_parallel ffn_policy;
                     llama_backend_policy_match rms_match;
@@ -911,29 +957,59 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                     cb_route(weighted, (std::string("ffn_norm.") + route_tag).c_str(), il,
                             mul_match.backends.front().c_str());
 
+                    std::vector<ggml_tensor *> route_partials;
                     ggml_tensor * route_out = build_ffn(weighted,
                             model.layers[il].ffn_up,   model.layers[il].ffn_up_b,   model.layers[il].ffn_up_s,
                             model.layers[il].ffn_gate, model.layers[il].ffn_gate_b, model.layers[il].ffn_gate_s,
                             model.layers[il].ffn_down, model.layers[il].ffn_down_b, model.layers[il].ffn_down_s,
                             NULL,
-                            LLM_FFN_SILU, LLM_FFN_PAR, il, &ffn_policy, route_tag);
-                    cb(route_out, (std::string("ffn_route_out.") + route_tag).c_str(), il);
-                    ggml_build_forward_expand(gf, route_out);
+                            LLM_FFN_SILU, LLM_FFN_PAR, il, &ffn_policy, route_tag,
+                            nullptr, nullptr,
+                            runtime_add4_bundle ? &route_partials : nullptr);
+
+                    std::vector<ggml_tensor *> route_outputs;
+                    if (runtime_add4_bundle) {
+                        if (route_partials.size() != 3) {
+                            GGML_ABORT(
+                                    "runtime_routes: profile %s layer %d passed ADD4 preflight but did not build three FFN partials",
+                                    profile.c_str(), il);
+                        }
+                        route_outputs = route_partials;
+                        route_out = route_partials.back();
+                        for (ggml_tensor * partial : route_partials) {
+                            ggml_build_forward_expand(gf, partial);
+                        }
+                    } else {
+                        cb(route_out, (std::string("ffn_route_out.") + route_tag).c_str(), il);
+                        ggml_build_forward_expand(gf, route_out);
+                        route_outputs = { route_out };
+                    }
 
                     if (route_subgraph_cb_func) {
                         route_subgraph_cb_func(
                                 "ffn_block", profile.c_str(), il,
-                                first, route_out, { route_out });
+                                first, route_out, route_outputs);
                     }
                     if (profile == runtime_routes.initial_profile) {
                         canonical_out = route_out;
+                        canonical_partials = route_partials;
                     }
                 }
                 if (canonical_out == nullptr) {
                     GGML_ABORT("runtime_routes: initial FFN profile %s was not built",
                             runtime_routes.initial_profile.c_str());
                 }
-                cur = canonical_out;
+                if (runtime_add4_bundle) {
+                    GGML_ASSERT(canonical_partials.size() == 3);
+                    cur = ggml_add4(ctx0,
+                            canonical_partials[0], canonical_partials[1],
+                            canonical_partials[2], ffn_inp);
+                    cb_route(cur, "ffn_parallel_add4", il, add4_fusion_backend.c_str());
+                    ffn_fusion_backend = add4_fusion_backend;
+                    ffn_residual_fused = true;
+                } else {
+                    cur = canonical_out;
+                }
             } else {
                 cur = build_norm(ffn_inp,
                         model.layers[il].ffn_norm, NULL,
@@ -954,8 +1030,18 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                         NULL,
                         LLM_FFN_SILU, LLM_FFN_PAR, il,
                         have_carried_ffn_policy ? &carried_ffn_policy : nullptr,
-                        have_carried_ffn_policy ? runtime_ffn_profile.c_str() : nullptr);
-                cb(cur, "ffn_out", il);
+                        have_carried_ffn_policy ? runtime_ffn_profile.c_str() : nullptr,
+                        ffn_inp, &ffn_residual_fused);
+                if (ffn_residual_fused) {
+                    if (!llm_graph_ffn_add4_opencl_backend(
+                                sched, ffn_inp, cur, &ffn_fusion_backend)) {
+                        GGML_ABORT(
+                                "ffn ADD4 layer %d lost its concrete OpenCL backend after graph construction",
+                                il);
+                    }
+                } else {
+                    cb(cur, "ffn_out", il);
+                }
             }
         } else {
             // MoE branch
@@ -981,11 +1067,23 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                     model.layers[il].ffn_down_exps_s);
             cb(cur, "ffn_moe_out", il);
         }
-        cur = ggml_add(ctx0, cur, ffn_inp);
-        cb(cur, "ffn_out", il);
+        if (!ffn_residual_fused) {
+            cur = ggml_add(ctx0, cur, ffn_inp);
+            cb(cur, "ffn_out", il);
+        } else {
+            // Use a strict hint for every subsequent name callback on the same
+            // tensor. This prevents a generic ffn_out op rule from moving the
+            // fused node back to the legacy CPU reduce backend.
+            cb_route(cur, "ffn_out", il, ffn_fusion_backend.c_str());
+        }
 
+        ggml_tensor * pre_cvec = cur;
         cur = build_cvec(cur, il);
-        cb(cur, "l_out", il);
+        if (ffn_residual_fused && cur == pre_cvec) {
+            cb_route(cur, "l_out", il, ffn_fusion_backend.c_str());
+        } else {
+            cb(cur, "l_out", il);
+        }
 
         // input for next layer
         inpL = cur;

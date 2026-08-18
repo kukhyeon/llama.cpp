@@ -18,6 +18,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <sstream>
@@ -62,6 +63,198 @@ static bool can_reuse_kq_mask(
 
 static bool tensor_is_allocated(const ggml_tensor * t) {
     return t != nullptr && t->buffer != nullptr;
+}
+
+static bool ffn_fused_add3_enabled() {
+    const char * value = std::getenv("LLAMA_FFN_FUSED_ADD3");
+    return value != nullptr && std::atoi(value) != 0;
+}
+
+bool llm_graph_ffn_fused_add4_enabled() {
+    const char * value = std::getenv("LLAMA_FFN_FUSED_ADD4");
+    return value != nullptr && std::atoi(value) != 0;
+}
+
+static std::string ffn_backend_key(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return (char) std::tolower(c);
+    });
+    return value;
+}
+
+static bool ffn_is_hybrid_prefix_backend(const std::string & backend) {
+    const std::string key = ffn_backend_key(backend);
+    return key.find("htp") != std::string::npos ||
+           key.find("hexagon") != std::string::npos;
+}
+
+bool llm_graph_ffn_add4_policies_eligible(
+        const std::vector<llama_backend_policy_ffn_parallel> & policies,
+        int64_t n_ff,
+        int64_t weight_block_size) {
+    if (policies.empty() || n_ff <= 0 || weight_block_size <= 0) {
+        return false;
+    }
+
+    std::vector<std::pair<std::string, std::string>> reference_slots;
+    for (const auto & policy : policies) {
+        const int64_t align = std::max<int64_t>(1, policy.align);
+        std::vector<llama_backend_policy_ffn_split> splits;
+        for (const auto & split : policy.splits) {
+            if (split.size < 0) {
+                return false;
+            }
+            if (split.size > 0) {
+                splits.push_back(split);
+            }
+        }
+        std::sort(splits.begin(), splits.end(), [](const auto & lhs, const auto & rhs) {
+            return lhs.start < rhs.start;
+        });
+        if (splits.size() != 3) {
+            return false;
+        }
+
+        int64_t covered = 0;
+        for (const auto & split : splits) {
+            if (split.start != covered || split.size <= 0 ||
+                    split.start % align != 0 || split.size % align != 0 ||
+                    split.size % weight_block_size != 0) {
+                return false;
+            }
+            covered = split.start + split.size;
+        }
+        if (covered != n_ff) {
+            return false;
+        }
+
+        std::stable_sort(splits.begin(), splits.end(), [](const auto & lhs, const auto & rhs) {
+            const bool lhs_prefix = ffn_is_hybrid_prefix_backend(lhs.backend);
+            const bool rhs_prefix = ffn_is_hybrid_prefix_backend(rhs.backend);
+            if (lhs_prefix != rhs_prefix) {
+                return !lhs_prefix;
+            }
+            return lhs.start < rhs.start;
+        });
+
+        std::vector<std::pair<std::string, std::string>> slots;
+        slots.reserve(splits.size());
+        for (const auto & split : splits) {
+            slots.emplace_back(
+                    split.id.empty() ? ffn_backend_key(split.backend) : split.id,
+                    ffn_backend_key(split.backend));
+        }
+        if (reference_slots.empty()) {
+            reference_slots = std::move(slots);
+        } else if (slots != reference_slots) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool llm_graph_ffn_add4_opencl_backend(
+        ggml_backend_sched_t sched,
+        ggml_tensor * residual,
+        ggml_tensor * candidate,
+        std::string * backend_name) {
+    if (sched == nullptr || residual == nullptr || candidate == nullptr) {
+        return false;
+    }
+
+    // ffn_inp is named/placed by the ordinary op-policy callback before this
+    // helper runs. Reuse that exact backend so the residual stays resident and
+    // the fused node naturally feeds the next OpenCL layer. Do not silently
+    // select CPU merely because legacy ffn_parallel.reduce_backend says CPU.
+    ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, residual);
+    ggml_backend_dev_t dev = backend != nullptr ? ggml_backend_get_device(backend) : nullptr;
+    ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    const char * reg_name = reg != nullptr ? ggml_backend_reg_name(reg) : nullptr;
+    if (reg_name == nullptr ||
+            ffn_backend_key(reg_name).find("opencl") == std::string::npos ||
+            !ggml_backend_supports_op(backend, candidate)) {
+        return false;
+    }
+
+    if (backend_name != nullptr) {
+        *backend_name = ggml_backend_dev_name(dev);
+    }
+    return true;
+}
+
+// Preserve the existing three-lane reduction order exactly:
+//     branch[0] + (branch[1] + branch[2])
+//
+// The intermediate ADD tensor is deliberately not materialized. This callback
+// is only selected for contiguous F32 tensors on the CPU reduce backend; all
+// other layouts and topologies keep using the ordinary GGML ADD tree.
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((optimize("no-associative-math")))
+#endif
+static void ffn_fused_add3_f32(
+        ggml_tensor * dst,
+        const ggml_tensor * a,
+        const ggml_tensor * b,
+        const ggml_tensor * c,
+        int ith,
+        int nth,
+        void * userdata) {
+#if defined(__clang__)
+#pragma clang fp reassociate(off)
+#endif
+    GGML_UNUSED(userdata);
+    GGML_ASSERT(dst != nullptr && a != nullptr && b != nullptr && c != nullptr);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 &&
+                a->type == GGML_TYPE_F32 &&
+                b->type == GGML_TYPE_F32 &&
+                c->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(dst, a));
+    GGML_ASSERT(ggml_are_same_shape(a, b));
+    GGML_ASSERT(ggml_are_same_shape(a, c));
+    GGML_ASSERT(ggml_is_contiguous(dst) &&
+                ggml_is_contiguous(a) &&
+                ggml_is_contiguous(b) &&
+                ggml_is_contiguous(c));
+    GGML_ASSERT(ith >= 0 && ith < nth);
+
+    const int64_t n = ggml_nelements(dst);
+    const int64_t i0 = n * ith / nth;
+    const int64_t i1 = n * (ith + 1) / nth;
+    float * GGML_RESTRICT dst_data = ggml_get_data_f32(dst);
+    const float * GGML_RESTRICT a_data = ggml_get_data_f32(a);
+    const float * GGML_RESTRICT b_data = ggml_get_data_f32(b);
+    const float * GGML_RESTRICT c_data = ggml_get_data_f32(c);
+
+    for (int64_t i = i0; i < i1; ++i) {
+        const float rhs = b_data[i] + c_data[i];
+        dst_data[i] = a_data[i] + rhs;
+    }
+}
+
+ggml_tensor * llm_graph_try_build_ffn_fused_add3(
+        ggml_context * ctx,
+        ggml_tensor * a,
+        ggml_tensor * b,
+        ggml_tensor * c,
+        const char * reduce_backend) {
+    const bool cpu_reduce = reduce_backend != nullptr &&
+        std::strlen(reduce_backend) == 3 &&
+        std::tolower((unsigned char) reduce_backend[0]) == 'c' &&
+        std::tolower((unsigned char) reduce_backend[1]) == 'p' &&
+        std::tolower((unsigned char) reduce_backend[2]) == 'u';
+    if (!ffn_fused_add3_enabled() || !cpu_reduce ||
+            ctx == nullptr || a == nullptr || b == nullptr || c == nullptr ||
+            a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 ||
+            c->type != GGML_TYPE_F32 ||
+            !ggml_are_same_shape(a, b) || !ggml_are_same_shape(a, c) ||
+            !ggml_is_contiguous(a) || !ggml_is_contiguous(b) ||
+            !ggml_is_contiguous(c)) {
+        return nullptr;
+    }
+
+    return ggml_map_custom3(
+            ctx, a, b, c, ffn_fused_add3_f32, GGML_N_TASKS_MAX, nullptr);
 }
 
 // impl
@@ -1997,7 +2190,16 @@ ggml_tensor * llm_graph_context::build_ffn(
      llm_ffn_gate_type   type_gate,
                  int   il,
     const llama_backend_policy_ffn_parallel * policy_override,
-         const char * route_tag) const {
+         const char * route_tag,
+        ggml_tensor * residual,
+                bool * out_residual_fused,
+    std::vector<ggml_tensor *> * out_parallel_partials) const {
+    if (out_residual_fused != nullptr) {
+        *out_residual_fused = false;
+    }
+    if (out_parallel_partials != nullptr) {
+        out_parallel_partials->clear();
+    }
     llama_backend_policy_ffn_parallel ffn_policy;
     const bool is_prefill = n_tokens > 1;
     const bool has_policy_override = policy_override != nullptr;
@@ -2069,16 +2271,8 @@ ggml_tensor * llm_graph_context::build_ffn(
             // Keep the HTP/NPU branch after non-HTP branches so that ffn_norm is
             // emitted as a completed prefix split before all parallel branches.
             std::stable_sort(exec_splits.begin(), exec_splits.end(), [](const auto & a, const auto & b) {
-                auto is_hybrid_prefix_backend = [](std::string backend) {
-                    std::transform(backend.begin(), backend.end(), backend.begin(), [](unsigned char c) {
-                        return (char) std::tolower(c);
-                    });
-                    return backend.find("htp") != std::string::npos ||
-                           backend.find("hexagon") != std::string::npos;
-                };
-
-                const bool a_prefix = is_hybrid_prefix_backend(a.backend);
-                const bool b_prefix = is_hybrid_prefix_backend(b.backend);
+                const bool a_prefix = ffn_is_hybrid_prefix_backend(a.backend);
+                const bool b_prefix = ffn_is_hybrid_prefix_backend(b.backend);
                 if (a_prefix != b_prefix) {
                     return !a_prefix;
                 }
@@ -2099,6 +2293,23 @@ ggml_tensor * llm_graph_context::build_ffn(
                 if (outs.empty()) {
                     return nullptr;
                 }
+
+                // Keep the fused path intentionally narrow. MAP_CUSTOM3 is a
+                // CPU-only callback and the scheduler treats it as an FFN join
+                // only when its three sources are distinct FFN branches. Any
+                // unsupported type, layout, topology, or reduce backend falls
+                // through to the existing ADD tree unchanged.
+                if (outs.size() == 3) {
+                    ggml_tensor * acc = llm_graph_try_build_ffn_fused_add3(
+                            ctx0, outs[0], outs[1], outs[2],
+                            ffn_policy.reduce_backend.c_str());
+                    if (acc != nullptr) {
+                        cb_parallel(acc, ("ffn_parallel_sum" + route_suffix).c_str(),
+                                ffn_policy.reduce_backend.c_str());
+                        return acc;
+                    }
+                }
+
                 ggml_tensor * acc = outs.back();
                 for (size_t ri = outs.size() - 1; ri > 0; --ri) {
                     acc = reduce_add(outs[ri - 1], acc);
@@ -2178,6 +2389,48 @@ ggml_tensor * llm_graph_context::build_ffn(
             }
 
             if (valid && !branch_outs.empty() && branch_outs.size() == exec_splits.size()) {
+                // Runtime-route ADD4 keeps the three full-width partials as an
+                // atomic output bundle. The common ADD4 consumer is emitted
+                // only after every profile subgraph has been built, so a
+                // selected alternate commits all three slots before use.
+                if (out_parallel_partials != nullptr &&
+                        llm_graph_ffn_fused_add4_enabled() &&
+                        branch_outs.size() == 3) {
+                    *out_parallel_partials = branch_outs;
+                    return branch_outs.back();
+                }
+
+                // Static graphs can fuse both ADD reduction nodes and the
+                // residual ADD directly. Probe the concrete policy backend
+                // before attaching the candidate; unsupported OpenCL/CPU
+                // implementations fall through to the original ADD tree.
+                if (residual != nullptr && out_residual_fused != nullptr &&
+                        llm_graph_ffn_fused_add4_enabled() &&
+                        branch_outs.size() == 3 &&
+                        branch_outs[0]->type == GGML_TYPE_F32 &&
+                        branch_outs[1]->type == GGML_TYPE_F32 &&
+                        branch_outs[2]->type == GGML_TYPE_F32 &&
+                        residual->type == GGML_TYPE_F32 &&
+                        ggml_are_same_shape(branch_outs[0], branch_outs[1]) &&
+                        ggml_are_same_shape(branch_outs[0], branch_outs[2]) &&
+                        ggml_are_same_shape(branch_outs[0], residual) &&
+                        ggml_is_contiguous(branch_outs[0]) &&
+                        ggml_is_contiguous(branch_outs[1]) &&
+                        ggml_is_contiguous(branch_outs[2]) &&
+                        ggml_is_contiguous(residual)) {
+                    ggml_tensor * fused = ggml_add4(
+                            ctx0, branch_outs[0], branch_outs[1],
+                            branch_outs[2], residual);
+                    std::string fusion_backend;
+                    if (llm_graph_ffn_add4_opencl_backend(
+                                sched, residual, fused, &fusion_backend)) {
+                        cb_parallel(fused, ("ffn_parallel_add4" + route_suffix).c_str(),
+                                fusion_backend.c_str());
+                        *out_residual_fused = true;
+                        return fused;
+                    }
+                }
+
                 ggml_tensor * acc = reduce_branches(branch_outs);
                 // A single active shard already is the complete FFN result.
                 // There is no reduction operation for reduce_backend to own;
