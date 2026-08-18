@@ -1987,6 +1987,261 @@ bool test_invalid_runtime_routes_are_transactional(
     return true;
 }
 
+bool test_partition_break_even_routes() {
+    // A break-even guard needs no second selector or mutable threshold state.
+    // Two profiles may intentionally share one clock point as long as their
+    // shape applicability is disjoint. Zero-width lanes turn the small-shape
+    // profile into each module's existing singleton fast path.
+    static const char * policy_json = R"JSON(
+{
+  "enabled": true,
+  "ffn_clock_switch": { "enabled": false },
+  "ffn_parallel": {
+    "enabled": true,
+    "phase": "prefill",
+    "layer_range": [0, 0],
+    "align": 64,
+    "reduce_backend": "CPU",
+    "reduce_threads": 2,
+    "split_layout": [
+      { "id": "npu", "backend": "HTP0-REPACK" },
+      { "id": "gpu", "backend": "OpenCL" },
+      { "id": "cpu", "backend": "CPU_REPACK" }
+    ],
+    "split_sizes": { "npu": 0, "gpu": 8192, "cpu": 0 }
+  },
+  "attn_qkv_shards": {
+    "enabled": true,
+    "phase": "prefill",
+    "layer_range": [0, 0],
+    "head_dim": 128,
+    "assemble_backend": "OpenCL",
+    "split_layout": [
+      { "id": "cpu", "backend": "CPU", "align": 128 },
+      { "id": "gpu", "backend": "OpenCL", "align": 128 },
+      { "id": "npu", "backend": "HTP0-REPACK", "align": 256 }
+    ],
+    "split_sizes": {
+      "q": { "cpu": 0, "gpu": 3072, "npu": 0 },
+      "k": { "cpu": 0, "gpu": 1024, "npu": 0 },
+      "v": { "cpu": 0, "gpu": 1024, "npu": 0 }
+    }
+  },
+  "attn_out_shards": {
+    "enabled": true,
+    "phase": "prefill",
+    "partition_axis": "output",
+    "layer_range": [0, 0],
+    "head_dim": 128,
+    "reduce_backend": "OpenCL",
+    "split_layout": [
+      { "id": "cpu", "backend": "CPU", "align": 128 },
+      { "id": "gpu", "backend": "OpenCL", "align": 128 },
+      { "id": "npu", "backend": "HTP0-REPACK", "align": 256 }
+    ],
+    "split_sizes": { "cpu": 0, "gpu": 3072, "npu": 0 }
+  },
+  "profile_defaults": {
+    "ffn_parallel": {
+      "enabled": true,
+      "phase": "prefill",
+      "layer_range": [0, 0],
+      "align": 64,
+      "reduce_backend": "CPU",
+      "reduce_threads": 2,
+      "split_layout": [
+        { "id": "npu", "backend": "HTP0-REPACK" },
+        { "id": "gpu", "backend": "OpenCL" },
+        { "id": "cpu", "backend": "CPU_REPACK" }
+      ]
+    },
+    "ops": {
+      "enabled": true,
+      "rules": [
+        { "name": "attn_rms_norm", "op": "RMS_NORM", "phase": "prefill", "backend": "OpenCL" },
+        { "name": "attn_norm", "op": "MUL", "phase": "prefill", "backend": "OpenCL" },
+        { "name": "ffn_rms_norm", "op": "RMS_NORM", "phase": "prefill", "backend": "OpenCL" },
+        { "name": "ffn_norm", "op": "MUL", "phase": "prefill", "backend": "OpenCL" },
+        { "name": "ffn_inp", "op": "ADD", "phase": "prefill", "backend": "OpenCL" }
+      ]
+    }
+  },
+  "profiles": {
+    "gpu-only": {
+      "clock_point": {
+        "prime": { "index": 0, "khz": 1000 },
+        "gold":  { "index": 0, "khz": 1000 },
+        "gpu":   { "index": 0, "hz": 1000000 }
+      },
+      "applicability": {
+        "input_tokens": [1, 1024],
+        "ubatch_tokens": [1, 63]
+      },
+      "ffn_parallel": {
+        "split_sizes": { "npu": 0, "gpu": 8192, "cpu": 0 }
+      },
+      "attn_qkv_shards": {
+        "split_sizes": {
+          "q": { "cpu": 0, "gpu": 3072, "npu": 0 },
+          "k": { "cpu": 0, "gpu": 1024, "npu": 0 },
+          "v": { "cpu": 0, "gpu": 1024, "npu": 0 }
+        }
+      },
+      "attn_out_shards": {
+        "split_sizes": { "cpu": 0, "gpu": 3072, "npu": 0 }
+      }
+    },
+    "partition": {
+      "clock_point": {
+        "prime": { "index": 0, "khz": 1000 },
+        "gold":  { "index": 0, "khz": 1000 },
+        "gpu":   { "index": 0, "hz": 1000000 }
+      },
+      "applicability": {
+        "input_tokens": [1, 1024],
+        "ubatch_tokens": [64, 1024]
+      },
+      "ffn_parallel": {
+        "split_sizes": { "npu": 3584, "gpu": 3008, "cpu": 1600 }
+      },
+      "attn_qkv_shards": {
+        "split_sizes": {
+          "q": { "cpu": 128, "gpu": 384, "npu": 2560 },
+          "k": { "cpu": 256, "gpu": 512, "npu": 256 },
+          "v": { "cpu": 256, "gpu": 512, "npu": 256 }
+        }
+      },
+      "attn_out_shards": {
+        "split_sizes": { "cpu": 256, "gpu": 1024, "npu": 1792 }
+      }
+    }
+  },
+  "runtime_routes": {
+    "enabled": true,
+    "mode": "clock",
+    "phase": "prefill",
+    "initial_profile": "gpu-only",
+    "profiles": ["gpu-only", "partition"],
+    "transitions": "complete",
+    "candidate_kinds": [
+      "weightless_stateless",
+      "weighted_norm",
+      "ffn_block",
+      "attn_qkv_block",
+      "attn_out_block"
+    ],
+    "boundary": { "node": "l_out", "backend": "auto", "granularity": "layer" },
+    "output_mode": "canonical",
+    "strict": true
+  },
+  "residency": {
+    "enabled": true,
+    "rules": [
+      {
+        "pattern": "^blk\\.[0-9]+\\.(attn|ffn)_norm\\.weight$",
+        "copies": ["CPU", "OpenCL", "HTP0-REPACK"]
+      }
+    ]
+  }
+}
+)JSON";
+
+    temporary_policy_file policy_file(
+            "test-backend-policy-partition-break-even.json", policy_json);
+
+    llama_backend_policy_clear();
+    CHECK(llama_backend_policy_load(policy_file.path(), false, true));
+
+    llama_backend_policy_runtime_routes routes;
+    CHECK(llama_backend_policy_resolve_runtime_routes(true, routes));
+    CHECK(routes.mode == "clock");
+    CHECK(routes.initial_profile == "gpu-only");
+    CHECK(routes.profiles == std::vector<std::string>({ "gpu-only", "partition" }));
+
+    llama_backend_policy_runtime_route_selection selection;
+    CHECK(llama_backend_policy_select_runtime_route_profile(
+            "gpu-only", true, 512, 63, 1000, 1000, 1000000, selection));
+    CHECK(selection.enabled && selection.matched && selection.profile == "gpu-only");
+
+    // The first shape at the measured break-even selects the partition graph,
+    // even though both profiles deliberately have an identical clock point.
+    CHECK(llama_backend_policy_select_runtime_route_profile(
+            "gpu-only", true, 512, 64, 1000, 1000, 1000000, selection));
+    CHECK(selection.profile == "partition");
+    CHECK(llama_backend_policy_select_runtime_route_profile(
+            "partition", true, 512, 63, 1000, 1000, 1000000, selection));
+    CHECK(selection.profile == "gpu-only");
+
+    CHECK(!llama_backend_policy_select_runtime_route_profile(
+            "partition", true, 512, 1025, 1000, 1000, 1000000, selection));
+    CHECK(selection.enabled && !selection.matched);
+    CHECK(!llama_backend_policy_select_runtime_route_profile(
+            "partition", false, 512, 63, 1000, 1000, 1000000, selection));
+    CHECK(!selection.enabled && !selection.matched);
+
+    llama_backend_policy_ffn_parallel ffn;
+    CHECK(llama_backend_policy_match_ffn_parallel_for_profile(
+            "gpu-only", 0, true, ffn));
+    CHECK(std::count_if(ffn.splits.begin(), ffn.splits.end(), [](const auto & split) {
+        return split.size > 0;
+    }) == 1);
+    CHECK(ffn.splits[1].id == "gpu" && ffn.splits[1].start == 0 && ffn.splits[1].size == 8192);
+
+    CHECK(llama_backend_policy_match_ffn_parallel_for_profile(
+            "partition", 0, true, ffn));
+    CHECK(std::count_if(ffn.splits.begin(), ffn.splits.end(), [](const auto & split) {
+        return split.size > 0;
+    }) == 3);
+    CHECK(ffn.splits[0].size == 3584 && ffn.splits[1].size == 3008 && ffn.splits[2].size == 1600);
+
+    llama_backend_policy_attn_qkv_shards qkv;
+    CHECK(llama_backend_policy_match_attn_qkv_shards_for_profile(
+            "gpu-only", 0, true, qkv));
+    CHECK(qkv.splits[0].q_size == 0 && qkv.splits[1].q_size == 3072 && qkv.splits[2].q_size == 0);
+    CHECK(qkv.splits[1].k_size == 1024 && qkv.splits[1].v_size == 1024);
+    CHECK(llama_backend_policy_match_attn_qkv_shards_for_profile(
+            "partition", 0, true, qkv));
+    CHECK(qkv.splits[0].q_size == 128 && qkv.splits[1].q_size == 384 && qkv.splits[2].q_size == 2560);
+
+    llama_backend_policy_attn_out_shards attn_out;
+    CHECK(llama_backend_policy_match_attn_out_shards_for_profile(
+            "gpu-only", 0, true, attn_out));
+    CHECK(attn_out.splits[0].size == 0 && attn_out.splits[1].size == 3072 && attn_out.splits[2].size == 0);
+    CHECK(llama_backend_policy_match_attn_out_shards_for_profile(
+            "partition", 0, true, attn_out));
+    CHECK(attn_out.splits[0].size == 256 && attn_out.splits[1].size == 1024 && attn_out.splits[2].size == 1792);
+
+    // Both variants are prebuilt. Their union residency must retain the
+    // partition covers while also giving the GPU singleton a complete cover.
+    const auto has_cover = [](const llama_backend_policy_residency_plan & plan,
+                              const char * backend, int64_t start, int64_t size) {
+        return std::any_of(plan.covers.begin(), plan.covers.end(), [&](const auto & cover) {
+            return cover.backend == backend && cover.start == start && cover.size == size;
+        });
+    };
+
+    llama_backend_policy_residency_plan plan;
+    CHECK(llama_backend_policy_build_ffn_residency_plan(0, plan));
+    CHECK(plan.keep_full_source);
+    CHECK(has_cover(plan, "OpenCL", 0, 8192));
+    CHECK(has_cover(plan, "HTP0-REPACK", 0, 3584));
+    CHECK(has_cover(plan, "CPU_REPACK", 6592, 1600));
+
+    CHECK(llama_backend_policy_build_attn_qkv_residency_plan(
+            0, LLAMA_BACKEND_POLICY_ATTN_QKV_PROJECTION_Q, plan));
+    CHECK(has_cover(plan, "OpenCL", 0, 3072));
+    CHECK(has_cover(plan, "CPU", 0, 128));
+    CHECK(has_cover(plan, "HTP0-REPACK", 512, 2560));
+
+    CHECK(llama_backend_policy_build_attn_out_residency_plan(0, plan));
+    CHECK(has_cover(plan, "OpenCL", 0, 3072));
+    CHECK(has_cover(plan, "CPU", 0, 256));
+    CHECK(has_cover(plan, "HTP0-REPACK", 1280, 1792));
+
+    llama_backend_policy_clear();
+    return true;
+}
+
 bool test_compact_unified_ffn_routes(const char * policy_path) {
     llama_backend_policy_clear();
     CHECK(llama_backend_policy_load(policy_path, false, true));
@@ -2791,6 +3046,10 @@ int main() {
                     ambiguous_runtime_route_file.path(),
                     non_layer_boundary_clock_route_file.path(),
                 })) {
+            llama_backend_policy_clear();
+            return 1;
+        }
+        if (!test_partition_break_even_routes()) {
             llama_backend_policy_clear();
             return 1;
         }
