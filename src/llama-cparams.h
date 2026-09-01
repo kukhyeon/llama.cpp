@@ -15,6 +15,7 @@ struct llama_cparams {
     uint32_t n_seq_max;
     int32_t  n_threads;       // number of threads to use for generation
     int32_t  n_threads_batch; // number of threads to use for batch processing
+    uint32_t prefill_graph_cache_tokens;
 
     float rope_freq_base;
     float rope_freq_scale;
@@ -41,6 +42,7 @@ struct llama_cparams {
     bool attn_qkv_parallel;
     bool attn_qkv_shards;
     bool attn_out_shards;
+    bool prefill_graph_cache_strict;
     bool kv_unified;
     bool pipeline_parallel;
 

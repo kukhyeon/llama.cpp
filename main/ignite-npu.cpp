@@ -416,8 +416,16 @@ void ctx_kv_cache_clear(struct llama_context * ctx) {
     llama_memory_clear(mem, true);
 }
 
-std::tuple<int, double, int, double> llama_perf_context_print_custom(const struct llama_context * ctx, const std::string & output_filename, std::chrono::time_point<std::chrono::system_clock> start_sys_time, const llama_igparams * ig) {
+std::tuple<int, double, int, double> llama_perf_context_print_custom(
+        const struct llama_context * ctx,
+        const std::string & output_filename,
+        std::chrono::time_point<std::chrono::system_clock> start_sys_time,
+        const llama_igparams * ig,
+        double sampling_ms,
+        double ttft_e2e_ms,
+        bool strict_sample_only_completed) {
     const auto data = llama_perf_context(ctx);
+    const auto graph_cache = llama_prefill_graph_cache_get_data(ctx);
     const double t_end_ms = 1e-3 * ggml_time_us();
 
     // ("%s:        load time = %10.2f ms\n", __func__, data.t_load_ms);
@@ -434,14 +442,34 @@ std::tuple<int, double, int, double> llama_perf_context_print_custom(const struc
     // Convert time_point to time_t (seconds since epoch)
     auto now_sys_time = std::chrono::system_clock::now();
     auto sys_time = std::chrono::duration_cast<std::chrono::milliseconds>(now_sys_time-start_sys_time).count();
+    // llama_perf_context() clamps n_eval to at least one. In strict sample-only
+    // mode no generated token is evaluated, so expose the semantic decode count
+    // instead of that presentation-layer sentinel in the experiment CSV.
+    // Mask the upstream n_eval>=1 presentation sentinel only after the runtime
+    // state machine has actually completed the sample-only transition. Do not
+    // infer this from CLI configuration alone.
+    const bool sample_only = strict_sample_only_completed;
+    const int32_t decode_tokens = sample_only ? 0 : data.n_eval;
     const double prefill_speed = data.t_p_eval_ms > 0.0 && data.n_p_eval > 0 ? 1e3 / data.t_p_eval_ms * data.n_p_eval : 0.0;
-    const double decode_speed  = data.t_eval_ms   > 0.0 && data.n_eval   > 0 ? 1e3 / data.t_eval_ms   * data.n_eval   : 0.0;
+    const double decode_speed  = !sample_only && data.t_eval_ms > 0.0 && decode_tokens > 0 ?
+        1e3 / data.t_eval_ms * decode_tokens : 0.0;
 
     // system time, prefill speed, decode speed, prefill tokens, decode tokens, ttft
     std::ofstream file(output_filename, std::ios::app);
     if (file.is_open()) {
         file << std::to_string(sys_time) << "," << prefill_speed << "," << decode_speed << ","
-              << data.n_p_eval << ","<< data.n_eval << "," << (data.t_p_eval_ms);
+              << data.n_p_eval << "," << decode_tokens << "," << (data.t_p_eval_ms)
+              << "," << sampling_ms << "," << ttft_e2e_ms
+              << "," << graph_cache.configured_tokens
+              << "," << graph_cache.n_hits
+              << "," << graph_cache.n_misses
+              << "," << graph_cache.n_builds
+              << "," << graph_cache.n_invalidations
+              << "," << graph_cache.n_bypasses
+              << "," << graph_cache.t_build_ms
+              << "," << graph_cache.t_alloc_ms
+              << "," << (graph_cache.ready ? 1 : 0)
+              << "," << (graph_cache.invalidated ? 1 : 0);
         if (should_write_backend_profile_csv(ig)) {
             const auto prof = ggml_backend_sched_profile_get();
             file << "," << prof.prefill_cpu_layers
@@ -481,7 +509,7 @@ std::tuple<int, double, int, double> llama_perf_context_print_custom(const struc
         // LLAMA_LOG_INFO("Failed to open file: %s\n", output_filename.c_str());
     }
 
-    return std::make_tuple(data.n_p_eval, prefill_speed, data.n_eval, decode_speed);
+    return std::make_tuple(data.n_p_eval, prefill_speed, decode_tokens, decode_speed);
 }
 
 std::vector<std::string> loadQuestions(const std::string &filename) {
@@ -872,6 +900,30 @@ int main(int argc, char ** argv) {
         LOG_DBG("tokens: %s\n", string_from(ctx, embd_inp).c_str());
     }
 
+    // JSON questions are independent requests even when conversation mode is
+    // enabled. Preserve only the configured system message between requests,
+    // together with the tokens that represent it after the KV cache is cleared.
+    std::vector<common_chat_msg> json_chat_baseline;
+    std::vector<llama_token> json_embd_baseline;
+    if (params.conversation_mode && params.enable_chat_template && !params.system_prompt.empty()) {
+        common_chat_msg system_msg;
+        system_msg.role = "system";
+        system_msg.content = params.system_prompt;
+        json_chat_baseline.push_back(system_msg);
+
+        common_chat_templates_inputs inputs;
+        inputs.use_jinja = g_params->use_jinja;
+        inputs.messages = json_chat_baseline;
+        inputs.add_generation_prompt = false;
+        const std::string system_prompt = common_chat_templates_apply(chat_templates.get(), inputs).prompt;
+        json_embd_baseline = common_tokenize(ctx, system_prompt, true, true);
+    } else if (llama_vocab_get_add_bos(vocab)) {
+        const llama_token bos = llama_vocab_bos(vocab);
+        if (bos != LLAMA_TOKEN_NULL) {
+            json_embd_baseline.push_back(bos);
+        }
+    }
+
     // Should not run without any tokens
     if (!waiting_for_first_input && embd_inp.empty()) {
         if (add_bos) {
@@ -986,7 +1038,13 @@ int main(int argc, char ** argv) {
     auto start_sys_time = std::chrono::system_clock::now();
     std::ofstream file(output_path_infer, std::ios::app);
     if (file.is_open() && output_path_infer!="/inference_stats.csv") {
-        file << "sys_time,prefill_speed,decode_speed,prefill_token,decode_token,ttft";
+        // Keep the legacy `ttft` column unchanged for compatibility. It stores
+        // llama's prompt-evaluation time; ttft_e2e_ms below is the request-to-
+        // first-sampled-token wall time.
+        file << "sys_time,prefill_speed,decode_speed,prefill_token,decode_token,ttft,sampling_ms,ttft_e2e_ms";
+        file << ",graph_cache_tokens,graph_cache_hits,graph_cache_misses,graph_cache_builds";
+        file << ",graph_cache_invalidations,graph_cache_bypasses,graph_cache_build_ms,graph_cache_alloc_ms";
+        file << ",graph_cache_ready,graph_cache_invalidated";
         if (should_write_backend_profile_csv(ig)) {
             file << ",prefill_cpu_layers,prefill_htp_layers,prefill_gpu_layers";
             file << ",prefill_cpu_ms,prefill_htp_ms,prefill_gpu_ms";
@@ -1242,6 +1300,7 @@ int main(int argc, char ** argv) {
 // ------------------------------------------------
     // timer variables
     std::chrono::steady_clock::time_point inference_start_time;
+    std::chrono::steady_clock::time_point query_e2e_start_time;
     bool inference_started = false;
 
     struct query_timing_sample {
@@ -1352,6 +1411,15 @@ int main(int argc, char ** argv) {
     bool generation_started = false;
     bool prefill_active = false;
     bool decode_active = false;
+    bool strict_prefill_sample_pending = false;
+    bool strict_sample_only_completed = false;
+
+    // Per-query sampling/first-token wall timings. These are deliberately kept
+    // separate from llama's prompt-evaluation counters so prefill throughput and
+    // the legacy CSV `ttft` column retain their existing meaning.
+    double query_sampling_ms = 0.0;
+    double query_ttft_e2e_ms = 0.0;
+    bool query_first_sample_recorded = false;
 // ------------------------------------------------
 
     if (params.interactive) {
@@ -1781,6 +1849,11 @@ int main(int argc, char ** argv) {
 
                 GGML_ASSERT(n_eval <= params.n_batch);
 
+                if (strict_sample_only_completed && generation_started) {
+                    LOG_ERR("strict sample-only invariant violated: generated-token decode was requested\n");
+                    return 1;
+                }
+
                 if (llama_decode(ctx, llama_batch_get_one(embd.data(), n_eval))) {
                     LOG_ERR("%s : failed to eval\n", __func__);
                     return 1;
@@ -1788,19 +1861,20 @@ int main(int argc, char ** argv) {
 
                 n_past += n_eval;
 
-                // STRICT_LIMIT=0 is an explicit prefill-only JSON query. Finish
-                // all asynchronous backend work now and enter the existing query
-                // transition path before common_sampler_sample() can enqueue a
-                // generated-token decode graph.
+                // STRICT_LIMIT=0 samples the first output token but does not
+                // evaluate it. Finish asynchronous prefill work now so the
+                // sampling timer below excludes prompt evaluation. The sampled
+                // token is discarded by the same-iteration query transition
+                // before another llama_decode() can run.
                 const bool prefill_only_done =
-                    is_prefill_eval &&
+                    !generation_started &&
                     params.strict_limit &&
                     params.strict_limit_length == 0 &&
                     n_consumed == (int) embd_inp.size();
                 if (prefill_only_done) {
                     llama_synchronize(ctx);
-                    is_interacting = true;
-                    LOG_DBG("strict prefill-only query complete\n");
+                    strict_prefill_sample_pending = true;
+                    LOG_DBG("strict prefill-only prompt complete; sampling one token\n");
                 }
 
                 LOG_DBG("n_past = %d\n", n_past);
@@ -1816,7 +1890,14 @@ int main(int argc, char ** argv) {
                         llama_synchronize(ctx);
                     }
                     if (output_path_infer != "/inference_stats.csv") {
-                        llama_perf_context_print_custom(ctx, output_path_infer, start_sys_time, ig);
+                        llama_perf_context_print_custom(
+                                ctx,
+                                output_path_infer,
+                                start_sys_time,
+                                ig,
+                                query_sampling_ms,
+                                query_ttft_e2e_ms,
+                                false);
                     }
                     if (csv_load && output_path_load != "/inference_load.csv") {
                         llama_op_load_profile_print_custom(output_path_load, current_question_index, start_sys_time, csv_op_load, csv_op_load_breakdown);
@@ -1862,12 +1943,23 @@ int main(int argc, char ** argv) {
                 LOG_DBG("saved session to %s\n", path_session.c_str());
             }
 
-            const int64_t t_sample_us = ig->backend_compute_profile ? ggml_time_us() : 0;
+            // common_sampler_sample() synchronizes internally. Synchronize before
+            // starting this timer as well so sampling_ms never absorbs pending
+            // model-compute time in ordinary generation paths.
+            llama_synchronize(ctx);
+            const int64_t t_sample_us = ggml_time_us();
             const llama_token id = common_sampler_sample(smpl, ctx, -1);
 
             common_sampler_accept(smpl, id, /* accept_grammar= */ true);
+            const double sample_ms = (ggml_time_us() - t_sample_us) / 1000.0;
+            query_sampling_ms += sample_ms;
             if (ig->backend_compute_profile) {
-                ggml_backend_sched_profile_add_sampling_ms((ggml_time_us() - t_sample_us) / 1000.0);
+                ggml_backend_sched_profile_add_sampling_ms(sample_ms);
+            }
+            if (!query_first_sample_recorded && inference_started) {
+                query_ttft_e2e_ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - query_e2e_start_time).count();
+                query_first_sample_recorded = true;
             }
 
             // LOG_DBG("last: %s\n", string_from(ctx, smpl->prev.to_vector()).c_str());
@@ -1883,6 +1975,13 @@ int main(int argc, char ** argv) {
 
             // decrement remaining sampling budget
             --n_remain;
+
+            if (strict_prefill_sample_pending) {
+                strict_prefill_sample_pending = false;
+                strict_sample_only_completed = true;
+                is_interacting = true;
+                LOG_DBG("strict prefill-only query sampled one token; skipping generated-token decode\n");
+            }
 
             LOG_DBG("n_remain: %d\n", n_remain);
         } else {
@@ -2001,7 +2100,7 @@ int main(int argc, char ** argv) {
                 is_interacting = true;
             }
 
-            if (params.conversation_mode && !waiting_for_first_input) {
+            if (params.conversation_mode && !waiting_for_first_input && !strict_sample_only_completed) {
                 if (!prompt.empty()) {
                     prompt.clear();
                     is_interacting = false;
@@ -2023,7 +2122,14 @@ int main(int argc, char ** argv) {
                     // LOG_INF("Inference time for previous question: %lld ms\n", inference_duration);
                     common_perf_print(ctx, smpl);
                     if(output_path_infer!="/inference_stats.csv"){ // deprecated in future
-                        llama_perf_context_print_custom(ctx, output_path_infer, start_sys_time, ig);
+                        llama_perf_context_print_custom(
+                                ctx,
+                                output_path_infer,
+                                start_sys_time,
+                                ig,
+                                query_sampling_ms,
+                                query_ttft_e2e_ms,
+                                strict_sample_only_completed);
                     }
                     if (csv_load && output_path_load != "/inference_load.csv") {
                         llama_op_load_profile_print_custom(output_path_load, current_question_index, start_sys_time, csv_op_load, csv_op_load_breakdown);
@@ -2254,6 +2360,11 @@ int main(int argc, char ** argv) {
                         }
                     }
 
+                    // This is the request-service boundary used by both paced
+                    // query timing and ttft_e2e_ms. It precedes context/profile
+                    // reset, tokenization, prompt evaluation, and sampling.
+                    query_e2e_start_time = query_pacing_enabled ?
+                        query_actual_start : std::chrono::steady_clock::now();
                     current_question_index += 1;
                     if (query_pacing_enabled) {
                         query_timing.query_id = current_question_index;
@@ -2270,17 +2381,12 @@ int main(int argc, char ** argv) {
                     // Reset the context for an independent JSON question. A token sampled
                     // before entering this block is still pending in embd; carrying it
                     // across the reset would evaluate a separate one-token graph before
-                    // the real prompt. Discard it, then queue a fresh BOS with the prompt
-                    // so the whole input is evaluated as one physical ubatch.
+                    // the real prompt. Discard it and restore the system-only chat/token
+                    // baseline so the next user input is one independent physical ubatch.
                     ctx_kv_cache_clear(ctx);
                     embd.clear();
-                    embd_inp.clear();
-                    if (llama_vocab_get_add_bos(vocab)) {
-                        const llama_token bos = llama_vocab_bos(vocab);
-                        if (bos != LLAMA_TOKEN_NULL) {
-                            embd_inp.push_back(bos);
-                        }
-                    }
+                    chat_msgs = json_chat_baseline;
+                    embd_inp = json_embd_baseline;
                     llama_perf_context_reset(ctx);
                     if (ig->backend_compute_profile) {
                         ggml_backend_sched_profile_reset();
@@ -2303,6 +2409,8 @@ int main(int argc, char ** argv) {
                     prefill_active = false;
                     decode_active = false;
                     generation_started = false;
+                    strict_prefill_sample_pending = false;
+                    strict_sample_only_completed = false;
 
                     n_remain = params.n_predict;
                     ga_i = 0;
@@ -2316,6 +2424,9 @@ int main(int argc, char ** argv) {
                     // Record the begining time of inference for a new question
                     inference_start_time = std::chrono::steady_clock::now();
                     inference_started = true;
+                    query_sampling_ms = 0.0;
+                    query_ttft_e2e_ms = 0.0;
+                    query_first_sample_recorded = false;
                 } else if (current_question_index >= params.max_query_number) {
                     LOG_INF("Reached maximum query number (%d) from %s. Exiting interactive mode.\n", params.max_query_number, json_path.c_str());
                     break;

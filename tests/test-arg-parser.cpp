@@ -326,6 +326,73 @@ int main(void) {
     argv = {"binary_name", "-m", "model.gguf", "--attn-out-shards", "invalid"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), attn_out_shards_invalid_params, LLAMA_EXAMPLE_COMPLETION));
 
+    common_params prefill_graph_cache_default_params;
+    assert(prefill_graph_cache_default_params.prefill_graph_cache_tokens == 0);
+    assert(prefill_graph_cache_default_params.prefill_graph_cache_strict == true);
+    const llama_context_params prefill_graph_cache_api_default_params = llama_context_default_params();
+    assert(prefill_graph_cache_api_default_params.prefill_graph_cache_tokens == 0);
+    assert(prefill_graph_cache_api_default_params.prefill_graph_cache_strict == true);
+    const llama_prefill_graph_cache_data prefill_graph_cache_null_data =
+        llama_prefill_graph_cache_get_data(nullptr);
+    assert(prefill_graph_cache_null_data.configured_tokens == 0);
+    assert(prefill_graph_cache_null_data.n_hits == 0);
+    assert(prefill_graph_cache_null_data.ready == false);
+
+    common_params prefill_graph_cache_on_params;
+    argv = {
+        "binary_name", "-m", "model.gguf", "--ubatch-size", "512",
+        "--prefill-graph-cache-tokens", "256",
+        "--prefill-graph-cache-strict", "off",
+    };
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), prefill_graph_cache_on_params, LLAMA_EXAMPLE_COMPLETION));
+    assert(prefill_graph_cache_on_params.prefill_graph_cache_tokens == 256);
+    assert(prefill_graph_cache_on_params.prefill_graph_cache_strict == false);
+    const llama_context_params prefill_graph_cache_context_params =
+        common_context_params_to_llama(prefill_graph_cache_on_params);
+    assert(prefill_graph_cache_context_params.prefill_graph_cache_tokens == 256);
+    assert(prefill_graph_cache_context_params.prefill_graph_cache_strict == false);
+
+    common_params prefill_graph_cache_zero_params;
+    argv = {"binary_name", "-m", "model.gguf", "--prefill-graph-cache-tokens", "0"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), prefill_graph_cache_zero_params, LLAMA_EXAMPLE_COMPLETION));
+    assert(prefill_graph_cache_zero_params.prefill_graph_cache_tokens == 0);
+
+    common_params prefill_graph_cache_inherit_ubatch_params;
+    argv = {
+        "binary_name", "-m", "model.gguf", "--batch-size", "512", "--ubatch-size", "0",
+        "--prefill-graph-cache-tokens", "256",
+    };
+    assert(true == common_params_parse(
+        argv.size(), list_str_to_char(argv).data(), prefill_graph_cache_inherit_ubatch_params, LLAMA_EXAMPLE_COMPLETION));
+    assert(prefill_graph_cache_inherit_ubatch_params.prefill_graph_cache_tokens == 256);
+
+    common_params prefill_graph_cache_one_params;
+    argv = {"binary_name", "-m", "model.gguf", "--prefill-graph-cache-tokens", "1"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), prefill_graph_cache_one_params, LLAMA_EXAMPLE_COMPLETION));
+
+    common_params prefill_graph_cache_negative_params;
+    argv = {"binary_name", "-m", "model.gguf", "--prefill-graph-cache-tokens", "-1"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), prefill_graph_cache_negative_params, LLAMA_EXAMPLE_COMPLETION));
+
+    common_params prefill_graph_cache_too_large_params;
+    argv = {
+        "binary_name", "-m", "model.gguf", "--ubatch-size", "128",
+        "--prefill-graph-cache-tokens", "256",
+    };
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), prefill_graph_cache_too_large_params, LLAMA_EXAMPLE_COMPLETION));
+
+    common_params prefill_graph_cache_batch_limited_params;
+    argv = {
+        "binary_name", "-m", "model.gguf", "--batch-size", "128", "--ubatch-size", "512",
+        "--prefill-graph-cache-tokens", "256",
+    };
+    assert(false == common_params_parse(
+        argv.size(), list_str_to_char(argv).data(), prefill_graph_cache_batch_limited_params, LLAMA_EXAMPLE_COMPLETION));
+
+    common_params prefill_graph_cache_strict_invalid_params;
+    argv = {"binary_name", "-m", "model.gguf", "--prefill-graph-cache-strict", "invalid"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), prefill_graph_cache_strict_invalid_params, LLAMA_EXAMPLE_COMPLETION));
+
     common_params max_query_unlimited_params;
     argv = {"binary_name", "-m", "model.gguf", "--max-query-number", "-1"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), max_query_unlimited_params, LLAMA_EXAMPLE_COMPLETION));
@@ -380,6 +447,15 @@ int main(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), attn_out_shards_env_params, LLAMA_EXAMPLE_COMPLETION));
     assert(attn_out_shards_env_params.attn_out_shards == true);
     unsetenv("LLAMA_ARG_ATTN_OUT_SHARDS");
+
+    setenv("LLAMA_ARG_PREFILL_GRAPH_CACHE_TOKENS", "256", true);
+    setenv("LLAMA_ARG_PREFILL_GRAPH_CACHE_STRICT", "off", true);
+    common_params prefill_graph_cache_env_params;
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), prefill_graph_cache_env_params, LLAMA_EXAMPLE_COMPLETION));
+    assert(prefill_graph_cache_env_params.prefill_graph_cache_tokens == 256);
+    assert(prefill_graph_cache_env_params.prefill_graph_cache_strict == false);
+    unsetenv("LLAMA_ARG_PREFILL_GRAPH_CACHE_TOKENS");
+    unsetenv("LLAMA_ARG_PREFILL_GRAPH_CACHE_STRICT");
 
     setenv("LLAMA_ARG_BATTERY_TEMP_SYNC", "on", true);
     setenv("LLAMA_ARG_BATTERY_TEMP_PATH", "/sys/class/power_supply/battery/temp", true);

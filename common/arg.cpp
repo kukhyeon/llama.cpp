@@ -664,6 +664,15 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                 "error: --attn-qkv-parallel and --attn-qkv-shards are mutually exclusive\n");
     }
 
+    const int32_t effective_ubatch = params.n_ubatch == 0 ?
+        params.n_batch : std::min(params.n_batch, params.n_ubatch);
+    if (params.prefill_graph_cache_tokens > 0 &&
+            (effective_ubatch <= 0 || params.prefill_graph_cache_tokens > (uint32_t) effective_ubatch)) {
+        throw std::invalid_argument(string_format(
+                "error: --prefill-graph-cache-tokens (%u) exceeds the effective physical ubatch size (%d)\n",
+                params.prefill_graph_cache_tokens, effective_ubatch));
+    }
+
     postprocess_cpu_params(params.cpuparams,       nullptr);
     postprocess_cpu_params(params.cpuparams_batch, &params.cpuparams);
 
@@ -1422,6 +1431,34 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_examples({LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_ATTN_OUT_SHARDS"));
+    add_opt(common_arg(
+        {"--prefill-graph-cache-tokens"}, "N",
+        "pin one prefill graph and its scheduler allocation for physical ubatches of N tokens "
+        "(0 = off; does not cache token values, KV data, logits, or results)",
+        [](common_params & params, int value) {
+            if (value < 0 || value == 1) {
+                throw std::invalid_argument(
+                    "--prefill-graph-cache-tokens must be 0 or at least 2");
+            }
+            params.prefill_graph_cache_tokens = (uint32_t) value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_PREFILL_GRAPH_CACHE_TOKENS"));
+    add_opt(common_arg(
+        {"--prefill-graph-cache-strict"}, "on|off",
+        "reject a prefill shape/topology mismatch or any graph that would evict a populated pinned graph; "
+        "after population this includes decode graphs, so use strict mode for fixed prefill-only workloads (default: on)",
+        [](common_params & params, const std::string & value) {
+            const std::string normalized = common_arg_lower(value);
+            if (is_truthy(normalized)) {
+                params.prefill_graph_cache_strict = true;
+            } else if (is_falsey(normalized)) {
+                params.prefill_graph_cache_strict = false;
+            } else {
+                throw std::invalid_argument(string_format(
+                    "error: unknown value for --prefill-graph-cache-strict: '%s'\n", value.c_str()));
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_PREFILL_GRAPH_CACHE_STRICT"));
     add_opt(common_arg(
         {"--strict"}, "on|off",
         "enable ignite strict generation limit",
