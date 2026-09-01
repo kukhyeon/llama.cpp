@@ -522,6 +522,11 @@ struct common_params {
     // before the partitioned graph can be selected.
     bool attn_out_shards = false;
 
+    // Explicit single-entry graph/scheduler-allocation cache for a physical
+    // prefill ubatch size. This does not cache token values, KV data, or results.
+    uint32_t prefill_graph_cache_tokens = 0;
+    bool prefill_graph_cache_strict = true;
+
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale
 
