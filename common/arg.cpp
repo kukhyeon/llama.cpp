@@ -1470,7 +1470,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
     add_opt(common_arg(
         {"--battery-temp-sync"}, "on|off",
-        "wait for battery temperature updates before the first JSON query (default: off)",
+        "wait for battery temperature updates before model loading (default: off)",
         [](common_params & params, const std::string & value) {
             const std::string normalized = common_arg_lower(value);
             if (is_truthy(normalized)) {
@@ -1492,7 +1492,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_BATTERY_TEMP_PATH"));
     add_opt(common_arg(
         {"--battery-temp-update-count"}, "N",
-        "number of battery temperature updates to observe before inference (default: 1)",
+        "number of battery temperature updates to observe before model loading (default: 1)",
         [](common_params & params, int value) {
             if (value <= 0) {
                 throw std::invalid_argument("error: --battery-temp-update-count must be positive");
