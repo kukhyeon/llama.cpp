@@ -560,6 +560,27 @@ static bool file_is_empty(const std::string & path) {
     return f.tellg() == 0;
 }
 
+static battery_temperature_gate_result wait_for_startup_battery_temperature(
+        const common_params & params) {
+    battery_temperature_gate_config gate_config;
+    gate_config.temperature_path = params.battery_temp_path;
+    gate_config.update_count = params.battery_temp_update_count;
+    gate_config.poll_interval = std::chrono::milliseconds(params.battery_temp_poll_ms);
+    gate_config.settle_delay = std::chrono::milliseconds(params.battery_temp_settle_ms);
+    gate_config.timeout = std::chrono::milliseconds(params.battery_temp_timeout_ms);
+
+    LOG_INF(
+        "battery_temp_sync: waiting before model load for %d update(s), poll=%d ms, "
+        "settle=%d ms, timeout=%d ms, path=%s\n",
+        gate_config.update_count,
+        params.battery_temp_poll_ms,
+        params.battery_temp_settle_ms,
+        params.battery_temp_timeout_ms,
+        gate_config.temperature_path.empty() ? "auto" : gate_config.temperature_path.c_str());
+
+    return battery_temperature_wait_for_updates(gate_config, &sigterm);
+}
+
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__)) || defined (_WIN32)
 static void sigint_handler(int signo) {
     if (signo == SIGINT) {
@@ -591,14 +612,6 @@ int main(int argc, char ** argv) {
 
     common_init();
 
-    // The ordinary warm-up performs a real llama_decode() while the model is
-    // initialized. Suppress it so an enabled startup gate remains the first
-    // model-compute boundary in the supported JSON-query path.
-    if (params.battery_temp_sync && params.warmup) {
-        LOG_WRN("battery_temp_sync: disabling model warm-up so no inference runs before the gate\n");
-        params.warmup = false;
-    }
-
     auto & sparams = params.sampling;
 
     // save choice to use color for later
@@ -625,6 +638,30 @@ int main(int argc, char ** argv) {
 
     if (params.rope_freq_scale != 0.0) {
         LOG_WRN("%s: warning: scaling RoPE frequency by %g.\n", __func__, params.rope_freq_scale);
+    }
+
+    if (params.battery_temp_sync) {
+        const auto gate_result = wait_for_startup_battery_temperature(params);
+        if (gate_result.status != battery_temperature_gate_status::ready) {
+            LOG_ERR(
+                "battery_temp_sync: %s after %lld ms "
+                "(path=%s updates=%d detail=%s); aborting before model load\n",
+                battery_temperature_gate_status_name(gate_result.status),
+                (long long) gate_result.elapsed.count(),
+                gate_result.temperature_path.empty() ? "unresolved" : gate_result.temperature_path.c_str(),
+                gate_result.updates_observed,
+                gate_result.detail.c_str());
+            return 3;
+        }
+
+        LOG_INF(
+            "battery_temp_sync: ready before model load after %lld ms "
+            "(path=%s updates=%d raw=%lld->%lld)\n",
+            (long long) gate_result.elapsed.count(),
+            gate_result.temperature_path.c_str(),
+            gate_result.updates_observed,
+            (long long) gate_result.initial_raw_temperature.value_or(0),
+            (long long) gate_result.final_raw_temperature.value_or(0));
     }
 
     const bool csv_op_load = should_write_op_load_csv();
@@ -1205,10 +1242,9 @@ int main(int argc, char ** argv) {
         }
     };
 
-    // Avoid holding the requested high prefill clocks throughout a potentially
-    // 30-70 second battery update wait. The same clocks are applied immediately
-    // after the gate succeeds (or here, unchanged, when the feature is off).
-    if (ig->is_ignite_active && want_prefill_dvfs && !params.battery_temp_sync) {
+    // The optional battery-temperature gate has already completed before
+    // model initialization, so prefill clocks can now be applied uniformly.
+    if (ig->is_ignite_active && want_prefill_dvfs) {
         apply_dvfs(
             ig->cpu_clk_idx_p,
             params.cpu_gold_clk_idx_p,
@@ -1251,20 +1287,6 @@ int main(int argc, char ** argv) {
                 json_questions.size(),
                 max_query_num);
     }
-    bool battery_temp_gate_pending =
-        params.battery_temp_sync && !json_questions.empty() && max_query_num > 0;
-    if (params.battery_temp_sync && !battery_temp_gate_pending) {
-        LOG_WRN("battery_temp_sync: no runnable JSON query; skipping the battery temperature gate\n");
-        if (ig->is_ignite_active && want_prefill_dvfs) {
-            apply_dvfs(
-                ig->cpu_clk_idx_p,
-                params.cpu_gold_clk_idx_p,
-                params.cpu_prime_clk_idx_p,
-                ig->ram_clk_idx_p,
-                ig->gpu_clk_idx_p);
-        }
-    }
-    // JSON questions load done
 //------------------------------------------------
 
     // ctrl+C handling
@@ -2211,61 +2233,6 @@ int main(int argc, char ** argv) {
                     // 2. json-query mode
                     // Use next question from JSON file
                     // TODO: apply seamless think mode only Qwen3.
-                    if (battery_temp_gate_pending) {
-                        battery_temperature_gate_config gate_config;
-                        gate_config.temperature_path = params.battery_temp_path;
-                        gate_config.update_count = params.battery_temp_update_count;
-                        gate_config.poll_interval =
-                            std::chrono::milliseconds(params.battery_temp_poll_ms);
-                        gate_config.settle_delay =
-                            std::chrono::milliseconds(params.battery_temp_settle_ms);
-                        gate_config.timeout =
-                            std::chrono::milliseconds(params.battery_temp_timeout_ms);
-
-                        LOG_INF(
-                            "battery_temp_sync: waiting for %d update(s), poll=%d ms, "
-                            "settle=%d ms, timeout=%d ms, path=%s\n",
-                            gate_config.update_count,
-                            params.battery_temp_poll_ms,
-                            params.battery_temp_settle_ms,
-                            params.battery_temp_timeout_ms,
-                            gate_config.temperature_path.empty() ? "auto" : gate_config.temperature_path.c_str());
-
-                        const auto gate_result =
-                            battery_temperature_wait_for_updates(gate_config, &sigterm);
-                        if (gate_result.status != battery_temperature_gate_status::ready) {
-                            LOG_ERR(
-                                "battery_temp_sync: %s after %lld ms "
-                                "(path=%s updates=%d detail=%s); aborting before the first query\n",
-                                battery_temperature_gate_status_name(gate_result.status),
-                                (long long) gate_result.elapsed.count(),
-                                gate_result.temperature_path.empty() ? "unresolved" : gate_result.temperature_path.c_str(),
-                                gate_result.updates_observed,
-                                gate_result.detail.c_str());
-                            query_pacing_exit_status = 3;
-                            break;
-                        }
-
-                        LOG_INF(
-                            "battery_temp_sync: ready after %lld ms "
-                            "(path=%s updates=%d raw=%lld->%lld)\n",
-                            (long long) gate_result.elapsed.count(),
-                            gate_result.temperature_path.c_str(),
-                            gate_result.updates_observed,
-                            (long long) gate_result.initial_raw_temperature.value_or(0),
-                            (long long) gate_result.final_raw_temperature.value_or(0));
-
-                        battery_temp_gate_pending = false;
-                        if (ig->is_ignite_active && want_prefill_dvfs) {
-                            apply_dvfs(
-                                ig->cpu_clk_idx_p,
-                                params.cpu_gold_clk_idx_p,
-                                params.cpu_prime_clk_idx_p,
-                                ig->ram_clk_idx_p,
-                                ig->gpu_clk_idx_p);
-                        }
-                    }
-
                     std::chrono::steady_clock::time_point query_actual_start;
                     std::chrono::steady_clock::time_point query_scheduled_start;
                     std::chrono::steady_clock::duration query_actual_prewake_lead =
