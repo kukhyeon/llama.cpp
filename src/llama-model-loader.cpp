@@ -1475,7 +1475,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     auto create_residency_covers = [&](const ggml_tensor * cur, const char * tensor_name, int axis,
                                        const char * cover_family, const llama_backend_policy_residency_plan & residency_plan,
-                                       const buft_list_t * allowed_cover_bufts) {
+                                       const buft_list_t * allowed_cover_bufts,
+                                       ggml_tensor * canonical_tensor,
+                                       ggml_backend_buffer_type_t canonical_buft) {
         if (buft_list_all == nullptr) {
             return false;
         }
@@ -1580,6 +1582,51 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 }
                 backend_devices.emplace(cover.backend, cover_dev);
                 device_backends.emplace(cover_dev, cover.backend);
+            }
+
+            // A complete Q/K/V or W_O projection assigned to the canonical
+            // buffer type already has the exact bytes and packing required by
+            // REGION matmul. Keep the canonical tensor for ordinary
+            // decode/fallback, and let the prefill path reference that same
+            // allocation instead of materializing an identical full cover.
+            bool same_canonical_layout = canonical_tensor != nullptr &&
+                canonical_tensor->view_src == nullptr &&
+                canonical_tensor->type == cover_meta.type;
+            for (int dim = 0; same_canonical_layout && dim < GGML_MAX_DIMS; ++dim) {
+                same_canonical_layout =
+                    canonical_tensor->ne[dim] == cover_meta.ne[dim] &&
+                    canonical_tensor->nb[dim] == cover_meta.nb[dim];
+            }
+            const bool aliases_canonical =
+                residency_plan.keep_full_source &&
+                (is_attn_qkv_cover || is_attn_out_cover) &&
+                cover.start == 0 && cover.size == cover_dim &&
+                canonical_buft != nullptr && cover_buft == canonical_buft &&
+                same_canonical_layout;
+            if (aliases_canonical) {
+                const llama_tensor_cover_info alias_info = {
+                    tensor_name, cover.backend, axis, cover.start, cover.size
+                };
+                const auto inserted = residency_cover_alias_infos.emplace(
+                        canonical_tensor, alias_info);
+                if (!inserted.second) {
+                    const auto & existing = inserted.first->second;
+                    if (existing.source_name != alias_info.source_name ||
+                            existing.backend != alias_info.backend ||
+                            existing.axis != alias_info.axis ||
+                            existing.start != alias_info.start ||
+                            existing.size != alias_info.size) {
+                        throw std::runtime_error(format(
+                                "backend_policy: conflicting canonical cover aliases for %s",
+                                tensor_name));
+                    }
+                }
+
+                LLAMA_LOG_DEBUG(
+                        "backend_policy: %s full-span cover %s for %s aliases canonical tensor using %s\n",
+                        cover_family, cover.id.c_str(), tensor_name,
+                        ggml_backend_buft_name(canonical_buft));
+                continue;
             }
 
             ggml_context * cover_ctx = ctx_for_buft(cover_buft);
@@ -1807,7 +1854,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         virtual_tensor_names.insert(ggml_get_name(tensor));
 
         if (!create_residency_covers(
-                    cur, ggml_get_name(tensor), ffn_axis, "ffn", ffn_residency_plan, nullptr)) {
+                    cur, ggml_get_name(tensor), ffn_axis, "ffn", ffn_residency_plan,
+                    nullptr, nullptr, nullptr)) {
             throw std::runtime_error(format(
                     "backend_policy: failed to create complete cover-only FFN residency for tensor %s",
                     ggml_get_name(tensor)));
@@ -1854,16 +1902,17 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         // full source happens to use the same buffer type. A region matmul
         // interprets offsets relative to the cover's physical packed layout.
         (void) create_residency_covers(
-                cur, ggml_get_name(tensor), ffn_axis, "ffn", ffn_residency_plan, nullptr);
+                cur, ggml_get_name(tensor), ffn_axis, "ffn", ffn_residency_plan,
+                nullptr, nullptr, nullptr);
     }
 
     if (attn_qkv_layer_enabled) {
         // Keep the canonical full source for ordinary decode/off/LoRA
-        // fallback, while routed prefill variants consume only independently
-        // packed output-axis covers.
+        // fallback. Routed prefill variants consume packed output-axis covers,
+        // or alias that source when one cover is the identical full tensor.
         if (!create_residency_covers(
                     cur, ggml_get_name(tensor), 1, "attn_qkv",
-                    attn_qkv_residency_plan, buft_list_all)) {
+                    attn_qkv_residency_plan, buft_list_all, tensor, buft)) {
             throw std::runtime_error(format(
                     "backend_policy: failed to create complete attention Q/K/V residency for tensor %s",
                     ggml_get_name(tensor)));
@@ -1872,12 +1921,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     if (attn_out_layer_enabled) {
         // The full source remains resident for decode and the feature-off
-        // graph, but all active independently packed lane covers on the chosen
-        // W_O axis are mandatory when preparation is requested.
+        // graph. Active lane covers on the chosen W_O axis are independently
+        // packed unless a cover is identical to that retained full source.
         const int attn_out_axis = attn_out_policy.partition_axis == "output" ? 1 : 0;
         if (!create_residency_covers(
                     cur, ggml_get_name(tensor), attn_out_axis, "attn_out", attn_out_residency_plan,
-                    buft_list_all)) {
+                    buft_list_all, tensor, buft)) {
             throw std::runtime_error(format(
                     "backend_policy: failed to create complete attention output residency for tensor %s",
                     ggml_get_name(tensor)));

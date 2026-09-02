@@ -112,11 +112,12 @@ struct llama_backend_policy_residency_cover {
 // Generic model-load residency descriptor produced by module-specific policy
 // planners. Each entry is one connected union cover for a backend. Overlapping
 // or touching intervals may be merged, while genuinely disjoint intervals
-// remain separate covers. Each cover tensor is independently packed by its
-// backend and graph builders select logical sub-regions with
-// GGML_OP_MUL_MAT_SRC0_REGION. Target tensors, axes, allocation counts, and
-// graph-node costs remain module-specific and are intentionally not inferred
-// from this plan.
+// remain separate covers. Covers are independently packed by their backend,
+// except that a full-span cover may alias a retained canonical tensor with the
+// exact same buffer type and physical layout. Graph builders select logical
+// sub-regions with GGML_OP_MUL_MAT_SRC0_REGION. Target tensors, axes,
+// allocation counts, and graph-node costs remain module-specific and are
+// intentionally not inferred from this plan.
 struct llama_backend_policy_residency_plan {
     bool enabled = false;
     bool keep_full_source = true;

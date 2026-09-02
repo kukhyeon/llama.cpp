@@ -128,6 +128,12 @@ struct llama_model_loader {
     std::unordered_map<std::string, std::vector<ggml_tensor *>> residency_tensors_by_name;
     std::unordered_map<ggml_tensor *, llama_tensor_cover_info> residency_cover_infos;
 
+    // Full-span covers whose physical representation is exactly the primary
+    // tensor's representation. These aliases are runtime lookup metadata only:
+    // keeping them separate from residency_cover_infos prevents model loading
+    // from treating a canonical tensor as an independently extracted cover.
+    std::unordered_map<ggml_tensor *, llama_tensor_cover_info> residency_cover_alias_infos;
+
     // Metadata-only tensors whose data is intentionally provided by residency
     // covers instead of a full primary weight allocation.
     std::vector<ggml_context_ptr> virtual_ctxs;
