@@ -350,8 +350,6 @@ llama_context::llama_context(
 
     cparams.n_threads        = params.n_threads;
     cparams.n_threads_batch  = params.n_threads_batch;
-    cparams.prefill_graph_cache_tokens = params.prefill_graph_cache_tokens;
-    cparams.prefill_graph_cache_strict = params.prefill_graph_cache_strict;
     cparams.yarn_ext_factor  = params.yarn_ext_factor  >= 0.0f ? params.yarn_ext_factor  : hparams.yarn_ext_factor;
     cparams.yarn_attn_factor = params.yarn_attn_factor >= 0.0f ? params.yarn_attn_factor : hparams.yarn_attn_factor;
     cparams.yarn_beta_fast   = params.yarn_beta_fast   >= 0.0f ? params.yarn_beta_fast   : hparams.yarn_beta_fast;
@@ -494,28 +492,6 @@ llama_context::llama_context(
         if (graph_reuse_disable) {
             LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
         }
-    }
-
-    if (cparams.prefill_graph_cache_tokens > 0) {
-        if (llama_model_has_encoder(&model)) {
-            throw std::runtime_error(
-                    "prefill graph cache currently supports decoder-only models");
-        }
-        if (cparams.prefill_graph_cache_tokens < 2 ||
-                cparams.prefill_graph_cache_tokens > cparams.n_ubatch) {
-            throw std::runtime_error(format(
-                    "prefill graph cache token count %u must be in [2, n_ubatch=%u]",
-                    cparams.prefill_graph_cache_tokens, cparams.n_ubatch));
-        }
-        if (graph_reuse_disable) {
-            throw std::runtime_error(
-                    "prefill graph cache cannot be combined with LLAMA_GRAPH_REUSE_DISABLE");
-        }
-        LLAMA_LOG_INFO(
-                "%s: explicit prefill graph cache enabled for physical ubatch=%u, strict=%s; "
-                "only graph metadata and scheduler allocation are retained\n",
-                __func__, cparams.prefill_graph_cache_tokens,
-                cparams.prefill_graph_cache_strict ? "on" : "off");
     }
 
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
@@ -972,22 +948,6 @@ llama_context::~llama_context() {
     sched.reset();
 }
 
-void llama_context::prefill_graph_cache_invalidate(const char * reason) {
-    if (cparams.prefill_graph_cache_tokens == 0 || !prefill_graph_cache_ready) {
-        return;
-    }
-
-    prefill_graph_cache_ready = false;
-    prefill_graph_cache_invalidated = true;
-    prefill_graph_cache_invalidation_reason = reason != nullptr ? reason : "unspecified scheduler reset";
-    ++n_prefill_graph_cache_invalidations;
-
-    LLAMA_LOG_WARN(
-            "prefill graph cache: invalidated physical ubatch=%u (%s)\n",
-            cparams.prefill_graph_cache_tokens,
-            prefill_graph_cache_invalidation_reason.c_str());
-}
-
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
@@ -998,8 +958,6 @@ void llama_context::sched_reserve() {
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
     synchronize();
-
-    prefill_graph_cache_invalidate("scheduler reserve");
 
     const int64_t t_start_us = ggml_time_us();
 
@@ -1447,7 +1405,6 @@ bool llama_context::memory_update(bool optimize) {
         // reset the previous graph result to make sure that it won't be reused
         // TODO: change the mctx->apply() to return information if a graph reserve is needed
         //       reset the graph result only if the memory module did reset the scheduler
-        prefill_graph_cache_invalidate("memory update");
         gf_res_prev->reset();
 
         if (!mctx->apply()) {
@@ -1898,75 +1855,19 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
-    lp_is_prefill = (ubatch.n_tokens > 1);
-
-    // Common model warmup intentionally uses a tiny synthetic ubatch. It is not
-    // part of the measured fixed-shape workload and must not populate or violate
-    // the pinned prefill cache contract. The first real matching ubatch remains
-    // a cold cache fill after warmup finishes.
-    const bool prefill_graph_cache_enabled =
-        cparams.prefill_graph_cache_tokens > 0 && !cparams.warmup;
-    const bool prefill_graph_cache_target = prefill_graph_cache_enabled && lp_is_prefill &&
-        ubatch.n_tokens == cparams.prefill_graph_cache_tokens;
-
-    if (prefill_graph_cache_enabled) {
-        if (lp_is_prefill && !prefill_graph_cache_target) {
-            ++n_prefill_graph_cache_misses;
-            if (cparams.prefill_graph_cache_strict) {
-                LLAMA_LOG_ERROR(
-                        "prefill graph cache: strict physical-ubatch mismatch, configured=%u actual=%u\n",
-                        cparams.prefill_graph_cache_tokens, ubatch.n_tokens);
-                ret = GGML_STATUS_FAILED;
-                return nullptr;
-            }
-            prefill_graph_cache_invalidate("physical prefill ubatch mismatch");
-            ++n_prefill_graph_cache_bypasses;
-        } else if (!lp_is_prefill) {
-            if (prefill_graph_cache_ready && cparams.prefill_graph_cache_strict) {
-                ++n_prefill_graph_cache_misses;
-                LLAMA_LOG_ERROR(
-                        "prefill graph cache: strict pinned graph cannot be replaced by a non-prefill graph\n");
-                ret = GGML_STATUS_FAILED;
-                return nullptr;
-            }
-            prefill_graph_cache_invalidate("non-prefill graph");
-            ++n_prefill_graph_cache_bypasses;
-        }
-
-        if (prefill_graph_cache_target && prefill_graph_cache_invalidated &&
-                cparams.prefill_graph_cache_strict) {
-            ++n_prefill_graph_cache_misses;
-            LLAMA_LOG_ERROR(
-                    "prefill graph cache: strict pinned graph was invalidated (%s)\n",
-                    prefill_graph_cache_invalidation_reason.c_str());
-            ret = GGML_STATUS_FAILED;
-            return nullptr;
-        }
-    }
-
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
 
+    lp_is_prefill = (ubatch.n_tokens > 1);
     if (!llama_module_bench_profile_matches(model, cparams)) {
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
     if (llama_backend_policy_update_runtime_profile(lp_is_prefill)) {
-        prefill_graph_cache_invalidate("backend policy runtime profile changed");
         gf_res_prev->reset();
-    }
-
-    if (prefill_graph_cache_target && prefill_graph_cache_invalidated &&
-            cparams.prefill_graph_cache_strict) {
-        ++n_prefill_graph_cache_misses;
-        LLAMA_LOG_ERROR(
-                "prefill graph cache: strict pinned graph was invalidated (%s)\n",
-                prefill_graph_cache_invalidation_reason.c_str());
-        ret = GGML_STATUS_FAILED;
-        return nullptr;
     }
     ggml_backend_sched_profile_set_phase(lp_is_prefill ? GGML_BACKEND_SCHED_PROFILE_PREFILL : GGML_BACKEND_SCHED_PROFILE_DECODE);
     {
@@ -1982,37 +1883,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    bool reuse_graph = false;
-    if (prefill_graph_cache_target) {
-        if (prefill_graph_cache_ready) {
-            reuse_graph = res->can_reuse(gparams);
-            if (reuse_graph) {
-                ++n_prefill_graph_cache_hits;
-                LLAMA_LOG_DEBUG(
-                        "prefill graph cache: hit physical ubatch=%u (graph metadata and scheduler allocation reused)\n",
-                        ubatch.n_tokens);
-            } else {
-                ++n_prefill_graph_cache_misses;
-                if (cparams.prefill_graph_cache_strict) {
-                    LLAMA_LOG_ERROR(
-                            "prefill graph cache: strict topology mismatch for physical ubatch=%u\n",
-                            ubatch.n_tokens);
-                    ret = GGML_STATUS_FAILED;
-                    return nullptr;
-                }
-                prefill_graph_cache_invalidate("graph topology compatibility check failed");
-            }
-        } else {
-            ++n_prefill_graph_cache_misses;
-            LLAMA_LOG_INFO(
-                    "prefill graph cache: cold miss physical ubatch=%u; building pinned graph\n",
-                    ubatch.n_tokens);
-        }
-    } else {
-        reuse_graph = !graph_reuse_disable && res->can_reuse(gparams);
-    }
-
-    if (reuse_graph) {
+    if (!graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -2024,8 +1895,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
     } else {
-        const bool cache_fill = prefill_graph_cache_target;
-
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
@@ -2033,7 +1902,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
         const bool profile_backend_compute = igparams.backend_compute_profile;
-        const int64_t t_build_us = profile_backend_compute || cache_fill ? ggml_time_us() : 0;
+        const int64_t t_build_us = profile_backend_compute ? ggml_time_us() : 0;
 
         if (runtime_routes_configured) {
             runtime_route_graph_begin(lp_is_prefill);
@@ -2048,9 +1917,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
-        const int64_t build_elapsed_us = profile_backend_compute || cache_fill ? ggml_time_us() - t_build_us : 0;
         if (profile_backend_compute) {
-            ggml_backend_sched_profile_add_build_ms(build_elapsed_us / 1000.0);
+            ggml_backend_sched_profile_add_build_ms((ggml_time_us() - t_build_us) / 1000.0);
         }
 
         if (!gf) {
@@ -2059,29 +1927,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        const int64_t t_alloc_us = profile_backend_compute || cache_fill ? ggml_time_us() : 0;
+        const int64_t t_alloc_us = profile_backend_compute ? ggml_time_us() : 0;
         const bool alloc_ok = ggml_backend_sched_alloc_graph(sched.get(), gf);
-        const int64_t alloc_elapsed_us = profile_backend_compute || cache_fill ? ggml_time_us() - t_alloc_us : 0;
         if (profile_backend_compute) {
-            ggml_backend_sched_profile_add_build_ms(alloc_elapsed_us / 1000.0);
+            ggml_backend_sched_profile_add_build_ms((ggml_time_us() - t_alloc_us) / 1000.0);
         }
         if (!alloc_ok) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
-        }
-
-        if (cache_fill) {
-            prefill_graph_cache_ready = true;
-            prefill_graph_cache_invalidated = false;
-            prefill_graph_cache_invalidation_reason.clear();
-            ++n_prefill_graph_cache_builds;
-            t_prefill_graph_cache_build_us += build_elapsed_us;
-            t_prefill_graph_cache_alloc_us += alloc_elapsed_us;
-            LLAMA_LOG_INFO(
-                    "prefill graph cache: populated physical ubatch=%u build=%.3f ms alloc=%.3f ms; "
-                    "token/KV/result data are not cached\n",
-                    ubatch.n_tokens, build_elapsed_us / 1000.0, alloc_elapsed_us / 1000.0);
         }
     }
 
@@ -3837,8 +3691,6 @@ ggml_cgraph * llama_context::graph_reserve(
         LLAMA_LOG_DEBUG("%s: making n_tokens a multiple of n_seqs - n_tokens = %u, n_seqs = %u, n_outputs = %u\n", __func__, n_tokens, n_seqs, n_outputs);
     }
 
-    prefill_graph_cache_invalidate("explicit graph reserve");
-
     ggml_backend_sched_reset(sched.get());
 
     // when the scheduler is reset, we cannot reuse the old graph, so we reset the previous graph result to prevent that
@@ -4898,37 +4750,11 @@ llama_perf_context_data llama_context::perf_get_data() const {
     return data;
 }
 
-llama_prefill_graph_cache_data llama_context::prefill_graph_cache_get_data() const {
-    llama_prefill_graph_cache_data data = {};
-
-    data.t_build_ms = 1e-3 * t_prefill_graph_cache_build_us;
-    data.t_alloc_ms = 1e-3 * t_prefill_graph_cache_alloc_us;
-    data.configured_tokens = cparams.prefill_graph_cache_tokens;
-    data.n_hits = std::max(0, n_prefill_graph_cache_hits);
-    data.n_misses = std::max(0, n_prefill_graph_cache_misses);
-    data.n_builds = std::max(0, n_prefill_graph_cache_builds);
-    data.n_invalidations = std::max(0, n_prefill_graph_cache_invalidations);
-    data.n_bypasses = std::max(0, n_prefill_graph_cache_bypasses);
-    data.strict = cparams.prefill_graph_cache_strict;
-    data.ready = prefill_graph_cache_ready;
-    data.invalidated = prefill_graph_cache_invalidated;
-
-    return data;
-}
-
 void llama_context::perf_reset() {
     t_start_us  = ggml_time_us();
     t_eval_us   = n_eval = 0;
     t_p_eval_us = n_p_eval = 0;
     n_reused    = 0;
-
-    n_prefill_graph_cache_hits = 0;
-    n_prefill_graph_cache_misses = 0;
-    n_prefill_graph_cache_builds = 0;
-    n_prefill_graph_cache_invalidations = 0;
-    n_prefill_graph_cache_bypasses = 0;
-    t_prefill_graph_cache_build_us = 0;
-    t_prefill_graph_cache_alloc_us = 0;
 }
 
 llama_memory_breakdown llama_context::memory_breakdown() const {
@@ -5187,7 +5013,6 @@ llama_context_params llama_context_default_params() {
         /*.n_seq_max                   =*/ 1,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
-        /*.prefill_graph_cache_tokens  =*/ 0,
         /*.rope_scaling_type           =*/ LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
         /*.pooling_type                =*/ LLAMA_POOLING_TYPE_UNSPECIFIED,
         /*.attention_type              =*/ LLAMA_ATTENTION_TYPE_UNSPECIFIED,
@@ -5223,7 +5048,6 @@ llama_context_params llama_context_default_params() {
         /*.attn_qkv_parallel           =*/ false,
         /*.attn_qkv_shards             =*/ false,
         /*.attn_out_shards             =*/ false,
-        /*.prefill_graph_cache_strict  =*/ true,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
     };
@@ -5840,19 +5664,8 @@ llama_perf_context_data llama_perf_context(const llama_context * ctx) {
     return data;
 }
 
-llama_prefill_graph_cache_data llama_prefill_graph_cache_get_data(const llama_context * ctx) {
-    llama_prefill_graph_cache_data data = {};
-
-    if (ctx == nullptr) {
-        return data;
-    }
-
-    return ctx->prefill_graph_cache_get_data();
-}
-
 void llama_perf_context_print(const llama_context * ctx) {
     const auto data = llama_perf_context(ctx);
-    const auto cache = llama_prefill_graph_cache_get_data(ctx);
 
     const double t_end_ms = 1e-3 * ggml_time_us();
 
@@ -5863,18 +5676,6 @@ void llama_perf_context_print(const llama_context * ctx) {
             __func__, data.t_eval_ms, data.n_eval, data.t_eval_ms / data.n_eval, 1e3 / data.t_eval_ms * data.n_eval);
     LLAMA_LOG_INFO("%s:       total time = %10.2f ms / %5d tokens\n", __func__, (t_end_ms - data.t_start_ms), (data.n_p_eval + data.n_eval));
     LLAMA_LOG_INFO("%s:    graphs reused = %10d\n", __func__, data.n_reused);
-    if (cache.configured_tokens > 0) {
-        LLAMA_LOG_INFO(
-                "%s: prefill graph cache = tokens %u, strict %s, ready %s, invalidated %s, "
-                "hits %d, misses %d, builds %d, invalidations %d, bypasses %d, build %.3f ms, alloc %.3f ms\n",
-                __func__, cache.configured_tokens,
-                cache.strict ? "on" : "off",
-                cache.ready ? "yes" : "no",
-                cache.invalidated ? "yes" : "no",
-                cache.n_hits, cache.n_misses, cache.n_builds,
-                cache.n_invalidations, cache.n_bypasses,
-                cache.t_build_ms, cache.t_alloc_ms);
-    }
 }
 
 void llama_perf_context_reset(llama_context * ctx) {
