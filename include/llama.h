@@ -367,7 +367,6 @@ extern "C" {
         uint32_t n_seq_max;         // max number of sequences (i.e. distinct states for recurrent models)
         int32_t  n_threads;         // number of threads to use for generation
         int32_t  n_threads_batch;   // number of threads to use for batch processing
-        uint32_t prefill_graph_cache_tokens; // pin one prefill graph for this physical ubatch size, 0 = disabled [EXPERIMENTAL]
 
         enum llama_rope_scaling_type rope_scaling_type; // RoPE scaling type, from `enum llama_rope_scaling_type`
         enum llama_pooling_type      pooling_type;      // whether to pool (sum) embedding results by sequence id
@@ -420,7 +419,6 @@ extern "C" {
         bool attn_qkv_parallel; // run independent prefill Q/K/V projection branches concurrently [EXPERIMENTAL]
         bool attn_qkv_shards;   // shard each prefill Q/K/V projection across policy backends [EXPERIMENTAL]
         bool attn_out_shards;   // shard the prefill attention output projection across policy backends [EXPERIMENTAL]
-        bool prefill_graph_cache_strict; // reject graph shapes/topologies (including decode after population) that would replace the pinned graph [EXPERIMENTAL]
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -1684,26 +1682,6 @@ extern "C" {
         int32_t n_reused;   // number of times a ggml compute graph had been reused
     };
 
-    // Explicit single-entry prefill graph-cache statistics. The cache retains
-    // graph metadata and the scheduler allocation only; token values, KV data,
-    // logits, and other computation results are never cached. Counters and
-    // timings cover the interval since llama_perf_context_reset().
-    struct llama_prefill_graph_cache_data {
-        double t_build_ms; // time spent building cache-fill graph topology
-        double t_alloc_ms; // time spent allocating cache-fill scheduler graphs
-
-        uint32_t configured_tokens; // configured physical ubatch size, 0 = disabled
-        int32_t  n_hits;
-        int32_t  n_misses;
-        int32_t  n_builds;
-        int32_t  n_invalidations;
-        int32_t  n_bypasses;
-
-        bool strict;
-        bool ready;
-        bool invalidated;
-    };
-
     struct llama_perf_sampler_data {
         double t_sample_ms; // time needed for sampling in ms
 
@@ -1713,9 +1691,6 @@ extern "C" {
     LLAMA_API struct llama_perf_context_data llama_perf_context      (const struct llama_context * ctx);
     LLAMA_API void                           llama_perf_context_print(const struct llama_context * ctx);
     LLAMA_API void                           llama_perf_context_reset(      struct llama_context * ctx);
-
-    LLAMA_API struct llama_prefill_graph_cache_data llama_prefill_graph_cache_get_data(
-            const struct llama_context * ctx);
 
     // NOTE: the following work only with samplers constructed via llama_sampler_chain_init
     LLAMA_API struct llama_perf_sampler_data llama_perf_sampler      (const struct llama_sampler * chain);

@@ -1597,8 +1597,6 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.attn_qkv_parallel        = params.attn_qkv_parallel;
     cparams.attn_qkv_shards          = params.attn_qkv_shards;
     cparams.attn_out_shards          = params.attn_out_shards;
-    cparams.prefill_graph_cache_tokens = params.prefill_graph_cache_tokens;
-    cparams.prefill_graph_cache_strict = params.prefill_graph_cache_strict;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

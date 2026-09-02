@@ -522,20 +522,6 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
         LOG_INF("%s: unaccounted time = %10.2f ms / %5.1f %%      (total - sampling - prompt eval - eval) / (total)\n", __func__, t_unacc_ms, t_unacc_pc);
         LOG_INF("%s:    graphs reused = %10d\n", __func__, data.n_reused);
 
-        const auto cache = llama_prefill_graph_cache_get_data(ctx);
-        if (cache.configured_tokens > 0) {
-            LOG_INF(
-                    "%s: prefill graph cache = tokens %u, strict %s, ready %s, invalidated %s, "
-                    "hits %d, misses %d, builds %d, invalidations %d, bypasses %d, build %.3f ms, alloc %.3f ms\n",
-                    __func__, cache.configured_tokens,
-                    cache.strict ? "on" : "off",
-                    cache.ready ? "yes" : "no",
-                    cache.invalidated ? "yes" : "no",
-                    cache.n_hits, cache.n_misses, cache.n_builds,
-                    cache.n_invalidations, cache.n_bypasses,
-                    cache.t_build_ms, cache.t_alloc_ms);
-        }
-
         common_memory_breakdown_print(ctx);
     }
 }

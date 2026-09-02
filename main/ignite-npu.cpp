@@ -425,7 +425,6 @@ std::tuple<int, double, int, double> llama_perf_context_print_custom(
         double ttft_e2e_ms,
         bool strict_sample_only_completed) {
     const auto data = llama_perf_context(ctx);
-    const auto graph_cache = llama_prefill_graph_cache_get_data(ctx);
     const double t_end_ms = 1e-3 * ggml_time_us();
 
     // ("%s:        load time = %10.2f ms\n", __func__, data.t_load_ms);
@@ -459,17 +458,7 @@ std::tuple<int, double, int, double> llama_perf_context_print_custom(
     if (file.is_open()) {
         file << std::to_string(sys_time) << "," << prefill_speed << "," << decode_speed << ","
               << data.n_p_eval << "," << decode_tokens << "," << (data.t_p_eval_ms)
-              << "," << sampling_ms << "," << ttft_e2e_ms
-              << "," << graph_cache.configured_tokens
-              << "," << graph_cache.n_hits
-              << "," << graph_cache.n_misses
-              << "," << graph_cache.n_builds
-              << "," << graph_cache.n_invalidations
-              << "," << graph_cache.n_bypasses
-              << "," << graph_cache.t_build_ms
-              << "," << graph_cache.t_alloc_ms
-              << "," << (graph_cache.ready ? 1 : 0)
-              << "," << (graph_cache.invalidated ? 1 : 0);
+              << "," << sampling_ms << "," << ttft_e2e_ms;
         if (should_write_backend_profile_csv(ig)) {
             const auto prof = ggml_backend_sched_profile_get();
             file << "," << prof.prefill_cpu_layers
@@ -1042,9 +1031,6 @@ int main(int argc, char ** argv) {
         // llama's prompt-evaluation time; ttft_e2e_ms below is the request-to-
         // first-sampled-token wall time.
         file << "sys_time,prefill_speed,decode_speed,prefill_token,decode_token,ttft,sampling_ms,ttft_e2e_ms";
-        file << ",graph_cache_tokens,graph_cache_hits,graph_cache_misses,graph_cache_builds";
-        file << ",graph_cache_invalidations,graph_cache_bypasses,graph_cache_build_ms,graph_cache_alloc_ms";
-        file << ",graph_cache_ready,graph_cache_invalidated";
         if (should_write_backend_profile_csv(ig)) {
             file << ",prefill_cpu_layers,prefill_htp_layers,prefill_gpu_layers";
             file << ",prefill_cpu_ms,prefill_htp_ms,prefill_gpu_ms";

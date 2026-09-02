@@ -185,7 +185,6 @@ struct llama_context {
     //
 
     llama_perf_context_data perf_get_data() const;
-    llama_prefill_graph_cache_data prefill_graph_cache_get_data() const;
     void perf_reset();
 
     llama_memory_breakdown memory_breakdown() const;
@@ -408,23 +407,6 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
-
-    // Explicit single-entry cache contract for one prefill graph shape. This
-    // pins gf_res_prev together with the scheduler's current allocation; no
-    // token, KV, logits, or computation-result data is cached here.
-    bool prefill_graph_cache_ready = false;
-    bool prefill_graph_cache_invalidated = false;
-    std::string prefill_graph_cache_invalidation_reason;
-
-    int32_t n_prefill_graph_cache_hits = 0;
-    int32_t n_prefill_graph_cache_misses = 0;
-    int32_t n_prefill_graph_cache_builds = 0;
-    int32_t n_prefill_graph_cache_invalidations = 0;
-    int32_t n_prefill_graph_cache_bypasses = 0;
-    int64_t t_prefill_graph_cache_build_us = 0;
-    int64_t t_prefill_graph_cache_alloc_us = 0;
-
-    void prefill_graph_cache_invalidate(const char * reason);
 
     // Optional prepared layer routes. All graph metadata remains empty
     // when runtime_routes is absent/disabled, keeping the legacy graph and
