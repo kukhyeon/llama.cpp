@@ -916,6 +916,38 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                             sched, ffn_inp, probe, &add4_fusion_backend);
                 }
 
+                struct prepared_ffn_topology {
+                    llama_backend_policy_ffn_parallel policy;
+                    std::vector<std::string> rms_backends;
+                    std::vector<std::string> mul_backends;
+                    ggml_tensor * norm_weight = nullptr;
+                    ggml_tensor * first = nullptr;
+                    ggml_tensor * output = nullptr;
+                    std::vector<ggml_tensor *> outputs;
+                    std::vector<ggml_tensor *> partials;
+                };
+                std::vector<prepared_ffn_topology> prepared;
+                prepared.reserve(runtime_route_profiles.size());
+
+                const auto same_ffn_policy = [](const auto & lhs, const auto & rhs) {
+                    if (lhs.enabled != rhs.enabled || lhs.phase != rhs.phase ||
+                            lhs.layer_start != rhs.layer_start || lhs.layer_end != rhs.layer_end ||
+                            lhs.align != rhs.align || lhs.reduce_backend != rhs.reduce_backend ||
+                            lhs.reduce_threads != rhs.reduce_threads ||
+                            lhs.splits.size() != rhs.splits.size()) {
+                        return false;
+                    }
+                    for (size_t i = 0; i < lhs.splits.size(); ++i) {
+                        const auto & a = lhs.splits[i];
+                        const auto & b = rhs.splits[i];
+                        if (a.id != b.id || a.start != b.start || a.size != b.size ||
+                                a.backend != b.backend) {
+                            return false;
+                        }
+                    }
+                    return true;
+                };
+
                 for (const std::string & profile : runtime_route_profiles) {
                     llama_backend_policy_ffn_parallel ffn_policy;
                     llama_backend_policy_match rms_match;
@@ -943,56 +975,75 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                                 profile.c_str(), il, mul_match.backends.front().c_str());
                     }
 
-                    char route_tag[24];
-                    // Keep the profile visible in scheduler_trace.csv branch
-                    // and node names. The scheduler still routes by the stable
-                    // numeric plan ID; this tag is observability only.
-                    snprintf(route_tag, sizeof(route_tag), "%s", profile.c_str());
+                    auto existing = std::find_if(
+                            prepared.begin(), prepared.end(), [&](const auto & candidate) {
+                                return same_ffn_policy(candidate.policy, ffn_policy) &&
+                                    candidate.rms_backends == rms_match.backends &&
+                                    candidate.mul_backends == mul_match.backends &&
+                                    candidate.norm_weight == norm_weight;
+                            });
+                    if (existing == prepared.end()) {
+                        char route_tag[24];
+                        // The first profile that owns a topology supplies its
+                        // observable node tag. Other clock anchors with the
+                        // same effective graph register their plan IDs against
+                        // these same node ranges instead of rebuilding them.
+                        snprintf(route_tag, sizeof(route_tag), "%s", profile.c_str());
 
-                    ggml_tensor * first = ggml_rms_norm(ctx0, ffn_inp, hparams.f_norm_rms_eps);
-                    cb_route(first, (std::string("ffn_rms_norm.") + route_tag).c_str(), il,
-                            rms_match.backends.front().c_str());
+                        prepared_ffn_topology topology;
+                        topology.policy = ffn_policy;
+                        topology.rms_backends = rms_match.backends;
+                        topology.mul_backends = mul_match.backends;
+                        topology.norm_weight = norm_weight;
 
-                    ggml_tensor * weighted = ggml_mul(ctx0, first, norm_weight);
-                    cb_route(weighted, (std::string("ffn_norm.") + route_tag).c_str(), il,
-                            mul_match.backends.front().c_str());
+                        topology.first = ggml_rms_norm(ctx0, ffn_inp, hparams.f_norm_rms_eps);
+                        cb_route(topology.first,
+                                (std::string("ffn_rms_norm.") + route_tag).c_str(), il,
+                                rms_match.backends.front().c_str());
 
-                    std::vector<ggml_tensor *> route_partials;
-                    ggml_tensor * route_out = build_ffn(weighted,
-                            model.layers[il].ffn_up,   model.layers[il].ffn_up_b,   model.layers[il].ffn_up_s,
-                            model.layers[il].ffn_gate, model.layers[il].ffn_gate_b, model.layers[il].ffn_gate_s,
-                            model.layers[il].ffn_down, model.layers[il].ffn_down_b, model.layers[il].ffn_down_s,
-                            NULL,
-                            LLM_FFN_SILU, LLM_FFN_PAR, il, &ffn_policy, route_tag,
-                            nullptr, nullptr,
-                            runtime_add4_bundle ? &route_partials : nullptr);
+                        ggml_tensor * weighted = ggml_mul(ctx0, topology.first, norm_weight);
+                        cb_route(weighted, (std::string("ffn_norm.") + route_tag).c_str(), il,
+                                mul_match.backends.front().c_str());
 
-                    std::vector<ggml_tensor *> route_outputs;
-                    if (runtime_add4_bundle) {
-                        if (route_partials.size() != 3) {
-                            GGML_ABORT(
-                                    "runtime_routes: profile %s layer %d passed ADD4 preflight but did not build three FFN partials",
-                                    profile.c_str(), il);
+                        topology.output = build_ffn(weighted,
+                                model.layers[il].ffn_up,   model.layers[il].ffn_up_b,   model.layers[il].ffn_up_s,
+                                model.layers[il].ffn_gate, model.layers[il].ffn_gate_b, model.layers[il].ffn_gate_s,
+                                model.layers[il].ffn_down, model.layers[il].ffn_down_b, model.layers[il].ffn_down_s,
+                                NULL,
+                                LLM_FFN_SILU, LLM_FFN_PAR, il, &topology.policy, route_tag,
+                                nullptr, nullptr,
+                                runtime_add4_bundle ? &topology.partials : nullptr);
+
+                        if (runtime_add4_bundle) {
+                            if (topology.partials.size() != 3) {
+                                GGML_ABORT(
+                                        "runtime_routes: profile %s layer %d passed ADD4 preflight but did not build three FFN partials",
+                                        profile.c_str(), il);
+                            }
+                            topology.outputs = topology.partials;
+                            topology.output = topology.partials.back();
+                            for (ggml_tensor * partial : topology.partials) {
+                                ggml_build_forward_expand(gf, partial);
+                            }
+                        } else {
+                            cb(topology.output,
+                                    (std::string("ffn_route_out.") + route_tag).c_str(), il);
+                            ggml_build_forward_expand(gf, topology.output);
+                            topology.outputs = { topology.output };
                         }
-                        route_outputs = route_partials;
-                        route_out = route_partials.back();
-                        for (ggml_tensor * partial : route_partials) {
-                            ggml_build_forward_expand(gf, partial);
-                        }
-                    } else {
-                        cb(route_out, (std::string("ffn_route_out.") + route_tag).c_str(), il);
-                        ggml_build_forward_expand(gf, route_out);
-                        route_outputs = { route_out };
+
+                        prepared.push_back(std::move(topology));
+                        existing = std::prev(prepared.end());
                     }
 
                     if (route_subgraph_cb_func) {
                         route_subgraph_cb_func(
                                 "ffn_block", profile.c_str(), il,
-                                first, route_out, route_outputs);
+                                existing->first, existing->output, existing->outputs);
                     }
                     if (profile == runtime_routes.initial_profile) {
-                        canonical_out = route_out;
-                        canonical_partials = route_partials;
+                        canonical_out = existing->output;
+                        canonical_partials = existing->partials;
                     }
                 }
                 if (canonical_out == nullptr) {

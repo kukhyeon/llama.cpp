@@ -3600,20 +3600,23 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     }
 
     if (runtime_routes_configured) {
-        // A canonical node needs at most one clone per alternate concrete
-        // backend, even when several profiles select that same backend. This
-        // conservative metadata reserve keeps all candidate construction out
-        // of the inference path after context initialization.
-        // Keep room for the original canonical node plus one clone for every
-        // concrete backend. The initial profile may leave canonical placement
-        // unspecified while the remaining profiles cover every backend.
-        const uint64_t backend_variants = 1u + backends.size();
-        res *= backend_variants;
-
         llama_backend_policy_runtime_routes routes;
-        if (n_tokens > 1 &&
-                llama_backend_policy_resolve_runtime_routes(true, routes) &&
-                (routes.mode == "clock" || routes.mode == "fixed") &&
+        const bool active_runtime_routes = n_tokens > 1 &&
+            llama_backend_policy_resolve_runtime_routes(true, routes) &&
+            (routes.mode == "clock" || routes.mode == "fixed");
+
+        if (active_runtime_routes &&
+                std::find(routes.candidate_kinds.begin(), routes.candidate_kinds.end(),
+                        "weightless_stateless") != routes.candidate_kinds.end()) {
+            // Only weightless single-node candidates clone arbitrary canonical
+            // nodes onto alternate concrete backends. Prebuilt block candidates
+            // have their own bounded reserves below and must not multiply the
+            // entire base graph capacity.
+            const uint64_t backend_variants = 1u + backends.size();
+            res *= backend_variants;
+        }
+
+        if (active_runtime_routes &&
                 cparams.attn_qkv_shards &&
                 std::find(routes.candidate_kinds.begin(), routes.candidate_kinds.end(),
                         "attn_qkv_block") != routes.candidate_kinds.end()) {
@@ -3625,22 +3628,95 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
             res += (uint64_t) model.hparams.n_layer * routes.profiles.size() *
                 nodes_per_qkv_variant;
         }
-        if (n_tokens > 1 &&
-                llama_backend_policy_resolve_runtime_routes(true, routes) &&
-                (routes.mode == "clock" || routes.mode == "fixed") &&
+        if (active_runtime_routes &&
                 std::find(routes.candidate_kinds.begin(), routes.candidate_kinds.end(),
                         "ffn_block") != routes.candidate_kinds.end()) {
             // Each prebuilt dense-FFN route contains weighted RMS+MUL, three
             // four-op shard branches, and a short reduction chain. Keep this
-            // reserve separate from weightless single-node clones so 24 clock
-            // profiles x 28 layers cannot exhaust graph metadata.
-            constexpr uint64_t nodes_per_ffn_variant = 20;
-            res += (uint64_t) model.hparams.n_layer * routes.profiles.size() *
-                nodes_per_ffn_variant;
+            // reserve separate from weightless single-node clones. Profiles
+            // with the same effective FFN and norm placement share one graph
+            // range, so reserve one variant for each unique topology.
+            constexpr uint64_t fallback_nodes_per_ffn_variant = 20;
+            struct ffn_reserve_topology {
+                llama_backend_policy_ffn_parallel policy;
+                std::vector<std::string> rms_backends;
+                std::vector<std::string> mul_backends;
+                ggml_tensor * norm_weight = nullptr;
+            };
+            const auto same_ffn_policy = [](const auto & lhs, const auto & rhs) {
+                if (lhs.enabled != rhs.enabled || lhs.phase != rhs.phase ||
+                        lhs.layer_start != rhs.layer_start || lhs.layer_end != rhs.layer_end ||
+                        lhs.align != rhs.align || lhs.reduce_backend != rhs.reduce_backend ||
+                        lhs.reduce_threads != rhs.reduce_threads ||
+                        lhs.splits.size() != rhs.splits.size()) {
+                    return false;
+                }
+                for (size_t i = 0; i < lhs.splits.size(); ++i) {
+                    const auto & a = lhs.splits[i];
+                    const auto & b = rhs.splits[i];
+                    if (a.id != b.id || a.start != b.start || a.size != b.size ||
+                            a.backend != b.backend) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+
+            uint64_t reserved_ffn_nodes = 0;
+            for (uint32_t il = 0; il < model.hparams.n_layer; ++il) {
+                std::vector<ffn_reserve_topology> prepared;
+                prepared.reserve(routes.profiles.size());
+                for (const std::string & profile : routes.profiles) {
+                    ffn_reserve_topology candidate;
+                    llama_backend_policy_match rms_match;
+                    llama_backend_policy_match mul_match;
+                    const bool have_ffn = llama_backend_policy_match_ffn_parallel_for_profile(
+                            profile.c_str(), (int) il, true, candidate.policy);
+                    const bool have_rms = llama_backend_policy_match_op_for_profile(
+                            profile.c_str(), "ffn_rms_norm", "ffn_rms_norm",
+                            GGML_OP_RMS_NORM, (int) il, true, rms_match);
+                    const bool have_mul = llama_backend_policy_match_op_for_profile(
+                            profile.c_str(), "ffn_norm", "ffn_norm",
+                            GGML_OP_MUL, (int) il, true, mul_match);
+                    if (!have_ffn || !have_rms || rms_match.backends.empty() ||
+                            !have_mul || mul_match.backends.empty()) {
+                        // Policy validation normally makes this unreachable;
+                        // retain a full per-profile slot if it is encountered.
+                        reserved_ffn_nodes += fallback_nodes_per_ffn_variant;
+                        continue;
+                    }
+
+                    candidate.rms_backends = std::move(rms_match.backends);
+                    candidate.mul_backends = std::move(mul_match.backends);
+                    candidate.norm_weight = model.get_backend_policy_residency_tensor(
+                            model.layers[il].ffn_norm, candidate.mul_backends);
+
+                    const bool duplicate = std::any_of(
+                            prepared.begin(), prepared.end(), [&](const auto & existing) {
+                                return same_ffn_policy(existing.policy, candidate.policy) &&
+                                    existing.rms_backends == candidate.rms_backends &&
+                                    existing.mul_backends == candidate.mul_backends &&
+                                    existing.norm_weight == candidate.norm_weight;
+                            });
+                    if (!duplicate) {
+                        prepared.push_back(std::move(candidate));
+                    }
+                }
+                for (const auto & topology : prepared) {
+                    const uint64_t active_splits = std::count_if(
+                            topology.policy.splits.begin(), topology.policy.splits.end(),
+                            [](const auto & split) { return split.size > 0; });
+                    // Two norm nodes, four nodes per active shard, and at most
+                    // N-1 reduction nodes. Keep four extra slots for probes or
+                    // future post-ops without assuming that FFN has only three
+                    // processor lanes.
+                    reserved_ffn_nodes += 2u + 4u * active_splits +
+                        (active_splits > 0 ? active_splits - 1u : 0u) + 4u;
+                }
+            }
+            res += reserved_ffn_nodes;
         }
-        if (n_tokens > 1 &&
-                llama_backend_policy_resolve_runtime_routes(true, routes) &&
-                (routes.mode == "clock" || routes.mode == "fixed") &&
+        if (active_runtime_routes &&
                 std::find(routes.candidate_kinds.begin(), routes.candidate_kinds.end(),
                         "weighted_norm") != routes.candidate_kinds.end()) {
             // Attention-side weighted norm candidates contain exactly one
@@ -3650,9 +3726,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
             res += (uint64_t) model.hparams.n_layer * routes.profiles.size() *
                 nodes_per_weighted_norm_variant;
         }
-        if (cparams.attn_out_shards && n_tokens > 1 &&
-                llama_backend_policy_resolve_runtime_routes(true, routes) &&
-                (routes.mode == "clock" || routes.mode == "fixed") &&
+        if (active_runtime_routes && cparams.attn_out_shards &&
                 std::find(routes.candidate_kinds.begin(), routes.candidate_kinds.end(),
                         "attn_out_block") != routes.candidate_kinds.end()) {
             // A profile-specific W_O variant contains three REGION matmuls,
