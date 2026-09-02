@@ -1432,6 +1432,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     ml.done_getting_tensors();
     pimpl->backend_policy_residency_tensors = ml.residency_tensors_by_name;
     pimpl->backend_policy_residency_cover_infos = ml.residency_cover_infos;
+    for (const auto & [tensor, info] : ml.residency_cover_alias_infos) {
+        auto & candidates = pimpl->backend_policy_residency_tensors[info.source_name];
+        if (std::find(candidates.begin(), candidates.end(), tensor) == candidates.end()) {
+            candidates.push_back(tensor);
+        }
+        const auto inserted = pimpl->backend_policy_residency_cover_infos.emplace(tensor, info);
+        if (!inserted.second) {
+            throw std::runtime_error(format(
+                    "backend_policy: duplicate runtime cover metadata for canonical tensor %s",
+                    info.source_name.c_str()));
+        }
+    }
 
     // populate tensors_by_name
     for (auto & [_, ctx_ptr] : ml.ctx_map) {
