@@ -1164,7 +1164,12 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor(ggml_backend_buffer
             t_ij->data = (char *) ggml_backend_buffer_get_base(simple_buf)
                 + size_t(tensor->data) - size_t(ggml_backend_buffer_get_base(buffer));
         }
-        t_ij->extra = tensor->extra;
+        if (simple_buf != nullptr) {
+            // The backend that owns the child buffer initializes its tensor metadata.
+            GGML_ASSERT(ggml_backend_buffer_init_tensor(simple_buf, t_ij) == GGML_STATUS_SUCCESS);
+        } else {
+            t_ij->extra = tensor->extra;
+        }
         for (int i = 0; i < GGML_MAX_SRC; i++) {
             t_ij->src[i] = tensor->src[i];
             if (tensor->src[i] == tensor) {
@@ -1433,6 +1438,16 @@ static const ggml_backend_buffer_i ggml_backend_meta_buffer_iface = {
 
 bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf) {
     return buf != nullptr && buf->iface.free_buffer == ggml_backend_meta_buffer_iface.free_buffer;
+}
+
+void ggml_backend_meta_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage) {
+    GGML_ASSERT(ggml_backend_buffer_is_meta(buffer));
+    ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buffer->context;
+    for (const auto & config : buf_ctx->buf_configs) {
+        if (config.buf != nullptr) {
+            ggml_backend_buffer_set_usage(config.buf, usage);
+        }
+    }
 }
 
 static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
