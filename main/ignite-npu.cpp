@@ -4,6 +4,7 @@
 #include "log.h"
 #include "query-pacing.h"
 #include "sampling.h"
+#include "memory-stats.h"
 #include "llama.h"
 #include "chat.h"
 
@@ -664,6 +665,17 @@ int main(int argc, char ** argv) {
             (long long) gate_result.final_raw_temperature.value_or(0));
     }
 
+    const std::string memory_stats_path = params.output_dir.empty()
+        ? "memory_stats.csv"
+        : params.output_dir + "/memory_stats.csv";
+    memory_stats_writer memory_stats(params.memory_stats, memory_stats_path);
+    if (!memory_stats.ready()) {
+        LOG_ERR("%s: unable to create memory stats file: %s\n",
+                __func__, memory_stats.path().c_str());
+        return 1;
+    }
+    memory_stats.record("startup_pre_model", nullptr);
+
     const bool csv_op_load = should_write_op_load_csv();
     const bool csv_op_load_breakdown = should_write_op_load_breakdown_csv();
     const bool csv_load = csv_op_load || csv_op_load_breakdown;
@@ -719,6 +731,14 @@ int main(int argc, char ** argv) {
         LOG_ERR("%s: error: unable to create context\n", __func__);
         return 1;
     }
+    memory_stats.record("context_ready", ctx);
+    bool memory_stats_first_query_recorded = false;
+    const auto record_first_query_memory = [&]() {
+        if (memory_stats.enabled() && !memory_stats_first_query_recorded) {
+            memory_stats.record("first_query_end", ctx);
+            memory_stats_first_query_recorded = true;
+        }
+    };
 
     auto * ig = get_ignite_params(ctx);
     if (ig == nullptr) {
@@ -1916,6 +1936,7 @@ int main(int argc, char ** argv) {
                     if (node_wall_trace) {
                         ggml_backend_node_wall_trace_flush();
                     }
+                    record_first_query_memory();
                     inference_started = false;
                     LOG_INF("module-bench complete; exiting after isolated module graph\n");
                     break;
@@ -2180,6 +2201,7 @@ int main(int argc, char ** argv) {
                                     query_duration_ms(next_start.lateness));
                             query_timing.valid = false;
                             query_pacing_exit_status = 2;
+                            record_first_query_memory();
                             break;
                         }
 
@@ -2195,6 +2217,10 @@ int main(int argc, char ** argv) {
                             query_timing.valid = false;
                         }
                     }
+                    // Keep /proc reads and CSV I/O outside the measured
+                    // inference/post-processing interval. This is a one-shot
+                    // diagnostic snapshot, never a per-query operation.
+                    record_first_query_memory();
                 }
 // -------------------------------
                 LOG_DBG("waiting for user input\n");
@@ -2520,6 +2546,8 @@ int main(int argc, char ** argv) {
         record_thread.join();
     }
     #endif
+
+    memory_stats.record("run_end_pre_free", ctx);
 
     reset_dvfs();
 

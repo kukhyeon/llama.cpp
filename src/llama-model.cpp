@@ -1659,6 +1659,77 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
     return ret;
 }
 
+llama_partition_weight_breakdown llama_model::partition_weight_breakdown() const {
+    llama_partition_weight_breakdown ret;
+    std::unordered_map<const ggml_tensor *, std::string> counted;
+
+    const auto add_checked = [&ret](size_t & dst, size_t value) {
+        if (value > std::numeric_limits<size_t>::max() - dst) {
+            dst = std::numeric_limits<size_t>::max();
+            ret.overflow = true;
+            return;
+        }
+        dst += value;
+    };
+
+    for (const auto & [source_name, candidates] : pimpl->backend_policy_residency_tensors) {
+        const ggml_tensor * source = get_tensor(source_name.c_str());
+
+        if (source == nullptr) {
+            ret.valid = false;
+            continue;
+        }
+
+        const bool replaces_virtual_source = source->buffer == nullptr && source->view_src == nullptr;
+        if (source->buffer == nullptr && !replaces_virtual_source) {
+            ret.valid = false;
+            continue;
+        }
+        if (replaces_virtual_source) {
+            add_checked(ret.omitted_canonical_payload, ggml_nbytes(source));
+        }
+
+        for (const ggml_tensor * candidate : candidates) {
+            // A full-span canonical cover aliases the source allocation.
+            if (candidate == source || (candidate != nullptr && candidate->view_src != nullptr)) {
+                continue;
+            }
+            if (candidate == nullptr || candidate->buffer == nullptr) {
+                ret.valid = false;
+                continue;
+            }
+
+            const auto [seen, inserted] = counted.emplace(candidate, source_name);
+            if (!inserted) {
+                if (seen->second != source_name) {
+                    ret.valid = false;
+                }
+                continue;
+            }
+
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(candidate->buffer);
+            const size_t alignment = ggml_backend_buft_get_alignment(buft);
+            const size_t alloc_size = ggml_backend_buft_get_alloc_size(buft, candidate);
+            if (alignment == 0 || alloc_size > std::numeric_limits<size_t>::max() - (alignment - 1)) {
+                ret.overflow = true;
+                continue;
+            }
+            const size_t alloc_span = GGML_PAD(alloc_size, alignment);
+            const size_t payload = ggml_nbytes(candidate);
+            auto & memory = ret.buffers[buft];
+            if (replaces_virtual_source) {
+                add_checked(memory.replacement_payload, payload);
+                add_checked(memory.replacement_alloc_span, alloc_span);
+            } else {
+                add_checked(memory.added_payload, payload);
+                add_checked(memory.added_alloc_span, alloc_span);
+            }
+        }
+    }
+
+    return ret;
+}
+
 uint64_t llama_model::n_elements() const {
     return pimpl->n_elements;
 }
@@ -2644,6 +2715,10 @@ ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int 
         return nullptr;
     }
     return model->devices[i].dev;
+}
+
+llama_partition_weight_breakdown llama_get_partition_weight_breakdown(const struct llama_model * model) {
+    return model->partition_weight_breakdown();
 }
 
 //
