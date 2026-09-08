@@ -1169,9 +1169,11 @@ static bool run_alternate_terminal_lifetime_case() {
                 alternates[i], alternates[i], (uint64_t) i + 1, 0);
     }
 
-    size_t sizes[1] = {};
+    size_t base_sizes[1] = {};
+    size_t routed_sizes[1] = {};
     if (setup_ok) {
-        ggml_backend_sched_reserve_size(sched, graph, sizes);
+        setup_ok = ggml_backend_sched_reserve_route_sizes(
+                sched, graph, base_sizes, routed_sizes);
     }
 
     // Input + canonical/output + one reusable alternate scratch terminal fit
@@ -1179,8 +1181,10 @@ static bool run_alternate_terminal_lifetime_case() {
     // 24 alternate roots alone require 24 MiB and this assertion fails.
     const bool ok =
         check(setup_ok, scenario, "route registration failed") &&
-        check(sizes[0] > 0, scenario, "reserve size was not reported") &&
-        check(sizes[0] < 8 * 1024 * 1024,
+        check(base_sizes[0] > 0, scenario, "base reserve size was not reported") &&
+        check(routed_sizes[0] >= base_sizes[0],
+                scenario, "routed reserve was smaller than its canonical path") &&
+        check(routed_sizes[0] < 8 * 1024 * 1024,
                 scenario, "alternate terminals remained live to graph end");
 
     cleanup();

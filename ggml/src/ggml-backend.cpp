@@ -4911,7 +4911,23 @@ static bool ggml_backend_sched_resolve_route_candidate_splits(
     return true;
 }
 
-void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+struct ggml_backend_sched_route_base_capture {
+    std::vector<ggml_tensor *> nodes;
+    std::vector<int> node_backend_ids;
+    std::vector<ggml_tensor *> leafs;
+    std::vector<int> leaf_backend_ids;
+};
+
+static void ggml_backend_sched_split_graph_impl(
+        ggml_backend_sched_t sched, struct ggml_cgraph * graph,
+        ggml_backend_sched_route_base_capture * route_base) {
+    if (route_base != nullptr) {
+        route_base->nodes.clear();
+        route_base->node_backend_ids.clear();
+        route_base->leafs.clear();
+        route_base->leaf_backend_ids.clear();
+    }
+
     // reset splits
     sched->n_splits = 0;
     sched->n_graph_inputs = 0;
@@ -5721,9 +5737,20 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         allocated_split_input_copies =
             std::make_unique<std::unordered_set<struct ggml_tensor *>>();
     }
+    std::unordered_set<struct ggml_tensor *> route_base_split_input_copies;
+    std::vector<bool> route_base_include_splits(
+            route_base != nullptr ? (size_t) sched->n_splits : 0, true);
 
     for (int i = 0; i < sched->n_splits; i++) {
         struct ggml_backend_sched_split * split = &sched->splits[i];
+        bool route_base_include = route_base != nullptr;
+        if (route_base_include && route_candidate_mode && route_state->prepared) {
+            const int group_index = route_state->split_to_group[i];
+            route_base_include = group_index < 0 ||
+                route_state->split_to_variant[i] ==
+                    route_state->groups[group_index].canonical_variant_index;
+            route_base_include_splits[(size_t) i] = route_base_include;
+        }
         split->graph = ggml_graph_view(graph, split->i_start, split->i_end);
         split->contains_transformer_layer = false;
         if (sched->cpu_graph_prewake_hold_us > 0) {
@@ -5750,24 +5777,41 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             assert(graph_copy->size > graph_copy->n_nodes);
             struct ggml_tensor * input_dep = ggml_view_tensor(sched->ctx, input);
             input_dep->src[0] = input;
-            sched->node_backend_ids[graph_copy->n_nodes] = sched->hv_tensor_backend_ids[input_id];
+            const int input_backend_id = sched->hv_tensor_backend_ids[input_id];
+            sched->node_backend_ids[graph_copy->n_nodes] = input_backend_id;
             graph_copy->nodes[graph_copy->n_nodes++] = input_dep;
+            if (route_base_include) {
+                route_base->node_backend_ids.push_back(input_backend_id);
+                route_base->nodes.push_back(input_dep);
+            }
 
             // A physical input copy can be refreshed by several mutually
             // exclusive route domains. Keep each domain's source dependency,
             // but add the shared copy tensor to the allocation graph once.
-            if (!route_candidate_mode ||
-                    allocated_split_input_copies->insert(input_cpy).second) {
+            const bool append_full_copy = !route_candidate_mode ||
+                allocated_split_input_copies->insert(input_cpy).second;
+            if (append_full_copy) {
                 assert(graph_copy->size > graph_copy->n_nodes);
                 sched->node_backend_ids[graph_copy->n_nodes] = split->backend_id;
                 graph_copy->nodes[graph_copy->n_nodes++] = input_cpy;
+            }
+            if (route_base_include &&
+                    (!route_candidate_mode ||
+                     route_base_split_input_copies.insert(input_cpy).second)) {
+                route_base->node_backend_ids.push_back(split->backend_id);
+                route_base->nodes.push_back(input_cpy);
             }
         }
 
         for (int j = split->i_start; j < split->i_end; j++) {
             assert(graph_copy->size > graph_copy->n_nodes);
-            sched->node_backend_ids[graph_copy->n_nodes] = tensor_backend_id(graph->nodes[j]);
+            const int node_backend_id = tensor_backend_id(graph->nodes[j]);
+            sched->node_backend_ids[graph_copy->n_nodes] = node_backend_id;
             graph_copy->nodes[graph_copy->n_nodes++] = graph->nodes[j];
+            if (route_base_include) {
+                route_base->node_backend_ids.push_back(node_backend_id);
+                route_base->nodes.push_back(graph->nodes[j]);
+            }
         }
 
         if (route_candidate_mode && route_state->prepared &&
@@ -5799,6 +5843,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     if (sched->n_copies > 1) {
         std::unique_ptr<std::unordered_set<struct ggml_tensor *>> allocated_copy_leafs;
+        std::unordered_set<struct ggml_tensor *> route_base_copy_leafs;
         if (route_candidate_mode) {
             allocated_copy_leafs =
                 std::make_unique<std::unordered_set<struct ggml_tensor *>>();
@@ -5810,13 +5855,19 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             int backend_id = tensor_backend_id(input);
             for (int c = 0; c < sched->n_copies; c++) {
                 struct ggml_tensor * input_cpy = tensor_id_copy(id, backend_id, c);
-                if (route_candidate_mode &&
-                        !allocated_copy_leafs->insert(input_cpy).second) {
-                    continue;
+                const bool append_full = !route_candidate_mode ||
+                    allocated_copy_leafs->insert(input_cpy).second;
+                if (append_full) {
+                    sched->leaf_backend_ids[graph_copy->n_leafs] = backend_id;
+                    assert(graph_copy->size > graph_copy->n_leafs);
+                    graph_copy->leafs[graph_copy->n_leafs++] = input_cpy;
                 }
-                sched->leaf_backend_ids[graph_copy->n_leafs] = backend_id;
-                assert(graph_copy->size > graph_copy->n_leafs);
-                graph_copy->leafs[graph_copy->n_leafs++] = input_cpy;
+                if (route_base != nullptr &&
+                        (!route_candidate_mode ||
+                         route_base_copy_leafs.insert(input_cpy).second)) {
+                    route_base->leaf_backend_ids.push_back(backend_id);
+                    route_base->leafs.push_back(input_cpy);
+                }
             }
         }
 
@@ -5828,13 +5879,19 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 size_t id = hash_id(input);
                 for (int c = 0; c < sched->n_copies; c++) {
                     struct ggml_tensor * input_cpy = tensor_id_copy(id, backend_id, c);
-                    if (route_candidate_mode &&
-                            !allocated_copy_leafs->insert(input_cpy).second) {
-                        continue;
+                    const bool append_full = !route_candidate_mode ||
+                        allocated_copy_leafs->insert(input_cpy).second;
+                    if (append_full) {
+                        sched->leaf_backend_ids[graph_copy->n_leafs] = backend_id;
+                        assert(graph_copy->size > graph_copy->n_leafs);
+                        graph_copy->leafs[graph_copy->n_leafs++] = input_cpy;
                     }
-                    sched->leaf_backend_ids[graph_copy->n_leafs] = backend_id;
-                    assert(graph_copy->size > graph_copy->n_leafs);
-                    graph_copy->leafs[graph_copy->n_leafs++] = input_cpy;
+                    if (route_base != nullptr && route_base_include_splits[(size_t) i] &&
+                            (!route_candidate_mode ||
+                             route_base_copy_leafs.insert(input_cpy).second)) {
+                        route_base->leaf_backend_ids.push_back(backend_id);
+                        route_base->leafs.push_back(input_cpy);
+                    }
                 }
             }
         }
@@ -5846,12 +5903,20 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         sched->leaf_backend_ids[graph_copy->n_leafs] = tensor_backend_id(leaf);
         assert(graph_copy->size > graph_copy->n_leafs);
         graph_copy->leafs[graph_copy->n_leafs++] = leaf;
+        if (route_base != nullptr) {
+            route_base->leaf_backend_ids.push_back(tensor_backend_id(leaf));
+            route_base->leafs.push_back(leaf);
+        }
     }
 
     // set ids for all splits
     for (int i = 0; i < sched->n_splits; ++i) {
         sched->splits[i].graph.uid = ggml_graph_next_uid();
     }
+}
+
+void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    ggml_backend_sched_split_graph_impl(sched, graph, nullptr);
 }
 
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
@@ -9350,6 +9415,52 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
     ggml_backend_sched_split_graph(sched, measure_graph);
 
     ggml_gallocr_reserve_n_size(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
+}
+
+bool ggml_backend_sched_reserve_route_sizes(
+        ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph,
+        size_t * base_sizes, size_t * routed_sizes) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(measure_graph);
+    GGML_ASSERT(base_sizes);
+    GGML_ASSERT(routed_sizes);
+    GGML_ASSERT((int) sched->hash_set.size >=
+            measure_graph->n_nodes + measure_graph->n_leafs);
+
+    const bool expect_routes =
+        sched->route_candidates != nullptr && sched->route_candidates->enabled();
+    const bool expect_checkpoints =
+        sched->layer_checkpoints != nullptr && sched->layer_checkpoints->enabled;
+
+    ggml_backend_sched_synchronize(sched);
+    ggml_backend_sched_route_base_capture base;
+    ggml_backend_sched_split_graph_impl(sched, measure_graph, &base);
+
+    if ((expect_routes && !sched->route_candidates->prepared) ||
+            (expect_checkpoints && !sched->layer_checkpoints->prepared)) {
+        GGML_LOG_ERROR("%s: failed to prepare routed graph for sizing\n", __func__);
+        return false;
+    }
+    GGML_ASSERT(base.nodes.size() == base.node_backend_ids.size());
+    GGML_ASSERT(base.leafs.size() == base.leaf_backend_ids.size());
+
+    ggml_cgraph base_graph = {};
+    base_graph.size = (int) std::max(base.nodes.size(), base.leafs.size());
+    base_graph.n_nodes = (int) base.nodes.size();
+    base_graph.n_leafs = (int) base.leafs.size();
+    base_graph.nodes = base.nodes.data();
+    base_graph.leafs = base.leafs.data();
+
+    ggml_gallocr_reserve_n_size(
+            sched->galloc, &base_graph,
+            base.node_backend_ids.data(), base.leaf_backend_ids.data(),
+            base_sizes);
+    // Leave the allocator sized for the complete routed graph.
+    ggml_gallocr_reserve_n_size(
+            sched->galloc, &sched->graph,
+            sched->node_backend_ids, sched->leaf_backend_ids,
+            routed_sizes);
+    return true;
 }
 
 bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph) {

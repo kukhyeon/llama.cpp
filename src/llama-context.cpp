@@ -370,6 +370,7 @@ llama_context::llama_context(
     cparams.attn_qkv_parallel        = params.attn_qkv_parallel;
     cparams.attn_qkv_shards          = params.attn_qkv_shards;
     cparams.attn_out_shards          = params.attn_out_shards;
+    memory_stats_enabled             = params.memory_stats;
 
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
     cparams.rope_freq_base   = params.rope_freq_base  == 0.0f ? hparams.rope_freq_base_train  : params.rope_freq_base;
@@ -839,6 +840,9 @@ llama_context::llama_context(
         backend_buft.clear();
         backend_ptrs.clear();
         backend_buf_exp_size.clear();
+        backend_buf_graph_base_size.clear();
+        backend_buf_graph_routed_size.clear();
+        backend_buf_graph_measurement_valid = false;
 
         for (auto & backend : backends) {
             auto * buft = ggml_backend_get_default_buffer_type(backend.get());
@@ -954,6 +958,10 @@ void llama_context::sched_reserve() {
     }
 
     sched_need_reserve = false;
+
+    backend_buf_graph_base_size.clear();
+    backend_buf_graph_routed_size.clear();
+    backend_buf_graph_measurement_valid = false;
 
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
@@ -1119,6 +1127,42 @@ void llama_context::sched_reserve() {
     int n_splits_tg = -1;
     int n_nodes_tg  = -1;
 
+    // Split the prefill graph once and size both its canonical initial-profile
+    // path and the complete routed candidate graph. A following normal reserve
+    // rebuilds the scheduler state used for inference.
+    const auto measure_prefill_graph_memory = [&]() {
+        backend_buf_graph_base_size.clear();
+        backend_buf_graph_routed_size.clear();
+        backend_buf_graph_measurement_valid = false;
+
+        if (!memory_stats_enabled || n_tokens <= 1) {
+            return;
+        }
+
+        std::vector<size_t> base_sizes(backend_ptrs.size(), 0);
+        std::vector<size_t> routed_sizes(backend_ptrs.size(), 0);
+
+        auto * gf_measure = graph_reserve(
+                n_tokens, n_seqs, n_tokens, mctx.get(), true,
+                routed_sizes.data(), base_sizes.data());
+        const bool measured = gf_measure != nullptr;
+
+        if (!measured) {
+            LLAMA_LOG_WARN("%s: unable to measure prefill compute-buffer breakdown\n", __func__);
+        } else {
+            for (size_t i = 0; i < backend_buft.size(); ++i) {
+                auto * buft = backend_buft[i];
+                backend_buf_graph_base_size[buft] =
+                    std::max(backend_buf_graph_base_size[buft], base_sizes[i]);
+                backend_buf_graph_routed_size[buft] =
+                    std::max(backend_buf_graph_routed_size[buft], routed_sizes[i]);
+            }
+            backend_buf_graph_measurement_valid = true;
+        }
+    };
+
+    measure_prefill_graph_memory();
+
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
         auto * gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get(),
@@ -1130,6 +1174,10 @@ void llama_context::sched_reserve() {
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
                 ggml_backend_sched_set_ffn_parallel_reduce_threads(
                         sched.get(), cparams.n_threads_batch, llama_backend_policy_ffn_parallel_reduce_threads());
+                // The previous diagnostic belonged to the discarded
+                // pipeline-parallel scheduler. Re-measure against the actual
+                // scheduler before retrying the normal reserve.
+                measure_prefill_graph_memory();
                 gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get());
             }
             if (!gf) {
@@ -3752,7 +3800,9 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
 }
 
 ggml_cgraph * llama_context::graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs,
+        const llama_memory_context_i * mctx, bool split_only, size_t * sizes,
+        size_t * route_base_sizes) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
     GGML_ASSERT(n_outputs >= 1);
 
@@ -3789,12 +3839,14 @@ ggml_cgraph * llama_context::graph_reserve(
     }
 
     auto * res = gf_res_reserve.get();
+    const bool reserve_is_prefill = n_tokens > 1;
 
-    const auto gparams = graph_params(res, ubatch, mctx, LLM_GRAPH_TYPE_DEFAULT);
+    const auto gparams = graph_params(
+            res, ubatch, mctx, LLM_GRAPH_TYPE_DEFAULT,
+            route_base_sizes != nullptr ? (reserve_is_prefill ? 1 : 0) : -1);
 
     res->reset();
 
-    const bool reserve_is_prefill = n_tokens > 1;
     if (runtime_routes_configured) {
         runtime_route_graph_begin(reserve_is_prefill);
     }
@@ -3813,7 +3865,14 @@ ggml_cgraph * llama_context::graph_reserve(
     // initialize scheduler with the specified graph
     if (split_only) {
         if (sizes) {
-            ggml_backend_sched_reserve_size(sched.get(), gf, sizes);
+            if (route_base_sizes != nullptr) {
+                if (!ggml_backend_sched_reserve_route_sizes(
+                            sched.get(), gf, route_base_sizes, sizes)) {
+                    return nullptr;
+                }
+            } else {
+                ggml_backend_sched_reserve_size(sched.get(), gf, sizes);
+            }
         } else {
             ggml_backend_sched_split_graph(sched.get(), gf);
         }
@@ -3830,7 +3889,8 @@ llm_graph_params llama_context::graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const {
+                          llm_graph_type   gtype,
+                                   int32_t policy_phase_override) const {
     // Derive the phase from the graph being built. graph_reserve() calls this
     // before process_ubatch() has updated lp_is_prefill, so consulting the
     // cached member here can silently build a decode-shaped reserve graph for
@@ -3884,7 +3944,7 @@ llm_graph_params llama_context::graph_params(
             !cparams.pipeline_parallel && cparams.cb_eval == nullptr && !lp_enable &&
             !module_bench_active,
         /*.runtime_ffn_profile =*/ std::move(runtime_ffn_profile),
-        /*.cb          =*/ graph_get_cb(),
+        /*.cb          =*/ graph_get_cb(policy_phase_override),
         /*.route_subgraph_cb =*/ [this](
                 const char * kind, const char * profile, int il,
                 ggml_tensor * first, ggml_tensor * last,
@@ -4034,8 +4094,15 @@ bool llama_context::lp_eval_callback(struct ggml_tensor * t, bool ask, void * us
     return is_mha || is_ffn;
 }
 
-llm_graph_cb llama_context::graph_get_cb() const {
-    return [&](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il, const char * backend_hint) {
+llm_graph_cb llama_context::graph_get_cb(int32_t policy_phase_override) const {
+    return [this, policy_phase_override](
+            const llama_ubatch & ubatch, ggml_tensor * cur,
+            const char * name, int il, const char * backend_hint) {
+        // Preserve the legacy runtime callback behavior unless the diagnostic
+        // reserve explicitly supplies the phase of its synthetic ubatch.
+        const bool graph_is_prefill = policy_phase_override >= 0
+            ? policy_phase_override != 0
+            : lp_is_prefill;
         if (il >= 0) {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
@@ -4086,7 +4153,8 @@ llm_graph_cb llama_context::graph_get_cb() const {
                 }
 
                 llama_backend_policy_match weight_match;
-                if (!llama_backend_policy_match_profile_weight(ggml_get_name(src), lp_is_prefill, weight_match)) {
+                if (!llama_backend_policy_match_profile_weight(
+                            ggml_get_name(src), graph_is_prefill, weight_match)) {
                     continue;
                 }
 
@@ -4110,7 +4178,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
                     ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend_ptr);
                     LLAMA_LOG_DEBUG("backend_policy: op %s (%s, il=%d, phase=%s) using backend hint %s -> %s\n",
                             ggml_get_name(cur), ggml_op_name(cur->op), il,
-                            lp_is_prefill ? "prefill" : "decode",
+                            graph_is_prefill ? "prefill" : "decode",
                             backend_hint,
                             ggml_backend_dev_name(ggml_backend_get_device(backend_ptr)));
                     return;
@@ -4118,13 +4186,15 @@ llm_graph_cb llama_context::graph_get_cb() const {
             }
             LLAMA_LOG_DEBUG("backend_policy: op %s (%s, il=%d, phase=%s) backend hint %s was not supported\n",
                     ggml_get_name(cur), ggml_op_name(cur->op), il,
-                    lp_is_prefill ? "prefill" : "decode",
+                    graph_is_prefill ? "prefill" : "decode",
                     backend_hint);
         }
 
         if (llama_backend_policy_ops_enabled()) {
             llama_backend_policy_match policy_match;
-            if (llama_backend_policy_match_op(name, ggml_get_name(cur), cur->op, il, lp_is_prefill, policy_match)) {
+            if (llama_backend_policy_match_op(
+                        name, ggml_get_name(cur), cur->op, il,
+                        graph_is_prefill, policy_match)) {
                 // Op policy is a scheduling hint. Each requested backend is
                 // checked for op support first; unsupported requests fall
                 // through to the next policy fallback or to the stock scheduler.
@@ -4138,7 +4208,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
                             ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend_ptr);
                             LLAMA_LOG_DEBUG("backend_policy: op %s (%s, il=%d, phase=%s) matched %s, using %s\n",
                                     ggml_get_name(cur), ggml_op_name(cur->op), il,
-                                    lp_is_prefill ? "prefill" : "decode",
+                                    graph_is_prefill ? "prefill" : "decode",
                                     policy_match.source.c_str(),
                                     ggml_backend_dev_name(ggml_backend_get_device(backend_ptr)));
                             return;
@@ -4147,7 +4217,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
                 }
                 LLAMA_LOG_DEBUG("backend_policy: op %s (%s, il=%d, phase=%s) matched %s, but no requested/fallback backend supports it\n",
                         ggml_get_name(cur), ggml_op_name(cur->op), il,
-                        lp_is_prefill ? "prefill" : "decode",
+                        graph_is_prefill ? "prefill" : "decode",
                         policy_match.source.c_str());
             }
         }
@@ -4841,17 +4911,35 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].context += size;
         }
     }
+    if (buf_output) {
+        auto * buft = ggml_backend_buffer_get_type(buf_output.get());
+        ret[buft].context += ggml_backend_buffer_get_size(buf_output.get());
+    }
     if (model.hparams.no_alloc) {
+        std::unordered_set<ggml_backend_buffer_type_t> seen_bufts;
         for (size_t i = 0; i < backends.size(); ++i) {
             ggml_backend_t             backend = backends[i].get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
-            ret[buft].compute += backend_buf_exp_size[i];
+            if (seen_bufts.insert(buft).second) {
+                ret[buft].compute += backend_buf_exp_size[i];
+            }
         }
     } else {
-        for (const auto & backend_ptr : backends) {
-            ggml_backend_t             backend = backend_ptr.get();
+        for (size_t i = 0; i < backends.size(); ++i) {
+            ggml_backend_t             backend = backends[i].get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
-            ret[buft].compute += ggml_backend_sched_get_buffer_size(sched.get(), backend);
+            const size_t compute = ggml_backend_sched_get_buffer_size(sched.get(), backend);
+            ret[buft].compute += compute;
+        }
+    }
+    if (backend_buf_graph_measurement_valid) {
+        for (const auto & [buft, size] : backend_buf_graph_base_size) {
+            ret[buft].compute_graph_base = size;
+            ret[buft].compute_graph_measurement_valid = true;
+        }
+        for (const auto & [buft, size] : backend_buf_graph_routed_size) {
+            ret[buft].compute_graph_routed = size;
+            ret[buft].compute_graph_measurement_valid = true;
         }
     }
     return ret;
@@ -5122,6 +5210,7 @@ llama_context_params llama_context_default_params() {
         /*.attn_qkv_parallel           =*/ false,
         /*.attn_qkv_shards             =*/ false,
         /*.attn_out_shards             =*/ false,
+        /*.memory_stats                =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
     };

@@ -390,6 +390,12 @@ extern "C" {
 
     // Initialize backend buffers from a measure graph
     GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
+    // Split a routed graph once and measure both its canonical initial-profile
+    // path and the full set of prepared candidates. The caller must reset or
+    // rebuild the scheduler before executing a graph.
+    GGML_API bool                 ggml_backend_sched_reserve_route_sizes(
+            ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph,
+            size_t * base_sizes, size_t * routed_sizes);
     GGML_API bool                 ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph); // returns success
 
     GGML_API int                  ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched);

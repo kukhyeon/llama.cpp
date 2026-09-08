@@ -247,7 +247,9 @@ public:
 
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs,
+        const llama_memory_context_i * mctx, bool split_only = false,
+        size_t * sizes = nullptr, size_t * route_base_sizes = nullptr);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
@@ -265,9 +267,10 @@ private:
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const;
+                          llm_graph_type   gtype,
+                                   int32_t policy_phase_override = -1) const;
 
-    llm_graph_cb graph_get_cb() const;
+    llm_graph_cb graph_get_cb(int32_t policy_phase_override = -1) const;
 
     struct runtime_route_node_meta {
         int layer = -1;
@@ -393,6 +396,10 @@ private:
     std::vector<ggml_backend_t>             backend_ptrs;
     std::vector<ggml_backend_buffer_type_t> backend_buft;
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
+    std::map<ggml_backend_buffer_type_t, size_t> backend_buf_graph_base_size;
+    std::map<ggml_backend_buffer_type_t, size_t> backend_buf_graph_routed_size;
+    bool backend_buf_graph_measurement_valid = false;
+    bool memory_stats_enabled = false;
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;

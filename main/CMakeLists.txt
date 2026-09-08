@@ -10,7 +10,7 @@ if (LLAMA_IGNITE_INSTALL)
 endif()
 
 set(TARGET llama-ignite-npu)
-add_executable(${TARGET} ignite-npu.cpp)
+add_executable(${TARGET} ignite-npu.cpp memory-stats.cpp memory-stats.h)
 target_link_libraries(${TARGET} PRIVATE llama-common llama dvfs ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 if (LLAMA_IGNITE_INSTALL)

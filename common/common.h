@@ -756,6 +756,7 @@ struct common_params {
     std::string json_path = "questions.json"; // deprecated, use input_path
     std::string input_path = "";
     std::string output_dir = "";
+    bool memory_stats = false;
     bool hardware_stats = true;
     int hardware_stats_core = -1;
     bool battery_temp_sync = false;

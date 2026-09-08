@@ -17,6 +17,7 @@
 struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
+struct llama_partition_weight_breakdown;
 
 struct llama_backend_policy_resident_cover {
     struct ggml_tensor * tensor = nullptr;
@@ -605,6 +606,7 @@ struct llama_model {
     llama_split_mode split_mode() const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
+    llama_partition_weight_breakdown partition_weight_breakdown() const;
 
     // total number of parameters in the model
     uint64_t n_elements() const;

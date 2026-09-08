@@ -419,6 +419,7 @@ extern "C" {
         bool attn_qkv_parallel; // run independent prefill Q/K/V projection branches concurrently [EXPERIMENTAL]
         bool attn_qkv_shards;   // shard each prefill Q/K/V projection across policy backends [EXPERIMENTAL]
         bool attn_out_shards;   // shard the prefill attention output projection across policy backends [EXPERIMENTAL]
+        bool memory_stats;      // measure routed-vs-base graph memory while reserving the context [EXPERIMENTAL]
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)

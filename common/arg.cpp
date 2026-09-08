@@ -1444,6 +1444,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
     add_opt(common_arg(
+        {"--memory-stats"}, "on|off",
+        "write milestone-based memory_stats.csv logging (default: off)",
+        [](common_params & params, const std::string & value) {
+            const std::string normalized = common_arg_lower(value);
+            if (is_truthy(normalized)) {
+                params.memory_stats = true;
+            } else if (is_falsey(normalized)) {
+                params.memory_stats = false;
+            } else {
+                throw std::invalid_argument(
+                    string_format("error: unknown value for --memory-stats: '%s'\n", value.c_str()));
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_MEMORY_STATS"));
+    add_opt(common_arg(
         {"--hardware-stats"}, "on|off",
         "enable hardware_stats.csv logging (default: on)",
         [](common_params & params, const std::string & value) {
