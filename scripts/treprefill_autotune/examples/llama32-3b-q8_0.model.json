@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "model_id": "Llama-3.2-3B-Instruct-Q8_0",
+  "architecture": "llama",
+  "quantization": "Q8_0",
+  "n_layer": 28,
+  "n_embd": 3072,
+  "n_ff": 8192,
+  "n_head": 24,
+  "n_head_kv": 8,
+  "head_dim": 128
+}

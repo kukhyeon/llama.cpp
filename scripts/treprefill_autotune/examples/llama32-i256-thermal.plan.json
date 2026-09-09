@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "name": "llama32-i256-thermal",
+  "tokens": [256],
+  "gpu_indices": [14, 4],
+  "query_periods_ms": [2000, 6000],
+  "repeats": 1,
+  "token_json_paths": {
+    "256": "data/llama32_prefill_256.json"
+  },
+  "common_env": {
+    "MAX_QUERY_NUMBER": "100",
+    "CPU_PRIME_P": "15",
+    "CPU_GOLD_P": "15",
+    "SCHED_TRACE": "on",
+    "SCHED_TRACE_PHASE": "prefill",
+    "HARDWARE_STATS": "on"
+  },
+  "results_root": "../../../autotune-runs/llama32-i256-thermal",
+  "script": "llama32_ffn_switch_hybrid.sh",
+  "policy": "../../../pkg-adb/llama.cpp/policy/DATE2027/llama32-3b-256-0908-th5.json",
+  "required_artifacts": [
+    "scheduler_trace.csv",
+    "hardware_stats.csv"
+  ],
+  "timeout_seconds": 900,
+  "use_su": true,
+  "shuffle_seed": 20260909
+}

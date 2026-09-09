@@ -13,6 +13,27 @@ long long read_first_positive_integer(const std::vector<std::string> & candidate
     return -1;
 }
 
+int nearest_frequency_index(const std::vector<int> & frequencies, long long frequency) {
+    if (frequencies.empty() || frequency <= 0) {
+        return -1;
+    }
+
+    const auto upper = std::lower_bound(frequencies.begin(), frequencies.end(), frequency);
+    if (upper == frequencies.begin()) {
+        return 0;
+    }
+    if (upper == frequencies.end()) {
+        return (int) frequencies.size() - 1;
+    }
+
+    const auto lower = upper - 1;
+    const long long lower_distance = frequency - *lower;
+    const long long upper_distance = *upper - frequency;
+    return (int) (lower_distance <= upper_distance
+        ? lower - frequencies.begin()
+        : upper - frequencies.begin());
+}
+
 } // namespace
 
 // DVFS --------------------------------------
@@ -268,6 +289,34 @@ bool DVFS::get_s25_clock_targets(
     targets.cpu_prime_khz = prime_it->second[cpu_prime_idx];
     targets.gpu_hz = gpu[gpu_idx];
     return true;
+}
+
+bool DVFS::get_s25_clock_indices(
+        const S25ClockSnapshot & snapshot,
+        int & cpu_gold_idx,
+        int & cpu_prime_idx,
+        int & gpu_idx) const {
+    cpu_gold_idx = -1;
+    cpu_prime_idx = -1;
+    gpu_idx = -1;
+    if (get_device_name() != "S25" ||
+            snapshot.cpu_gold_khz <= 0 ||
+            snapshot.cpu_prime_khz <= 0 ||
+            snapshot.gpu_hz <= 0) {
+        return false;
+    }
+
+    const auto & cpu = get_cpu_freq();
+    const auto gold_it = cpu.find(0);
+    const auto prime_it = cpu.find(6);
+    if (gold_it == cpu.end() || prime_it == cpu.end()) {
+        return false;
+    }
+
+    cpu_gold_idx = nearest_frequency_index(gold_it->second, snapshot.cpu_gold_khz);
+    cpu_prime_idx = nearest_frequency_index(prime_it->second, snapshot.cpu_prime_khz);
+    gpu_idx = nearest_frequency_index(get_gpu_freq(), snapshot.gpu_hz);
+    return cpu_gold_idx >= 0 && cpu_prime_idx >= 0 && gpu_idx >= 0;
 }
 // -------------------------------------------
 

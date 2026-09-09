@@ -1907,6 +1907,10 @@ struct ggml_backend_sched_trace_row {
     char timing_mode[32] = {};
     int64_t cpu_idle_before_us = -1;
     bool cpu_prewake_requested = false;
+    char actual_clock_profile[32] = {};
+    int64_t actual_prime_khz = -1;
+    int64_t actual_gold_khz = -1;
+    int64_t actual_gpu_hz = -1;
 };
 
 struct ggml_backend_sched_trace_state {
@@ -1923,6 +1927,10 @@ struct ggml_backend_sched_trace_state {
     int token_index = -1;
     int n_past = -1;
     int n_tokens = -1;
+    char actual_clock_profile[32] = {};
+    int64_t actual_prime_khz = -1;
+    int64_t actual_gold_khz = -1;
+    int64_t actual_gpu_hz = -1;
     std::vector<ggml_backend_sched_trace_row> rows;
 };
 
@@ -2247,7 +2255,8 @@ static constexpr char GGML_SCHED_TRACE_CSV_HEADER[] =
         "compute_submit_us,compute_wall_us,"
         "is_ffn_group,ffn_branch,group_id,group_wall_us,group_copy_us,"
         "timing_mode,is_parallel_group,parallel_group_kind,parallel_branch,"
-        "cpu_idle_before_us,cpu_prewake_requested\n";
+        "cpu_idle_before_us,cpu_prewake_requested,"
+        "actual_clock_profile,actual_prime_khz,actual_gold_khz,actual_gpu_hz\n";
 
 static FILE * ggml_sched_trace_file(void) {
     ggml_sched_trace_init();
@@ -2612,9 +2621,14 @@ static void ggml_sched_trace_flush_rows(void) {
         ggml_sched_trace_csv_cell(f, row.parallel_kind);
         fputc(',', f);
         ggml_sched_trace_csv_cell(f, row.parallel_branch);
-        fprintf(f, ",%lld,%d\n",
+        fprintf(f, ",%lld,%d,",
                 (long long) row.cpu_idle_before_us,
                 row.cpu_prewake_requested ? 1 : 0);
+        ggml_sched_trace_csv_cell(f, row.actual_clock_profile);
+        fprintf(f, ",%lld,%lld,%lld\n",
+                (long long) row.actual_prime_khz,
+                (long long) row.actual_gold_khz,
+                (long long) row.actual_gpu_hz);
     }
 
     fflush(f);
@@ -2668,6 +2682,10 @@ void ggml_backend_sched_trace_reset(void) {
         g_sched_trace.token_index = -1;
         g_sched_trace.n_past = -1;
         g_sched_trace.n_tokens = -1;
+        g_sched_trace.actual_clock_profile[0] = '\0';
+        g_sched_trace.actual_prime_khz = -1;
+        g_sched_trace.actual_gold_khz = -1;
+        g_sched_trace.actual_gpu_hz = -1;
     }
     if (worker_trace_enabled) {
         ggml_ffn_worker_trace_flush_rows();
@@ -2708,6 +2726,25 @@ void ggml_backend_sched_trace_set_ubatch(int token_index, int n_past, int n_toke
         g_ffn_worker_trace.n_past = n_past;
         g_ffn_worker_trace.n_tokens = n_tokens;
     }
+}
+
+void ggml_backend_sched_trace_set_clock_snapshot(
+        const char * actual_profile,
+        int64_t actual_prime_khz,
+        int64_t actual_gold_khz,
+        int64_t actual_gpu_hz) {
+    if (!ggml_sched_trace_enabled()) {
+        return;
+    }
+
+    snprintf(
+            g_sched_trace.actual_clock_profile,
+            sizeof(g_sched_trace.actual_clock_profile),
+            "%s",
+            actual_profile ? actual_profile : "");
+    g_sched_trace.actual_prime_khz = actual_prime_khz;
+    g_sched_trace.actual_gold_khz = actual_gold_khz;
+    g_sched_trace.actual_gpu_hz = actual_gpu_hz;
 }
 
 void ggml_backend_sched_trace_flush(void) {
@@ -6533,6 +6570,9 @@ static void ggml_backend_sched_trace_append_split(
     row.group_copy_us = group_copy_us;
     row.cpu_idle_before_us = cpu_idle_before_us;
     row.cpu_prewake_requested = cpu_prewake_requested;
+    row.actual_prime_khz = g_sched_trace.actual_prime_khz;
+    row.actual_gold_khz = g_sched_trace.actual_gold_khz;
+    row.actual_gpu_hz = g_sched_trace.actual_gpu_hz;
 
     ggml_sched_trace_copy_string(row.backend, sizeof(row.backend), ggml_backend_name(sched->backends[split->backend_id]));
     ggml_sched_trace_copy_string(row.first_node, sizeof(row.first_node), first ? first->name : "");
@@ -6542,6 +6582,10 @@ static void ggml_backend_sched_trace_append_split(
     ggml_sched_trace_copy_string(row.parallel_kind, sizeof(row.parallel_kind), parallel_kind);
     ggml_sched_trace_copy_string(row.parallel_branch, sizeof(row.parallel_branch), parallel_branch);
     ggml_sched_trace_copy_string(row.timing_mode, sizeof(row.timing_mode), timing_mode);
+    ggml_sched_trace_copy_string(
+            row.actual_clock_profile,
+            sizeof(row.actual_clock_profile),
+            g_sched_trace.actual_clock_profile);
 }
 
 static int64_t ggml_ffn_worker_trace_delta(int64_t end_us, int64_t begin_us) {

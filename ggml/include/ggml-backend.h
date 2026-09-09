@@ -699,6 +699,13 @@ extern "C" {
     GGML_API void ggml_backend_sched_trace_set_query_id(int query_id);
     // Attaches the current ubatch context to subsequent trace rows.
     GGML_API void ggml_backend_sched_trace_set_ubatch(int token_index, int n_past, int n_tokens);
+    // Attaches the latest actual-clock sample to subsequent scheduler trace rows.
+    // Pass NULL/empty profile and negative clocks to invalidate the current sample.
+    GGML_API void ggml_backend_sched_trace_set_clock_snapshot(
+            const char * actual_profile,
+            int64_t actual_prime_khz,
+            int64_t actual_gold_khz,
+            int64_t actual_gpu_hz);
     // Writes buffered scheduler and FFN worker trace rows to their CSV files.
     GGML_API void ggml_backend_sched_trace_flush(void);
 

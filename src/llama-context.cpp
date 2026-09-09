@@ -123,11 +123,48 @@ static bool llama_module_bench_profile_matches(const llama_model & model, const 
     if (cparams.module_bench_type == LLAMA_MODULE_BENCH_OFF) {
         return true;
     }
+
+    const auto & hparams = model.hparams;
+    if (cparams.module_bench_profile == "auto") {
+        // The semantic module graphs below are currently implemented by the
+        // dense Llama graph builder.  Keep the automatic profile deliberately
+        // capability-based and narrow: accepting an unrelated architecture or
+        // quantization here would only fail later with a less useful graph or
+        // backend error.
+        const bool dense_llama_layers = std::all_of(
+                model.layers.begin(), model.layers.end(), [](const llama_layer & layer) {
+                    return layer.wq != nullptr && layer.wk != nullptr && layer.wv != nullptr &&
+                           layer.wo != nullptr && layer.attn_norm != nullptr &&
+                           layer.ffn_norm != nullptr && layer.ffn_gate != nullptr &&
+                           layer.ffn_up != nullptr && layer.ffn_down != nullptr &&
+                           layer.wqkv == nullptr && layer.ffn_gate_inp == nullptr;
+                });
+        const bool ok =
+            model.arch == LLM_ARCH_LLAMA &&
+            model.ftype == LLAMA_FTYPE_MOSTLY_Q8_0 &&
+            hparams.n_layer > 0 &&
+            model.layers.size() == hparams.n_layer &&
+            hparams.n_embd > 0 &&
+            hparams.n_ff() > 0 &&
+            hparams.n_head() > 0 &&
+            hparams.n_head_kv() > 0 &&
+            hparams.n_embd % hparams.n_head() == 0 &&
+            dense_llama_layers;
+        if (!ok) {
+            LLAMA_LOG_ERROR(
+                    "%s: automatic module-bench currently requires a dense Llama Q8_0 model "
+                    "with valid layer/embedding/FFN/head metadata "
+                    "(got name='%s', arch=%d, ftype=%d, layers=%u, embd=%u, ff=%u, heads=%u/%u)\n",
+                    __func__, model.name.c_str(), (int) model.arch, (int) model.ftype,
+                    hparams.n_layer, hparams.n_embd, hparams.n_ff(), hparams.n_head(), hparams.n_head_kv());
+        }
+        return ok;
+    }
+
     if (cparams.module_bench_profile != "llama3.2_3b_q8_0") {
         LLAMA_LOG_ERROR("%s: unsupported module-bench profile '%s'\n", __func__, cparams.module_bench_profile.c_str());
         return false;
     }
-    const auto & hparams = model.hparams;
     const bool ok =
         model.arch == LLM_ARCH_LLAMA &&
         model.name == "Llama 3.2 3B Instruct" &&
