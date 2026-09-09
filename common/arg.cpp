@@ -1337,7 +1337,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_MODULE_BENCH"));
     add_opt(common_arg(
         {"--module-bench-profile"}, "NAME",
-        "module-bench model profile (currently: llama3.2_3b_q8_0)",
+        "module-bench model profile (auto or llama3.2_3b_q8_0)",
         [](common_params & params, const std::string & value) {
             params.module_bench_profile = value;
         }
