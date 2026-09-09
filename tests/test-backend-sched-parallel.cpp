@@ -546,6 +546,8 @@ public:
         ggml_backend_sched_trace_reset();
         ggml_backend_sched_trace_set_query_id(query_id);
         ggml_backend_sched_trace_set_ubatch(0, 0, 1);
+        ggml_backend_sched_trace_set_clock_snapshot(
+                "p13-g12-gpu10", 4089600, 2918400, 900000000);
         active_ = true;
     }
 
@@ -1411,6 +1413,10 @@ struct trace_row {
     std::string timing_mode;
     std::string parallel_kind;
     std::string parallel_branch;
+    std::string actual_clock_profile;
+    int actual_prime_khz = -1;
+    int actual_gold_khz = -1;
+    int actual_gpu_hz = -1;
 };
 
 static bool parse_csv_line(const std::string & line, std::vector<std::string> * fields) {
@@ -1484,6 +1490,10 @@ static bool read_trace(
     const int parallel_branch_col = column_index(columns, "parallel_branch");
     const int cpu_idle_before_us_col = column_index(columns, "cpu_idle_before_us");
     const int cpu_prewake_requested_col = column_index(columns, "cpu_prewake_requested");
+    const int actual_clock_profile_col = column_index(columns, "actual_clock_profile");
+    const int actual_prime_khz_col = column_index(columns, "actual_prime_khz");
+    const int actual_gold_khz_col = column_index(columns, "actual_gold_khz");
+    const int actual_gpu_hz_col = column_index(columns, "actual_gpu_hz");
     const int required_columns[] = {
         split_id_col,
         group_id_col,
@@ -1496,6 +1506,10 @@ static bool read_trace(
         parallel_branch_col,
         cpu_idle_before_us_col,
         cpu_prewake_requested_col,
+        actual_clock_profile_col,
+        actual_prime_khz_col,
+        actual_gold_khz_col,
+        actual_gpu_hz_col,
     };
     for (int column : required_columns) {
         if (!check(column >= 0, scenario, "scheduler trace is missing a required column")) {
@@ -1517,7 +1531,13 @@ static bool read_trace(
         trace_row row;
         if (!check(parse_int(fields[split_id_col], &row.split_id), scenario, "invalid split id") ||
                 !check(parse_int(fields[group_id_col], &row.group_id), scenario, "invalid group id") ||
-                !check(parse_int(fields[node_count_col], &row.node_count), scenario, "invalid node count")) {
+                !check(parse_int(fields[node_count_col], &row.node_count), scenario, "invalid node count") ||
+                !check(parse_int(fields[actual_prime_khz_col], &row.actual_prime_khz),
+                    scenario, "invalid actual Prime clock") ||
+                !check(parse_int(fields[actual_gold_khz_col], &row.actual_gold_khz),
+                    scenario, "invalid actual Gold clock") ||
+                !check(parse_int(fields[actual_gpu_hz_col], &row.actual_gpu_hz),
+                    scenario, "invalid actual GPU clock")) {
             return false;
         }
         row.is_parallel_group = fields[is_parallel_group_col] == "1";
@@ -1526,6 +1546,16 @@ static bool read_trace(
         row.timing_mode = fields[timing_mode_col];
         row.parallel_kind = fields[parallel_kind_col];
         row.parallel_branch = fields[parallel_branch_col];
+        row.actual_clock_profile = fields[actual_clock_profile_col];
+        if (!check(
+                    row.actual_clock_profile == "p13-g12-gpu10" &&
+                    row.actual_prime_khz == 4089600 &&
+                    row.actual_gold_khz == 2918400 &&
+                    row.actual_gpu_hz == 900000000,
+                    scenario,
+                    "scheduler trace clock snapshot mismatch")) {
+            return false;
+        }
         rows->push_back(std::move(row));
     }
 

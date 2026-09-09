@@ -162,3 +162,6 @@ AGENTS.local.md
 # codex
 /analysis/
 /prompts/
+
+# Local TrePrefill autotuning tools
+/scripts/treprefill_autotune/

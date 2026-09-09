@@ -161,6 +161,13 @@ public:
             int gpu_idx,
             S25ClockSnapshot & targets) const;
 
+    // Map an observed S25 clock snapshot to the nearest available DVFS steps.
+    bool get_s25_clock_indices(
+            const S25ClockSnapshot & snapshot,
+            int & cpu_gold_idx,
+            int & cpu_prime_idx,
+            int & gpu_idx) const;
+
     // FD cache
     int init_fd_cache();    // sysfs open
     void close_fd_cache();  // sysfs close

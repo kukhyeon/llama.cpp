@@ -83,6 +83,7 @@ struct runtime_route_clock_producer_state {
     const DVFS * dvfs = nullptr;
     S25ClockSnapshot requested_clocks;
     bool enabled = false;
+    bool trace_enabled = false;
     bool prefill_active = false;
     int32_t input_tokens = 0;
     size_t query_id = 0;
@@ -95,6 +96,29 @@ struct runtime_route_clock_producer_state {
 
 static bool is_power_of_two(uint32_t value) {
     return value != 0 && (value & (value - 1)) == 0;
+}
+
+static void sched_trace_set_s25_clock_snapshot(
+        const DVFS * dvfs,
+        const S25ClockSnapshot * clocks) {
+    if (dvfs == nullptr || clocks == nullptr) {
+        ggml_backend_sched_trace_set_clock_snapshot(nullptr, -1, -1, -1);
+        return;
+    }
+
+    int gold_idx = -1;
+    int prime_idx = -1;
+    int gpu_idx = -1;
+    char profile[32] = {};
+    if (dvfs->get_s25_clock_indices(*clocks, gold_idx, prime_idx, gpu_idx)) {
+        std::snprintf(profile, sizeof(profile), "p%d-g%d-gpu%d", prime_idx, gold_idx, gpu_idx);
+    }
+
+    ggml_backend_sched_trace_set_clock_snapshot(
+            profile,
+            clocks->cpu_prime_khz,
+            clocks->cpu_gold_khz,
+            clocks->gpu_hz);
 }
 
 static void runtime_route_clock_layer_producer(
@@ -111,12 +135,18 @@ static void runtime_route_clock_layer_producer(
 
     if (state->skip_boundaries > 0) {
         --state->skip_boundaries;
+        if (state->trace_enabled) {
+            sched_trace_set_s25_clock_snapshot(nullptr, nullptr);
+        }
         return;
     }
 
     S25ClockSnapshot clocks;
     ++state->samples;
     if (!state->dvfs->read_s25_clock_snapshot(clocks)) {
+        if (state->trace_enabled) {
+            sched_trace_set_s25_clock_snapshot(nullptr, nullptr);
+        }
         ++state->read_failures;
         ++state->read_failure_streak;
 
@@ -148,6 +178,10 @@ static void runtime_route_clock_layer_producer(
     }
     state->read_failure_streak = 0;
     state->skip_boundaries = 0;
+
+    if (state->trace_enabled) {
+        sched_trace_set_s25_clock_snapshot(state->dvfs, &clocks);
+    }
 
     const std::string active_profile = llama_runtime_route_active_profile(ctx);
     const auto selection = llama_backend_policy_select_layer_route_profile(
@@ -1123,6 +1157,8 @@ int main(int argc, char ** argv) {
 
     const bool ffn_clock_switch_enabled = llama_backend_policy_ffn_clock_switch_enabled();
     const bool runtime_route_clock_enabled = llama_backend_policy_runtime_route_clock_enabled();
+    const bool clock_snapshot_sampling_enabled =
+        ffn_clock_switch_enabled || runtime_route_clock_enabled || sched_trace;
     S25ClockSnapshot requested_prefill_clocks;
     const bool requested_prefill_clocks_valid = dvfs.get_s25_clock_targets(
             params.cpu_gold_clk_idx_p,
@@ -1130,13 +1166,12 @@ int main(int argc, char ** argv) {
             ig->gpu_clk_idx_p,
             requested_prefill_clocks);
     const bool clock_snapshot_cache_ready =
-        (ffn_clock_switch_enabled || runtime_route_clock_enabled) &&
+        clock_snapshot_sampling_enabled &&
         dvfs.init_s25_clock_snapshot_cache();
-    if ((ffn_clock_switch_enabled || runtime_route_clock_enabled) &&
-            !clock_snapshot_cache_ready) {
+    if (clock_snapshot_sampling_enabled && !clock_snapshot_cache_ready) {
         LOG_WRN(
                 "%s: failed to cache S25 current-clock descriptors; clock "
-                "selection will use rate-limited fallback reads\n",
+                "sampling will use rate-limited fallback reads\n",
                 __func__);
     }
     if (ffn_clock_switch_enabled && !requested_prefill_clocks_valid) {
@@ -1158,6 +1193,7 @@ int main(int argc, char ** argv) {
         route_clock_producer.dvfs = &dvfs;
         route_clock_producer.requested_clocks = requested_prefill_clocks;
         route_clock_producer.enabled = true;
+        route_clock_producer.trace_enabled = sched_trace;
         route_clock_producer_registered = llama_runtime_route_set_layer_producer(
                 ctx, runtime_route_clock_layer_producer, &route_clock_producer);
         if (!route_clock_producer_registered) {
@@ -1702,6 +1738,9 @@ int main(int argc, char ** argv) {
                         route_clock_producer.skip_boundaries = 0;
                     }
                 }
+                if (sched_trace && !is_prefill_eval) {
+                    sched_trace_set_s25_clock_snapshot(nullptr, nullptr);
+                }
                 if (is_prefill_eval) {
                     // prefill phase
                     if (!prefill_active && ig->is_ignite_active) {
@@ -1732,8 +1771,7 @@ int main(int argc, char ** argv) {
                     }
                 }
 
-                if (entering_prefill &&
-                        (ffn_clock_switch_enabled || runtime_route_clock_enabled)) {
+                if (entering_prefill && clock_snapshot_sampling_enabled) {
                     S25ClockSnapshot clocks;
                     llama_backend_policy_ffn_clock_result selection = {};
                     selection.distance = -1.0;
@@ -1742,7 +1780,14 @@ int main(int argc, char ** argv) {
                     const bool clocks_valid = dvfs.read_s25_clock_snapshot(clocks);
                     bool thermal_throttled = false;
 
-                    if (clocks_valid && requested_prefill_clocks_valid) {
+                    if (sched_trace) {
+                        sched_trace_set_s25_clock_snapshot(
+                                clocks_valid ? &dvfs : nullptr,
+                                clocks_valid ? &clocks : nullptr);
+                    }
+
+                    if ((ffn_clock_switch_enabled || runtime_route_clock_enabled) &&
+                            clocks_valid && requested_prefill_clocks_valid) {
                         thermal_throttled =
                             clocks.cpu_gold_khz < requested_prefill_clocks.cpu_gold_khz ||
                             clocks.cpu_prime_khz < requested_prefill_clocks.cpu_prime_khz ||
@@ -1833,12 +1878,13 @@ int main(int argc, char ** argv) {
                                         embd_inp.size(), profile_ubatch_tokens);
                             }
                         }
-                    } else if (!clocks_valid) {
+                    } else if ((ffn_clock_switch_enabled || runtime_route_clock_enabled) &&
+                            !clocks_valid) {
                         LOG_WRN(
                                 "clock_switch: failed to read the S25 Gold/Prime/GPU "
                                 "clock snapshot for query=%zu; keeping current profiles\n",
                                 current_question_index);
-                    } else {
+                    } else if (ffn_clock_switch_enabled || runtime_route_clock_enabled) {
                         LOG_WRN(
                                 "clock_switch: requested S25 prefill clocks are unavailable "
                                 "for query=%zu; keeping current profiles\n",
