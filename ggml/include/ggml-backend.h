@@ -375,6 +375,9 @@ extern "C" {
         uint64_t plan_misses;
         uint64_t canonical_commits;
         uint64_t commit_wait_us;
+        // Cumulative host time spent in canonical copy calls. Concurrent QKV
+        // prefetch copies are counted per branch, so this is copy work rather
+        // than elapsed route wall time.
         uint64_t commit_copy_us;
         uint64_t plan_latches;
         uint64_t plan_changes;
@@ -464,8 +467,11 @@ extern "C" {
 
     // Register one plan mapping for a prepared route-candidate group. The
     // canonical tensor and all of its alternate variants must be non-view
-    // graph nodes. Alternate nodes must immediately follow their canonical
-    // node in the graph; the scheduler validates this when the graph is split.
+    // operations. A caller may give a compute variant zero-offset view-backed
+    // storage shared with its canonical tensor when the two routes are
+    // mutually exclusive and backend/layout-compatible. Alternate nodes must
+    // immediately follow their canonical node in the graph; the scheduler
+    // validates this when the graph is split.
     // A variant may equal canonical, which selects the no-copy path for that
     // plan. Unknown plan IDs safely fall back to the canonical node.
     //
