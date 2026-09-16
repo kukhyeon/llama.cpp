@@ -1191,6 +1191,129 @@ static bool run_alternate_terminal_lifetime_case() {
     return ok;
 }
 
+static bool run_exact_storage_alias_case() {
+    const char * scenario = "exact-storage-route-alias";
+    const size_t graph_size = 32;
+    const ggml_init_params params = {
+        /* .mem_size   = */ 64 * ggml_tensor_overhead() +
+                              ggml_graph_overhead_custom(graph_size, false),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+
+    ggml_context * ctx = ggml_init(params);
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    ggml_backend_t backends[] = { backend };
+    ggml_backend_sched_t sched = backend != nullptr
+        ? ggml_backend_sched_new(backends, nullptr, 1, 64, false, true)
+        : nullptr;
+    auto cleanup = [&]() {
+        ggml_backend_sched_free(sched);
+        ggml_backend_free(backend);
+        ggml_free(ctx);
+    };
+    if (!check(ctx != nullptr && sched != nullptr, scenario, "backend setup failed")) {
+        cleanup();
+        return false;
+    }
+
+    ggml_tensor * x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+    ggml_tensor * y = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+    ggml_set_input(x);
+    ggml_set_input(y);
+    ggml_set_name(x, "route-alias-x");
+    ggml_set_name(y, "route-alias-y");
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, graph_size, false);
+    ggml_tensor * canonical = ggml_add(ctx, x, y);
+    ggml_tensor * alternate = ggml_mul(ctx, x, y);
+    ggml_set_name(canonical, "route-alias-canonical");
+    ggml_set_name(alternate, "route-alias-alternate");
+    ggml_build_forward_expand(graph, canonical);
+    ggml_build_forward_expand(graph, alternate);
+
+    ggml_tensor * output = ggml_scale(ctx, canonical, 1.0f);
+    ggml_set_name(output, "route-alias-output");
+    ggml_set_output(output);
+    ggml_build_forward_expand(graph, output);
+
+    ggml_backend_sched_set_tensor_backend(sched, canonical, backend);
+    ggml_backend_sched_set_tensor_backend(sched, alternate, backend);
+    ggml_backend_sched_set_tensor_backend(sched, output, backend);
+
+    bool setup_ok =
+        ggml_backend_sched_register_route_subgraph(
+                sched, canonical, canonical,
+                canonical, canonical, 0, 0) &&
+        ggml_backend_sched_register_route_subgraph(
+                sched, canonical, canonical,
+                alternate, alternate, 1, 0);
+
+    // Route outputs remain distinct producer tensors, but mutually-exclusive
+    // same-backend variants may write directly into the canonical allocation.
+    // Apply the allocation view only after registration so route validation
+    // still observes the real alternate producer operation.
+    alternate->view_src = canonical;
+    alternate->view_offs = 0;
+    setup_ok = setup_ok && ggml_backend_sched_alloc_graph(sched, graph);
+    if (!check(setup_ok, scenario, "route preparation failed")) {
+        cleanup();
+        return false;
+    }
+
+    bool ok =
+        check(canonical != alternate, scenario, "route producers were not distinct") &&
+        check(canonical->buffer != nullptr, scenario, "canonical was not allocated") &&
+        check(alternate->buffer == canonical->buffer,
+                scenario, "route outputs use different backend buffers") &&
+        check(alternate->data == canonical->data,
+                scenario, "route outputs use different backing addresses");
+
+    const float x_data[4] = { 1.0f, 2.0f, 3.0f, 4.0f };
+    const float y_data[4] = { 5.0f, 6.0f, 7.0f, 8.0f };
+    auto compute_and_check = [&](uint64_t plan_id, bool select_alternate) {
+        ggml_backend_tensor_set(x, x_data, 0, sizeof(x_data));
+        ggml_backend_tensor_set(y, y_data, 0, sizeof(y_data));
+        ggml_backend_sched_layer_checkpoint_set_plan_id(sched, plan_id);
+        if (!check(
+                    ggml_backend_sched_graph_compute(sched, graph) ==
+                        GGML_STATUS_SUCCESS,
+                    scenario, "graph compute failed")) {
+            return false;
+        }
+
+        float actual[4] = {};
+        ggml_backend_tensor_get(output, actual, 0, sizeof(actual));
+        for (int i = 0; i < 4; ++i) {
+            const float expected = select_alternate
+                ? x_data[i] * y_data[i]
+                : x_data[i] + y_data[i];
+            if (!check(std::fabs(actual[i] - expected) < 1e-5f,
+                        scenario, "downstream observed stale aliased output")) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    // Repeatedly switch producers to prove that each selected route overwrites
+    // the shared canonical slot before its downstream consumer runs.
+    ok = compute_and_check(1, true) &&
+         compute_and_check(0, false) &&
+         compute_and_check(1, true) && ok;
+
+    ggml_backend_sched_route_candidate_stats stats = {};
+    ggml_backend_sched_get_route_candidate_stats(sched, &stats);
+    ok =
+        check(stats.groups_executed == 3, scenario, "unexpected route group count") &&
+        check(stats.canonical_selected == 1, scenario, "canonical selection mismatch") &&
+        check(stats.alternate_selected == 2, scenario, "alternate selection mismatch") &&
+        check(stats.canonical_commits == 2, scenario, "logical alias commit mismatch") && ok;
+
+    cleanup();
+    return ok;
+}
+
 static bool run_multi_consumer_commit_case() {
     const char * scenario = "multi-consumer-canonical-commit";
     const size_t graph_size = 32;
@@ -2415,6 +2538,7 @@ int main() {
     ok = run_qkv_composite_lane_bundle_case() && ok;
     ok = run_attn_out_fork_join_subgraph_case() && ok;
     ok = run_alternate_terminal_lifetime_case() && ok;
+    ok = run_exact_storage_alias_case() && ok;
 
     if (ok) {
         std::puts("scheduler route-candidate tests passed");

@@ -28,6 +28,7 @@
 #include <exception>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -1023,6 +1024,7 @@ struct ggml_backend_sched {
     bool qkv_lazy_opencl_sync;
     bool ffn_add4_lazy_opencl_sync;
     bool ffn_prefetch_reduce_inputs;
+    bool qkv_prefetch_reduce_inputs;
 
     // Non-trivial worker state is owned separately because this scheduler is
     // allocated with calloc/free.
@@ -1605,6 +1607,28 @@ static bool ggml_backend_sched_ffn_prefetch_reduce_inputs_enabled() {
     return false;
 }
 
+static bool ggml_backend_sched_qkv_prefetch_reduce_inputs_enabled() {
+    const char * value = getenv("GGML_QKV_PREFETCH_REDUCE_INPUTS");
+    if (value == nullptr || value[0] == '\0') {
+        return false;
+    }
+    if (strcmp(value, "1") == 0 || strcmp(value, "on") == 0 || strcmp(value, "ON") == 0 ||
+            strcmp(value, "true") == 0 || strcmp(value, "TRUE") == 0 ||
+            strcmp(value, "yes") == 0 || strcmp(value, "YES") == 0) {
+        return true;
+    }
+    if (strcmp(value, "0") == 0 || strcmp(value, "off") == 0 || strcmp(value, "OFF") == 0 ||
+            strcmp(value, "false") == 0 || strcmp(value, "FALSE") == 0 ||
+            strcmp(value, "no") == 0 || strcmp(value, "NO") == 0) {
+        return false;
+    }
+
+    GGML_LOG_WARN(
+            "%s: invalid GGML_QKV_PREFETCH_REDUCE_INPUTS='%s'; using the atomic late QKV commit\n",
+            __func__, value);
+    return false;
+}
+
 static bool ggml_backend_sched_ffn_add4_lazy_opencl_sync_enabled() {
     // The graph builder emits the OpenCL-resident fused consumer only under
     // this explicit llama-level opt-in. The scheduler still requires the
@@ -1724,6 +1748,64 @@ struct ggml_backend_sched_ffn_prefetch_pending {
     }
 };
 
+// Routed QKV variants publish three logical outputs (Q, K, and V) into the
+// initial profile's canonical bundle.  A copy-required output can be moved as
+// soon as its producer branch completes while slower sibling branches remain
+// in flight.  The route group is still joined before any common downstream
+// node is submitted, so early physical copies never weaken atomic publication.
+struct ggml_backend_sched_qkv_prefetch_copy {
+    const struct ggml_tensor * src = nullptr;
+    struct ggml_tensor * dst = nullptr;
+    int output_index = -1;
+};
+
+struct alignas(64) ggml_backend_sched_qkv_prefetch_branch {
+    ggml_backend_sched_qkv_prefetch_copy copies[GGML_SCHED_MAX_SPLIT_INPUTS];
+    int n_copies = 0;
+    bool active = false;
+    bool attempted = false;
+    bool succeeded = false;
+    int64_t copy_us = 0;
+};
+
+struct ggml_backend_sched_qkv_prefetch_plan {
+    bool active = false;
+    int route_group_index = -1;
+    int route_variant_index = -1;
+    int n_outputs = 0;
+    bool output_ready[GGML_SCHED_MAX_SPLIT_INPUTS] = {};
+    int64_t destination_wait_us = 0;
+    ggml_backend_sched_qkv_prefetch_branch branches[GGML_SCHED_MAX_BACKENDS];
+};
+
+static void ggml_backend_sched_run_qkv_prefetch_copies(
+        ggml_backend_sched_qkv_prefetch_branch * branch,
+        const char * backend_name) noexcept {
+    GGML_ASSERT(branch != nullptr);
+    GGML_ASSERT(branch->active);
+
+    branch->attempted = true;
+    branch->succeeded = false;
+    const int64_t t0_us = ggml_time_us();
+    try {
+        for (int copy_id = 0; copy_id < branch->n_copies; ++copy_id) {
+            const auto & copy = branch->copies[copy_id];
+            GGML_ASSERT(copy.src != nullptr && copy.dst != nullptr);
+            ggml_backend_tensor_copy(copy.src, copy.dst);
+        }
+        branch->succeeded = true;
+    } catch (const std::exception & error) {
+        GGML_LOG_ERROR(
+                "%s: backend %s threw while prefetching routed QKV outputs: %s\n",
+                __func__, backend_name != nullptr ? backend_name : "", error.what());
+    } catch (...) {
+        GGML_LOG_ERROR(
+                "%s: backend %s threw while prefetching routed QKV outputs\n",
+                __func__, backend_name != nullptr ? backend_name : "");
+    }
+    branch->copy_us = ggml_time_us() - t0_us;
+}
+
 static void ggml_backend_sched_run_ffn_prefetch_copies(
         ggml_backend_sched_ffn_prefetch_branch * branch,
         const char * backend_name) noexcept {
@@ -1760,6 +1842,7 @@ struct ggml_backend_sched_ffn_device_job {
     ggml_backend_sched_ffn_worker_timeline * timeline = nullptr;
     ggml_backend_async_flush_t flush_after_submit = nullptr;
     ggml_backend_sched_ffn_prefetch_branch * prefetch = nullptr;
+    ggml_backend_sched_qkv_prefetch_branch * qkv_prefetch = nullptr;
     bool sync_after = true;
 };
 
@@ -1812,6 +1895,13 @@ static void ggml_backend_sched_run_ffn_device_job(void * context) {
             // slower sibling branches are still running.
             ggml_backend_sched_run_ffn_prefetch_copies(
                     job->prefetch, ggml_backend_name(job->backend));
+        }
+        if (status == GGML_STATUS_SUCCESS && job->qkv_prefetch != nullptr) {
+            // Q/K/V canonical copies use the same completion point as FFN
+            // input prefetch: the source branch is complete, but siblings can
+            // continue running until the scheduler collects the whole group.
+            ggml_backend_sched_run_qkv_prefetch_copies(
+                    job->qkv_prefetch, ggml_backend_name(job->backend));
         }
     } catch (const std::exception & error) {
         compute_t1_us = ggml_time_us();
@@ -6220,6 +6310,21 @@ static int ggml_backend_sched_qkv_lazy_group_tensor_owner(
     return -1;
 }
 
+static bool ggml_backend_sched_tensors_share_exact_storage(
+        const struct ggml_tensor * lhs,
+        const struct ggml_tensor * rhs) {
+    if (lhs == nullptr || rhs == nullptr) {
+        return false;
+    }
+    if (lhs == rhs) {
+        return true;
+    }
+    return lhs->buffer != nullptr && lhs->buffer == rhs->buffer &&
+        lhs->data != nullptr && lhs->data == rhs->data &&
+        ggml_nbytes(lhs) == ggml_nbytes(rhs) &&
+        ggml_are_same_layout(lhs, rhs);
+}
+
 static bool ggml_backend_sched_qkv_lazy_consumer_reads_group(
         const struct ggml_backend_sched_split * splits,
         int split_id,
@@ -7546,6 +7651,152 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
         return true;
     };
 
+    auto prepare_qkv_route_prefetch = [&] (
+            int group_split_id,
+            int group_size,
+            const std::vector<ggml_backend_sched_ffn_branch_info> & infos,
+            bool run_group_serially,
+            int route_group_index,
+            int route_variant_index,
+            ggml_backend_sched_qkv_prefetch_plan * plan,
+            const char ** reason) {
+        GGML_ASSERT(plan != nullptr && reason != nullptr);
+        *plan = {};
+
+        if (!sched->qkv_prefetch_reduce_inputs) {
+            *reason = "feature disabled";
+            return false;
+        }
+        if constexpr (!UseRouteCandidates) {
+            *reason = "runtime route metadata is unavailable";
+            return false;
+        } else {
+            if (sched->n_copies != 1) {
+                *reason = "scheduler has multiple in-flight copy slots";
+                return false;
+            }
+            if (sched->callback_eval != nullptr) {
+                *reason = "evaluation callback is active";
+                return false;
+            }
+            const bool qkv_group = !infos.empty() &&
+                (infos[0].kind == "attn_qkv" ||
+                 infos[0].kind == "attn_qkv_shard");
+            if (run_group_serially || !qkv_group || group_size < 2 ||
+                    group_size > GGML_SCHED_MAX_BACKENDS ||
+                    (int) infos.size() != group_size) {
+                *reason = "group is not an eligible parallel routed QKV topology";
+                return false;
+            }
+            if (route_group_index < 0 || route_variant_index < 0) {
+                *reason = "QKV group is not a routed alternate";
+                return false;
+            }
+
+            auto & route_group =
+                sched->route_candidates->groups[route_group_index];
+            if (route_variant_index == route_group.canonical_variant_index) {
+                *reason = "initial-profile canonical route is selected";
+                return false;
+            }
+            if (route_variant_index >= (int) route_group.variants.size()) {
+                *reason = "selected QKV route variant is invalid";
+                return false;
+            }
+            const auto & variant = route_group.variants[route_variant_index];
+            if (variant.split_end != group_split_id + group_size) {
+                // Multi-lane intra-projection routes still have CONCAT/post-op
+                // splits after the branch group. Their full Q/K/V outputs do
+                // not exist yet and remain on the ordinary late-commit path.
+                *reason = "full Q/K/V terminals are produced after a join split";
+                return false;
+            }
+            if (variant.outputs.empty() ||
+                    variant.outputs.size() != route_group.canonical_outputs.size() ||
+                    variant.outputs.size() > GGML_SCHED_MAX_SPLIT_INPUTS) {
+                *reason = "QKV route output bundle is invalid";
+                return false;
+            }
+
+            int eligible_copies = 0;
+            int late_only_copies = 0;
+            plan->route_group_index = route_group_index;
+            plan->route_variant_index = route_variant_index;
+            plan->n_outputs = (int) variant.outputs.size();
+            for (int output_index = 0;
+                    output_index < plan->n_outputs; ++output_index) {
+                struct ggml_tensor * src = variant.outputs[output_index];
+                struct ggml_tensor * dst =
+                    route_group.canonical_outputs[output_index];
+                if (ggml_backend_sched_tensors_share_exact_storage(src, dst)) {
+                    // Alias-backed Q/V terminals already publish into their
+                    // canonical storage. The branch completion barrier still
+                    // protects downstream consumers.
+                    plan->output_ready[output_index] = true;
+                    continue;
+                }
+
+                const int owner = ggml_backend_sched_qkv_lazy_group_tensor_owner(
+                        splits, group_split_id, group_size, src);
+                if (owner < 0 || owner >= group_size || src->buffer == nullptr ||
+                        dst->buffer == nullptr || !ggml_are_same_layout(src, dst)) {
+                    ++late_only_copies;
+                    continue;
+                }
+                const int owner_backend_id =
+                    splits[group_split_id + owner].backend_id;
+                if (ggml_backend_sched_get_tensor_backend(sched, src) !=
+                        sched->backends[owner_backend_id]) {
+                    ++late_only_copies;
+                    continue;
+                }
+
+                // Blocking ggml_backend_tensor_copy() is safe to issue from a
+                // source worker while other processors run only when the
+                // canonical destination belongs to an ordinary CPU backend:
+                // the transfer reads the completed source and writes a
+                // disjoint host tensor. A host-mapped accelerator buffer is
+                // not sufficient because a sibling may concurrently own that
+                // accelerator's queue or mapped storage.
+                ggml_backend_t dst_backend =
+                    ggml_backend_sched_get_tensor_backend(sched, dst);
+                ggml_backend_dev_t dst_device = dst_backend != nullptr
+                    ? ggml_backend_get_device(dst_backend)
+                    : nullptr;
+                if (!ggml_backend_buffer_is_host(dst->buffer) ||
+                        dst_device == nullptr ||
+                        ggml_backend_dev_type(dst_device) !=
+                            GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    ++late_only_copies;
+                    continue;
+                }
+
+                auto & branch = plan->branches[owner];
+                if (branch.n_copies >= GGML_SCHED_MAX_SPLIT_INPUTS) {
+                    *reason = "QKV branch prefetch list exceeds fixed capacity";
+                    *plan = {};
+                    return false;
+                }
+                branch.copies[branch.n_copies++] = { src, dst, output_index };
+                branch.active = true;
+                ++eligible_copies;
+            }
+
+            if (eligible_copies == 0) {
+                *reason = late_only_copies > 0
+                    ? "copy-required canonical outputs are not CPU-resident"
+                    : "QKV bundle needs no early physical copy";
+                return false;
+            }
+
+            plan->active = true;
+            *reason = late_only_copies > 0
+                ? "eligible host outputs; device outputs remain late"
+                : "eligible";
+            return true;
+        }
+    };
+
     auto ffn_reduce_set_n_threads = [&](struct ggml_backend_sched_split * split) -> ggml_backend_set_n_threads_t {
         if (sched->ffn_parallel_reduce_threads <= 0 ||
                 sched->cpu_threads <= 0 ||
@@ -7743,7 +7994,8 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
     auto commit_route_alternate = [&](
             int group_index,
             int variant_index,
-            ggml_backend_sched_trace_io_times * trace_io_times) {
+            ggml_backend_sched_trace_io_times * trace_io_times,
+            const ggml_backend_sched_qkv_prefetch_plan * qkv_prefetch) {
         if constexpr (!UseRouteCandidates) {
             GGML_UNUSED(group_index);
             GGML_UNUSED(variant_index);
@@ -7761,6 +8013,24 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
             GGML_ASSERT(!variant_outputs.empty());
             GGML_ASSERT(variant_outputs.size() == canonical_outputs.size());
 
+            std::vector<uint8_t> late_copy(variant_outputs.size(), 0);
+            bool have_late_copy = false;
+            for (size_t output_index = 0;
+                    output_index < variant_outputs.size(); ++output_index) {
+                const bool already_prefetched =
+                    qkv_prefetch != nullptr && qkv_prefetch->active &&
+                    qkv_prefetch->route_group_index == group_index &&
+                    qkv_prefetch->route_variant_index == variant_index &&
+                    output_index < (size_t) qkv_prefetch->n_outputs &&
+                    qkv_prefetch->output_ready[output_index];
+                const bool shares_storage =
+                    ggml_backend_sched_tensors_share_exact_storage(
+                            variant_outputs[output_index],
+                            canonical_outputs[output_index]);
+                late_copy[output_index] = !already_prefetched && !shares_storage;
+                have_late_copy = have_late_copy || late_copy[output_index] != 0;
+            }
+
             ggml_backend_t variant_backends[GGML_SCHED_MAX_BACKENDS] = {};
             ggml_backend_t canonical_backends[GGML_SCHED_MAX_BACKENDS] = {};
             int n_variant_backends = 0;
@@ -7777,6 +8047,9 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
             };
             for (size_t output_index = 0;
                     output_index < variant_outputs.size(); ++output_index) {
+                if (!late_copy[output_index]) {
+                    continue;
+                }
                 const int variant_backend_id = tensor_backend_id(variant_outputs[output_index]);
                 const int canonical_backend_id = tensor_backend_id(canonical_outputs[output_index]);
                 GGML_ASSERT(variant_backend_id >= 0 && variant_backend_id < sched->n_backends);
@@ -7799,18 +8072,21 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
             bool queued_commit = false;
             bool queued_backend_drained = false;
             ggml_backend_t queued_backend = nullptr;
-            if (same_backend_bundle && queued_backend_id >= 0) {
+            if (have_late_copy && same_backend_bundle && queued_backend_id >= 0) {
                 queued_backend = sched->backends[queued_backend_id];
                 same_backend_bundle = queued_backend->iface.cpy_tensor_async != nullptr &&
                     sched->async_flush_fns[queued_backend_id] != nullptr;
             }
 
-            if (same_backend_bundle) {
+            if (have_late_copy && same_backend_bundle) {
                 const int64_t copy_t0_us = ggml_time_us();
                 queued_commit = true;
                 size_t n_queued_outputs = 0;
                 for (size_t output_index = 0;
                         output_index < variant_outputs.size(); ++output_index) {
+                    if (!late_copy[output_index]) {
+                        continue;
+                    }
                     if (!queued_backend->iface.cpy_tensor_async(
                                 queued_backend,
                                 queued_backend,
@@ -7843,7 +8119,7 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                 copy_us += ggml_time_us() - copy_t0_us;
             }
 
-            if (!queued_commit) {
+            if (have_late_copy && !queued_commit) {
                 const int64_t wait_t0_us = ggml_time_us();
                 for (int backend_index = 0;
                         backend_index < n_variant_backends; ++backend_index) {
@@ -7872,6 +8148,9 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                 // copied, so consumers can never observe a mixed Q/K/V profile.
                 for (size_t output_index = 0;
                         output_index < variant_outputs.size(); ++output_index) {
+                    if (!late_copy[output_index]) {
+                        continue;
+                    }
                     ggml_backend_tensor_copy(
                             variant_outputs[output_index], canonical_outputs[output_index]);
                 }
@@ -7888,8 +8167,17 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
             // one atomic canonical commit even though it copies several
             // terminal tensors.
             state.stats.canonical_commits++;
-            state.stats.commit_wait_us += (uint64_t) std::max<int64_t>(wait_us, 0);
-            state.stats.commit_copy_us += (uint64_t) std::max<int64_t>(copy_us, 0);
+            state.stats.commit_wait_us += (uint64_t) std::max<int64_t>(
+                    wait_us + (qkv_prefetch != nullptr
+                        ? qkv_prefetch->destination_wait_us : 0), 0);
+            int64_t prefetch_copy_us = 0;
+            if (qkv_prefetch != nullptr) {
+                for (const auto & branch : qkv_prefetch->branches) {
+                    prefetch_copy_us += branch.copy_us;
+                }
+            }
+            state.stats.commit_copy_us += (uint64_t) std::max<int64_t>(
+                    copy_us + prefetch_copy_us, 0);
         }
     };
 
@@ -8290,6 +8578,18 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                     &ffn_prefetch_plan,
                     &ffn_prefetch_reason);
 
+            ggml_backend_sched_qkv_prefetch_plan qkv_prefetch_plan;
+            const char * qkv_prefetch_reason = "not checked";
+            (void) prepare_qkv_route_prefetch(
+                    split_id,
+                    ffn_group_size,
+                    ffn_group_infos,
+                    run_group_serially,
+                    route_group_index,
+                    route_variant_index,
+                    &qkv_prefetch_plan,
+                    &qkv_prefetch_reason);
+
             const int64_t group_t0_us = ggml_time_us();
             const int64_t copy_t0_us = group_t0_us;
             GGML_ASSERT(ffn_group_size <= GGML_SCHED_MAX_BACKENDS);
@@ -8348,6 +8648,55 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                     io_times[0].wait_us += wait_us;
                 }
             }
+            if (qkv_prefetch_plan.active) {
+                // Canonical host tensors may still be referenced by queued
+                // work from the previous layer/query. Drain each destination
+                // backend exactly once before branch workers can overwrite
+                // those physical slots.
+                bool destination_synced[GGML_SCHED_MAX_BACKENDS] = {};
+                const int64_t wait_t0_us = ggml_sched_profile_time_us();
+                try {
+                    for (int branch_id = 0;
+                            branch_id < ffn_group_size; ++branch_id) {
+                        const auto & branch = qkv_prefetch_plan.branches[branch_id];
+                        for (int copy_id = 0;
+                                copy_id < branch.n_copies; ++copy_id) {
+                            const int destination_backend_id =
+                                tensor_backend_id(branch.copies[copy_id].dst);
+                            if (destination_backend_id < 0 ||
+                                    destination_backend_id >= sched->n_backends) {
+                                throw std::runtime_error(
+                                        "canonical QKV destination has no backend");
+                            }
+                            if (!destination_synced[destination_backend_id]) {
+                                ggml_backend_synchronize(sched->backends[
+                                        destination_backend_id]);
+                                destination_synced[destination_backend_id] = true;
+                            }
+                        }
+                    }
+                } catch (const std::exception & error) {
+                    qkv_prefetch_plan.active = false;
+                    qkv_prefetch_reason = "canonical destination synchronize failed";
+                    GGML_LOG_ERROR(
+                            "%s: routed QKV prefetch destination synchronize threw: %s\n",
+                            __func__, error.what());
+                } catch (...) {
+                    qkv_prefetch_plan.active = false;
+                    qkv_prefetch_reason = "canonical destination synchronize failed";
+                    GGML_LOG_ERROR(
+                            "%s: routed QKV prefetch destination synchronize threw\n",
+                            __func__);
+                }
+                qkv_prefetch_plan.destination_wait_us =
+                    ggml_sched_profile_time_us() - wait_t0_us;
+                ggml_sched_profile_add_wait_us(
+                        qkv_prefetch_plan.destination_wait_us);
+                if (trace_enabled) {
+                    io_times[0].wait_us +=
+                        qkv_prefetch_plan.destination_wait_us;
+                }
+            }
             if (sched->ffn_prefetch_reduce_inputs && !ffn_group_infos.empty() &&
                     ffn_group_infos[0].kind == "ffn") {
                 GGML_LOG_DEBUG(
@@ -8356,6 +8705,16 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                         split_id,
                         ffn_prefetch_plan.active ? "eligible" : "fallback",
                         ffn_prefetch_reason);
+            }
+            if (sched->qkv_prefetch_reduce_inputs && !ffn_group_infos.empty() &&
+                    (ffn_group_infos[0].kind == "attn_qkv" ||
+                     ffn_group_infos[0].kind == "attn_qkv_shard")) {
+                GGML_LOG_DEBUG(
+                        "sched: routed QKV output prefetch layer %d group split %d %s: %s\n",
+                        ffn_group_infos[0].layer,
+                        split_id,
+                        qkv_prefetch_plan.active ? "eligible" : "fallback",
+                        qkv_prefetch_reason);
             }
             const int64_t copy_t1_us = ggml_time_us();
 
@@ -8457,6 +8816,11 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                             ffn_prefetch_plan.branches[i].active
                                 ? &ffn_prefetch_plan.branches[i]
                                 : nullptr;
+                        device_jobs[i].qkv_prefetch =
+                            qkv_prefetch_plan.active &&
+                            qkv_prefetch_plan.branches[i].active
+                                ? &qkv_prefetch_plan.branches[i]
+                                : nullptr;
                         device_jobs[i].sync_after = i != deferred_sync_i;
                         const bool submitted = sched->ffn_device_executor->submit(
                                 device_split->backend_id,
@@ -8533,6 +8897,14 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                                             ggml_backend_name(sched->backends[
                                                 splits[split_id + i].backend_id]));
                                 }
+                                if (status[i] == GGML_STATUS_SUCCESS &&
+                                        qkv_prefetch_plan.active &&
+                                        qkv_prefetch_plan.branches[i].active) {
+                                    ggml_backend_sched_run_qkv_prefetch_copies(
+                                            &qkv_prefetch_plan.branches[i],
+                                            ggml_backend_name(sched->backends[
+                                                splits[split_id + i].backend_id]));
+                                }
                             } catch (const std::exception & error) {
                                 status[i] = GGML_STATUS_FAILED;
                                 GGML_LOG_ERROR(
@@ -8590,6 +8962,14 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                             ffn_prefetch_plan.branches[main_i].active) {
                         ggml_backend_sched_run_ffn_prefetch_copies(
                                 &ffn_prefetch_plan.branches[main_i],
+                                ggml_backend_name(sched->backends[
+                                    splits[split_id + main_i].backend_id]));
+                    }
+                    if (status[main_i] == GGML_STATUS_SUCCESS &&
+                            qkv_prefetch_plan.active &&
+                            qkv_prefetch_plan.branches[main_i].active) {
+                        ggml_backend_sched_run_qkv_prefetch_copies(
+                                &qkv_prefetch_plan.branches[main_i],
                                 ggml_backend_name(sched->backends[
                                     splits[split_id + main_i].backend_id]));
                     }
@@ -8714,6 +9094,36 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                     }
                 }
             }
+            int64_t qkv_prefetch_copy_us = 0;
+            bool qkv_prefetch_succeeded = qkv_prefetch_plan.active;
+            if (qkv_prefetch_plan.active) {
+                for (int i = 0; i < ffn_group_size; ++i) {
+                    const auto & branch = qkv_prefetch_plan.branches[i];
+                    if (!branch.active) {
+                        continue;
+                    }
+                    const bool branch_succeeded =
+                        status[i] == GGML_STATUS_SUCCESS &&
+                        branch.attempted && branch.succeeded;
+                    qkv_prefetch_succeeded =
+                        qkv_prefetch_succeeded && branch_succeeded;
+                    qkv_prefetch_copy_us += branch.copy_us;
+                    ggml_sched_profile_add_copy_us(branch.copy_us);
+                    if (trace_enabled) {
+                        io_times[i].copy_us += branch.copy_us;
+                    }
+                    if (branch_succeeded) {
+                        for (int copy_id = 0;
+                                copy_id < branch.n_copies; ++copy_id) {
+                            const int output_index =
+                                branch.copies[copy_id].output_index;
+                            GGML_ASSERT(output_index >= 0 &&
+                                    output_index < qkv_prefetch_plan.n_outputs);
+                            qkv_prefetch_plan.output_ready[output_index] = true;
+                        }
+                    }
+                }
+            }
             const int64_t compute_t1_us = ggml_time_us();
             const int64_t group_t1_us = compute_t1_us;
             const char * group_timing_mode = run_group_serially
@@ -8730,6 +9140,10 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                     ? use_persistent_device_workers
                         ? "persistent_deferred_sync"
                         : "deferred_sync"
+                : qkv_prefetch_succeeded
+                    ? use_persistent_device_workers
+                        ? "persistent_qkv_prefetch_outputs"
+                        : "qkv_prefetch_outputs"
                 : ffn_prefetch_succeeded
                     ? use_persistent_device_workers
                         ? "persistent_prefetch_reduce"
@@ -8788,6 +9202,12 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                         "next reduce will use the complete legacy copy path\n",
                         ffn_group_infos[0].layer, split_id);
             }
+            if (qkv_prefetch_plan.active && !qkv_prefetch_succeeded) {
+                GGML_LOG_DEBUG(
+                        "sched: routed QKV output prefetch layer %d group split %d failed; "
+                        "uncopied outputs will use the atomic late commit\n",
+                        ffn_group_infos[0].layer, split_id);
+            }
 
             ggml_backend_sched_trace_io_times direct_scatter_io = {};
             int direct_scatter_join_split_id = -1;
@@ -8823,6 +9243,9 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                                 ? attn_out_direct_scatter
                                     ? &direct_scatter_io
                                     : &io_times[ffn_group_size - 1]
+                                : nullptr,
+                            qkv_prefetch_plan.active
+                                ? &qkv_prefetch_plan
                                 : nullptr);
                 }
             }
@@ -8861,6 +9284,8 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
             const int64_t copy_us = copy_t1_us - copy_t0_us;
             const int64_t compute_wall_us = compute_t1_us - compute_t0_us;
             const int64_t group_wall_us = group_t1_us - group_t0_us;
+            const int64_t prefetch_copy_us =
+                ffn_prefetch_copy_us + qkv_prefetch_copy_us;
             int64_t serial_compute_us = 0;
             int64_t min_branch_us = LLONG_MAX;
             int64_t max_branch_us = 0;
@@ -8928,7 +9353,7 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                         (double) compute_wall_us / 1000.0,
                         (double) group_wall_us / 1000.0,
                         (double) copy_us / 1000.0,
-                        (double) ffn_prefetch_copy_us / 1000.0);
+                        (double) prefetch_copy_us / 1000.0);
             } else {
                 GGML_LOG_DEBUG(
                         "sched: parallel %s group layer %d splits %s: %s, compute_wall %.3f ms, group_wall %.3f ms, copy_in %.3f ms, prefetch_copy %.3f ms, speedup %.2fx, overlap %.1f%%, balance %.1f%%\n",
@@ -8939,7 +9364,7 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                         (double) compute_wall_us / 1000.0,
                         (double) group_wall_us / 1000.0,
                         (double) copy_us / 1000.0,
-                        (double) ffn_prefetch_copy_us / 1000.0,
+                        (double) prefetch_copy_us / 1000.0,
                         speedup,
                         overlap,
                         balance);
@@ -9036,7 +9461,8 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                     commit_route_alternate(
                             route_group_index,
                             route_variant_index,
-                            trace_enabled ? &io_times : nullptr);
+                            trace_enabled ? &io_times : nullptr,
+                            nullptr);
                 }
             }
             prof_add(split->graph, split_bucket, dt_us);
@@ -9184,6 +9610,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
         ggml_backend_sched_ffn_add4_lazy_opencl_sync_enabled();
     sched->ffn_prefetch_reduce_inputs =
         ggml_backend_sched_ffn_prefetch_reduce_inputs_enabled();
+    sched->qkv_prefetch_reduce_inputs =
+        ggml_backend_sched_qkv_prefetch_reduce_inputs_enabled();
     sched->cpu_graph_prewake_hold_us = ggml_backend_sched_cpu_graph_prewake_hold_us();
     sched->cpu_graph_prewake_idle_us = sched->cpu_graph_prewake_hold_us > 0
         ? ggml_backend_sched_cpu_graph_prewake_idle_us()
@@ -9302,6 +9730,19 @@ ggml_backend_sched_t ggml_backend_sched_new(
         } else {
             GGML_LOG_INFO(
                     "%s: FFN reduce-input prefetch enabled for eligible CPU reduce groups\n",
+                    __func__);
+        }
+    }
+
+    if (sched->qkv_prefetch_reduce_inputs) {
+        if (sched->n_copies != 1) {
+            GGML_LOG_WARN(
+                    "%s: routed QKV output prefetch requested with %d scheduler copy slots; "
+                    "using the atomic late QKV commit\n",
+                    __func__, sched->n_copies);
+        } else {
+            GGML_LOG_INFO(
+                    "%s: routed QKV output prefetch enabled for eligible canonical bundles\n",
                     __func__);
         }
     }

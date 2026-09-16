@@ -460,12 +460,174 @@ struct fixture {
     }
 };
 
+struct qkv_route_fixture {
+    static constexpr int64_t element_count = 1 << 14;
+
+    fake_control control;
+    ggml_context * ctx = nullptr;
+    ggml_backend_t cpu = nullptr;
+    ggml_backend_t gpu = nullptr;
+    ggml_backend_t npu = nullptr;
+    ggml_backend_sched_t sched = nullptr;
+    ggml_cgraph * graph = nullptr;
+    ggml_tensor * input = nullptr;
+    ggml_tensor * output = nullptr;
+
+    ~qkv_route_fixture() {
+        ggml_backend_sched_free(sched);
+        ggml_backend_free(npu);
+        ggml_backend_free(gpu);
+        ggml_backend_free(cpu);
+        ggml_free(ctx);
+    }
+
+    bool build(bool parallel_copies, bool alias_qv = false) {
+        constexpr size_t graph_size = 48;
+        const ggml_init_params params = {
+            /* .mem_size   = */ 96 * ggml_tensor_overhead() +
+                                  ggml_graph_overhead_custom(graph_size, false),
+            /* .mem_buffer = */ nullptr,
+            /* .no_alloc   = */ true,
+        };
+        ctx = ggml_init(params);
+        cpu = make_fake_backend(
+                fake_role::cpu, "QKVPrefetchCPU", GGML_BACKEND_DEVICE_TYPE_CPU, &control);
+        gpu = make_fake_backend(
+                fake_role::gpu, "QKVPrefetchGPU", GGML_BACKEND_DEVICE_TYPE_GPU, &control);
+        npu = make_fake_backend(
+                fake_role::npu, "QKVPrefetchNPU", GGML_BACKEND_DEVICE_TYPE_ACCEL, &control);
+        if (ctx == nullptr || cpu == nullptr || gpu == nullptr || npu == nullptr) {
+            return false;
+        }
+
+        ggml_backend_t backends[] = { gpu, npu, cpu };
+        ggml_backend_buffer_type_t bufts[] = {
+            ggml_backend_get_default_buffer_type(gpu),
+            ggml_backend_get_default_buffer_type(npu),
+            ggml_backend_get_default_buffer_type(cpu),
+        };
+        sched = ggml_backend_sched_new(
+                backends, bufts, 3, graph_size, parallel_copies, true);
+        if (sched == nullptr) {
+            return false;
+        }
+
+        graph = ggml_new_graph_custom(ctx, graph_size, false);
+        input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, element_count);
+        ggml_set_input(input);
+        ggml_set_name(input, "qkv-prefetch-input");
+        ggml_backend_sched_set_tensor_backend(sched, input, cpu);
+
+        ggml_tensor * canonical[3] = {};
+        ggml_tensor * alternate[3] = {};
+        static const char * projections[] = { "q", "k", "v" };
+        ggml_backend_t canonical_backends[] = {
+            alias_qv ? gpu : cpu,
+            cpu,
+            cpu,
+        };
+        for (int i = 0; i < 3; ++i) {
+            canonical[i] = ggml_scale(ctx, input, 10.0f + (float) i);
+            ggml_set_name(canonical[i],
+                    (std::string("qkv-prefetch-canonical-") + projections[i]).c_str());
+            ggml_backend_sched_set_tensor_backend(
+                    sched, canonical[i], canonical_backends[i]);
+            ggml_build_forward_expand(graph, canonical[i]);
+        }
+
+        ggml_backend_t alternate_backends[] = { gpu, npu, cpu };
+        for (int i = 0; i < 3; ++i) {
+            alternate[i] = ggml_scale(ctx, input, 2.0f + (float) i);
+            ggml_set_name(alternate[i],
+                    (std::string("attn_qkv.") + projections[i] + ".proj-0").c_str());
+            ggml_backend_sched_set_tensor_backend(
+                    sched, alternate[i], alternate_backends[i]);
+            ggml_build_forward_expand(graph, alternate[i]);
+        }
+
+        output = ggml_add4(
+                ctx, canonical[0], canonical[1], canonical[2], input);
+        ggml_set_name(output, "qkv-prefetch-downstream-0");
+        ggml_set_output(output);
+        ggml_backend_sched_set_tensor_backend(sched, output, cpu);
+        ggml_build_forward_expand(graph, output);
+
+        bool ok = ggml_backend_sched_register_route_subgraph_bundle(
+                sched,
+                canonical[0], canonical,
+                canonical[0], canonical,
+                3, 0, 0) &&
+            ggml_backend_sched_register_route_subgraph_bundle(
+                sched,
+                canonical[0], canonical,
+                alternate[0], alternate,
+                3, 1, 0);
+        if (alias_qv) {
+            // Model the production mixed bundle: Q and V keep the same
+            // concrete backend across profiles and therefore share canonical
+            // storage, while K changes backend and still needs an early copy.
+            alternate[0]->view_src = canonical[0];
+            alternate[0]->view_offs = 0;
+            alternate[2]->view_src = canonical[2];
+            alternate[2]->view_offs = 0;
+        }
+        ggml_backend_sched_layer_checkpoint_set_plan_id(sched, 1);
+        ok = ok && ggml_backend_sched_alloc_graph(sched, graph);
+        if (ok && alias_qv) {
+            ok = alternate[0]->buffer == canonical[0]->buffer &&
+                alternate[0]->data == canonical[0]->data &&
+                alternate[2]->buffer == canonical[2]->buffer &&
+                alternate[2]->data == canonical[2]->data &&
+                alternate[1]->data != canonical[1]->data;
+        }
+        control.reset();
+        return ok;
+    }
+
+    bool compute_and_check(int query, const char * scenario) {
+        std::vector<float> values((size_t) element_count);
+        for (int64_t i = 0; i < element_count; ++i) {
+            values[(size_t) i] =
+                (float) query * 0.0625f + (float) (i % 31) * 0.03125f;
+        }
+        ggml_backend_tensor_set(
+                input, values.data(), 0, values.size() * sizeof(values[0]));
+        ggml_backend_sched_trace_set_query_id(query);
+        if (!check(
+                    ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS,
+                    scenario, "graph compute failed")) {
+            return false;
+        }
+
+        std::vector<float> result((size_t) element_count);
+        ggml_backend_tensor_get(
+                output, result.data(), 0, result.size() * sizeof(result[0]));
+        for (int64_t i = 0; i < element_count; ++i) {
+            // Selected alternate Q/K/V are 2x, 3x, and 4x; downstream
+            // additionally consumes x itself.
+            const float expected = 10.0f * values[(size_t) i];
+            if (!check(std::fabs(result[(size_t) i] - expected) < 1e-5f,
+                        scenario, "QKV canonical bundle mismatch")) {
+                return false;
+            }
+        }
+
+        ggml_backend_sched_route_candidate_stats stats = {};
+        ggml_backend_sched_get_route_candidate_stats(sched, &stats);
+        return check(stats.alternate_selected >= 1,
+                    scenario, "alternate QKV route was not selected") &&
+            check(stats.canonical_commits >= 1,
+                    scenario, "QKV canonical bundle was not published");
+    }
+};
+
 struct trace_row {
     int query_id = -1;
     int64_t copy_us = -1;
     bool parallel_group = false;
     std::string first_node;
     std::string timing_mode;
+    std::string parallel_kind;
     std::string branch;
 };
 
@@ -519,9 +681,11 @@ static bool read_trace(
     const int group_col = column_index(columns, "is_parallel_group");
     const int first_col = column_index(columns, "first_node");
     const int mode_col = column_index(columns, "timing_mode");
+    const int kind_col = column_index(columns, "parallel_group_kind");
     const int branch_col = column_index(columns, "parallel_branch");
     if (!check(query_col >= 0 && copy_col >= 0 && group_col >= 0 &&
-                    first_col >= 0 && mode_col >= 0 && branch_col >= 0,
+                    first_col >= 0 && mode_col >= 0 && kind_col >= 0 &&
+                    branch_col >= 0,
                 scenario, "trace schema is missing required columns")) {
         return false;
     }
@@ -542,6 +706,7 @@ static bool read_trace(
         row.parallel_group = fields[(size_t) group_col] == "1";
         row.first_node = fields[(size_t) first_col];
         row.timing_mode = fields[(size_t) mode_col];
+        row.parallel_kind = fields[(size_t) kind_col];
         row.branch = fields[(size_t) branch_col];
         rows->push_back(std::move(row));
     }
@@ -625,6 +790,33 @@ static bool check_callback_fallback_trace(
         check(reduce_rows == 1, scenario, "callback fallback reduce row is missing");
 }
 
+static bool check_qkv_query_trace(
+        const std::vector<trace_row> & rows,
+        int query_id,
+    bool expect_prefetch,
+    const char * scenario) {
+    int group_rows = 0;
+    for (const trace_row & row : rows) {
+        if (row.query_id != query_id || !row.parallel_group ||
+                row.parallel_kind != "attn_qkv") {
+            continue;
+        }
+        ++group_rows;
+        const std::string expected = expect_prefetch
+            ? "persistent_qkv_prefetch_outputs"
+            : "persistent_synced_wall";
+        if (!check(row.timing_mode == expected, scenario,
+                    "unexpected QKV group timing mode")) {
+            return false;
+        }
+    }
+    // The fixture's downstream numerical result verifies that all three
+    // canonical tensors were published. Do not require a positive
+    // microsecond duration here: a fast in-memory copy can legitimately be
+    // rounded to zero by the trace clock.
+    return check(group_rows == 3, scenario, "expected three QKV group trace rows");
+}
+
 static bool run_default_off_case() {
     const char * scenario = "FFN prefetch default-off";
     set_env("GGML_FFN_PREFETCH_REDUCE_INPUTS", nullptr);
@@ -677,6 +869,23 @@ static bool run_callback_fallback_case() {
         test.compute_and_check(604, scenario);
 }
 
+static bool run_qkv_default_off_case() {
+    const char * scenario = "QKV canonical-output prefetch default-off";
+    set_env("GGML_QKV_PREFETCH_REDUCE_INPUTS", nullptr);
+    qkv_route_fixture test;
+    return check(test.build(false), scenario, "fixture build failed") &&
+        test.compute_and_check(610, scenario);
+}
+
+static bool run_qkv_enabled_reuse_case() {
+    const char * scenario = "QKV canonical-output prefetch two-query reuse";
+    set_env("GGML_QKV_PREFETCH_REDUCE_INPUTS", "1");
+    qkv_route_fixture test;
+    return check(test.build(false, true), scenario, "fixture build failed") &&
+        test.compute_and_check(611, scenario) &&
+        test.compute_and_check(612, scenario);
+}
+
 } // namespace
 
 int main() {
@@ -694,7 +903,9 @@ int main() {
     bool ok = run_default_off_case() &&
         run_enabled_reuse_case() &&
         run_multiple_copy_slots_fallback_case() &&
-        run_callback_fallback_case();
+        run_callback_fallback_case() &&
+        run_qkv_default_off_case() &&
+        run_qkv_enabled_reuse_case();
     ggml_backend_sched_trace_flush();
 
     std::vector<trace_row> rows;
@@ -704,10 +915,17 @@ int main() {
         check_query_trace(rows, 602, true, "FFN prefetch query 2 trace") &&
         check_query_trace(rows, 603, false, "FFN prefetch multiple-copy trace") &&
         check_callback_fallback_trace(
-                rows, 604, "FFN prefetch callback fallback trace");
+                rows, 604, "FFN prefetch callback fallback trace") &&
+        check_qkv_query_trace(
+                rows, 610, false, "QKV prefetch default-off trace") &&
+        check_qkv_query_trace(
+                rows, 611, true, "QKV prefetch query 1 trace") &&
+        check_qkv_query_trace(
+                rows, 612, true, "QKV prefetch query 2 trace");
 
     ggml_backend_sched_trace_set_enabled(false);
     set_env("GGML_FFN_PREFETCH_REDUCE_INPUTS", nullptr);
+    set_env("GGML_QKV_PREFETCH_REDUCE_INPUTS", nullptr);
     set_env("GGML_FFN_PERSISTENT_DEVICE_WORKERS", nullptr);
     return ok ? 0 : 1;
 }

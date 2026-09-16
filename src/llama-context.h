@@ -308,6 +308,41 @@ private:
             uint64_t active_plan_id,
             void * user_data);
 
+    struct graph_cache_route_state {
+        std::unordered_map<uint64_t, std::string> plan_names;
+        bool is_prefill = true;
+        std::string mode = "off";
+        int min_dwell_layers = 1;
+        int layers_since_switch = 0;
+    };
+
+    struct graph_cache_state {
+        bool valid = false;
+        bool is_prefill = false;
+        uint32_t n_tokens = 0;
+        uint32_t n_outputs = 0;
+        llm_graph_type gtype = LLM_GRAPH_TYPE_DEFAULT;
+        std::string backend_policy_profile;
+        size_t max_nodes = 0;
+        uint64_t last_used = 0;
+        graph_cache_route_state route;
+    };
+
+    struct graph_cache_entry {
+        // Keep the result before the scheduler so reverse member destruction
+        // releases scheduler-owned workers and graph references first.
+        llm_graph_result_ptr result;
+        ggml_backend_sched_ptr scheduler;
+        graph_cache_state state;
+    };
+
+    ggml_backend_sched_ptr graph_cache_create_scheduler(size_t max_nodes);
+    void graph_cache_swap_active(graph_cache_entry & entry);
+    void graph_cache_prepare_miss(size_t max_nodes);
+    void graph_cache_capture_active_route();
+    void graph_cache_clear_inactive();
+    void graph_cache_invalidate();
+
     // TODO: read/write lora adapters and cvec
     size_t state_write_data(llama_io_write_i & io);
     size_t state_read_data (llama_io_read_i  & io);
@@ -375,6 +410,14 @@ private:
     std::vector<swap_info> output_swaps;
 
     ggml_backend_sched_ptr sched;
+
+    // `sched` + `gf_res_prev` form the active graph-cache entry. The vector
+    // stores only inactive entries so existing execution/output code can keep
+    // using the active scheduler without an extra indirection.
+    std::vector<graph_cache_entry> graph_cache_entries;
+    graph_cache_state graph_cache_active_state;
+    size_t graph_cache_capacity = 8;
+    uint64_t graph_cache_clock = 0;
 
     bool sched_need_reserve = true;
 
@@ -445,7 +488,7 @@ private:
     mutable int32_t n_p_eval = 0; // number of tokens in eval calls for the prompt (with batch size > 1)
     mutable int32_t n_eval   = 0; // number of eval calls
 
-    mutable int32_t n_reused = 0; // number of times the previous graph was reused
+    mutable int32_t n_reused = 0; // number of graph-cache hits (active or inactive entry)
 
     llama_igparams igparams = {};
 
