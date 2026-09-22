@@ -142,6 +142,10 @@ struct llama_backend_policy_runtime_routes {
     bool enabled = false;
     std::string mode = "off";
     std::string phase = "prefill";
+    // exact preserves the original applicability behavior. nearest permits a
+    // query shape outside every authored token range to use the closest
+    // profile bucket, with deterministic lower-token tie breaking.
+    std::string token_fallback = "exact";
     std::string initial_profile;
     std::vector<std::string> profiles;
     std::vector<llama_backend_policy_runtime_route_transition> transitions;

@@ -1416,6 +1416,23 @@ bool token_range_contains(const token_range & range, int32_t value) {
     return !range.configured || (value >= range.min && value <= range.max);
 }
 
+int64_t token_range_distance(const token_range & range, int32_t value) {
+    if (!range.configured || token_range_contains(range, value)) {
+        return 0;
+    }
+    if (value < range.min) {
+        return (int64_t) range.min - value;
+    }
+    return (int64_t) value - range.max;
+}
+
+int32_t token_range_anchor(const token_range & range) {
+    // Unified token policies currently use point ranges such as [64, 64].
+    // Using the lower bound also gives wider ranges a stable, documented
+    // ordering without depending on JSON/profile iteration order.
+    return range.configured ? range.min : 0;
+}
+
 bool token_ranges_overlap(const token_range & lhs, const token_range & rhs) {
     if (!lhs.configured || !rhs.configured) {
         return true;
@@ -1433,11 +1450,16 @@ struct clock_profile_selection {
     bool matched = false;
     std::string profile;
     double distance = -1.0;
+    int64_t input_token_distance = std::numeric_limits<int64_t>::max();
+    int64_t ubatch_token_distance = std::numeric_limits<int64_t>::max();
+    int32_t input_token_anchor = std::numeric_limits<int32_t>::max();
+    int32_t ubatch_token_anchor = std::numeric_limits<int32_t>::max();
 };
 
 clock_profile_selection select_clock_profile_locked(
         const std::vector<std::string> * candidates,
         bool require_enabled_ffn,
+        bool nearest_token_fallback,
         int32_t input_tokens,
         int32_t ubatch_tokens,
         int64_t gold_khz,
@@ -1459,11 +1481,28 @@ clock_profile_selection select_clock_profile_locked(
         if (!profile.clock_point.configured ||
             (require_enabled_ffn &&
                 (!profile.ffn_parallel.configured ||
-                 !env_enabled("LLAMA_FFN_PARALLEL", profile.ffn_parallel.enabled))) ||
-            !token_range_contains(profile.input_tokens, input_tokens) ||
-            !token_range_contains(profile.ubatch_tokens, ubatch_tokens)) {
+                 !env_enabled("LLAMA_FFN_PARALLEL", profile.ffn_parallel.enabled)))) {
             return;
         }
+
+        const bool input_contains = token_range_contains(profile.input_tokens, input_tokens);
+        const bool ubatch_contains = token_range_contains(profile.ubatch_tokens, ubatch_tokens);
+        if (!nearest_token_fallback && (!input_contains || !ubatch_contains)) {
+            return;
+        }
+
+        const int64_t input_distance = nearest_token_fallback
+            ? token_range_distance(profile.input_tokens, input_tokens)
+            : 0;
+        const int64_t ubatch_distance = nearest_token_fallback
+            ? token_range_distance(profile.ubatch_tokens, ubatch_tokens)
+            : 0;
+        const int32_t input_anchor = nearest_token_fallback
+            ? token_range_anchor(profile.input_tokens)
+            : 0;
+        const int32_t ubatch_anchor = nearest_token_fallback
+            ? token_range_anchor(profile.ubatch_tokens)
+            : 0;
 
         const auto relative_error = [](int64_t actual, int64_t target) {
             return std::fabs((long double) actual - (long double) target) /
@@ -1478,18 +1517,39 @@ clock_profile_selection select_clock_profile_locked(
             (long double) profile.clock_point.gold.frequency +
             (long double) profile.clock_point.gpu.frequency / 1000.0L;
 
+        const bool token_bucket_better =
+            input_distance < result.input_token_distance ||
+            (input_distance == result.input_token_distance &&
+             ubatch_distance < result.ubatch_token_distance) ||
+            (input_distance == result.input_token_distance &&
+             ubatch_distance == result.ubatch_token_distance &&
+             input_anchor < result.input_token_anchor) ||
+            (input_distance == result.input_token_distance &&
+             ubatch_distance == result.ubatch_token_distance &&
+             input_anchor == result.input_token_anchor &&
+             ubatch_anchor < result.ubatch_token_anchor);
+        const bool token_bucket_tied =
+            input_distance == result.input_token_distance &&
+            ubatch_distance == result.ubatch_token_distance &&
+            input_anchor == result.input_token_anchor &&
+            ubatch_anchor == result.ubatch_token_anchor;
         const bool distance_better = distance + tie_epsilon < best_distance;
         const bool distance_tied = std::fabs(distance - best_distance) <= tie_epsilon;
         const bool lower_frequency = total_khz + tie_epsilon < best_total_khz;
         const bool fully_tied = distance_tied &&
             std::fabs(total_khz - best_total_khz) <= tie_epsilon;
-        if (best == nullptr || distance_better ||
-            (distance_tied && lower_frequency) ||
-            (fully_tied && profile_name < best_name)) {
+        if (best == nullptr || token_bucket_better ||
+            (token_bucket_tied && distance_better) ||
+            (token_bucket_tied && distance_tied && lower_frequency) ||
+            (token_bucket_tied && fully_tied && profile_name < best_name)) {
             best = &profile;
             best_name = profile_name;
             best_distance = distance;
             best_total_khz = total_khz;
+            result.input_token_distance = input_distance;
+            result.ubatch_token_distance = ubatch_distance;
+            result.input_token_anchor = input_anchor;
+            result.ubatch_token_anchor = ubatch_anchor;
         }
     };
 
@@ -1691,8 +1751,13 @@ void parse_runtime_routes(const json & root, policy_state & state) {
     llama_backend_policy_runtime_routes routes;
     routes.enabled = state.enabled;
     routes.mode = lower(trim(section.value("mode", std::string("fixed"))));
+    routes.token_fallback = lower(trim(
+            section.value("token_fallback", std::string("exact"))));
     if (routes.mode != "off" && routes.mode != "prepare" && routes.mode != "fixed" && routes.mode != "clock") {
         throw std::runtime_error("runtime_routes.mode must be off, prepare, fixed, or clock");
+    }
+    if (routes.token_fallback != "exact" && routes.token_fallback != "nearest") {
+        throw std::runtime_error("runtime_routes.token_fallback must be exact or nearest");
     }
     if (!routes.enabled || routes.mode == "off") {
         routes.enabled = false;
@@ -2322,9 +2387,10 @@ bool llama_backend_policy_load(const char * path, bool enable_weights, bool enab
                 g_policy.profiles.size());
         if (g_policy.runtime_routes.enabled) {
             LLAMA_LOG_INFO(
-                    "backend_policy: runtime routes enabled (mode=%s, phase=%s, initial=%s, profiles=%zu)\n",
+                    "backend_policy: runtime routes enabled (mode=%s, phase=%s, token_fallback=%s, initial=%s, profiles=%zu)\n",
                     g_policy.runtime_routes.mode.c_str(),
                     g_policy.runtime_routes.phase.c_str(),
+                    g_policy.runtime_routes.token_fallback.c_str(),
                     g_policy.runtime_routes.initial_profile.c_str(),
                     g_policy.runtime_routes.profiles.size());
         }
@@ -2444,6 +2510,7 @@ struct llama_backend_policy_ffn_clock_result llama_backend_policy_select_ffn_clo
 
     const auto selection = select_clock_profile_locked(
             nullptr, /* require_enabled_ffn = */ true,
+            /* nearest_token_fallback = */ false,
             input_tokens, ubatch_tokens, gold_khz, prime_khz, gpu_hz);
     if (!selection.matched) {
         if (!g_policy.pending_clock_profile.empty()) {
@@ -2762,8 +2829,10 @@ bool llama_backend_policy_select_runtime_route_profile(
     // Pick the globally best clock profile first. A greedy choice restricted
     // to current+successors can become permanently stuck when a legal recovery
     // path contains a temporarily worse intermediate clock point.
+    const bool nearest_token_fallback = routes.token_fallback == "nearest";
     const auto target = select_clock_profile_locked(
             &routes.profiles, /* require_enabled_ffn = */ false,
+            nearest_token_fallback,
             input_tokens, ubatch_tokens, gold_khz, prime_khz, gpu_hz);
     if (!target.matched) {
         return false;
@@ -2780,9 +2849,27 @@ bool llama_backend_policy_select_runtime_route_profile(
         predecessor.emplace(current, std::string());
         const auto profile_applies_to_shape = [&](const std::string & profile_name) {
             const auto profile_it = g_policy.profiles.find(profile_name);
-            return profile_it != g_policy.profiles.end() &&
-                token_range_contains(profile_it->second.input_tokens, input_tokens) &&
-                token_range_contains(profile_it->second.ubatch_tokens, ubatch_tokens);
+            if (profile_it == g_policy.profiles.end()) {
+                return false;
+            }
+            const auto & profile = profile_it->second;
+            if (!nearest_token_fallback) {
+                return token_range_contains(profile.input_tokens, input_tokens) &&
+                    token_range_contains(profile.ubatch_tokens, ubatch_tokens);
+            }
+            // A fallback route may start in the prior query's token bucket,
+            // but every intermediate destination must belong to the bucket
+            // selected for this query. This avoids briefly running a graph
+            // optimized for a farther input shape merely because it forms a
+            // shorter transition path.
+            return token_range_distance(profile.input_tokens, input_tokens) ==
+                       target.input_token_distance &&
+                   token_range_distance(profile.ubatch_tokens, ubatch_tokens) ==
+                       target.ubatch_token_distance &&
+                   token_range_anchor(profile.input_tokens) ==
+                       target.input_token_anchor &&
+                   token_range_anchor(profile.ubatch_tokens) ==
+                       target.ubatch_token_anchor;
         };
         for (size_t head = 0; head < queue.size() && predecessor.find(target.profile) == predecessor.end(); ++head) {
             // Keep a value copy: queue growth below may reallocate and would
@@ -2831,6 +2918,7 @@ bool llama_backend_policy_select_runtime_route_profile(
     const std::vector<std::string> selected = { selected_profile };
     const auto hop = select_clock_profile_locked(
             &selected, /* require_enabled_ffn = */ false,
+            nearest_token_fallback,
             input_tokens, ubatch_tokens, gold_khz, prime_khz, gpu_hz);
     if (!hop.matched) {
         return false;
