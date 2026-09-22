@@ -726,6 +726,7 @@ public:
 
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
+    size_t get_metadata_capacity_bytes() const { return buf_compute_meta.capacity(); }
 
     int64_t get_max_nodes() const;
 

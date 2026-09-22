@@ -757,6 +757,8 @@ struct common_params {
     std::string input_path = "";
     std::string output_dir = "";
     bool memory_stats = false;
+    bool graph_memory_stats = false;
+    std::string graph_memory_stats_path = "graph_memory_stats.csv";
     bool hardware_stats = true;
     int hardware_stats_core = -1;
     bool battery_temp_sync = false;

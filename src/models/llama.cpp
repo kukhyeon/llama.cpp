@@ -498,11 +498,21 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
         ggml_tensor * inpSA = inpL;
 
         // Attention-side norm is stateless but its final MUL is weighted. In
-        // route mode, prebuild one compact RMS+MUL candidate per clock profile
-        // using a backend-resident duplicate of attn_norm.weight. This does not
-        // alter the Q/K/V or KV-cache topology; only the norm feeding QKV is
-        // selected at the layer's already-latched plan.
+        // route mode, prebuild one compact RMS+MUL candidate per effective
+        // backend/weight topology. Profiles with identical placement share
+        // that range. This does not alter the Q/K/V or KV-cache topology; only
+        // the norm feeding QKV is selected at the layer's already-latched plan.
         if (runtime_weighted_norm_routes) {
+            struct prepared_weighted_norm_topology {
+                std::string rms_backend;
+                std::string mul_backend;
+                ggml_tensor * norm_weight = nullptr;
+                ggml_tensor * first = nullptr;
+                ggml_tensor * output = nullptr;
+            };
+            std::vector<prepared_weighted_norm_topology> prepared;
+            prepared.reserve(runtime_route_profiles.size());
+
             ggml_tensor * canonical_norm = nullptr;
             for (const std::string & profile : runtime_route_profiles) {
                 llama_backend_policy_match rms_match;
@@ -528,23 +538,44 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                             profile.c_str(), il, mul_match.backends.front().c_str());
                 }
 
-                char route_tag[24];
-                snprintf(route_tag, sizeof(route_tag), "%s", profile.c_str());
-                ggml_tensor * first = ggml_rms_norm(ctx0, inpL, hparams.f_norm_rms_eps);
-                cb_route(first, (std::string("attn_rms_norm.") + route_tag).c_str(), il,
-                        rms_match.backends.front().c_str());
-                ggml_tensor * weighted = ggml_mul(ctx0, first, norm_weight);
-                cb_route(weighted, (std::string("attn_norm.") + route_tag).c_str(), il,
-                        mul_match.backends.front().c_str());
-                ggml_build_forward_expand(gf, weighted);
+                auto existing = std::find_if(
+                        prepared.begin(), prepared.end(), [&](const auto & candidate) {
+                            return candidate.rms_backend == rms_match.backends.front() &&
+                                candidate.mul_backend == mul_match.backends.front() &&
+                                candidate.norm_weight == norm_weight;
+                        });
+                if (existing == prepared.end()) {
+                    char route_tag[24];
+                    // The first profile using an effective norm topology owns
+                    // its graph nodes. Other profiles register their plan IDs
+                    // against this same node range instead of rebuilding it.
+                    snprintf(route_tag, sizeof(route_tag), "%s", profile.c_str());
+
+                    prepared_weighted_norm_topology topology;
+                    topology.rms_backend = rms_match.backends.front();
+                    topology.mul_backend = mul_match.backends.front();
+                    topology.norm_weight = norm_weight;
+                    topology.first = ggml_rms_norm(ctx0, inpL, hparams.f_norm_rms_eps);
+                    cb_route(topology.first,
+                            (std::string("attn_rms_norm.") + route_tag).c_str(), il,
+                            topology.rms_backend.c_str());
+                    topology.output = ggml_mul(ctx0, topology.first, norm_weight);
+                    cb_route(topology.output,
+                            (std::string("attn_norm.") + route_tag).c_str(), il,
+                            topology.mul_backend.c_str());
+                    ggml_build_forward_expand(gf, topology.output);
+
+                    prepared.push_back(std::move(topology));
+                    existing = std::prev(prepared.end());
+                }
 
                 if (route_subgraph_cb_func) {
                     route_subgraph_cb_func(
                             "weighted_norm", profile.c_str(), il,
-                            first, weighted, { weighted });
+                            existing->first, existing->output, { existing->output });
                 }
                 if (profile == runtime_routes.initial_profile) {
-                    canonical_norm = weighted;
+                    canonical_norm = existing->output;
                 }
             }
             if (canonical_norm == nullptr) {

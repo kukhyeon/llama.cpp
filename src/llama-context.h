@@ -342,6 +342,16 @@ private:
     void graph_cache_capture_active_route();
     void graph_cache_clear_inactive();
     void graph_cache_invalidate();
+    void graph_memory_stats_initialize();
+    void graph_memory_stats_record(
+            const llama_ubatch & ubatch,
+            llm_graph_type gtype,
+            const std::string & backend_policy_profile,
+            llm_graph_result * result,
+            ggml_cgraph * graph,
+            size_t metadata_empty_used_bytes,
+            const std::vector<size_t> & base_planned_sizes,
+            const std::vector<size_t> & full_planned_sizes);
 
     // TODO: read/write lora adapters and cvec
     size_t state_write_data(llama_io_write_i & io);
@@ -443,6 +453,8 @@ private:
     std::map<ggml_backend_buffer_type_t, size_t> backend_buf_graph_routed_size;
     bool backend_buf_graph_measurement_valid = false;
     bool memory_stats_enabled = false;
+    bool graph_memory_stats_enabled = false;
+    std::string graph_memory_stats_path;
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
