@@ -94,6 +94,8 @@ struct route_fixture {
     std::vector<ggml_tensor *> canonicals;
     std::vector<ggml_tensor *> alternates;
     std::vector<ggml_tensor *> boundaries;
+    std::vector<size_t> measured_base_sizes;
+    std::vector<size_t> measured_full_sizes;
 
     ~route_fixture() {
         ggml_backend_sched_free(sched);
@@ -108,7 +110,8 @@ struct route_fixture {
             uint64_t initial_request,
             bool configure_routes = true,
             bool clear_after_registration = false,
-            bool use_request_producer = false) {
+            bool use_request_producer = false,
+            bool measure_graph_memory = false) {
         const size_t graph_size = 64;
         const ggml_init_params params = {
             /* .mem_size   = */ 128 * ggml_tensor_overhead() +
@@ -236,7 +239,14 @@ struct route_fixture {
             ggml_backend_sched_layer_checkpoint_set_plan_id(sched, initial_request);
         }
 
-        return ggml_backend_sched_alloc_graph(sched, graph);
+        if (!measure_graph_memory) {
+            return ggml_backend_sched_alloc_graph(sched, graph);
+        }
+
+        measured_base_sizes.assign(2, 0);
+        measured_full_sizes.assign(2, 0);
+        return ggml_backend_sched_alloc_graph_measure(
+                sched, graph, measured_base_sizes.data(), measured_full_sizes.data());
     }
 };
 
@@ -2505,6 +2515,29 @@ static bool run_default_off_case() {
             "checkpoint ranges survived clear");
 }
 
+static bool run_measured_alloc_case() {
+    const char * scenario = "measured-alloc";
+    callback_script script;
+    route_fixture fixture;
+    if (!check(
+                fixture.build(2, &script, 0, true, false, false, true),
+                scenario,
+                "measured fixture setup failed")) {
+        return false;
+    }
+
+    const size_t base_total = fixture.measured_base_sizes[0] + fixture.measured_base_sizes[1];
+    const size_t full_total = fixture.measured_full_sizes[0] + fixture.measured_full_sizes[1];
+    return
+        check(base_total > 0, scenario, "canonical planned size was not measured") &&
+        check(full_total > 0, scenario, "routed planned size was not measured") &&
+        check(ggml_backend_sched_get_metadata_size(fixture.sched) > 0,
+                scenario, "scheduler metadata size was not measured") &&
+        check(ggml_backend_sched_get_auxiliary_buffer_size(fixture.sched) == 0,
+                scenario, "unexpected auxiliary staging allocation") &&
+        check_output(fixture, 2, scenario);
+}
+
 } // namespace
 
 int main() {
@@ -2514,6 +2547,7 @@ int main() {
     (void) setenv("SCHED_TRACE_PHASE", "both", 1);
 #endif
     bool ok = true;
+    ok = run_measured_alloc_case() && ok;
     ok = run_default_off_case() && ok;
     ok = run_two_layer_case(
         "canonical-to-alternate",
