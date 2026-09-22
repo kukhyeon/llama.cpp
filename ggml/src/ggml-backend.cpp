@@ -985,6 +985,7 @@ struct ggml_backend_sched {
 
     int * prev_node_backend_ids; // [graph_size]
     int * prev_leaf_backend_ids; // [graph_size]
+    size_t backend_id_capacity;
 
     // copy of the graph with modified inputs
     struct ggml_cgraph graph;
@@ -5098,13 +5099,32 @@ static void ggml_backend_sched_split_graph_impl(
         }
     }
 
+    // The scheduler is created before the concrete graph is built, so its
+    // graph_size argument is a conservative upper bound.  Size the temporary
+    // copy/view tensor arena from the graph that is actually being split
+    // instead of eagerly reserving for that upper bound.
+    ggml_free(sched->ctx);
+    sched->ctx = nullptr;
+
+    const size_t actual_graph_size = std::max<size_t>(
+        1, std::max(graph->n_nodes, graph->n_leafs));
+    const size_t required_context_buffer_size =
+        actual_graph_size*GGML_SCHED_MAX_SPLIT_INPUTS*2*sizeof(struct ggml_tensor) +
+        ggml_graph_overhead_custom(actual_graph_size, false);
+
+    if (required_context_buffer_size > sched->context_buffer_size) {
+        char * context_buffer = (char *) realloc(
+            sched->context_buffer, required_context_buffer_size);
+        GGML_ASSERT(context_buffer != nullptr);
+        sched->context_buffer = context_buffer;
+        sched->context_buffer_size = required_context_buffer_size;
+    }
+
     struct ggml_init_params params = {
         /* .mem_size =   */ sched->context_buffer_size,
         /* .mem_buffer = */ sched->context_buffer,
         /* .no_alloc =   */ true
     };
-
-    ggml_free(sched->ctx);
 
     sched->ctx = ggml_init(params);
     if (sched->ctx == NULL) {
@@ -9631,6 +9651,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     const size_t ggml_sched_max_splits = graph_size; // at most there is one split for each node in the graph
     const size_t nodes_size = graph_size + ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2;
+    sched->backend_id_capacity = nodes_size;
     sched->node_backend_ids = (int *) calloc(nodes_size, sizeof(sched->node_backend_ids[0]));
     sched->leaf_backend_ids = (int *) calloc(nodes_size, sizeof(sched->leaf_backend_ids[0]));
     sched->prev_node_backend_ids = (int *) calloc(nodes_size, sizeof(sched->prev_node_backend_ids[0]));
@@ -9639,8 +9660,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->debug_graph_size = 0;
     sched->debug_prev_graph_size = 0;
 
-    sched->context_buffer_size = ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2*sizeof(struct ggml_tensor) + ggml_graph_overhead_custom(graph_size, false);
-    sched->context_buffer = (char *) malloc(sched->context_buffer_size);
+    // The temporary copy/view tensor arena is allocated lazily once the
+    // concrete graph size is known in ggml_backend_sched_split_graph_impl().
+    sched->context_buffer_size = 0;
+    sched->context_buffer = nullptr;
 
     const int initial_splits_capacity = 16;
     sched->splits = (ggml_backend_sched_split *) calloc(initial_splits_capacity, sizeof(sched->splits[0]));
@@ -9965,17 +9988,22 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
     return true;
 }
 
-bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+static bool ggml_backend_sched_alloc_graph_impl(
+        ggml_backend_sched_t sched, struct ggml_cgraph * graph,
+        size_t * base_sizes, size_t * full_sizes) {
     GGML_ASSERT(sched);
     GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
     GGML_ASSERT(!sched->is_alloc);
+    GGML_ASSERT((base_sizes == nullptr) == (full_sizes == nullptr));
 
     ggml_backend_sched_qkv_lazy_opencl_drain(sched);
 
     sched->cur_copy = sched->next_copy;
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
 
-    ggml_backend_sched_split_graph(sched, graph);
+    ggml_backend_sched_route_base_capture base;
+    ggml_backend_sched_split_graph_impl(
+            sched, graph, base_sizes != nullptr ? &base : nullptr);
 
     if (sched->layer_checkpoints != nullptr && sched->layer_checkpoints->enabled &&
             !sched->layer_checkpoints->prepared) {
@@ -9988,6 +10016,29 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
         return false;
     }
 
+    if (base_sizes != nullptr) {
+        GGML_ASSERT(base.nodes.size() == base.node_backend_ids.size());
+        GGML_ASSERT(base.leafs.size() == base.leaf_backend_ids.size());
+
+        ggml_cgraph base_graph = {};
+        base_graph.size = (int) std::max(base.nodes.size(), base.leafs.size());
+        base_graph.n_nodes = (int) base.nodes.size();
+        base_graph.n_leafs = (int) base.leafs.size();
+        base_graph.nodes = base.nodes.data();
+        base_graph.leafs = base.leafs.data();
+
+        ggml_gallocr_t measure = ggml_gallocr_new_n(sched->bufts, sched->n_backends);
+        ggml_gallocr_reserve_n_size(
+                measure, &base_graph,
+                base.node_backend_ids.data(), base.leaf_backend_ids.data(),
+                base_sizes);
+        ggml_gallocr_reserve_n_size(
+                measure, &sched->graph,
+                sched->node_backend_ids, sched->leaf_backend_ids,
+                full_sizes);
+        ggml_gallocr_free(measure);
+    }
+
     if (!ggml_backend_sched_alloc_splits(sched)) {
         return false;
     }
@@ -9995,6 +10046,18 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->is_alloc = true;
 
     return true;
+}
+
+bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    return ggml_backend_sched_alloc_graph_impl(sched, graph, nullptr, nullptr);
+}
+
+bool ggml_backend_sched_alloc_graph_measure(
+        ggml_backend_sched_t sched, struct ggml_cgraph * graph,
+        size_t * base_sizes, size_t * full_sizes) {
+    GGML_ASSERT(base_sizes);
+    GGML_ASSERT(full_sizes);
+    return ggml_backend_sched_alloc_graph_impl(sched, graph, base_sizes, full_sizes);
 }
 
 enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
@@ -10494,6 +10557,91 @@ int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
 int ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->n_copies;
+}
+
+size_t ggml_backend_sched_get_metadata_size(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+
+    // Count the scheduler-owned allocations whose capacities are explicitly
+    // tracked. Allocator bookkeeping hidden behind backend/event/thread
+    // implementations and malloc implementation overhead are intentionally
+    // excluded; process RSS/PSS remains the authoritative whole-process metric.
+    size_t bytes = sizeof(*sched);
+    bytes += sched->hash_set.size * sizeof(sched->hash_set.keys[0]);
+    bytes += ggml_bitset_size(sched->hash_set.size) * sizeof(sched->hash_set.used[0]);
+    bytes += sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]);
+    bytes += sched->hash_set.size * (size_t) sched->n_backends * (size_t) sched->n_copies *
+        sizeof(sched->hv_tensor_copies[0]);
+    bytes += 4 * sched->backend_id_capacity * sizeof(sched->node_backend_ids[0]);
+    bytes += sched->context_buffer_size;
+    bytes += (size_t) sched->splits_capacity * sizeof(sched->splits[0]);
+    bytes += 2 * (size_t) sched->graph.size * sizeof(sched->graph.nodes[0]);
+
+    if (sched->layer_checkpoints != nullptr) {
+        const auto & state = *sched->layer_checkpoints;
+        bytes += sizeof(state);
+        bytes += state.checkpoints.capacity() * sizeof(state.checkpoints[0]);
+        bytes += state.ranges.capacity() * sizeof(state.ranges[0]);
+    }
+
+    if (sched->route_candidates != nullptr) {
+        const auto & state = *sched->route_candidates;
+        bytes += sizeof(state);
+        bytes += state.registrations.capacity() * sizeof(state.registrations[0]);
+        for (const auto & registration : state.registrations) {
+            bytes += registration.canonical_outputs.capacity() * sizeof(registration.canonical_outputs[0]);
+            bytes += registration.variant_outputs.capacity() * sizeof(registration.variant_outputs[0]);
+        }
+        bytes += state.groups.capacity() * sizeof(state.groups[0]);
+        for (const auto & group : state.groups) {
+            bytes += group.canonical_outputs.capacity() * sizeof(group.canonical_outputs[0]);
+            bytes += group.variants.capacity() * sizeof(group.variants[0]);
+            for (const auto & variant : group.variants) {
+                bytes += variant.outputs.capacity() * sizeof(variant.outputs[0]);
+            }
+            bytes += group.plans.capacity() * sizeof(group.plans[0]);
+        }
+        bytes += (state.candidate_nodes.capacity() + 7) / 8;
+        bytes += state.node_to_group.capacity() * sizeof(state.node_to_group[0]);
+        bytes += state.node_to_variant.capacity() * sizeof(state.node_to_variant[0]);
+        bytes += state.split_to_group.capacity() * sizeof(state.split_to_group[0]);
+        bytes += state.split_to_variant.capacity() * sizeof(state.split_to_variant[0]);
+    }
+
+    if (sched->qkv_lazy_opencl != nullptr) {
+        const auto & state = *sched->qkv_lazy_opencl;
+        bytes += sizeof(state);
+        bytes += state.slots.capacity() * sizeof(state.slots[0]);
+        bytes += state.pending.input_slots.capacity() * sizeof(state.pending.input_slots[0]);
+    }
+
+    if (sched->ffn_device_executor != nullptr) {
+        bytes += sizeof(*sched->ffn_device_executor);
+        for (int i = 0; i < sched->ffn_device_executor->n_backends; ++i) {
+            const auto * worker = sched->ffn_device_executor->workers[i];
+            if (worker != nullptr) {
+                bytes += sizeof(*worker);
+                bytes += worker->backend_name.capacity() + 1;
+            }
+        }
+    }
+
+    return bytes;
+}
+
+size_t ggml_backend_sched_get_auxiliary_buffer_size(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    if (sched->qkv_lazy_opencl == nullptr) {
+        return 0;
+    }
+
+    size_t bytes = 0;
+    for (const auto & slot : sched->qkv_lazy_opencl->slots) {
+        if (slot.buffer != nullptr) {
+            bytes += ggml_backend_buffer_get_size(slot.buffer);
+        }
+    }
+    return bytes;
 }
 
 int ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched) {
