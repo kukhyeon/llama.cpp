@@ -398,6 +398,9 @@ extern "C" {
         const char * module_bench_profile;
         const char * module_bench_trace_path;
         const char * module_bench_backend;
+        // Owned-by-value so copied/deferred context parameters cannot retain a
+        // dangling pointer to a temporary common_params string.
+        char graph_memory_stats_path[1024];
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
@@ -420,6 +423,7 @@ extern "C" {
         bool attn_qkv_shards;   // shard each prefill Q/K/V projection across policy backends [EXPERIMENTAL]
         bool attn_out_shards;   // shard the prefill attention output projection across policy backends [EXPERIMENTAL]
         bool memory_stats;      // measure routed-vs-base graph memory while reserving the context [EXPERIMENTAL]
+        bool graph_memory_stats; // write per-built-graph logical and reserved memory statistics [EXPERIMENTAL]
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)

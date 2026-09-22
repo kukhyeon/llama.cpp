@@ -702,6 +702,9 @@ int main(int argc, char ** argv) {
     const std::string memory_stats_path = params.output_dir.empty()
         ? "memory_stats.csv"
         : params.output_dir + "/memory_stats.csv";
+    params.graph_memory_stats_path = params.output_dir.empty()
+        ? "graph_memory_stats.csv"
+        : params.output_dir + "/graph_memory_stats.csv";
     memory_stats_writer memory_stats(params.memory_stats, memory_stats_path);
     if (!memory_stats.ready()) {
         LOG_ERR("%s: unable to create memory stats file: %s\n",

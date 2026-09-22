@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <mutex>
@@ -100,6 +101,90 @@ static bool llama_runtime_route_output_alias_enabled() {
         return parsed;
     }();
     return enabled;
+}
+
+// A process can create more than one llama_context (for example, target and
+// draft contexts). Coordinate a shared trace path so a later context does not
+// truncate rows already written by an earlier one.
+static std::mutex llama_graph_memory_stats_file_mutex;
+static std::unordered_set<std::string> llama_graph_memory_stats_initialized_paths;
+static uint64_t llama_graph_memory_stats_next_event_id = 1;
+
+static std::string llama_graph_memory_csv_field(const std::string & value) {
+    if (value.find_first_of(",\"\n\r") == std::string::npos) {
+        return value;
+    }
+
+    std::string result;
+    result.reserve(value.size() + 2);
+    result.push_back('"');
+    for (char c : value) {
+        if (c == '"') {
+            result.push_back('"');
+        }
+        result.push_back(c);
+    }
+    result.push_back('"');
+    return result;
+}
+
+struct llama_graph_logical_storage {
+    size_t tensor_count = 0;
+    size_t bytes = 0;
+};
+
+static llama_graph_logical_storage llama_graph_measure_logical_storage(
+        ggml_context * ctx, ggml_cgraph * graph) {
+    llama_graph_logical_storage result;
+    if (ctx == nullptr || graph == nullptr) {
+        return result;
+    }
+
+    std::unordered_set<const ggml_tensor *> owned;
+    for (ggml_tensor * tensor = ggml_get_first_tensor(ctx);
+            tensor != nullptr;
+            tensor = ggml_get_next_tensor(ctx, tensor)) {
+        owned.insert(tensor);
+    }
+
+    std::unordered_set<const ggml_tensor *> visited;
+    std::unordered_set<const ggml_tensor *> storage_roots;
+    std::vector<const ggml_tensor *> pending;
+    pending.reserve((size_t) ggml_graph_n_nodes(graph));
+    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+        pending.push_back(ggml_graph_node(graph, i));
+    }
+
+    while (!pending.empty()) {
+        const ggml_tensor * tensor = pending.back();
+        pending.pop_back();
+        if (tensor == nullptr || !visited.insert(tensor).second) {
+            continue;
+        }
+
+        const ggml_tensor * root = tensor;
+        while (root->view_src != nullptr) {
+            root = root->view_src;
+        }
+        if (owned.find(root) != owned.end()) {
+            storage_roots.insert(root);
+        }
+
+        if (tensor->view_src != nullptr) {
+            pending.push_back(tensor->view_src);
+        }
+        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+            if (tensor->src[i] != nullptr) {
+                pending.push_back(tensor->src[i]);
+            }
+        }
+    }
+
+    result.tensor_count = storage_roots.size();
+    for (const ggml_tensor * tensor : storage_roots) {
+        result.bytes += ggml_nbytes(tensor);
+    }
+    return result;
 }
 
 static const char * llama_module_bench_type_name(llama_module_bench_type type) {
@@ -425,6 +510,11 @@ llama_context::llama_context(
     cparams.attn_qkv_shards          = params.attn_qkv_shards;
     cparams.attn_out_shards          = params.attn_out_shards;
     memory_stats_enabled             = params.memory_stats;
+    graph_memory_stats_enabled       = params.graph_memory_stats;
+    graph_memory_stats_path          = params.graph_memory_stats_path[0] != '\0'
+        ? params.graph_memory_stats_path
+        : "graph_memory_stats.csv";
+    graph_memory_stats_initialize();
 
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
     cparams.rope_freq_base   = params.rope_freq_base  == 0.0f ? hparams.rope_freq_base_train  : params.rope_freq_base;
@@ -1160,6 +1250,227 @@ void llama_context::graph_cache_invalidate() {
     graph_cache_active_state = {};
     graph_cache_active_state.max_nodes = active_max_nodes;
     graph_cache_clock = 0;
+}
+
+void llama_context::graph_memory_stats_initialize() {
+    if (!graph_memory_stats_enabled) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(llama_graph_memory_stats_file_mutex);
+    const bool initialize =
+        llama_graph_memory_stats_initialized_paths.insert(graph_memory_stats_path).second;
+    if (!initialize) {
+        return;
+    }
+
+    std::ofstream output(graph_memory_stats_path, std::ios::out | std::ios::trunc);
+    if (!output) {
+        llama_graph_memory_stats_initialized_paths.erase(graph_memory_stats_path);
+        LLAMA_LOG_WARN("%s: unable to create graph memory stats file: %s\n",
+                __func__, graph_memory_stats_path.c_str());
+        graph_memory_stats_enabled = false;
+        return;
+    }
+
+    output <<
+        "schema_version,event_id,event,phase,warmup,graph_type,n_tokens,n_outputs,n_seqs,"
+        "policy_profile,route_mode,cache_entry_count,n_nodes,metadata_empty_used_bytes,"
+        "metadata_arena_used_bytes,metadata_build_bytes,active_metadata_capacity_bytes,"
+        "context_metadata_capacity_bytes,active_scheduler_metadata_bytes,"
+        "context_scheduler_metadata_bytes,active_auxiliary_buffer_bytes,"
+        "context_auxiliary_buffer_bytes,reachable_owned_storage_count,"
+        "logical_unique_storage_bytes,logical_metadata_plus_storage_bytes,row_scope,backend,buffer_type,"
+        "base_planned_peak_bytes,full_planned_peak_bytes,active_compute_reserved_bytes,"
+        "context_compute_reserved_bytes,tracked_context_graph_reserved_bytes\n";
+}
+
+void llama_context::graph_memory_stats_record(
+        const llama_ubatch & ubatch,
+        llm_graph_type gtype,
+        const std::string & backend_policy_profile,
+        llm_graph_result * result,
+        ggml_cgraph * graph,
+        size_t metadata_empty_used_bytes,
+        const std::vector<size_t> & base_planned_sizes,
+        const std::vector<size_t> & full_planned_sizes) {
+    if (!graph_memory_stats_enabled || result == nullptr || graph == nullptr || sched == nullptr) {
+        return;
+    }
+
+    struct buffer_metrics {
+        std::string backend_names;
+        size_t base_planned = 0;
+        size_t full_planned = 0;
+        size_t active_reserved = 0;
+        size_t context_reserved = 0;
+    };
+
+    std::map<ggml_backend_buffer_type_t, buffer_metrics> buffers;
+    const auto add_scheduler_reservation = [&](ggml_backend_sched_t scheduler, bool active) {
+        std::map<ggml_backend_buffer_type_t, size_t> scheduler_sizes;
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            ggml_backend_buffer_type_t buft = backend_buft[i];
+            const size_t bytes = ggml_backend_sched_get_buffer_size(scheduler, backend_ptrs[i]);
+            scheduler_sizes[buft] = std::max(scheduler_sizes[buft], bytes);
+        }
+        for (const auto & [buft, bytes] : scheduler_sizes) {
+            buffers[buft].context_reserved += bytes;
+            if (active) {
+                buffers[buft].active_reserved = bytes;
+            }
+        }
+    };
+
+    for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+        ggml_backend_buffer_type_t buft = backend_buft[i];
+        auto & metrics = buffers[buft];
+        const char * backend_name = ggml_backend_name(backend_ptrs[i]);
+        if (backend_name != nullptr && backend_name[0] != '\0') {
+            if (!metrics.backend_names.empty()) {
+                metrics.backend_names += '|';
+            }
+            metrics.backend_names += backend_name;
+        }
+        if (i < base_planned_sizes.size()) {
+            metrics.base_planned = std::max(metrics.base_planned, base_planned_sizes[i]);
+        }
+        if (i < full_planned_sizes.size()) {
+            metrics.full_planned = std::max(metrics.full_planned, full_planned_sizes[i]);
+        }
+    }
+
+    add_scheduler_reservation(sched.get(), true);
+    for (const auto & entry : graph_cache_entries) {
+        if (entry.scheduler != nullptr) {
+            add_scheduler_reservation(entry.scheduler.get(), false);
+        }
+    }
+
+    const size_t metadata_arena_used_bytes = ggml_used_mem(result->get_ctx());
+    const size_t metadata_build_bytes = metadata_arena_used_bytes >= metadata_empty_used_bytes
+        ? metadata_arena_used_bytes - metadata_empty_used_bytes
+        : 0;
+    const size_t active_metadata_capacity_bytes = result->get_metadata_capacity_bytes();
+    size_t context_metadata_capacity_bytes = active_metadata_capacity_bytes;
+    if (gf_res_reserve != nullptr && gf_res_reserve.get() != result) {
+        context_metadata_capacity_bytes += gf_res_reserve->get_metadata_capacity_bytes();
+    }
+    for (const auto & entry : graph_cache_entries) {
+        if (entry.result != nullptr && entry.result.get() != result &&
+                entry.result.get() != gf_res_reserve.get()) {
+            context_metadata_capacity_bytes += entry.result->get_metadata_capacity_bytes();
+        }
+    }
+
+    const size_t active_scheduler_metadata_bytes =
+        ggml_backend_sched_get_metadata_size(sched.get());
+    const size_t active_auxiliary_buffer_bytes =
+        ggml_backend_sched_get_auxiliary_buffer_size(sched.get());
+    size_t context_scheduler_metadata_bytes = active_scheduler_metadata_bytes;
+    size_t context_auxiliary_buffer_bytes = active_auxiliary_buffer_bytes;
+    for (const auto & entry : graph_cache_entries) {
+        if (entry.scheduler != nullptr) {
+            context_scheduler_metadata_bytes +=
+                ggml_backend_sched_get_metadata_size(entry.scheduler.get());
+            context_auxiliary_buffer_bytes +=
+                ggml_backend_sched_get_auxiliary_buffer_size(entry.scheduler.get());
+        }
+    }
+
+    const llama_graph_logical_storage logical =
+        llama_graph_measure_logical_storage(result->get_ctx(), graph);
+    const size_t logical_metadata_plus_storage_bytes = metadata_arena_used_bytes + logical.bytes;
+
+    size_t cache_entry_count = graph_cache_active_state.valid ? 1 : 0;
+    for (const auto & entry : graph_cache_entries) {
+        cache_entry_count += entry.state.valid ? 1 : 0;
+    }
+
+    std::string route_mode;
+    {
+        std::lock_guard<std::mutex> lock(runtime_route_mutex);
+        route_mode = runtime_route_mode;
+    }
+
+    size_t total_base_planned = 0;
+    size_t total_full_planned = 0;
+    size_t total_active_reserved = 0;
+    size_t total_context_reserved = 0;
+    for (const auto & [buft, metrics] : buffers) {
+        (void) buft;
+        total_base_planned += metrics.base_planned;
+        total_full_planned += metrics.full_planned;
+        total_active_reserved += metrics.active_reserved;
+        total_context_reserved += metrics.context_reserved;
+    }
+    const size_t tracked_context_graph_reserved_bytes =
+        context_metadata_capacity_bytes +
+        context_scheduler_metadata_bytes +
+        context_auxiliary_buffer_bytes +
+        total_context_reserved;
+
+    std::lock_guard<std::mutex> file_lock(llama_graph_memory_stats_file_mutex);
+    std::ofstream output(graph_memory_stats_path, std::ios::out | std::ios::app);
+    if (!output) {
+        LLAMA_LOG_WARN("%s: unable to append graph memory stats file: %s\n",
+                __func__, graph_memory_stats_path.c_str());
+        graph_memory_stats_enabled = false;
+        return;
+    }
+
+    const uint64_t event_id = llama_graph_memory_stats_next_event_id++;
+    const auto write_prefix = [&](
+            const char * row_scope,
+            const std::string & backend,
+            const std::string & buffer_type) {
+        output
+            << 2 << ','
+            << event_id << ",build,"
+            << (ubatch.n_tokens > 1 ? "prefill" : "decode") << ','
+            << (cparams.warmup ? 1 : 0) << ','
+            << (int) gtype << ','
+            << ubatch.n_tokens << ','
+            << n_outputs << ','
+            << ubatch.n_seqs << ','
+            << llama_graph_memory_csv_field(backend_policy_profile) << ','
+            << llama_graph_memory_csv_field(route_mode) << ','
+            << cache_entry_count << ','
+            << ggml_graph_n_nodes(graph) << ','
+            << metadata_empty_used_bytes << ','
+            << metadata_arena_used_bytes << ','
+            << metadata_build_bytes << ','
+            << active_metadata_capacity_bytes << ','
+            << context_metadata_capacity_bytes << ','
+            << active_scheduler_metadata_bytes << ','
+            << context_scheduler_metadata_bytes << ','
+            << active_auxiliary_buffer_bytes << ','
+            << context_auxiliary_buffer_bytes << ','
+            << logical.tensor_count << ','
+            << logical.bytes << ','
+            << logical_metadata_plus_storage_bytes << ','
+            << row_scope << ','
+            << llama_graph_memory_csv_field(backend) << ','
+            << llama_graph_memory_csv_field(buffer_type) << ',';
+    };
+
+    for (const auto & [buft, metrics] : buffers) {
+        write_prefix("buffer", metrics.backend_names, ggml_backend_buft_name(buft));
+        output
+            << metrics.base_planned << ','
+            << metrics.full_planned << ','
+            << metrics.active_reserved << ','
+            << metrics.context_reserved << ",\n";
+    }
+
+    write_prefix("total", "ALL", "ALL");
+    output
+        << total_base_planned << ','
+        << total_full_planned << ','
+        << total_active_reserved << ','
+        << total_context_reserved << ','
+        << tracked_context_graph_reserved_bytes << '\n';
+    output.flush();
 }
 
 llama_context::~llama_context() {
@@ -2185,6 +2496,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     };
 
     bool reused = false;
+    size_t graph_metadata_empty_used_bytes = 0;
+    std::vector<size_t> graph_base_planned_sizes;
+    std::vector<size_t> graph_full_planned_sizes;
     auto * res = gf_res_prev.get();
     auto * gf = res->get_gf();
 
@@ -2264,6 +2578,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         res = gf_res_prev.get();
         gf = res->get_gf();
+        if (graph_memory_stats_enabled) {
+            graph_metadata_empty_used_bytes = ggml_used_mem(res->get_ctx());
+            graph_base_planned_sizes.assign(backend_ptrs.size(), 0);
+            graph_full_planned_sizes.assign(backend_ptrs.size(), 0);
+        }
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
         //const auto t_start_us = ggml_time_us();
@@ -2295,7 +2614,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         const int64_t t_alloc_us = profile_backend_compute ? ggml_time_us() : 0;
-        const bool alloc_ok = ggml_backend_sched_alloc_graph(sched.get(), gf);
+        const bool alloc_ok = graph_memory_stats_enabled
+            ? ggml_backend_sched_alloc_graph_measure(
+                    sched.get(), gf,
+                    graph_base_planned_sizes.data(), graph_full_planned_sizes.data())
+            : ggml_backend_sched_alloc_graph(sched.get(), gf);
         if (profile_backend_compute) {
             ggml_backend_sched_profile_add_build_ms((ggml_time_us() - t_alloc_us) / 1000.0);
         }
@@ -2313,6 +2636,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         graph_cache_active_state.backend_policy_profile = backend_policy_profile;
         graph_cache_active_state.last_used = ++graph_cache_clock;
         graph_cache_capture_active_route();
+        graph_memory_stats_record(
+                ubatch, gtype, backend_policy_profile, res, gf,
+                graph_metadata_empty_used_bytes,
+                graph_base_planned_sizes, graph_full_planned_sizes);
     }
 
     // set the input data for the input tensors
@@ -4199,11 +4526,60 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
                 std::find(routes.candidate_kinds.begin(), routes.candidate_kinds.end(),
                         "weighted_norm") != routes.candidate_kinds.end()) {
             // Attention-side weighted norm candidates contain exactly one
-            // RMS_NORM and one MUL per layer/profile. Their weights live in
-            // model residency buffers and do not consume graph metadata.
+            // RMS_NORM and one MUL. Profiles with the same effective RMS/MUL
+            // placement and resident norm weight share one graph range.
             constexpr uint64_t nodes_per_weighted_norm_variant = 2;
-            res += (uint64_t) model.hparams.n_layer * routes.profiles.size() *
-                nodes_per_weighted_norm_variant;
+            struct weighted_norm_reserve_topology {
+                std::string rms_backend;
+                std::string mul_backend;
+                ggml_tensor * norm_weight = nullptr;
+            };
+
+            uint64_t reserved_weighted_norm_nodes = 0;
+            for (uint32_t il = 0; il < model.hparams.n_layer; ++il) {
+                std::vector<weighted_norm_reserve_topology> prepared;
+                prepared.reserve(routes.profiles.size());
+                for (const std::string & profile : routes.profiles) {
+                    llama_backend_policy_match rms_match;
+                    llama_backend_policy_match mul_match;
+                    const bool have_rms = llama_backend_policy_match_op_for_profile(
+                            profile.c_str(), "attn_rms_norm", "attn_rms_norm",
+                            GGML_OP_RMS_NORM, (int) il, true, rms_match);
+                    const bool have_mul = llama_backend_policy_match_op_for_profile(
+                            profile.c_str(), "attn_norm", "attn_norm",
+                            GGML_OP_MUL, (int) il, true, mul_match);
+                    if (!have_rms || rms_match.backends.empty() ||
+                            !have_mul || mul_match.backends.empty()) {
+                        // Policy validation normally makes this unreachable;
+                        // retain a full slot if it is encountered.
+                        reserved_weighted_norm_nodes += nodes_per_weighted_norm_variant;
+                        continue;
+                    }
+
+                    weighted_norm_reserve_topology candidate;
+                    candidate.rms_backend = rms_match.backends.front();
+                    candidate.mul_backend = mul_match.backends.front();
+                    candidate.norm_weight = model.get_backend_policy_residency_tensor(
+                            model.layers[il].attn_norm, mul_match.backends);
+                    if (candidate.norm_weight == nullptr) {
+                        reserved_weighted_norm_nodes += nodes_per_weighted_norm_variant;
+                        continue;
+                    }
+
+                    const bool duplicate = std::any_of(
+                            prepared.begin(), prepared.end(), [&](const auto & existing) {
+                                return existing.rms_backend == candidate.rms_backend &&
+                                    existing.mul_backend == candidate.mul_backend &&
+                                    existing.norm_weight == candidate.norm_weight;
+                            });
+                    if (!duplicate) {
+                        prepared.push_back(std::move(candidate));
+                    }
+                }
+                reserved_weighted_norm_nodes +=
+                    prepared.size() * nodes_per_weighted_norm_variant;
+            }
+            res += reserved_weighted_norm_nodes;
         }
         if (active_runtime_routes && cparams.attn_out_shards &&
                 std::find(routes.candidate_kinds.begin(), routes.candidate_kinds.end(),
@@ -5656,6 +6032,7 @@ llama_context_params llama_context_default_params() {
         /*.module_bench_profile        =*/ nullptr,
         /*.module_bench_trace_path     =*/ nullptr,
         /*.module_bench_backend        =*/ nullptr,
+        /*.graph_memory_stats_path     =*/ {},
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
@@ -5668,6 +6045,7 @@ llama_context_params llama_context_default_params() {
         /*.attn_qkv_shards             =*/ false,
         /*.attn_out_shards             =*/ false,
         /*.memory_stats                =*/ false,
+        /*.graph_memory_stats          =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
     };
