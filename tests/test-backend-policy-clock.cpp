@@ -1832,6 +1832,177 @@ bool test_profile_only_residency_keeps_full_source(const char * policy_path) {
     return true;
 }
 
+bool test_runtime_route_nearest_token_fallback() {
+    static constexpr char nearest_policy_json[] = R"JSON(
+{
+  "enabled": true,
+  "profiles": {
+    "t64": {
+      "applicability": { "input_tokens": [64, 64], "ubatch_tokens": [64, 64] },
+      "clock_point": {
+        "prime": { "index": 0, "khz": 1000 },
+        "gold":  { "index": 0, "khz": 1000 },
+        "gpu":   { "index": 0, "hz": 1000000 }
+      }
+    },
+    "t128-warm": {
+      "applicability": { "input_tokens": [128, 128], "ubatch_tokens": [128, 128] },
+      "clock_point": {
+        "prime": { "index": 1, "khz": 2000 },
+        "gold":  { "index": 1, "khz": 2000 },
+        "gpu":   { "index": 1, "hz": 2000000 }
+      }
+    },
+    "t128-hot": {
+      "applicability": { "input_tokens": [128, 128], "ubatch_tokens": [128, 128] },
+      "clock_point": {
+        "prime": { "index": 2, "khz": 3000 },
+        "gold":  { "index": 2, "khz": 3000 },
+        "gpu":   { "index": 2, "hz": 3000000 }
+      }
+    },
+    "t256": {
+      "applicability": { "input_tokens": [256, 256], "ubatch_tokens": [256, 256] },
+      "clock_point": {
+        "prime": { "index": 3, "khz": 4000 },
+        "gold":  { "index": 3, "khz": 4000 },
+        "gpu":   { "index": 3, "hz": 4000000 }
+      }
+    },
+    "t512": {
+      "applicability": { "input_tokens": [512, 512], "ubatch_tokens": [512, 512] },
+      "clock_point": {
+        "prime": { "index": 4, "khz": 5000 },
+        "gold":  { "index": 4, "khz": 5000 },
+        "gpu":   { "index": 4, "hz": 5000000 }
+      }
+    }
+  },
+  "runtime_routes": {
+    "enabled": true,
+    "mode": "clock",
+    "phase": "prefill",
+    "token_fallback": "nearest",
+    "initial_profile": "t64",
+    "profiles": ["t64", "t128-warm", "t128-hot", "t256", "t512"],
+    "transitions": {
+      "t64": ["t128-warm"],
+      "t128-warm": ["t64", "t128-hot", "t256"],
+      "t128-hot": ["t128-warm"],
+      "t256": ["t128-warm", "t512"],
+      "t512": ["t256"]
+    },
+    "candidate_kinds": ["weightless_stateless"],
+    "boundary": { "node": "l_out", "backend": "auto", "granularity": "layer" },
+    "output_mode": "canonical"
+  }
+}
+)JSON";
+
+    std::string nearest_policy = nearest_policy_json;
+    std::string exact_policy = nearest_policy;
+    const std::string fallback_line = "    \"token_fallback\": \"nearest\",\n";
+    const size_t fallback_pos = exact_policy.find(fallback_line);
+    CHECK(fallback_pos != std::string::npos);
+    exact_policy.erase(fallback_pos, fallback_line.size());
+
+    std::string invalid_policy = nearest_policy;
+    const size_t invalid_pos = invalid_policy.find("\"nearest\"");
+    CHECK(invalid_pos != std::string::npos);
+    invalid_policy.replace(invalid_pos, std::string("\"nearest\"").size(), "\"closest\"");
+
+    temporary_policy_file nearest_file(
+            "test-backend-policy-runtime-routes-token-nearest.json",
+            nearest_policy.c_str());
+    temporary_policy_file exact_file(
+            "test-backend-policy-runtime-routes-token-exact.json",
+            exact_policy.c_str());
+    temporary_policy_file invalid_file(
+            "test-backend-policy-runtime-routes-token-invalid.json",
+            invalid_policy.c_str());
+
+    llama_backend_policy_clear();
+    CHECK(llama_backend_policy_load(nearest_file.path(), false, false));
+
+    llama_backend_policy_runtime_routes routes;
+    CHECK(llama_backend_policy_resolve_runtime_routes(true, routes));
+    CHECK(routes.token_fallback == "nearest");
+
+    llama_backend_policy_runtime_route_selection selection;
+
+    // Every authored shape retains its own bucket before clock distance is
+    // considered.
+    CHECK(llama_backend_policy_select_runtime_route_profile(
+            nullptr, true, 64, 64, 1000, 1000, 1000000, selection));
+    CHECK(selection.matched && selection.profile == "t64");
+    CHECK(llama_backend_policy_select_runtime_route_profile(
+            nullptr, true, 128, 128, 3000, 3000, 3000000, selection));
+    CHECK(selection.matched && selection.profile == "t128-hot");
+    CHECK(llama_backend_policy_select_runtime_route_profile(
+            nullptr, true, 256, 256, 4000, 4000, 4000000, selection));
+    CHECK(selection.matched && selection.profile == "t256");
+    CHECK(llama_backend_policy_select_runtime_route_profile(
+            nullptr, true, 512, 512, 5000, 5000, 5000000, selection));
+    CHECK(selection.matched && selection.profile == "t512");
+
+    // Unsupported input/ubatch sizes snap to the closest authored bucket.
+    CHECK(llama_backend_policy_select_runtime_route_profile(
+            nullptr, true, 100, 100, 3000, 3000, 3000000, selection));
+    CHECK(selection.matched && selection.profile == "t128-hot");
+    CHECK(llama_backend_policy_select_runtime_route_profile(
+            nullptr, true, 300, 300, 4000, 4000, 4000000, selection));
+    CHECK(selection.matched && selection.profile == "t256");
+    CHECK(llama_backend_policy_select_runtime_route_profile(
+            nullptr, true, 1, 1, 5000, 5000, 5000000, selection));
+    CHECK(selection.matched && selection.profile == "t64");
+    CHECK(llama_backend_policy_select_runtime_route_profile(
+            nullptr, true, 800, 800, 1000, 1000, 1000000, selection));
+    CHECK(selection.matched && selection.profile == "t512");
+    CHECK(!llama_backend_policy_select_runtime_route_profile(
+            nullptr, true, 0, 0, 1000, 1000, 1000000, selection));
+    CHECK(selection.enabled && !selection.matched);
+
+    // 96 is equally distant from 64 and 128 on both axes. The smaller input
+    // and ubatch anchors win even though the measured clock exactly matches a
+    // profile in the larger bucket.
+    CHECK(llama_backend_policy_select_runtime_route_profile(
+            nullptr, true, 96, 96, 3000, 3000, 3000000, selection));
+    CHECK(selection.matched && selection.profile == "t64");
+
+    // Input distance ties first; a closer ubatch then selects the 128 bucket.
+    CHECK(llama_backend_policy_select_runtime_route_profile(
+            nullptr, true, 96, 128, 3000, 3000, 3000000, selection));
+    CHECK(selection.matched && selection.profile == "t128-hot");
+
+    // The target is t128-hot, but it is two transitions away. The first hop
+    // may use t128-warm because it belongs to the same selected token bucket.
+    CHECK(llama_backend_policy_select_runtime_route_profile(
+            "t64", true, 100, 100, 3000, 3000, 3000000, selection));
+    CHECK(selection.matched && selection.profile == "t128-warm");
+    CHECK(llama_backend_policy_select_runtime_route_profile(
+            "t128-warm", true, 100, 100, 3000, 3000, 3000000, selection));
+    CHECK(selection.matched && selection.profile == "t128-hot");
+
+    // A bad replacement remains transactional.
+    CHECK(!llama_backend_policy_load(invalid_file.path(), false, false));
+    CHECK(llama_backend_policy_resolve_runtime_routes(true, routes));
+    CHECK(routes.token_fallback == "nearest");
+
+    // Omitting token_fallback preserves the legacy exact-only behavior.
+    CHECK(llama_backend_policy_load(exact_file.path(), false, false));
+    CHECK(llama_backend_policy_resolve_runtime_routes(true, routes));
+    CHECK(routes.token_fallback == "exact");
+    CHECK(!llama_backend_policy_select_runtime_route_profile(
+            nullptr, true, 100, 100, 3000, 3000, 3000000, selection));
+    CHECK(selection.enabled && !selection.matched);
+    CHECK(llama_backend_policy_select_runtime_route_profile(
+            nullptr, true, 128, 128, 3000, 3000, 3000000, selection));
+    CHECK(selection.matched && selection.profile == "t128-hot");
+
+    llama_backend_policy_clear();
+    return true;
+}
+
 bool test_runtime_route_catalog(const char * policy_path) {
     llama_backend_policy_clear();
     CHECK(llama_backend_policy_load(policy_path, false, true));
@@ -3024,6 +3195,10 @@ int main() {
             return 1;
         }
         if (!test_runtime_route_catalog(runtime_routes_file.path())) {
+            llama_backend_policy_clear();
+            return 1;
+        }
+        if (!test_runtime_route_nearest_token_fallback()) {
             llama_backend_policy_clear();
             return 1;
         }
