@@ -1,3 +1,4 @@
+#include "ggml-shared-weights.h"
 #include "llama-backend-policy.h"
 
 #include "llama-impl.h"
@@ -753,6 +754,30 @@ llama_backend_policy_ffn_parallel materialize_ffn_policy(const ffn_parallel_poli
         out.source = "LLAMA_FFN_PARALLEL_SPLITS";
     }
 
+    if (ggml_shared_weights_enabled() && out.enabled) {
+        // Preserve each lane's size and identity; place the HTP lane centrally.
+        auto rank = [](const std::string & name) {
+            const auto n = lower(name);
+            if (n.find("opencl") != std::string::npos || n == "gpu") { return 0; }
+            if (n.find("htp") != std::string::npos || n.find("hexagon") != std::string::npos) { return 1; }
+            if (n.find("cpu") != std::string::npos) { return 2; }
+            return 3;
+        };
+        if (out.splits.size() != 3) {
+            throw std::runtime_error("shared HTP FFN requires GPU, HTP, CPU lanes");
+        }
+        std::stable_sort(out.splits.begin(), out.splits.end(), [&](const auto & a, const auto & b) {
+            return rank(a.backend) < rank(b.backend);
+        });
+        int64_t start = 0;
+        for (size_t i = 0; i < out.splits.size(); ++i) {
+            if (rank(out.splits[i].backend) != (int) i) {
+                throw std::runtime_error("shared HTP FFN requires one GPU, HTP, CPU lane each");
+            }
+            out.splits[i].start = start;
+            start += out.splits[i].size;
+        }
+    }
     return out;
 }
 
@@ -3211,6 +3236,73 @@ bool llama_backend_policy_list_ffn_parallel_load_policies(
     return !out.empty();
 }
 
+// Convert backend unions into disjoint physical storage. HTP intervals are
+// shared; only pieces outside those intervals retain a backend-native layout.
+static void shared_weight_residency(llama_backend_policy_residency_plan & plan, bool attention) {
+    if (!ggml_shared_weights_enabled() || plan.covers.empty()) { return; }
+    std::vector<llama_backend_policy_residency_cover> shared;
+    std::vector<std::string> consumers;
+    int64_t width = 0;
+    for (const auto & c : plan.covers) {
+        width = std::max(width, c.start + c.size);
+        if (std::find(consumers.begin(), consumers.end(), c.backend) == consumers.end()) {
+            consumers.push_back(c.backend);
+        }
+        const auto name = lower(c.backend);
+        if (name.find("htp") != std::string::npos) {
+            auto s = c;
+            const auto suffix = s.backend.find('-');
+            s.backend = s.backend.substr(0, suffix) + "-SHARED";
+            s.id = "shared." + std::to_string(s.start) + "." + std::to_string(s.size);
+            shared.push_back(std::move(s));
+        }
+    }
+    if (shared.empty()) {
+        // A tensor never requested by HTP has no HTP overlap to eliminate.
+        return;
+    }
+    if (attention) {
+        // Ordinary decode/fallback still needs a full projection. Store that
+        // projection once in shared HTP layout and alias all prefill covers.
+        shared.resize(1);
+        shared[0].start = 0;
+        shared[0].size = width;
+        shared[0].id = "shared.canonical";
+    } else if (plan.keep_full_source) {
+        throw std::runtime_error("shared HTP FFN requires an all-phase root and fully covered layer policies");
+    }
+    std::sort(shared.begin(), shared.end(), [](const auto & a, const auto & b) { return a.start < b.start; });
+    for (auto & s : shared) { s.consumers = consumers; }
+    std::vector<llama_backend_policy_residency_cover> result = shared;
+    for (const auto & c : plan.covers) {
+        int64_t cursor = c.start;
+        const int64_t end = c.start + c.size;
+        for (const auto & s : shared) {
+            if (s.start + s.size <= cursor || s.start >= end) { continue; }
+            if (cursor < s.start) {
+                auto n = c; n.start = cursor; n.size = s.start - cursor;
+                n.id += ".native." + std::to_string(cursor); result.push_back(std::move(n));
+            }
+            cursor = std::max(cursor, s.start + s.size);
+        }
+        if (cursor < end) {
+            auto n = c; n.start = cursor; n.size = end - cursor;
+            n.id += ".native." + std::to_string(cursor); result.push_back(std::move(n));
+        }
+    }
+    // Overlap outside HTP needs another shared layout; do not silently retain duplicates.
+    for (size_t i = shared.size(); i < result.size(); ++i) {
+        for (size_t j = i + 1; j < result.size(); ++j) {
+            if (std::max(result[i].start, result[j].start) <
+                    std::min(result[i].start + result[i].size, result[j].start + result[j].size)) {
+                throw std::runtime_error("shared HTP policy has native-only backend overlap outside HTP cover");
+            }
+        }
+    }
+    plan.covers = std::move(result);
+    plan.source += " shared HTP";
+}
+
 bool llama_backend_policy_build_ffn_residency_plan(
         int il,
         llama_backend_policy_residency_plan & out) {
@@ -3333,6 +3425,7 @@ bool llama_backend_policy_build_ffn_residency_plan(
         append_cover();
     }
 
+    shared_weight_residency(out, false);
     return !out.covers.empty();
 }
 
@@ -3482,6 +3575,7 @@ bool llama_backend_policy_build_attn_qkv_residency_plan(
     out.enabled = !out.covers.empty();
     out.keep_full_source = true;
     out.source = std::string("attn_qkv_shards ") + projection_name + " axis-1 covers";
+    shared_weight_residency(out, true);
     return out.enabled;
 }
 
@@ -3590,6 +3684,7 @@ bool llama_backend_policy_build_attn_out_residency_plan(
     out.source = g_policy.attn_out_shards.partition_axis == "output"
         ? "attn_out_shards axis-1 covers"
         : "attn_out_shards axis-0 covers";
+    shared_weight_residency(out, true);
     return out.enabled;
 }
 

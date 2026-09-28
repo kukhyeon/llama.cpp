@@ -1,3 +1,4 @@
+#include "ggml-shared-weights.h"
 #include "llama-context.h"
 
 #include "ggml.h"
@@ -4442,7 +4443,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
             // reserve separate from weightless single-node clones. Profiles
             // with the same effective FFN and norm placement share one graph
             // range, so reserve one variant for each unique topology.
-            constexpr uint64_t fallback_nodes_per_ffn_variant = 20;
+            const uint64_t fallback_nodes_per_ffn_variant = ggml_shared_weights_enabled() ? 32 : 20;
             struct ffn_reserve_topology {
                 llama_backend_policy_ffn_parallel policy;
                 std::vector<std::string> rms_backends;
@@ -4513,10 +4514,12 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
                             topology.policy.splits.begin(), topology.policy.splits.end(),
                             [](const auto & split) { return split.size > 0; });
                     // Two norm nodes, four nodes per active shard, and at most
-                    // N-1 reduction nodes. Keep four extra slots for probes or
+                    // N-1 reduction nodes. Shared mode allows two segments
+                    // (eight ops plus their local sum) per active lane.
+                    // Keep four extra slots for probes or
                     // future post-ops without assuming that FFN has only three
                     // processor lanes.
-                    reserved_ffn_nodes += 2u + 4u * active_splits +
+                    reserved_ffn_nodes += 2u + (ggml_shared_weights_enabled() ? 9u : 4u) * active_splits +
                         (active_splits > 0 ? active_splits - 1u : 0u) + 4u;
                 }
             }
@@ -5046,6 +5049,34 @@ llm_graph_cb llama_context::graph_get_cb(int32_t policy_phase_override) const {
                         ggml_get_name(cur), ggml_op_name(cur->op), il,
                         graph_is_prefill ? "prefill" : "decode",
                         policy_match.source.c_str());
+            }
+        }
+
+        // Shared storage has no execution owner. Preserve the original ordinary
+        // projection placement after explicit shard/op hints have been applied.
+        if (ggml_shared_weights_tensor(cur->src[0])) {
+            const auto preferred = model.shared_weight_device(cur->src[0]);
+            llama_backend_policy_match weight_match;
+            const bool profile = llama_backend_policy_match_profile_weight(
+                ggml_get_name(cur->src[0]), graph_is_prefill, weight_match);
+            auto bind = [&](ggml_backend_t backend) {
+                if (!ggml_backend_supports_op(backend, cur)) { return false; }
+                ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend);
+                ggml_shared_weights_log("bind", cur->src[0], ggml_backend_name(backend),
+                    -1, 0, 0, ggml_get_name(cur));
+                return true;
+            };
+            if (profile) {
+                for (const auto & name : weight_match.backends) {
+                    for (const auto & backend : backends) {
+                        if (llama_backend_policy_backend_matches(backend.get(), name) && bind(backend.get())) {
+                            return;
+                        }
+                    }
+                }
+            }
+            for (const auto & backend : backends) {
+                if (ggml_backend_get_device(backend.get()) == preferred && bind(backend.get())) { return; }
             }
         }
 

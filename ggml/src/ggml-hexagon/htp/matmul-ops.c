@@ -2858,11 +2858,10 @@ static int htp_matmul_region_validate(
         return HTP_STATUS_INVAL_PARAMS;
     }
 
-    // Q8_0 is repacked as x4x2 super-blocks.  Requiring the active K range
-    // to start/end on a super-block keeps the gathered quant and scale rows
-    // wire-compatible with the existing HVX dot kernels.
+    // The gathered row keeps a 256-element length. Source Q8 quants and
+    // scales are independently addressable on 32-element block boundaries.
     if ((src0->ne[0] % QK_Q8_0x4x2) != 0 ||
-        (k_start % QK_Q8_0x4x2) != 0 ||
+        (k_start % 32) != 0 ||
         (k_size % QK_Q8_0x4x2) != 0) {
         return HTP_STATUS_INVAL_PARAMS;
     }

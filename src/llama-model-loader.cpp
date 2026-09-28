@@ -1,3 +1,4 @@
+#include "ggml-shared-weights.h"
 #include "llama-model-loader.h"
 
 #include "ggml-alloc.h"
@@ -1490,6 +1491,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             return false;
         }
 
+        if (ggml_shared_weights_enabled() && cur->type != GGML_TYPE_Q8_0) {
+            throw std::runtime_error("shared HTP residency currently requires Q8_0");
+        }
         bool complete = true;
         const int64_t cover_dim = axis == 0 ? cur->ne[0] : cur->ne[1];
         const bool require_unique_execution_devices =
@@ -1605,7 +1609,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 same_canonical_layout;
             if (aliases_canonical) {
                 const llama_tensor_cover_info alias_info = {
-                    tensor_name, cover.backend, axis, cover.start, cover.size
+                    tensor_name, cover.backend, axis, cover.start, cover.size, cover.consumers
                 };
                 const auto inserted = residency_cover_alias_infos.emplace(
                         canonical_tensor, alias_info);
@@ -1650,7 +1654,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             residency_tensors.insert(resident);
             residency_tensors_by_name[tensor_name].push_back(resident);
             residency_cover_infos[resident] = {
-                tensor_name, cover.backend, axis, cover.start, cover.size
+                tensor_name, cover.backend, axis, cover.start, cover.size, cover.consumers
             };
             size_data += ggml_nbytes(resident);
 
@@ -1871,7 +1875,32 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return tensor;
     }
 
-    ggml_backend_buffer_type_t buft = buft_for_tensor(t_meta);
+    ggml_backend_buffer_type_t buft = nullptr;
+    ggml_backend_dev_t shared_weight_device = nullptr;
+    const auto * shared_attention_plan = attn_qkv_layer_enabled ? &attn_qkv_residency_plan :
+        attn_out_layer_enabled ? &attn_out_residency_plan : nullptr;
+    if (ggml_shared_weights_enabled() && shared_attention_plan &&
+            shared_attention_plan->covers.size() == 1 &&
+            !shared_attention_plan->covers[0].consumers.empty()) {
+        if (t_meta->type != GGML_TYPE_Q8_0) {
+            throw std::runtime_error("shared HTP weights currently require Q8_0");
+        }
+        const auto original_buft = buft_for_tensor(t_meta);
+        if (!original_buft) { return nullptr; }
+        shared_weight_device = ggml_backend_buft_get_device(original_buft);
+        if (!shared_weight_device) {
+            shared_weight_device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        }
+        const auto & physical = shared_attention_plan->covers[0];
+        llama_backend_policy_match match;
+        match.matched = true; match.backends = {physical.backend}; match.source = shared_attention_plan->source;
+        buft = select_policy_weight_buft(hparams, t_meta, GGML_OP_MUL_MAT, match, buft_list_all);
+        if (!buft || !ggml_shared_weights_is_buft(buft)) {
+            throw std::runtime_error("shared HTP canonical weight buffer unavailable for " + tn.str());
+        }
+    } else {
+        buft = buft_for_tensor(t_meta);
+    }
     if (buft == nullptr) {
         return nullptr; // return type is ggml_tensor *
     }
@@ -1896,6 +1925,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, cur);
     ggml_set_name(tensor, ggml_get_name(cur));
+    if (shared_weight_device) {
+        shared_weight_devices.emplace(tensor, shared_weight_device);
+    }
 
     if (ffn_parallel_layer_enabled) {
         // Always create independently packed connected covers, even when the

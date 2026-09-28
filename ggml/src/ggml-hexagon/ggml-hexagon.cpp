@@ -35,6 +35,7 @@
 
 #define GGML_COMMON_IMPL_CPP
 #include "ggml-backend-impl.h"
+#include "ggml-shared-weights.h"
 #include "ggml-common.h"
 #include "ggml-hexagon.h"
 #include "ggml-impl.h"
@@ -170,6 +171,7 @@ struct ggml_hexagon_session {
 
     ggml_backend_buffer_type buffer_type        = {};
     ggml_backend_buffer_type repack_buffer_type = {};
+    ggml_backend_buffer_type shared_buffer_type = {};
 
     ggml_hexagon_session(int dev_id, ggml_backend_dev_t dev) noexcept(false);
     ~ggml_hexagon_session() noexcept(true);
@@ -1372,6 +1374,10 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                                    size_t                size) {
     auto sbuf = (ggml_hexagon_shared_buffer *) buffer->context;
     auto sess = sbuf->sess;
+    if (ggml_shared_weights_is_buft(buffer->buft)) {
+        GGML_ASSERT(tensor->type == GGML_TYPE_Q8_0);
+        GGML_ASSERT(tensor->ne[0] % QK_Q8_0x4x2 == 0);
+    }
 
     HEX_VERBOSE("ggml-hex: %s set-tensor %s : data %p offset %zu size %zu\n", sess->c_name(), tensor->name, data, offset, size);
 
@@ -1502,9 +1508,15 @@ static ggml_backend_buffer_t ggml_backend_hexagon_repack_buffer_type_alloc_buffe
             ggml_backend_buffer_type_t buffer_type, size_t size) {
     auto sess = static_cast<ggml_backend_hexagon_buffer_type_context *>(buffer_type->context)->sess;
     try {
-        size += 4 * 1024;  // guard page
+        const bool shared = ggml_shared_weights_is_buft(buffer_type);
+        const size_t usable = size;
+        size += 4 * 1024;  // guard page and external-memory import padding
         ggml_hexagon_shared_buffer * sbuf = new ggml_hexagon_shared_buffer(sess, size);
-        return ggml_backend_buffer_init(buffer_type, ggml_backend_hexagon_buffer_interface, sbuf, size);
+        auto buffer = ggml_backend_buffer_init(buffer_type, ggml_backend_hexagon_buffer_interface, sbuf, shared ? usable : size);
+        if (shared) {
+            ggml_shared_weights_register_buffer(buffer, sbuf->base, usable, size, sbuf->fd);
+        }
+        return buffer;
     } catch (const std::exception & exc) {
         GGML_LOG_ERROR("ggml-hex: %s failed to allocate buffer context (repack): %s\n", sess->c_name(), exc.what());
         return nullptr;
@@ -2371,6 +2383,7 @@ void ggml_hexagon_session::release() noexcept(true) {
 ggml_hexagon_session::ggml_hexagon_session(int dev_id, ggml_backend_dev_t dev) noexcept(false) {
     buffer_type.device        = dev;
     repack_buffer_type.device = dev;
+    shared_buffer_type.device = dev;
 
     op_batch = nullptr;
     op_queue = nullptr;
@@ -2383,6 +2396,9 @@ ggml_hexagon_session::ggml_hexagon_session(int dev_id, ggml_backend_dev_t dev) n
 
         repack_buffer_type.iface   = ggml_backend_hexagon_repack_buffer_type_interface;
         repack_buffer_type.context = new ggml_backend_hexagon_buffer_type_context(this->name + "-REPACK", this);
+        shared_buffer_type.iface = ggml_backend_hexagon_repack_buffer_type_interface;
+        shared_buffer_type.context = new ggml_backend_hexagon_buffer_type_context(this->name + "-SHARED", this);
+        ggml_shared_weights_register_buft(&shared_buffer_type);
     } catch (const std::exception & exc) {
         release();
         throw;
@@ -2394,6 +2410,8 @@ ggml_hexagon_session::~ggml_hexagon_session() noexcept(true) {
 
     delete static_cast<ggml_backend_hexagon_buffer_type_context *>(buffer_type.context);
     delete static_cast<ggml_backend_hexagon_buffer_type_context *>(repack_buffer_type.context);
+    ggml_shared_weights_unregister_buft(&shared_buffer_type);
+    delete static_cast<ggml_backend_hexagon_buffer_type_context *>(shared_buffer_type.context);
 }
 
 // ** backend interface
@@ -2523,10 +2541,10 @@ static bool ggml_hexagon_supported_mul_mat_src0_region(
         return false;
     }
 
-    // The HTP Q8_0 physical format is grouped in x4x2 (256-element)
-    // super-blocks.  Active starts/sizes must preserve that grouping.
+    // Parent and compact destination rows retain 256-element grouping. Q8
+    // quants/scales can start at any ordinary 32-element quantization block.
     if ((src0->ne[0] % QK_Q8_0x4x2) != 0 ||
-        (params.k_start % QK_Q8_0x4x2) != 0 ||
+        (params.k_start % 32) != 0 ||
         (params.k_size  % QK_Q8_0x4x2) != 0) {
         return false;
     }
@@ -3667,9 +3685,10 @@ static ggml_backend_buffer_type_t * ggml_backend_hexagon_device_get_extra_buffer
     auto s0 = static_cast<ggml_hexagon_session *>(dev->context);
     HEX_VERBOSE("ggml-hex: device-get-extra-buft : %s \n", s0->name.c_str());
 
-    static ggml_backend_buffer_type_t bufts[2];
+    static ggml_backend_buffer_type_t bufts[3];
     bufts[0] = ggml_backend_hexagon_device_get_repack_buffer_type(dev);
-    bufts[1] = NULL;
+    bufts[1] = ggml_shared_weights_enabled() ? &s0->shared_buffer_type : nullptr;
+    bufts[2] = nullptr;
     return bufts;
 }
 

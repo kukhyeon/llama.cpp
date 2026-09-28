@@ -1,5 +1,6 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
+#include "ggml-shared-weights.h"
 #include "ggml-cpu.h"
 #include "repack.h"
 #include "traits.h"
@@ -442,6 +443,10 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         return true;
     }
 
+    if (ggml_shared_weights_tensor(src0)) {
+        return ggml_shared_weights_supports_op(op);
+    }
+
     // check extra buffer types
     // note: only the first sources are checked for extra buffer types to reduce overhead, increase if necessary
     for (int i = 0; i < 4; i++) {
@@ -509,7 +514,7 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
 }
 
 static bool ggml_backend_cpu_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
-    return ggml_backend_buft_is_host(buft) || ggml_backend_cpu_is_extra_buffer_type(buft);
+    return ggml_shared_weights_is_buft(buft) || ggml_backend_buft_is_host(buft) || ggml_backend_cpu_is_extra_buffer_type(buft);
     GGML_UNUSED(dev);
 }
 

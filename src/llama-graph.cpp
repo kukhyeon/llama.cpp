@@ -1,3 +1,4 @@
+#include "ggml-shared-weights.h"
 #include "llama-graph.h"
 
 #include "llama-impl.h"
@@ -1645,6 +1646,11 @@ bool llm_graph_context::build_qkv_shards(
         const std::string name = std::string("attn_qkv_shard.") + lane.split.id + route_suffix + "." +
             projection + ".proj";
         cb_route(shard, name.c_str(), il, lane.split.backend.c_str());
+        if (ggml_shared_weights_enabled()) {
+            const int64_t start = projection == 'q' ? lane.split.q_start :
+                projection == 'k' ? lane.split.k_start : lane.split.v_start;
+            ggml_shared_weights_log("bind", weight, lane.split.backend.c_str(), 1, start, size, name.c_str());
+        }
         return shard;
     };
 
@@ -2080,6 +2086,11 @@ bool llm_graph_context::build_attn_out_shards(
         const std::string projection_name =
             "attn_out_shard." + split.id + route_suffix + ".proj";
         cb_route(lane.projection, projection_name.c_str(), il, split.backend.c_str());
+        if (ggml_shared_weights_enabled()) {
+            ggml_shared_weights_log("bind", lane.cover.tensor, split.backend.c_str(),
+                output_axis ? 1 : 0, split.start, split.size, projection_name.c_str());
+        }
+
 
         const ggml_backend_t projection_backend = sched != nullptr
             ? ggml_backend_sched_get_tensor_backend(sched, lane.projection)
@@ -2321,71 +2332,58 @@ ggml_tensor * llm_graph_context::build_ffn(
             branch_outs.reserve(exec_splits.size());
 
             for (const auto & split : exec_splits) {
-                const auto up_cover =
-                    model->get_backend_policy_resident_cover(up, split.backend, 1, split.start, split.size);
-                const auto gate_cover =
-                    model->get_backend_policy_resident_cover(gate, split.backend, 1, split.start, split.size);
-                const auto down_cover =
-                    model->get_backend_policy_resident_cover(down, split.backend, 0, split.start, split.size);
-
-                if (up_cover.tensor == nullptr || gate_cover.tensor == nullptr || down_cover.tensor == nullptr) {
-                    valid = false;
-                    LLAMA_LOG_DEBUG("backend_policy: ffn_parallel layer %d shard %s missing a containing resident cover for backend %s; falling back\n",
-                            il, split.id.c_str(), split.backend.c_str());
-                    break;
-                }
-
-                const std::string suffix = route_suffix + "." +
+                const auto segments = model->get_backend_policy_resident_segments(
+                    up, split.backend, 1, split.start, split.size);
+                if (segments.empty()) { valid = false; break; }
+                const std::string branch_suffix = route_suffix + "." +
                     (split.id.empty() ? split.backend : split.id);
-
-                const bool covers_consistent =
-                    up_cover.cover_start == gate_cover.cover_start &&
-                    up_cover.cover_start == down_cover.cover_start &&
-                    up_cover.cover_size == gate_cover.cover_size &&
-                    up_cover.cover_size == down_cover.cover_size &&
-                    up_cover.local_start == gate_cover.local_start &&
-                    up_cover.local_start == down_cover.local_start &&
-                    up_cover.local_start >= 0 &&
-                    up_cover.local_start <= up_cover.cover_size - split.size &&
-                    up_cover.tensor->ne[0] == up->ne[0] &&
-                    gate_cover.tensor->ne[0] == gate->ne[0] &&
-                    up_cover.tensor->ne[1] == up_cover.cover_size &&
-                    gate_cover.tensor->ne[1] == gate_cover.cover_size &&
-                    down_cover.tensor->ne[0] == down_cover.cover_size &&
-                    down_cover.tensor->ne[1] == down->ne[1];
-                if (!covers_consistent) {
-                    valid = false;
-                    LLAMA_LOG_DEBUG("backend_policy: ffn_parallel layer %d shard %s has inconsistent resident cover metadata for backend %s; falling back\n",
-                            il, split.id.c_str(), split.backend.c_str());
-                    break;
+                ggml_tensor * branch_sum = nullptr;
+                for (size_t si = 0; si < segments.size(); ++si) {
+                    const auto & up_cover = segments[si];
+                    const int64_t start = up_cover.cover_start + up_cover.local_start;
+                    const int64_t size = up_cover.active_size;
+                    const auto gate_cover = model->get_backend_policy_resident_cover(gate, split.backend, 1, start, size);
+                    const auto down_cover = model->get_backend_policy_resident_cover(down, split.backend, 0, start, size);
+                    if (!gate_cover.tensor || !down_cover.tensor ||
+                            up_cover.cover_start != gate_cover.cover_start ||
+                            up_cover.cover_start != down_cover.cover_start ||
+                            up_cover.cover_size != gate_cover.cover_size ||
+                            up_cover.cover_size != down_cover.cover_size ||
+                            up_cover.tensor->ne[0] != up->ne[0] ||
+                            gate_cover.tensor->ne[0] != gate->ne[0] ||
+                            down_cover.tensor->ne[1] != down->ne[1]) {
+                        valid = false; break;
+                    }
+                    const std::string suffix = branch_suffix +
+                        (segments.size() > 1 ? ".segment" + std::to_string(si) : "");
+                    ggml_tensor * up_cur = ggml_mul_mat_src0_region(ctx0, up_cover.tensor, cur,
+                        0, up_cover.tensor->ne[0], up_cover.local_start, size);
+                    cb_parallel(up_cur, ("ffn_up" + suffix).c_str(), split.backend.c_str());
+                    ggml_tensor * gate_cur = ggml_mul_mat_src0_region(ctx0, gate_cover.tensor, cur,
+                        0, gate_cover.tensor->ne[0], gate_cover.local_start, size);
+                    cb_parallel(gate_cur, ("ffn_gate" + suffix).c_str(), split.backend.c_str());
+                    ggml_tensor * act = ggml_swiglu_split(ctx0, gate_cur, up_cur);
+                    cb_parallel(act, ("ffn_swiglu" + suffix).c_str(), split.backend.c_str());
+                    ggml_tensor * partial = ggml_mul_mat_src0_region(ctx0, down_cover.tensor, act,
+                        down_cover.local_start, size, 0, down_cover.tensor->ne[1]);
+                    cb_parallel(partial, ("ffn_down" + suffix).c_str(), split.backend.c_str());
+                    if (!branch_sum) { branch_sum = partial; }
+                    else {
+                        branch_sum = ggml_add(ctx0, branch_sum, partial);
+                        cb_parallel(branch_sum, ("ffn_segment_sum" + branch_suffix).c_str(), split.backend.c_str());
+                    }
+                    if (ggml_shared_weights_enabled()) {
+                        for (auto * weight : {up_cover.tensor, gate_cover.tensor, down_cover.tensor}) {
+                            ggml_shared_weights_log("bind", weight, split.backend.c_str(),
+                                weight == down_cover.tensor ? 0 : 1, start, size, suffix.c_str());
+                        }
+                    }
                 }
-
-                // The cover tensors stay resident and independently packed for
-                // their processor. Only these immutable node-local regions
-                // change when a query-boundary clock profile selects a new
-                // shard proportion.
-                ggml_tensor * up_cur = ggml_mul_mat_src0_region(
-                        ctx0, up_cover.tensor, cur,
-                        0, up_cover.tensor->ne[0],
-                        up_cover.local_start, split.size);
-                cb_parallel(up_cur, ("ffn_up" + suffix).c_str(), split.backend.c_str());
-
-                ggml_tensor * gate_cur = ggml_mul_mat_src0_region(
-                        ctx0, gate_cover.tensor, cur,
-                        0, gate_cover.tensor->ne[0],
-                        gate_cover.local_start, split.size);
-                cb_parallel(gate_cur, ("ffn_gate" + suffix).c_str(), split.backend.c_str());
-
-                ggml_tensor * act = ggml_swiglu_split(ctx0, gate_cur, up_cur);
-                cb_parallel(act, ("ffn_swiglu" + suffix).c_str(), split.backend.c_str());
-
-                ggml_tensor * branch = ggml_mul_mat_src0_region(
-                        ctx0, down_cover.tensor, act,
-                        down_cover.local_start, split.size,
-                        0, down_cover.tensor->ne[1]);
-                cb_parallel(branch, ("ffn_down" + suffix).c_str(), split.backend.c_str());
-
-                branch_outs.push_back(branch);
+                if (!valid) { break; }
+                branch_outs.push_back(branch_sum);
+            }
+            if (!valid && ggml_shared_weights_enabled()) {
+                GGML_ABORT("shared HTP FFN graph has incomplete physical segments at layer %d", il);
             }
 
             if (valid && !branch_outs.empty() && branch_outs.size() == exec_splits.size()) {

@@ -95,7 +95,7 @@ static int hmx_x4x2_slice_layout(
         parent_k <= 0 || k_start < 0 || k_size <= 0 ||
         k_start > parent_k || k_size > parent_k - k_start ||
         parent_k % QK_Q4_0x4x2 != 0 ||
-        k_start  % QK_Q4_0x4x2 != 0 ||
+        k_start % (weight_type == HTP_TYPE_Q8_0 ? 32 : QK_Q4_0x4x2) != 0 ||
         k_size   % QK_Q4_0x4x2 != 0) {
         return -1;
     }
@@ -133,10 +133,11 @@ static int hmx_x4x2_slice_layout(
     layout->parent_row_stride  = parent_row_stride;
     layout->compact_row_stride =
         active_blocks * (quant_block_size + scale_block_size);
-    layout->quant_offset = start_block * quant_block_size;
+    layout->quant_offset = weight_type == HTP_TYPE_Q8_0 ? (size_t) k_start : start_block * quant_block_size;
     layout->quant_width  = active_blocks * quant_block_size;
     layout->scale_offset =
-        parent_blocks * quant_block_size + start_block * scale_block_size;
+        parent_blocks * quant_block_size +
+        (weight_type == HTP_TYPE_Q8_0 ? (size_t) k_start / 16 : start_block * scale_block_size);
     layout->scale_width = active_blocks * scale_block_size;
     layout->compact_full_row =
         k_start == 0 && k_size == parent_k &&

@@ -9,6 +9,7 @@
 #endif
 
 #include "ggml-backend.h"
+#include "ggml-shared-weights.h"
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
@@ -129,6 +130,7 @@ void ggml_backend_buffer_free(ggml_backend_buffer_t buffer) {
         return;
     }
 
+    ggml_shared_weights_unregister_buffer(buffer);
     if (buffer->iface.free_buffer != NULL) {
         buffer->iface.free_buffer(buffer);
     }
@@ -497,6 +499,10 @@ ggml_backend_dev_t ggml_backend_get_device(ggml_backend_t backend) {
 // backend copy
 
 void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor * dst) {
+    if (src != dst && ggml_shared_weights_tensor(src)) {
+        ggml_shared_weights_log("unexpected_copy", src, "scheduler", -1, 0, 0, dst->name);
+        GGML_ABORT("immutable shared HTP weight must be consumed directly: %s", src->name);
+    }
     GGML_ASSERT(ggml_are_same_layout(src, dst) && "cannot copy tensors with different layouts");
 
     if (src == dst) {
@@ -520,6 +526,10 @@ void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor
 }
 
 void ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst) {
+    if (src != dst && ggml_shared_weights_tensor(src)) {
+        ggml_shared_weights_log("unexpected_copy", src, "scheduler", -1, 0, 0, dst->name);
+        GGML_ABORT("shared HTP weight cannot be copied asynchronously: %s", src->name);
+    }
     GGML_ASSERT(ggml_are_same_layout(src, dst) && "cannot copy tensors with different layouts");
 
     if (src == dst) {
@@ -4085,6 +4095,7 @@ static bool ggml_backend_sched_parse_ffn_branch_name(
         "ffn_gate.",
         "ffn_swiglu.",
         "ffn_down.",
+        "ffn_segment_sum.",
     };
 
     if (name == nullptr) {
@@ -4111,6 +4122,12 @@ static bool ggml_backend_sched_parse_ffn_branch_name(
 
         if (branch != nullptr) {
             branch->assign(branch_start, layer_start - branch_start);
+            const size_t segment = branch->rfind(".segment");
+            if (segment != std::string::npos && segment + 8 < branch->size() &&
+                    std::all_of(branch->begin() + segment + 8, branch->end(),
+                        [](unsigned char c) { return c >= '0' && c <= '9'; })) {
+                branch->resize(segment);
+            }
         }
         if (layer != nullptr) {
             *layer = (int) parsed;
@@ -7266,6 +7283,11 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+            if (ggml_shared_weights_tensor(input)) {
+                ggml_shared_weights_log("unexpected_copy", input, ggml_backend_name(split_backend), -1, 0, 0, input_cpy->name);
+                GGML_ABORT("shared HTP weight must not enter scheduler copy inputs: %s", input->name);
+            }
+
 
             if (lazy_pending != nullptr) {
                 const int slot_id = lazy_pending->input_slots[input_id];

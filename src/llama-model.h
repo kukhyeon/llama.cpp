@@ -24,6 +24,7 @@ struct llama_backend_policy_resident_cover {
     int64_t cover_start = 0;
     int64_t cover_size = 0;
     int64_t local_start = 0;
+    int64_t active_size = 0;
 };
 
 // Transitional source name for the original FFN-only lookup result.
@@ -627,6 +628,8 @@ struct llama_model {
     bool attn_out_shards_enabled() const { return params.attn_out_shards; }
 
     const struct ggml_tensor * get_tensor(const char * name) const;
+    ggml_backend_dev_t shared_weight_device(const ggml_tensor * tensor) const;
+
     struct ggml_tensor * get_backend_policy_residency_tensor(
             const struct ggml_tensor * tensor,
             const std::vector<std::string> & backends) const;
@@ -638,6 +641,12 @@ struct llama_model {
             int axis,
             int64_t start,
             int64_t size) const;
+
+    // Ordered, gap-free intersections with physical covers. Each segment is
+    // consumed directly in its own native/shared layout.
+    std::vector<llama_backend_policy_resident_cover> get_backend_policy_resident_segments(
+            const struct ggml_tensor * tensor, const std::string & backend,
+            int axis, int64_t start, int64_t size) const;
 
     // Compatibility wrapper for the original FFN-specific API name.
     llama_backend_policy_ffn_resident_cover get_backend_policy_ffn_cover(

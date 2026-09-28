@@ -3,6 +3,7 @@
 
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
+#include "ggml-shared-weights.h"
 #include "traits.h"
 #include "ggml-cpu-impl.h"
 #include "ggml-impl.h"
@@ -1449,6 +1450,124 @@ UseGgmlGemm2:;
     }
 }
 
+// Shared HTP weights stay immutable. SIMD readers only unpack a few quants
+// into registers; there is no persistent native-weight cache or activation
+// quantization. AVX2 exercises the same tiled algorithm on x86 hosts.
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#define GGML_SHARED_HTP_VEC_WIDTH 4
+typedef float32x4_t ggml_shared_htp_vec;
+static inline ggml_shared_htp_vec ggml_shared_htp_load_q(const int8_t * q, float d) {
+    int32_t packed;
+    memcpy(&packed, q, sizeof(packed));
+    const int16x8_t q16 = vmovl_s8(vreinterpret_s8_s32(vdup_n_s32(packed)));
+    return vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16))), d);
+}
+static inline ggml_shared_htp_vec ggml_shared_htp_zero(void) { return vdupq_n_f32(0); }
+static inline ggml_shared_htp_vec ggml_shared_htp_load_x(const float * x) { return vld1q_f32(x); }
+static inline ggml_shared_htp_vec ggml_shared_htp_fma(ggml_shared_htp_vec s, ggml_shared_htp_vec w, ggml_shared_htp_vec x) {
+    return vfmaq_f32(s, w, x);
+}
+static inline float ggml_shared_htp_sum(ggml_shared_htp_vec s) { return vaddvq_f32(s); }
+#elif defined(__AVX2__)
+#define GGML_SHARED_HTP_VEC_WIDTH 8
+typedef __m256 ggml_shared_htp_vec;
+static inline ggml_shared_htp_vec ggml_shared_htp_load_q(const int8_t * q, float d) {
+    const __m128i q8 = _mm_loadl_epi64((const __m128i *) q);
+    return _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q8)), _mm256_set1_ps(d));
+}
+static inline ggml_shared_htp_vec ggml_shared_htp_zero(void) { return _mm256_setzero_ps(); }
+static inline ggml_shared_htp_vec ggml_shared_htp_load_x(const float * x) { return _mm256_loadu_ps(x); }
+static inline ggml_shared_htp_vec ggml_shared_htp_fma(ggml_shared_htp_vec s, ggml_shared_htp_vec w, ggml_shared_htp_vec x) {
+#if defined(__FMA__)
+    return _mm256_fmadd_ps(w, x, s);
+#else
+    return _mm256_add_ps(s, _mm256_mul_ps(w, x));
+#endif
+}
+static inline float ggml_shared_htp_sum(ggml_shared_htp_vec s) {
+    __m128 sum = _mm_add_ps(_mm256_castps256_ps128(s), _mm256_extractf128_ps(s, 1));
+    sum = _mm_hadd_ps(sum, sum);
+    return _mm_cvtss_f32(_mm_hadd_ps(sum, sum));
+}
+#endif
+
+// Direct HTP Q8 reader, including slices whose parent K differs from active K.
+static void ggml_compute_forward_shared_htp_q8(
+        const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    GGML_ASSERT(ggml_shared_weights_supports_op(dst));
+    const struct ggml_tensor * w = dst->src[0];
+    const struct ggml_tensor * x = dst->src[1];
+    struct ggml_mul_mat_src0_region_params r = {GGML_MUL_MAT_SRC0_REGION_PARAMS_VERSION, 0, 0, w->ne[0], 0, w->ne[1]};
+    if (dst->op == GGML_OP_MUL_MAT_SRC0_REGION) {
+        GGML_ASSERT(ggml_mul_mat_src0_region_get_params(dst, &r));
+    }
+#if defined(GGML_SHARED_HTP_VEC_WIDTH)
+    // A tile reuses each weight across four tokens, and each activation across
+    // two output rows. Contiguous tile ownership also limits output false sharing.
+    const int64_t row_tiles = (dst->ne[0] + 1) / 2;
+    const int64_t tiles = row_tiles * ((dst->ne[1] + 3) / 4);
+    const int64_t per_thread = (tiles + params->nth - 1) / params->nth;
+    const int64_t tile_end = MIN(tiles, (params->ith + 1) * per_thread);
+    for (int64_t tile = params->ith * per_thread; tile < tile_end; ++tile) {
+        const int64_t row = (tile % row_tiles) * 2;
+        const int64_t token = (tile / row_tiles) * 4;
+        const int nr = (int) MIN(2, dst->ne[0] - row);
+        const int nt = (int) MIN(4, dst->ne[1] - token);
+        const int8_t * q[2];
+        const ggml_fp16_t * d[2];
+        const float * a[4];
+        ggml_shared_htp_vec sums[4][2];
+        for (int m = 0; m < nr; ++m) {
+            q[m] = (const int8_t *) w->data + (r.out_start + row + m) * w->nb[1];
+            d[m] = (const ggml_fp16_t *) (q[m] + w->ne[0]);
+        }
+        for (int t = 0; t < nt; ++t) {
+            a[t] = (const float *) ((const char *) x->data + (token + t) * x->nb[1]);
+            for (int m = 0; m < nr; ++m) { sums[t][m] = ggml_shared_htp_zero(); }
+        }
+        for (int64_t k = 0; k < r.k_size; k += 32) {
+            float scale[2];
+            for (int m = 0; m < nr; ++m) { scale[m] = GGML_FP16_TO_FP32(d[m][(r.k_start + k) / 32]); }
+            for (int j = 0; j < 32; j += GGML_SHARED_HTP_VEC_WIDTH) {
+                ggml_shared_htp_vec weight[2];
+                for (int m = 0; m < nr; ++m) {
+                    weight[m] = ggml_shared_htp_load_q(q[m] + r.k_start + k + j, scale[m]);
+                }
+                for (int t = 0; t < nt; ++t) {
+                    const ggml_shared_htp_vec input = ggml_shared_htp_load_x(a[t] + k + j);
+                    for (int m = 0; m < nr; ++m) {
+                        sums[t][m] = ggml_shared_htp_fma(sums[t][m], weight[m], input);
+                    }
+                }
+            }
+        }
+        for (int t = 0; t < nt; ++t) {
+            float * out = (float *) ((char *) dst->data + (token + t) * dst->nb[1]);
+            for (int m = 0; m < nr; ++m) { out[row + m] = ggml_shared_htp_sum(sums[t][m]); }
+        }
+    }
+#else
+    // Portable reference/fallback for architectures without the SIMD readers.
+    const int64_t count = dst->ne[0] * dst->ne[1];
+    for (int64_t i = params->ith; i < count; i += params->nth) {
+        const int64_t row = i % dst->ne[0];
+        const int64_t token = i / dst->ne[0];
+        const int8_t * q = (const int8_t *) w->data + (r.out_start + row) * w->nb[1];
+        const ggml_fp16_t * d = (const ggml_fp16_t *) (q + w->ne[0]);
+        const float * a = (const float *) ((const char *) x->data + token * x->nb[1]);
+        float sum = 0.0f;
+        for (int64_t k = 0; k < r.k_size; k += 32) {
+            float dot = 0.0f;
+            for (int j = 0; j < 32; ++j) {
+                dot += (float) q[r.k_start + k + j] * a[k + j];
+            }
+            sum += GGML_FP16_TO_FP32(d[(r.k_start + k) / 32]) * dot;
+        }
+        ((float *) ((char *) dst->data + token * dst->nb[1]))[row] = sum;
+    }
+#endif
+}
+
 static void ggml_compute_forward_mul_mat_src0_region(
         const struct ggml_compute_params * params,
               struct ggml_tensor         * dst) {
@@ -1735,6 +1854,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     GGML_ASSERT(params);
 
     if (tensor->op == GGML_OP_NONE || ggml_is_empty(tensor)) {
+        return;
+    }
+
+    if (ggml_shared_weights_tensor(tensor->src[0])) {
+        ggml_compute_forward_shared_htp_q8(params, tensor);
         return;
     }
 

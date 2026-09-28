@@ -27,6 +27,7 @@ struct llama_tensor_cover_info {
     int axis = -1;
     int64_t start = 0;
     int64_t size = 0;
+    std::vector<std::string> consumers;
 };
 
 enum llama_fver {
@@ -133,6 +134,9 @@ struct llama_model_loader {
     // keeping them separate from residency_cover_infos prevents model loading
     // from treating a canonical tensor as an independently extracted cover.
     std::unordered_map<ggml_tensor *, llama_tensor_cover_info> residency_cover_alias_infos;
+
+    // Preserve ordinary projection placement when its storage becomes shared.
+    std::unordered_map<const ggml_tensor *, ggml_backend_dev_t> shared_weight_devices;
 
     // Metadata-only tensors whose data is intentionally provided by residency
     // covers instead of a full primary weight allocation.

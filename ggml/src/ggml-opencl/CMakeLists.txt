@@ -54,6 +54,7 @@ function(ggml_opencl_add_kernel KNAME)
 endfunction()
 
 set(GGML_OPENCL_KERNELS
+    mul_mat_htp_q8
     add
     add4
     add_id

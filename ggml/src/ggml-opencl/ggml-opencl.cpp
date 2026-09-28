@@ -9,11 +9,13 @@
 
 #include "ggml-opencl.h"
 #include "ggml-backend.h"
+#include "ggml-shared-weights.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 #include "ggml.h"
 
 #include <CL/cl.h>
+#include <CL/cl_ext.h>
 
 #include <inttypes.h>
 #include <string.h>
@@ -534,6 +536,12 @@ struct ggml_backend_opencl_context {
 
     cl_kernel kernel_add, kernel_add_row, kernel_add_f16, kernel_add_row_f16;
     cl_kernel kernel_add4_f32;
+    bool shared_external_host_ptr = false;
+    bool shared_dmabuf_host_ptr = false;
+    std::mutex shared_import_mutex;
+    std::once_flag shared_kernel_once;
+    std::shared_ptr<_cl_kernel> shared_kernel;
+    std::shared_ptr<_cl_kernel> shared_mm_kernel;
     std::once_flag add4_kernel_once;
     std::string add4_compile_opts;
 #ifndef GGML_OPENCL_EMBED_KERNELS
@@ -3693,6 +3701,15 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
     ext_buffer[ext_str_size] = '\0'; // ensure it is null terminated
     // Check if ext_buffer contains cl_khr_fp16
     backend_ctx->fp16_support = strstr(ext_buffer, "cl_khr_fp16") != NULL;
+    backend_ctx->shared_dmabuf_host_ptr = strstr(ext_buffer, "cl_qcom_dmabuf_host_ptr") != nullptr;
+    backend_ctx->shared_external_host_ptr =
+        (backend_ctx->shared_dmabuf_host_ptr || strstr(ext_buffer, "cl_qcom_ion_host_ptr") != nullptr) &&
+        strstr(ext_buffer, "cl_qcom_ext_host_ptr") != nullptr;
+    if (ggml_shared_weights_enabled()) {
+        GGML_LOG_INFO("ggml_opencl: shared HTP import: %s\n",
+            backend_ctx->shared_dmabuf_host_ptr ? "QCOM DMA-BUF" :
+            backend_ctx->shared_external_host_ptr ? "QCOM ION" : "unavailable");
+    }
     GGML_LOG_INFO("ggml_opencl: device FP16 support: %s\n", backend_ctx->fp16_support ? "true" : "false");
     // check Adreno large buffer support
     backend_ctx->adreno_has_large_buffer = strstr(ext_buffer, "cl_qcom_large_buffer") != NULL;
@@ -4952,10 +4969,86 @@ inline bool enable_adreno_trans_weight(
         const ggml_backend_opencl_context * backend_ctx,
         const ggml_tensor                 * tensor);
 
+struct ggml_opencl_shared_import {
+    cl_mem mem;
+    cl_command_queue queue;
+    void * read_mapping;
+    ~ggml_opencl_shared_import() {
+        CL_CHECK(clEnqueueUnmapMemObject(queue, mem, read_mapping, 0, nullptr, nullptr));
+        CL_CHECK(clFinish(queue));
+        CL_CHECK(clReleaseCommandQueue(queue));
+        CL_CHECK(clReleaseMemObject(mem));
+    }
+};
+
+static cl_mem ggml_opencl_import_shared_weight(
+        ggml_backend_opencl_context * ctx, const ggml_tensor * tensor) {
+    std::lock_guard<std::mutex> lock(ctx->shared_import_mutex);
+    if (auto * existing = static_cast<ggml_opencl_shared_import *>(
+            ggml_shared_weights_attachment(tensor->buffer, ctx->context))) {
+        return existing->mem;
+    }
+    const auto * d = ggml_shared_weights_buffer(tensor->buffer);
+    if (!ctx->shared_external_host_ptr || !d || d->fd < 0 || !d->base || d->size == 0) {
+        GGML_LOG_ERROR("shared HTP: OpenCL requires QCOM DMA-BUF/ION import and an exported rpcmem FD\n");
+        return nullptr;
+    }
+    size_t page = 0, padding = 0;
+    CL_CHECK(clGetDeviceInfo(ctx->device, CL_DEVICE_PAGE_SIZE_QCOM, sizeof(page), &page, nullptr));
+    CL_CHECK(clGetDeviceInfo(ctx->device, CL_DEVICE_EXT_MEM_PADDING_IN_BYTES_QCOM, sizeof(padding), &padding, nullptr));
+    if (!page || (uintptr_t) d->base % page || padding > d->allocation_size - d->size) {
+        GGML_LOG_ERROR("shared HTP: allocation fails OpenCL page/padding requirements\n");
+        return nullptr;
+    }
+    // cl_ext_qcom.h in the Adreno OpenCL SDK v2.3.2 defines DMA-BUF
+    // allocation_type 0x411D and the same ext/FD/host-pointer ABI as ION.
+    // Keep the small ABI declaration here for SDKs shipping only Khronos headers.
+    struct external_fd_host_ptr {
+        cl_mem_ext_host_ptr ext_host_ptr;
+        int fd;
+        void * hostptr;
+    } external = {};
+    external.ext_host_ptr.allocation_type = ctx->shared_dmabuf_host_ptr ? 0x411D : CL_MEM_ION_HOST_PTR_QCOM;
+    // rpcmem_alloc2 uses RPCMEM_DEFAULT_FLAGS (cached). Weights are immutable
+    // after upload; the import/read map is prepared before any graph executes.
+    external.ext_host_ptr.host_cache_policy = CL_MEM_HOST_WRITEBACK_QCOM;
+    external.fd = d->fd;
+    external.hostptr = d->base;
+    cl_int err;
+    cl_mem mem = clCreateBuffer(ctx->context,
+        CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR | CL_MEM_EXT_HOST_PTR_QCOM,
+        d->size, &external, &err);
+    if (err != CL_SUCCESS || !mem) {
+        GGML_LOG_ERROR("shared HTP: rpcmem FD %d OpenCL import failed: %d\n", d->fd, err);
+        return nullptr;
+    }
+    void * mapped = clEnqueueMapBuffer(ctx->queue, mem, CL_TRUE, CL_MAP_READ,
+        0, d->size, 0, nullptr, nullptr, &err);
+    if (err != CL_SUCCESS || !mapped) {
+        clReleaseMemObject(mem);
+        GGML_LOG_ERROR("shared HTP: immutable host read mapping failed: %d\n", err);
+        return nullptr;
+    }
+    CL_CHECK(clRetainCommandQueue(ctx->queue));
+    auto * imported = new ggml_opencl_shared_import{mem, ctx->queue, mapped};
+    ggml_shared_weights_attach(tensor->buffer, ctx->context, imported, [](void * p) {
+        delete static_cast<ggml_opencl_shared_import *>(p);
+    });
+    ggml_shared_weights_log("import", tensor, "OpenCL", -1, 0, 0, ctx->shared_dmabuf_host_ptr ? "QCOM DMA-BUF FD; immutable read mapping" : "QCOM ION FD; immutable read mapping");
+    return mem;
+}
+
+static bool ggml_backend_opencl_prepare_shared_weight(ggml_backend_dev_t dev, const ggml_tensor * tensor) {
+    return ggml_opencl_import_shared_weight(ggml_cl2_init(dev), tensor) != nullptr;
+}
+
 static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     ggml_backend_opencl_device_context * dev_ctx     = (ggml_backend_opencl_device_context *)dev->context;
     ggml_backend_opencl_context *        backend_ctx = dev_ctx->backend_ctx;
 
+    if (ggml_shared_weights_tensor(op->src[0])) {
+        return backend_ctx->shared_external_host_ptr && ggml_shared_weights_supports_op(op);
+    }
     switch (op->op) {
         case GGML_OP_NONE:
             return true;
@@ -8070,6 +8163,9 @@ static bool ggml_backend_opencl_device_supports_op(ggml_backend_dev_t dev, const
 }
 
 static bool ggml_backend_opencl_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
+    if (ggml_shared_weights_is_buft(buft)) {
+        return ggml_cl2_init(dev)->shared_external_host_ptr;
+    }
     // Check 'dev' and 'buffer_type' are not objects belonging to this backend.
     if (dev->iface.get_name != ggml_backend_opencl_device_get_name ||
         buft->iface.get_name != ggml_backend_opencl_buffer_type_get_name) {
@@ -8178,6 +8274,9 @@ static ggml_backend_dev_t ggml_backend_opencl_reg_device_get(ggml_backend_reg_t 
 }
 
 static void * ggml_backend_opencl_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (name && strcmp(name, "ggml_backend_prepare_shared_weight") == 0) {
+        return reinterpret_cast<void *>(ggml_backend_opencl_prepare_shared_weight);
+    }
     if (name != nullptr && strcmp(name, "ggml_backend_async_flush") == 0) {
         return reinterpret_cast<void *>(ggml_backend_opencl_async_flush);
     }
@@ -12309,6 +12408,62 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
     GGML_UNUSED(src1);
     GGML_UNUSED(dst);
 #endif
+}
+
+static void ggml_cl_mul_mat_shared_htp(
+        ggml_backend_t backend, const ggml_tensor * w, const ggml_tensor * x, ggml_tensor * dst) {
+    GGML_ASSERT(ggml_shared_weights_supports_op(dst));
+    auto * ctx = static_cast<ggml_backend_opencl_context *>(backend->context);
+    std::call_once(ctx->shared_kernel_once, [ctx]() {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string source {
+            #include "mul_mat_htp_q8.cl.h"
+        };
+#else
+        const std::string source = read_file("mul_mat_htp_q8.cl");
+#endif
+        cl_program program = build_program_from_source(ctx->context, ctx->device,
+            source.c_str(), "-cl-std=CL2.0");
+        cl_int err;
+        cl_kernel kernel = clCreateKernel(program, "kernel_mul_mat_htp_q8", &err);
+        CL_CHECK(err);
+        ctx->shared_kernel = std::shared_ptr<_cl_kernel>(kernel, [](cl_kernel k) { clReleaseKernel(k); });
+        kernel = clCreateKernel(program, "kernel_mul_mm_htp_q8", &err);
+        CL_CHECK(err);
+        ctx->shared_mm_kernel = std::shared_ptr<_cl_kernel>(kernel, [](cl_kernel k) { clReleaseKernel(k); });
+        CL_CHECK(clReleaseProgram(program));
+    });
+    auto * imported = static_cast<ggml_opencl_shared_import *>(
+        ggml_shared_weights_attachment(w->buffer, ctx->context));
+    // Import must happen during preparation, never while CPU/HTP readers run.
+    GGML_ASSERT(imported != nullptr);
+    const auto * d = ggml_shared_weights_buffer(w->buffer);
+    auto * ex = static_cast<ggml_tensor_extra_cl *>(x->extra);
+    auto * ey = static_cast<ggml_tensor_extra_cl *>(dst->extra);
+    GGML_ASSERT(d && ex && ey);
+    ggml_mul_mat_src0_region_params r = {GGML_MUL_MAT_SRC0_REGION_PARAMS_VERSION, 0, 0, w->ne[0], 0, w->ne[1]};
+    if (dst->op == GGML_OP_MUL_MAT_SRC0_REGION) { GGML_ASSERT(ggml_mul_mat_src0_region_get_params(dst, &r)); }
+    const cl_ulong wo = (const char *) w->data - (const char *) d->base;
+    const cl_ulong xo = ex->offset + x->view_offs, yo = ey->offset + dst->view_offs;
+    const cl_ulong ws = w->nb[1], xs = x->nb[1], ys = dst->nb[1];
+    const int pk = w->ne[0], ks = r.k_start, kn = r.k_size, os = r.out_start, on = r.out_size;
+    // Use actual output token count: the final prefill layer may produce only
+    // one token even when the query contains hundreds of tokens.
+    const int nt = dst->ne[1];
+    const bool tiled = nt >= 8;
+    cl_kernel kernel = tiled ? ctx->shared_mm_kernel.get() : ctx->shared_kernel.get();
+    int arg = 0;
+    auto set = [&](size_t size, const void * ptr) { CL_CHECK(clSetKernelArg(kernel, arg++, size, ptr)); };
+    set(sizeof(cl_mem), &imported->mem); set(sizeof(wo), &wo);
+    set(sizeof(cl_mem), &ex->data_device); set(sizeof(xo), &xo);
+    set(sizeof(cl_mem), &ey->data_device); set(sizeof(yo), &yo);
+    set(sizeof(pk), &pk); set(sizeof(ws), &ws);
+    set(sizeof(ks), &ks); set(sizeof(kn), &kn); set(sizeof(os), &os); set(sizeof(on), &on);
+    set(sizeof(xs), &xs); set(sizeof(ys), &ys); set(sizeof(nt), &nt);
+    size_t local[] = {64, 1};
+    size_t global[] = {tiled ? ((size_t) on + 31) / 32 * 64 : (size_t) on * 64,
+                       tiled ? ((size_t) nt + 31) / 32 : (size_t) nt};
+    ctx->enqueue_ndrange_kernel(kernel, 2, global, local, dst);
 }
 
 static void ggml_cl_mul_mat_q8_0_f32_adreno_region(
@@ -16482,6 +16637,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
 
     ggml_tensor * src0 = tensor->src[0];
     ggml_tensor * src1 = tensor->src[1];
+
+    if (ggml_shared_weights_tensor(src0)) {
+        if (!ggml_shared_weights_supports_op(tensor)) { return false; }
+        ggml_cl_mul_mat_shared_htp(backend, src0, src1, tensor);
+        return true;
+    }
 
     const bool any_on_device = tensor->extra
         || (src0 != nullptr && src0->extra)

@@ -103,6 +103,7 @@ struct llama_backend_policy_attn_out_shards {
 // tensor axis is bound by the module-specific planner/loader because one
 // logical split may map to different axes on different weights.
 struct llama_backend_policy_residency_cover {
+    std::vector<std::string> consumers;
     std::string id;
     int64_t start = 0;
     int64_t size = 0;

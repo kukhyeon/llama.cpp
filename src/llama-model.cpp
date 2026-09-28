@@ -1,3 +1,4 @@
+#include "ggml-shared-weights.h"
 #include "llama-model.h"
 
 #include "llama-arch.h"
@@ -963,6 +964,7 @@ struct llama_model::impl {
 
     std::unordered_map<std::string, std::vector<ggml_tensor *>> backend_policy_residency_tensors;
     std::unordered_map<ggml_tensor *, llama_tensor_cover_info> backend_policy_residency_cover_infos;
+    std::unordered_map<const ggml_tensor *, ggml_backend_dev_t> shared_weight_devices;
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -1432,6 +1434,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     ml.done_getting_tensors();
     pimpl->backend_policy_residency_tensors = ml.residency_tensors_by_name;
     pimpl->backend_policy_residency_cover_infos = ml.residency_cover_infos;
+    pimpl->shared_weight_devices = std::move(ml.shared_weight_devices);
     for (const auto & [tensor, info] : ml.residency_cover_alias_infos) {
         auto & candidates = pimpl->backend_policy_residency_tensors[info.source_name];
         if (std::find(candidates.begin(), candidates.end(), tensor) == candidates.end()) {
@@ -1585,6 +1588,26 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
+        }
+    }
+
+    if (ggml_shared_weights_enabled()) {
+        using prepare_t = bool (*)(ggml_backend_dev_t, const ggml_tensor *);
+        for (const auto & entry : pimpl->backend_policy_residency_cover_infos) {
+            const auto * weight = entry.first;
+            const auto & info = entry.second;
+            const bool shared = ggml_shared_weights_tensor(weight);
+            ggml_shared_weights_log("resident", weight, info.backend.c_str(), info.axis,
+                info.start, info.size, shared ? "HTP Q8 shared" : "native exclusive");
+            if (!shared) { continue; }
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                auto dev = ggml_backend_dev_get(i);
+                auto reg = ggml_backend_dev_backend_reg(dev);
+                auto prepare = reinterpret_cast<prepare_t>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_prepare_shared_weight"));
+                if (prepare && !prepare(dev, weight)) {
+                    throw std::runtime_error("shared HTP weight import failed; no native-copy fallback is allowed");
+                }
+            }
         }
     }
 
@@ -2008,6 +2031,11 @@ const ggml_tensor * llama_model::get_tensor(const char * name) const {
     return it->second;
 }
 
+ggml_backend_dev_t llama_model::shared_weight_device(const ggml_tensor * tensor) const {
+    const auto it = pimpl->shared_weight_devices.find(tensor);
+    return it == pimpl->shared_weight_devices.end() ? nullptr : it->second;
+}
+
 ggml_tensor * llama_model::get_backend_policy_residency_tensor(
         const ggml_tensor * tensor,
         const std::vector<std::string> & backends) const {
@@ -2094,7 +2122,9 @@ llama_backend_policy_resident_cover llama_model::get_backend_policy_resident_cov
         if (info.source_name != name_c || info.axis != axis ||
                 info.size <= 0 || info.start > std::numeric_limits<int64_t>::max() - info.size ||
                 info.start > start || info.start + info.size < end ||
-                !tensor_matches_backend(candidate, backend)) {
+                !(tensor_matches_backend(candidate, backend) ||
+                  (ggml_shared_weights_tensor(candidate) &&
+                   std::find(info.consumers.begin(), info.consumers.end(), backend) != info.consumers.end()))) {
             continue;
         }
 
@@ -2106,9 +2136,42 @@ llama_backend_policy_resident_cover llama_model::get_backend_policy_resident_cov
             result.cover_start = info.start;
             result.cover_size = info.size;
             result.local_start = start - info.start;
+            result.active_size = size;
         }
     }
 
+    return result;
+}
+
+std::vector<llama_backend_policy_resident_cover> llama_model::get_backend_policy_resident_segments(
+        const ggml_tensor * tensor, const std::string & backend, int axis, int64_t start, int64_t size) const {
+    std::vector<llama_backend_policy_resident_cover> result;
+    if (!tensor || start < 0 || size <= 0 || start > INT64_MAX - size) { return result; }
+    const auto found = pimpl->backend_policy_residency_tensors.find(tensor->name);
+    if (found == pimpl->backend_policy_residency_tensors.end()) { return result; }
+    const int64_t end = start + size;
+    while (start < end) {
+        int64_t next = end;
+        // Find the end of a physical cover that contains this position.
+        bool present = false;
+        for (const auto * candidate : found->second) {
+            const auto it = pimpl->backend_policy_residency_cover_infos.find(const_cast<ggml_tensor *>(candidate));
+            if (it == pimpl->backend_policy_residency_cover_infos.end()) { continue; }
+            const auto & info = it->second;
+            if (info.axis != axis || info.start > start || info.start + info.size <= start) { continue; }
+            const auto probe = get_backend_policy_resident_cover(tensor, backend, axis, start, 1);
+            if (probe.tensor == candidate) {
+                next = std::min(end, info.start + info.size);
+                present = true;
+                break;
+            }
+        }
+        if (!present) { return {}; }
+        auto segment = get_backend_policy_resident_cover(tensor, backend, axis, start, next - start);
+        if (!segment.tensor) { return {}; }
+        result.push_back(segment);
+        start = next;
+    }
     return result;
 }
 
