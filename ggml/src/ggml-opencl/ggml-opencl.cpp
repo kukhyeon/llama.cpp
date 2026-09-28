@@ -542,6 +542,44 @@ struct ggml_backend_opencl_context {
     std::once_flag shared_kernel_once;
     std::shared_ptr<_cl_kernel> shared_kernel;
     std::shared_ptr<_cl_kernel> shared_mm_kernel;
+    std::shared_ptr<_cl_kernel> shared_repack_kernel;
+    // A single reusable native weight slot, consumed before the next pack on
+    // the same in-order queue. No per-tensor/per-policy weight cache.
+    ggml_cl_buffer shared_native_q;
+    ggml_cl_buffer shared_native_d;
+    size_t shared_weight_request_bytes = 0;
+    size_t shared_activation_request_bytes = 0;
+    size_t shared_request_bytes = 0;
+    struct shared_repack_pending {
+        cl_event event;
+        ggml_tensor weight;
+        ggml_shared_weights_repack_event timing;
+        std::string node_name;
+    };
+    std::vector<shared_repack_pending> shared_repack_events;
+
+    void collect_shared_repack_events() {
+        // Called only after the backend's existing queue barrier (or teardown).
+        // Profiling START/END excludes host dispatch and queue waiting.
+        for (auto & pending : shared_repack_events) {
+            cl_ulong start = 0, end = 0;
+            const cl_int start_status = clGetEventProfilingInfo(pending.event,
+                CL_PROFILING_COMMAND_START, sizeof(start), &start, nullptr);
+            const cl_int end_status = clGetEventProfilingInfo(pending.event,
+                CL_PROFILING_COMMAND_END, sizeof(end), &end, nullptr);
+            pending.timing.node_name = pending.node_name.c_str();
+            if (start_status == CL_SUCCESS && end_status == CL_SUCCESS && end >= start) {
+                pending.timing.repack_us = (end - start) / 1000.0;
+            } else {
+                // An unavailable measurement must never appear as a zero-cost pack.
+                pending.timing.repack_us = -1.0;
+                pending.timing.timing_kind = "opencl_event_unavailable";
+            }
+            ggml_shared_weights_log_repack(&pending.weight, "OpenCL", &pending.timing);
+            CL_CHECK(clReleaseEvent(pending.event));
+        }
+        shared_repack_events.clear();
+    }
     std::once_flag add4_kernel_once;
     std::string add4_compile_opts;
 #ifndef GGML_OPENCL_EMBED_KERNELS
@@ -958,29 +996,30 @@ struct ggml_backend_opencl_context {
         return workgroup_size;
     }
 
-    void enqueue_ndrange_kernel(cl_kernel kernel, cl_uint work_dim, size_t *global_work_size, size_t *local_work_size, const ggml_tensor * tensor) {
+    void enqueue_ndrange_kernel(cl_kernel kernel, cl_uint work_dim, size_t *global_work_size,
+            size_t *local_work_size, const ggml_tensor * tensor, cl_event * retained_event = nullptr) {
         const bool op_load = ggml_backend_op_load_profile_should_measure(tensor->op, tensor->name);
         const bool node_wall_trace = node_wall_trace_dispatch;
         const bool breakdown = ggml_backend_op_load_profile_breakdown_enabled();
         const int64_t enqueue_t0_us = breakdown ? ggml_time_us() : 0;
 #ifdef GGML_OPENCL_PROFILING
-        cl_event evt;
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, &evt));
-
-        profiling_info.emplace_back();
-        populateProfilingInfo(profiling_info.back(), evt, kernel, work_dim, global_work_size, local_work_size, tensor);
+        const bool profile = true;
+        GGML_UNUSED(op_load);
 #else
-        if (op_load || node_wall_trace) {
-            cl_event evt;
-            CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, &evt));
-
+        const bool profile = op_load || node_wall_trace;
+#endif
+        cl_event evt = nullptr;
+        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, nullptr,
+            global_work_size, local_work_size, 0, nullptr,
+            profile || retained_event ? &evt : nullptr));
+        if (profile) {
             profiling_info.emplace_back();
             populateProfilingInfo(profiling_info.back(), evt, kernel, work_dim, global_work_size, local_work_size, tensor);
-        } else {
-            GGML_UNUSED(tensor);
-            CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, NULL));
         }
-#endif
+        if (retained_event) {
+            if (profile) { CL_CHECK(clRetainEvent(evt)); }
+            *retained_event = evt;
+        }
         if (!profiling_info.empty() && node_wall_trace && profiling_info.back().evt != nullptr) {
             ProfilingInfo & info = profiling_info.back();
             info.node_wall_trace = true;
@@ -1049,17 +1088,29 @@ struct ggml_backend_opencl_context {
     void free() {
         ref_count--;
         if (ref_count == 0) {
-            if (!profiling_info.empty()) {
+            if (!profiling_info.empty() || !shared_repack_events.empty()) {
                 // Normal collection happens after the backend's existing
                 // synchronize barrier. This is only a teardown fallback for
                 // callers that destroy a backend with pending trace events.
                 CL_CHECK(clFinish(queue));
                 accumulate_op_load_profiling_info();
+                collect_shared_repack_events();
             }
 #ifdef GGML_OPENCL_PROFILING
             write_profiling_info();
             profiling_info.clear();
 #endif
+            // Device contexts outlive their backend handles, so the buffer
+            // destructors are not reached here. Release this slot explicitly.
+            // Queued commands retain their own references until completion.
+            for (ggml_cl_buffer * scratch : {&shared_native_q, &shared_native_d}) {
+                if (scratch->buffer) { CL_CHECK(clReleaseMemObject(scratch->buffer)); }
+                scratch->buffer = nullptr;
+                scratch->size = 0;
+            }
+            shared_weight_request_bytes = 0;
+            shared_activation_request_bytes = 0;
+            shared_request_bytes = 0;
         }
     }
 };
@@ -3805,7 +3856,8 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
     command_queue_props |= CL_QUEUE_PROFILING_ENABLE;
 #endif
     if (ggml_backend_op_load_profile_enabled() || ggml_opencl_csv_op_load_env_enabled() ||
-            ggml_backend_node_wall_trace_enabled()) {
+            ggml_backend_node_wall_trace_enabled() ||
+            (ggml_shared_weights_repack_enabled() && ggml_shared_weights_timing_enabled())) {
         command_queue_props |= CL_QUEUE_PROFILING_ENABLE;
     }
     CL_CHECK((backend_ctx->queue = clCreateCommandQueue(context, device, command_queue_props, &err), err));
@@ -4418,6 +4470,7 @@ static void ggml_backend_opencl_synchronize(ggml_backend_t backend) {
     if (pending_profile_events) {
         backend_ctx->accumulate_op_load_profiling_info();
     }
+    backend_ctx->collect_shared_repack_events();
 }
 
 static void ggml_backend_opencl_async_flush(ggml_backend_t backend) {
@@ -8273,7 +8326,25 @@ static ggml_backend_dev_t ggml_backend_opencl_reg_device_get(ggml_backend_reg_t 
     GGML_UNUSED(index);
 }
 
+static bool ggml_backend_opencl_get_shared_weights_scratch_stats(
+        ggml_backend_t backend, ggml_shared_weights_scratch_stats * stats) {
+    if (!backend || !stats) { return false; }
+    auto * ctx = static_cast<ggml_backend_opencl_context *>(backend->context);
+    *stats = {};
+    stats->owner = ctx;
+    stats->weight_request_bytes = ctx->shared_weight_request_bytes;
+    stats->activation_request_bytes = ctx->shared_activation_request_bytes;
+    stats->request_bytes = ctx->shared_request_bytes;
+    if (ctx->shared_weight_request_bytes) {
+        stats->allocation_bytes = ctx->shared_native_q.size + ctx->shared_native_d.size + ctx->prealloc_act_trans.size;
+    }
+    return true;
+}
+
 static void * ggml_backend_opencl_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (name && strcmp(name, "ggml_backend_get_shared_weights_scratch_stats") == 0) {
+        return reinterpret_cast<void *>(ggml_backend_opencl_get_shared_weights_scratch_stats);
+    }
     if (name && strcmp(name, "ggml_backend_prepare_shared_weight") == 0) {
         return reinterpret_cast<void *>(ggml_backend_opencl_prepare_shared_weight);
     }
@@ -12410,6 +12481,13 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
 #endif
 }
 
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+static void ggml_cl_mul_mat_q8_0_f32_adreno_region_buffers(
+        ggml_backend_t backend, const ggml_tensor * src1, ggml_tensor * dst,
+        cl_mem weight_q, cl_mem weight_d, int parent_k, int parent_m,
+        const ggml_mul_mat_src0_region_params & params);
+#endif
+
 static void ggml_cl_mul_mat_shared_htp(
         ggml_backend_t backend, const ggml_tensor * w, const ggml_tensor * x, ggml_tensor * dst) {
     GGML_ASSERT(ggml_shared_weights_supports_op(dst));
@@ -12418,9 +12496,10 @@ static void ggml_cl_mul_mat_shared_htp(
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string source {
             #include "mul_mat_htp_q8.cl.h"
+            #include "repack_htp_q8.cl.h"
         };
 #else
-        const std::string source = read_file("mul_mat_htp_q8.cl");
+        const std::string source = read_file("mul_mat_htp_q8.cl") + read_file("repack_htp_q8.cl");
 #endif
         cl_program program = build_program_from_source(ctx->context, ctx->device,
             source.c_str(), "-cl-std=CL2.0");
@@ -12431,6 +12510,9 @@ static void ggml_cl_mul_mat_shared_htp(
         kernel = clCreateKernel(program, "kernel_mul_mm_htp_q8", &err);
         CL_CHECK(err);
         ctx->shared_mm_kernel = std::shared_ptr<_cl_kernel>(kernel, [](cl_kernel k) { clReleaseKernel(k); });
+        kernel = clCreateKernel(program, "kernel_repack_htp_q8_native", &err);
+        CL_CHECK(err);
+        ctx->shared_repack_kernel = std::shared_ptr<_cl_kernel>(kernel, [](cl_kernel k) { clReleaseKernel(k); });
         CL_CHECK(clReleaseProgram(program));
     });
     auto * imported = static_cast<ggml_opencl_shared_import *>(
@@ -12450,6 +12532,55 @@ static void ggml_cl_mul_mat_shared_htp(
     // Use actual output token count: the final prefill layer may produce only
     // one token even when the query contains hundreds of tokens.
     const int nt = dst->ne[1];
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+    // The native region kernels require four output rows. Packing resets the
+    // physical origins, so an HTP out_start not divisible by four is harmless.
+    // Keep the no-repack GEMV for nt=1: converting a whole matrix for one token
+    // would discard the bandwidth advantage of the canonical HTP representation.
+    const bool native = ggml_shared_weights_repack_enabled() && nt > 1 &&
+        ctx->gpu_family == GPU_FAMILY::ADRENO && (on % 4) == 0;
+    if (native) {
+        const size_t q_bytes = (size_t) kn * on;
+        const size_t d_bytes = (size_t) (kn / 32) * on * sizeof(ggml_fp16_t);
+        const size_t activation_bytes = (size_t) kn * CEIL_DIV(nt, 8) * 8 * sizeof(ggml_fp16_t);
+        ctx->shared_native_q.allocate(ctx->context, q_bytes);
+        ctx->shared_native_d.allocate(ctx->context, d_bytes);
+        ctx->shared_weight_request_bytes = std::max(ctx->shared_weight_request_bytes, q_bytes + d_bytes);
+        ctx->shared_activation_request_bytes = std::max(ctx->shared_activation_request_bytes, activation_bytes);
+        ctx->shared_request_bytes = std::max(ctx->shared_request_bytes, q_bytes + d_bytes + activation_bytes);
+        cl_kernel pack = ctx->shared_repack_kernel.get();
+        int arg = 0;
+        auto set = [&](size_t size, const void * ptr) { CL_CHECK(clSetKernelArg(pack, arg++, size, ptr)); };
+        set(sizeof(cl_mem), &imported->mem); set(sizeof(wo), &wo);
+        set(sizeof(pk), &pk); set(sizeof(ws), &ws);
+        set(sizeof(ks), &ks); set(sizeof(kn), &kn); set(sizeof(os), &os); set(sizeof(on), &on);
+        set(sizeof(cl_mem), &ctx->shared_native_q.buffer);
+        set(sizeof(cl_mem), &ctx->shared_native_d.buffer);
+        const bool timing = ggml_shared_weights_timing_enabled();
+        ggml_shared_weights_repack_event measurement = {};
+        if (timing) {
+            measurement = ggml_shared_weights_repack_begin(dst, "opencl_event", q_bytes + d_bytes,
+                q_bytes + d_bytes + activation_bytes);
+        }
+        size_t local[] = {64};
+        size_t global[] = {CEIL_DIV((size_t) kn / 4 * on, local[0]) * local[0]};
+        cl_event event = nullptr;
+        ctx->enqueue_ndrange_kernel(pack, 1, global, local, dst, timing ? &event : nullptr);
+        if (timing) {
+            ctx->shared_repack_events.push_back({event, *w, measurement,
+                measurement.node_name ? measurement.node_name : dst->name});
+        }
+        const ggml_mul_mat_src0_region_params compact = {
+            GGML_MUL_MAT_SRC0_REGION_PARAMS_VERSION, 0, 0, kn, 0, on};
+        ggml_cl_mul_mat_q8_0_f32_adreno_region_buffers(backend, x, dst,
+            ctx->shared_native_q.buffer, ctx->shared_native_d.buffer, kn, on, compact);
+        return;
+    }
+#endif
+    if (ggml_shared_weights_repack_enabled()) {
+        ggml_shared_weights_log("direct", w, "OpenCL", -1, 0, 0,
+            nt == 1 ? "single-token direct HTP" : "native scratch unsupported for this device/shape");
+    }
     const bool tiled = nt >= 8;
     cl_kernel kernel = tiled ? ctx->shared_mm_kernel.get() : ctx->shared_kernel.get();
     int arg = 0;
@@ -12466,44 +12597,28 @@ static void ggml_cl_mul_mat_shared_htp(
     ctx->enqueue_ndrange_kernel(kernel, 2, global, local, dst);
 }
 
-static void ggml_cl_mul_mat_q8_0_f32_adreno_region(
-        ggml_backend_t backend,
-        const ggml_tensor * src0,
-        const ggml_tensor * src1,
-        ggml_tensor * dst) {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-    GGML_ASSERT(src0 && src0->extra);
-    GGML_ASSERT(src1 && src1->extra);
-    GGML_ASSERT(dst && dst->extra);
-    GGML_ASSERT(src0->type == GGML_TYPE_Q8_0);
-    GGML_ASSERT(src1->type == GGML_TYPE_F32);
-
-    struct ggml_mul_mat_src0_region_params params;
-    GGML_ASSERT(ggml_mul_mat_src0_region_get_params(dst, &params));
-
-    const int parent_k = (int) src0->ne[0];
-    const int parent_m = (int) src0->ne[1];
-    const int k_start  = (int) params.k_start;
-    const int k_size   = (int) params.k_size;
+// Both persistent native tensors and the one-slot shared-weight scratch use
+// this exact compute path. Passing handles avoids mutating a tensor's extra.
+static void ggml_cl_mul_mat_q8_0_f32_adreno_region_buffers(
+        ggml_backend_t backend, const ggml_tensor * src1, ggml_tensor * dst,
+        cl_mem weight_q, cl_mem weight_d, int parent_k, int parent_m,
+        const ggml_mul_mat_src0_region_params & params) {
+    const int k_start = (int) params.k_start;
+    const int k_size = (int) params.k_size;
     const int out_start = (int) params.out_start;
-    const int out_size  = (int) params.out_size;
-
-    GGML_ASSERT(src0->ne[2] == 1 && src0->ne[3] == 1);
+    const int out_size = (int) params.out_size;
+    GGML_ASSERT(weight_q && weight_d && src1 && src1->extra && dst && dst->extra);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(src1->ne[2] == 1 && src1->ne[3] == 1);
-    GGML_ASSERT(src1->ne[0] == k_size);
-    GGML_ASSERT(dst->ne[0] == out_size);
+    GGML_ASSERT(src1->ne[0] == k_size && dst->ne[0] == out_size);
     GGML_ASSERT(k_start >= 0 && k_size > 0 && k_start + k_size <= parent_k);
     GGML_ASSERT(out_start >= 0 && out_size > 0 && out_start + out_size <= parent_m);
     GGML_ASSERT((k_start % 32) == 0 && (k_size % 32) == 0);
     GGML_ASSERT((out_start % 4) == 0 && (out_size % 4) == 0);
-
-    ggml_backend_opencl_context * backend_ctx =
-        (ggml_backend_opencl_context *) backend->context;
-    ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *) src1->extra;
-    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *) dst->extra;
-    ggml_tensor_extra_cl_q8_0 * extra0 =
-        (ggml_tensor_extra_cl_q8_0 *) src0->extra;
-
+    auto * backend_ctx = static_cast<ggml_backend_opencl_context *>(backend->context);
+    auto * extra1 = static_cast<ggml_tensor_extra_cl *>(src1->extra);
+    auto * extrad = static_cast<ggml_tensor_extra_cl *>(dst->extra);
     const cl_ulong offset1 = extra1->offset + src1->view_offs;
     const cl_ulong offsetd = extrad->offset + dst->view_offs;
     const int n = (int) dst->ne[1];
@@ -12523,7 +12638,7 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno_region(
         memset(&img_desc, 0, sizeof(img_desc));
         img_desc.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
         img_desc.image_width = (size_t) parent_m * parent_k / 4;
-        img_desc.buffer = extra0->q;
+        img_desc.buffer = weight_q;
         CL_CHECK((q_img = clCreateImage(
             context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
 
@@ -12543,7 +12658,7 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno_region(
 
         cl_kernel kernel = backend_ctx->CL_mul_mat_vec_q8_0_f32_region;
         CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &q_img));
-        CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),   &extra0->d));
+        CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),   &weight_d));
         CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &b_img));
         CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_mem),   &extrad->data_device));
         CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_ulong), &offsetd));
@@ -12624,8 +12739,8 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno_region(
         transpose, 2, transpose_global, transpose_local, dst);
 
     cl_kernel kernel = backend_ctx->kernel_mul_mm_q8_0_f32_8x4_region;
-    CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->q));
-    CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),   &extra0->d));
+    CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &weight_q));
+    CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),   &weight_d));
     CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &b_img_trans));
     CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_mem),   &extrad->data_device));
     CL_CHECK(clSetKernelArg(kernel,  4, sizeof(int),      &parent_k));
@@ -12651,6 +12766,20 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno_region(
     CL_CHECK(clReleaseMemObject(b_sub_buf_trans));
     CL_CHECK(clReleaseMemObject(b_img));
     CL_CHECK(clReleaseMemObject(b_sub_buf));
+}
+#endif
+
+static void ggml_cl_mul_mat_q8_0_f32_adreno_region(
+        ggml_backend_t backend, const ggml_tensor * src0,
+        const ggml_tensor * src1, ggml_tensor * dst) {
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+    GGML_ASSERT(src0 && src0->extra && src0->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(src0->ne[2] == 1 && src0->ne[3] == 1);
+    ggml_mul_mat_src0_region_params params;
+    GGML_ASSERT(ggml_mul_mat_src0_region_get_params(dst, &params));
+    auto * extra0 = static_cast<ggml_tensor_extra_cl_q8_0 *>(src0->extra);
+    ggml_cl_mul_mat_q8_0_f32_adreno_region_buffers(backend, src1, dst,
+        extra0->q, extra0->d, (int) src0->ne[0], (int) src0->ne[1], params);
 #else
     GGML_UNUSED(backend);
     GGML_UNUSED(src0);

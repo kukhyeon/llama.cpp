@@ -11,6 +11,7 @@
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
+#include <array>
 #include <map>
 #include <mutex>
 #include <string>
@@ -326,6 +327,11 @@ private:
         size_t max_nodes = 0;
         uint64_t last_used = 0;
         graph_cache_route_state route;
+        // Retain build measurements when a cached graph is sampled after
+        // backend-private scratch has been allocated during execution.
+        size_t metadata_empty_used_bytes = 0;
+        std::vector<size_t> base_planned_sizes;
+        std::vector<size_t> full_planned_sizes;
     };
 
     struct graph_cache_entry {
@@ -344,6 +350,7 @@ private:
     void graph_cache_invalidate();
     void graph_memory_stats_initialize();
     void graph_memory_stats_record(
+            const char * event,
             const llama_ubatch & ubatch,
             llm_graph_type gtype,
             const std::string & backend_policy_profile,
@@ -455,6 +462,10 @@ private:
     bool memory_stats_enabled = false;
     bool graph_memory_stats_enabled = false;
     std::string graph_memory_stats_path;
+    // Logical weight/activation/total high-water requests and actual private
+    // allocation capacity, deduplicated by backend context across graphs.
+    std::map<const void *, std::array<size_t, 4>> graph_memory_scratch_last_sample;
+    bool graph_memory_scratch_sampled = false;
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;

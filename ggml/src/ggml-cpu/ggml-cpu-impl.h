@@ -29,6 +29,20 @@ struct ggml_compute_params {
     bool use_ref;
 };
 
+// Shared HTP Q8 weights use an operation-sized native CPU_REPACK scratch.
+// Work-size and compute must select the same implementation for the whole graph.
+bool ggml_cpu_shared_repack_work_size(const struct ggml_tensor * op, size_t * size,
+        size_t * weight_bytes, size_t * activation_bytes);
+bool ggml_cpu_shared_repack_compute(struct ggml_compute_params * params, struct ggml_tensor * op);
+
+// Internal test hooks, exposed only through the CPU backend proc registry.
+// Change test mode only while no graph is executing; production never enables it.
+void ggml_cpu_shared_repack_test_mode(bool enabled);
+bool ggml_cpu_shared_repack_pack(const struct ggml_tensor * op, int interleave,
+        void * dst, size_t capacity);
+bool ggml_cpu_shared_repack_pack_reference(const struct ggml_tensor * canonical, int interleave,
+        void * dst, size_t capacity);
+
 
 #if defined(_MSC_VER)
 

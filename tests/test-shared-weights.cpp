@@ -76,7 +76,7 @@ static ggml_backend_buffer_type_t find_shared_type() {
 }
 
 static void run_case(const shape & s, ggml_backend_buffer_type_t buft,
-        const std::vector<ggml_backend_t> & backends, bool mock) {
+        const std::vector<ggml_backend_t> & backends, bool mock, bool native_compare = false) {
     ggml_init_params init = {1024 * 1024, nullptr, true};
     auto * wc = ggml_init(init);
     // Nonzero allocation offset catches readers that accidentally ignore the
@@ -150,21 +150,99 @@ static void run_case(const shape & s, ggml_backend_buffer_type_t buft,
             auto buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
             REQUIRE(buf);
             ggml_backend_tensor_set(x, input.data(), 0, ggml_nbytes(x));
+            const bool cpu = std::strcmp(ggml_backend_name(backend), "CPU") == 0;
+            const bool gpu = std::strcmp(ggml_backend_name(backend), "OpenCL") == 0;
+            const bool packed = native_compare && s.on % 4 == 0 &&
+                ((cpu && s.tokens >= 4) || (gpu && s.tokens > 1));
+            std::vector<double> comparison = reference;
+            if (packed) {
+                // Compare to the existing backend arithmetic, not a relaxed
+                // FP64 threshold: native CPU quantizes activations; Adreno's
+                // native GEMM accumulates in half precision.
+                auto * nc = ggml_init(init);
+                auto * nw = ggml_new_tensor_2d(nc, GGML_TYPE_Q8_0, s.kn, s.on);
+                auto nwb = ggml_backend_alloc_ctx_tensors(nc, backend);
+                REQUIRE(nwb);
+                ggml_backend_buffer_set_usage(nwb, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                std::vector<q8_block> selected((size_t)s.kn * s.on / 32);
+                for (int row = 0; row < s.on; ++row) {
+                    std::copy_n(blocks.data() + (s.os + row) * (s.pk / 32) + s.ks / 32,
+                        s.kn / 32, selected.data() + row * (s.kn / 32));
+                }
+                ggml_backend_tensor_set(nw, selected.data(), 0, ggml_nbytes(nw));
+                auto * rc = ggml_init(init);
+                auto * rx = ggml_new_tensor_2d(rc, GGML_TYPE_F32, s.kn, s.tokens);
+                auto * ry = ggml_mul_mat(rc, nw, rx);
+                auto * rg = ggml_new_graph_custom(rc, 16, false);
+                ggml_build_forward_expand(rg, ry);
+                auto rb = ggml_backend_alloc_ctx_tensors(rc, backend);
+                REQUIRE(rb);
+                ggml_backend_tensor_set(rx, input.data(), 0, ggml_nbytes(rx));
+                REQUIRE(ggml_backend_graph_compute(backend, rg) == GGML_STATUS_SUCCESS);
+                std::vector<float> native_output(reference.size());
+                ggml_backend_tensor_get(ry, native_output.data(), 0, ggml_nbytes(ry));
+                comparison.assign(native_output.begin(), native_output.end());
+                if (cpu) {
+                    using pack_fn = bool (*)(const ggml_tensor *, int, void *, size_t);
+                    auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+                    auto pack = reinterpret_cast<pack_fn>(ggml_backend_reg_get_proc_address(reg,
+                        "ggml_backend_cpu_shared_repack_pack"));
+                    auto pack_reference = reinterpret_cast<pack_fn>(ggml_backend_reg_get_proc_address(reg,
+                        "ggml_backend_cpu_shared_repack_pack_reference"));
+                    REQUIRE(pack && pack_reference);
+                    for (int interleave : {4, 8}) {
+                        const size_t bytes = ggml_nbytes(nw);
+                        std::vector<uint8_t> actual_pack(bytes + 128, 0xa5), expected_pack(bytes);
+                        REQUIRE(pack(y, interleave, actual_pack.data() + 64, bytes));
+                        REQUIRE(pack_reference(nw, interleave, expected_pack.data(), bytes));
+                        REQUIRE(std::memcmp(actual_pack.data() + 64, expected_pack.data(), bytes) == 0);
+                        REQUIRE(std::all_of(actual_pack.begin(), actual_pack.begin() + 64,
+                            [](uint8_t v) { return v == 0xa5; }));
+                        REQUIRE(std::all_of(actual_pack.end() - 64, actual_pack.end(),
+                            [](uint8_t v) { return v == 0xa5; }));
+                        REQUIRE(!pack(y, interleave, actual_pack.data() + 64, bytes - 1));
+                    }
+                }
+                ggml_backend_buffer_free(rb); ggml_free(rc);
+                ggml_backend_buffer_free(nwb); ggml_free(nc);
+            }
             REQUIRE(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+            if (packed) {
+                ggml_shared_weights_scratch_stats first{}, second{};
+                REQUIRE(ggml_shared_weights_get_scratch_stats(backend, &first));
+                REQUIRE(first.owner);
+                REQUIRE(first.weight_request_bytes >= ggml_row_size(GGML_TYPE_Q8_0, s.kn) * s.on);
+                REQUIRE(first.allocation_bytes >= first.request_bytes);
+                // Repeat on the same backend: the scratch allocation is reused.
+                REQUIRE(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+                REQUIRE(ggml_shared_weights_get_scratch_stats(backend, &second));
+                REQUIRE(first.owner == second.owner && first.allocation_bytes == second.allocation_bytes);
+                if (cpu) {
+                    auto plan = ggml_backend_graph_plan_create(backend, graph);
+                    REQUIRE(plan);
+                    ggml_shared_weights_scratch_stats planned{}, freed{};
+                    REQUIRE(ggml_shared_weights_get_scratch_stats(backend, &planned));
+                    REQUIRE(planned.allocation_bytes > second.allocation_bytes);
+                    REQUIRE(ggml_backend_graph_plan_compute(backend, plan) == GGML_STATUS_SUCCESS);
+                    ggml_backend_graph_plan_free(backend, plan);
+                    REQUIRE(ggml_shared_weights_get_scratch_stats(backend, &freed));
+                    REQUIRE(freed.allocation_bytes == second.allocation_bytes);
+                }
+            }
             std::vector<float> actual(reference.size());
             ggml_backend_tensor_get(y, actual.data(), 0, ggml_nbytes(y));
             double error = 0, norm = 0, max_error = 0, max_reference = 0;
             for (size_t i = 0; i < actual.size(); ++i) {
                 REQUIRE(std::isfinite(actual[i]));
-                const double delta = actual[i] - reference[i];
-                error += delta * delta; norm += reference[i] * reference[i];
+                const double delta = actual[i] - comparison[i];
+                error += delta * delta; norm += comparison[i] * comparison[i];
                 max_error = std::max(max_error, std::abs(delta));
-                max_reference = std::max(max_reference, std::abs(reference[i]));
+                max_reference = std::max(max_reference, std::abs(comparison[i]));
             }
             const double nmse = error / std::max(norm, 1e-20);
             const bool htp = std::strncmp(ggml_backend_name(backend), "HTP", 3) == 0;
-            // CPU/OpenCL keep FP32 activations and accumulation. HTP has a
-            // different arithmetic path, so retain its existing tolerance.
+            // Direct readers retain the strict FP64 reference. Native scratch
+            // compares strictly to the existing native backend result.
             REQUIRE(nmse < (htp ? 5e-4 : 1e-10));
             if (!htp) { REQUIRE(max_error < 2e-4 * std::max(1.0, max_reference)); }
             REQUIRE(ggml_shared_weights_buffer(wb)->allocation_id == allocation_id);
@@ -172,7 +250,8 @@ static void run_case(const shape & s, ggml_backend_buffer_type_t buft,
             std::snprintf(detail, sizeof(detail), "PASS nmse=%.9g parent_k=%d k_start=%d k_size=%d out_start=%d out_size=%d tokens=%d full=%d",
                 nmse, s.pk, s.ks, s.kn, s.os, s.on, s.tokens, s.full);
             ggml_shared_weights_log("validation", w, ggml_backend_name(backend), 0, s.ks, s.kn, detail);
-            std::printf("%s %s\n", ggml_backend_name(backend), detail);
+            std::printf("%s reference=%s %s\n", ggml_backend_name(backend),
+                packed ? "native" : "fp64", detail);
             ggml_backend_buffer_free(buf); ggml_free(ctx);
         }));
     }
@@ -285,6 +364,14 @@ static void verify_model(const char * model_path, const char * policy_path) {
 int main(int argc, char ** argv) {
     const bool native = argc == 4 && std::strcmp(argv[1], "--model-native") == 0;
     const bool disabled = argc == 2 && std::strcmp(argv[1], "--disabled") == 0;
+    const bool native_compare = argc == 2 &&
+        (std::strcmp(argv[1], "--native-repack") == 0 || std::strcmp(argv[1], "--device-native") == 0);
+    // Keep the original direct-reader fixture as an independent regression.
+#if defined(_WIN32)
+    _putenv_s("GGML_SHARED_HTP_REPACK", native_compare ? "1" : "0");
+#else
+    if (argc != 4) { setenv("GGML_SHARED_HTP_REPACK", native_compare ? "1" : "0", 1); }
+#endif
 #if defined(_WIN32)
     _putenv_s("GGML_SHARED_HTP_WEIGHTS", (native || disabled) ? "0" : "1");
 #else
@@ -306,7 +393,17 @@ int main(int argc, char ** argv) {
         if (argc == 4 && (native || std::strcmp(argv[1], "--model") == 0)) { verify_model(argv[2], argv[3]); return 0; }
         if (argc == 3 && std::strcmp(argv[1], "--policy") == 0) { verify_policy(argv[2]); return 0; }
         ggml_backend_load_all();
-        const bool device = argc == 2 && std::strcmp(argv[1], "--device") == 0;
+        const bool device = argc == 2 &&
+            (std::strcmp(argv[1], "--device") == 0 || std::strcmp(argv[1], "--device-native") == 0);
+        if (native_compare) {
+            auto reg = ggml_backend_reg_by_name("CPU"); REQUIRE(reg);
+            using test_mode_fn = void (*)(bool);
+            auto force = reinterpret_cast<test_mode_fn>(ggml_backend_reg_get_proc_address(reg,
+                "ggml_backend_cpu_shared_repack_test_mode"));
+            REQUIRE(force); force(true);
+            ggml_shared_weights_set_query_id(7);
+            ggml_shared_weights_set_phase(GGML_BACKEND_SCHED_PROFILE_PREFILL);
+        }
         auto buft = device ? find_shared_type() : ggml_backend_cpu_buffer_type();
         REQUIRE(buft);
         std::vector<ggml_backend_t> backends;
@@ -318,25 +415,32 @@ int main(int argc, char ** argv) {
             backends.push_back(ggml_backend_dev_init(ggml_backend_reg_dev_get(opencl, 0), nullptr)); REQUIRE(backends.back());
             backends.push_back(ggml_backend_dev_init(ggml_backend_buft_get_device(buft), nullptr)); REQUIRE(backends.back());
         }
-        run_case({3072, 32, 0, 3072, 0, 32, 1, true}, buft, backends, !device);
-        run_case({3072, 96, 0, 3072, 32, 32, 64}, buft, backends, !device);
+        run_case({3072, 32, 0, 3072, 0, 32, 1, true}, buft, backends, !device, native_compare);
+        run_case({3072, 96, 0, 3072, 32, 32, 64}, buft, backends, !device, native_compare);
         for (int n : {1, 64, 128, 256, 512}) {
-            run_case({6656, 64, 2688, 1792, 0, 32, n}, buft, backends, !device);
+            run_case({6656, 64, 2688, 1792, 0, 32, n}, buft, backends, !device, native_compare);
         }
-        run_case({6656, 64, 64, 256, 32, 32, 64}, buft, backends, !device);
+        run_case({6656, 64, 64, 256, 32, 32, 64}, buft, backends, !device, native_compare);
         // CPU/OpenCL edge cases: partial 32x32 GPU tiles, partial 2x4 CPU
         // tiles, short K, and unaligned channel starts. These regions are not
         // HTP matmul shapes, though they read the same HTP physical layout.
         auto readers = backends;
         if (device) { readers.pop_back(); }
         for (int n : {1, 3, 7, 8, 9, 31, 32, 33, 65}) {
-            run_case({512, 96, 32, 96, 3, 35, n}, buft, readers, !device);
+            run_case({512, 96, 32, 96, 3, 35, n}, buft, readers, !device, native_compare);
         }
         ggml_backend_cpu_set_n_threads(backends[0], 4);
-        run_case({256, 32, 224, 32, 31, 1, 5}, buft, readers, !device);
-        run_case({512, 96, 96, 352, 5, 67, 129}, buft, readers, !device);
+        run_case({256, 32, 224, 32, 31, 1, 5}, buft, readers, !device, native_compare);
+        run_case({512, 96, 96, 352, 5, 67, 129}, buft, readers, !device, native_compare);
         ggml_backend_cpu_set_n_threads(backends[0], 1);
-        run_case({256, 35, 0, 256, 0, 35, 33, true}, buft, readers, !device);
+        run_case({256, 35, 0, 256, 0, 35, 33, true}, buft, readers, !device, native_compare);
+        if (native_compare) {
+            ggml_backend_cpu_set_n_threads(backends[0], 4);
+            run_case({512, 96, 32, 96, 3, 36, 7}, buft, readers, !device, true);
+            run_case({256, 16, 224, 32, 7, 4, 5}, buft, readers, !device, true);
+            ggml_backend_cpu_set_n_threads(backends[0], 1);
+            run_case({256, 32, 0, 256, 0, 32, 33, true}, buft, readers, !device, true);
+        }
         for (auto backend : backends) { ggml_backend_free(backend); }
         return 0;
     } catch (const std::exception & error) {

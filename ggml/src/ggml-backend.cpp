@@ -2798,6 +2798,7 @@ void ggml_backend_sched_trace_reset(void) {
 }
 
 void ggml_backend_sched_trace_set_query_id(int query_id) {
+    ggml_shared_weights_set_query_id(query_id);
     const bool sched_trace_enabled = ggml_sched_trace_enabled();
     const bool worker_trace_enabled = ggml_ffn_worker_trace_enabled();
     if (!sched_trace_enabled && !worker_trace_enabled) {
@@ -3340,6 +3341,7 @@ void ggml_backend_sched_profile_reset(void) {
 }
 
 void ggml_backend_sched_profile_set_phase(enum ggml_backend_sched_profile_phase phase) {
+    ggml_shared_weights_set_phase((int) phase);
     if (!ggml_sched_profile_enabled() && !ggml_sched_trace_enabled() &&
             !ggml_backend_node_wall_trace_enabled()) {
         return;

@@ -1283,10 +1283,13 @@ void llama_context::graph_memory_stats_initialize() {
         "context_auxiliary_buffer_bytes,reachable_owned_storage_count,"
         "logical_unique_storage_bytes,logical_metadata_plus_storage_bytes,row_scope,backend,buffer_type,"
         "base_planned_peak_bytes,full_planned_peak_bytes,active_compute_reserved_bytes,"
-        "context_compute_reserved_bytes,tracked_context_graph_reserved_bytes\n";
+        "context_compute_reserved_bytes,tracked_context_graph_reserved_bytes,"
+        "weight_request_peak_bytes,activation_request_peak_bytes,scratch_request_peak_bytes,"
+        "backend_scratch_reserved_bytes,graph_plus_backend_scratch_reserved_bytes\n";
 }
 
 void llama_context::graph_memory_stats_record(
+        const char * event,
         const llama_ubatch & ubatch,
         llm_graph_type gtype,
         const std::string & backend_policy_profile,
@@ -1296,6 +1299,38 @@ void llama_context::graph_memory_stats_record(
         const std::vector<size_t> & base_planned_sizes,
         const std::vector<size_t> & full_planned_sizes) {
     if (!graph_memory_stats_enabled || result == nullptr || graph == nullptr || sched == nullptr) {
+        return;
+    }
+
+    struct scratch_metrics {
+        std::string backend_names;
+        ggml_shared_weights_scratch_stats stats = {};
+    };
+    std::map<const void *, scratch_metrics> scratch;
+    std::map<const void *, std::array<size_t, 4>> scratch_sample;
+    for (ggml_backend_t backend : backend_ptrs) {
+        ggml_shared_weights_scratch_stats stats = {};
+        if (!ggml_shared_weights_get_scratch_stats(backend, &stats)) {
+            continue;
+        }
+        const void * owner = stats.owner != nullptr ? stats.owner : backend;
+        auto inserted = scratch.emplace(owner, scratch_metrics {});
+        if (inserted.second) {
+            auto & metrics = inserted.first->second;
+            const char * name = ggml_backend_name(backend);
+            metrics.backend_names = name != nullptr ? name : "UNKNOWN";
+            metrics.stats = stats;
+            scratch_sample[owner] = {
+                stats.weight_request_bytes, stats.activation_request_bytes,
+                stats.request_bytes, stats.allocation_bytes,
+            };
+        }
+    }
+    const bool after_compute = strcmp(event, "compute") == 0;
+    if (after_compute && graph_memory_scratch_sampled &&
+            scratch_sample == graph_memory_scratch_last_sample) {
+        // Capacity/request changes matter here, not repeated submissions of
+        // the same graph. Avoid a graph walk and CSV write per decode token.
         return;
     }
 
@@ -1405,6 +1440,19 @@ void llama_context::graph_memory_stats_record(
         total_active_reserved += metrics.active_reserved;
         total_context_reserved += metrics.context_reserved;
     }
+    size_t total_weight_request = 0;
+    size_t total_activation_request = 0;
+    size_t total_scratch_request = 0;
+    size_t total_scratch_reserved = 0;
+    for (const auto & [owner, metrics] : scratch) {
+        (void) owner;
+        total_weight_request += metrics.stats.weight_request_bytes;
+        total_activation_request += metrics.stats.activation_request_bytes;
+        total_scratch_request += metrics.stats.request_bytes;
+        total_scratch_reserved += metrics.stats.allocation_bytes;
+    }
+    // Backend-private allocations are outside scheduler graph buffers. Count
+    // each owner once, regardless of the number of cached candidate graphs.
     const size_t tracked_context_graph_reserved_bytes =
         context_metadata_capacity_bytes +
         context_scheduler_metadata_bytes +
@@ -1426,8 +1474,8 @@ void llama_context::graph_memory_stats_record(
             const std::string & backend,
             const std::string & buffer_type) {
         output
-            << 2 << ','
-            << event_id << ",build,"
+            << 3 << ','
+            << event_id << ',' << event << ','
             << (ubatch.n_tokens > 1 ? "prefill" : "decode") << ','
             << (cparams.warmup ? 1 : 0) << ','
             << (int) gtype << ','
@@ -1461,7 +1509,17 @@ void llama_context::graph_memory_stats_record(
             << metrics.base_planned << ','
             << metrics.full_planned << ','
             << metrics.active_reserved << ','
-            << metrics.context_reserved << ",\n";
+            << metrics.context_reserved << ",,,,,,\n";
+    }
+
+    for (const auto & [owner, metrics] : scratch) {
+        (void) owner;
+        write_prefix("backend_scratch", metrics.backend_names, "PRIVATE");
+        output << ",,,,,"
+            << metrics.stats.weight_request_bytes << ','
+            << metrics.stats.activation_request_bytes << ','
+            << metrics.stats.request_bytes << ','
+            << metrics.stats.allocation_bytes << ",\n";
     }
 
     write_prefix("total", "ALL", "ALL");
@@ -1470,8 +1528,17 @@ void llama_context::graph_memory_stats_record(
         << total_full_planned << ','
         << total_active_reserved << ','
         << total_context_reserved << ','
-        << tracked_context_graph_reserved_bytes << '\n';
+        << tracked_context_graph_reserved_bytes << ','
+        << total_weight_request << ','
+        << total_activation_request << ','
+        << total_scratch_request << ','
+        << total_scratch_reserved << ','
+        << tracked_context_graph_reserved_bytes + total_scratch_reserved << '\n';
     output.flush();
+    if (after_compute) {
+        graph_memory_scratch_last_sample = std::move(scratch_sample);
+        graph_memory_scratch_sampled = true;
+    }
 }
 
 llama_context::~llama_context() {
@@ -2637,10 +2704,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         graph_cache_active_state.backend_policy_profile = backend_policy_profile;
         graph_cache_active_state.last_used = ++graph_cache_clock;
         graph_cache_capture_active_route();
+        graph_cache_active_state.metadata_empty_used_bytes = graph_metadata_empty_used_bytes;
+        graph_cache_active_state.base_planned_sizes = std::move(graph_base_planned_sizes);
+        graph_cache_active_state.full_planned_sizes = std::move(graph_full_planned_sizes);
         graph_memory_stats_record(
-                ubatch, gtype, backend_policy_profile, res, gf,
-                graph_metadata_empty_used_bytes,
-                graph_base_planned_sizes, graph_full_planned_sizes);
+                "build", ubatch, gtype, backend_policy_profile, res, gf,
+                graph_cache_active_state.metadata_empty_used_bytes,
+                graph_cache_active_state.base_planned_sizes,
+                graph_cache_active_state.full_planned_sizes);
     }
 
     // set the input data for the input tensors
@@ -2689,6 +2760,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     res->t_embd);
         }
     }
+
+    // Lazy backend allocations are visible after successful submission, even
+    // when the graph was reused. This does not wait for GPU completion: only
+    // host-side allocation capacities are sampled, not device memory contents.
+    graph_memory_stats_record(
+            "compute", ubatch, gtype, backend_policy_profile, res, res->get_gf(),
+            graph_cache_active_state.metadata_empty_used_bytes,
+            graph_cache_active_state.base_planned_sizes,
+            graph_cache_active_state.full_planned_sizes);
 
     ret = GGML_STATUS_SUCCESS;
 

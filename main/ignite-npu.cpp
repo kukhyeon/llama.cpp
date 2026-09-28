@@ -9,6 +9,7 @@
 #include "chat.h"
 
 #include "ggml-backend.h"
+#include "ggml-shared-weights.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -2419,6 +2420,7 @@ int main(int argc, char ** argv) {
                     if (ig->backend_compute_profile) {
                         ggml_backend_sched_profile_reset();
                     }
+                    ggml_shared_weights_set_query_id((int) current_question_index);
                     if (any_sched_trace) {
                         ggml_backend_sched_trace_reset();
                         ggml_backend_sched_trace_set_query_id((int) current_question_index);

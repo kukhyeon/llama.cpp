@@ -108,7 +108,43 @@ struct ggml_backend_cpu_context {
     void *              abort_callback_data;
 
     bool                use_ref;  // use reference implementation
+
+    ggml_shared_weights_scratch_stats shared_scratch{};
+    size_t shared_plan_capacity = 0;
+    bool shared_work_used = false;
 };
+
+// Workspace is shared with ordinary CPU operations. Report its actual retained
+// capacity, not a fictitious extra allocation equal to the packed weight size.
+static bool ggml_backend_cpu_record_shared_scratch(ggml_backend_cpu_context * ctx,
+        const ggml_cgraph * graph) {
+    if (!ggml_shared_weights_repack_enabled()) {
+        return false;
+    }
+    bool used = false;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        size_t request = 0, weight = 0, activation = 0;
+        if (ggml_cpu_shared_repack_work_size(graph->nodes[i], &request, &weight, &activation)) {
+            used = true;
+            ctx->shared_scratch.weight_request_bytes = MAX(ctx->shared_scratch.weight_request_bytes, weight);
+            ctx->shared_scratch.activation_request_bytes = MAX(ctx->shared_scratch.activation_request_bytes, activation);
+            ctx->shared_scratch.request_bytes = MAX(ctx->shared_scratch.request_bytes, request);
+        }
+    }
+    return used;
+}
+
+static bool ggml_backend_cpu_get_shared_weights_scratch_stats(ggml_backend_t backend,
+        ggml_shared_weights_scratch_stats * stats) {
+    if (!backend || !stats || !ggml_backend_is_cpu(backend)) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_cpu_context *>(backend->context);
+    *stats = ctx->shared_scratch;
+    stats->owner = ctx;
+    stats->allocation_bytes = (ctx->shared_work_used ? ctx->work_size : 0) + ctx->shared_plan_capacity;
+    return true;
+}
 
 static const char * ggml_backend_cpu_get_name(ggml_backend_t backend) {
     return "CPU";
@@ -126,6 +162,7 @@ static void ggml_backend_cpu_free(ggml_backend_t backend) {
 struct ggml_backend_plan_cpu {
     struct ggml_cplan cplan;
     struct ggml_cgraph cgraph;
+    bool shared_scratch = false;
 };
 
 static ggml_backend_graph_plan_t ggml_backend_cpu_graph_plan_create(ggml_backend_t backend, const struct ggml_cgraph * cgraph) {
@@ -144,6 +181,11 @@ static ggml_backend_graph_plan_t ggml_backend_cpu_graph_plan_create(ggml_backend
         }
     }
 
+    cpu_plan->shared_scratch = ggml_backend_cpu_record_shared_scratch(cpu_ctx, cgraph);
+    if (cpu_plan->shared_scratch) {
+        cpu_ctx->shared_plan_capacity += cpu_plan->cplan.work_size;
+    }
+
     cpu_plan->cplan.abort_callback      = cpu_ctx->abort_callback;
     cpu_plan->cplan.abort_callback_data = cpu_ctx->abort_callback_data;
     cpu_plan->cplan.use_ref             = cpu_ctx->use_ref;
@@ -154,10 +196,13 @@ static ggml_backend_graph_plan_t ggml_backend_cpu_graph_plan_create(ggml_backend
 static void ggml_backend_cpu_graph_plan_free(ggml_backend_t backend, ggml_backend_graph_plan_t plan) {
     struct ggml_backend_plan_cpu * cpu_plan = (struct ggml_backend_plan_cpu *)plan;
 
+    if (cpu_plan->shared_scratch) {
+        auto * cpu_ctx = static_cast<ggml_backend_cpu_context *>(backend->context);
+        GGML_ASSERT(cpu_ctx->shared_plan_capacity >= cpu_plan->cplan.work_size);
+        cpu_ctx->shared_plan_capacity -= cpu_plan->cplan.work_size;
+    }
     delete[] cpu_plan->cplan.work_data;
     delete cpu_plan;
-
-    GGML_UNUSED(backend);
 }
 
 static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backend, ggml_backend_graph_plan_t plan) {
@@ -181,6 +226,9 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
             return GGML_STATUS_ALLOC_FAILED;
         }
         cpu_ctx->work_size = cplan.work_size;
+    }
+    if (ggml_backend_cpu_record_shared_scratch(cpu_ctx, cgraph)) {
+        cpu_ctx->shared_work_used = true;
     }
     cplan.work_data = (uint8_t *)cpu_ctx->work_data;
 
@@ -680,6 +728,18 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
 }
 
 static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_get_shared_weights_scratch_stats") == 0) {
+        return (void *)ggml_backend_cpu_get_shared_weights_scratch_stats;
+    }
+    if (strcmp(name, "ggml_backend_cpu_shared_repack_test_mode") == 0) {
+        return (void *)ggml_cpu_shared_repack_test_mode;
+    }
+    if (strcmp(name, "ggml_backend_cpu_shared_repack_pack") == 0) {
+        return (void *)ggml_cpu_shared_repack_pack;
+    }
+    if (strcmp(name, "ggml_backend_cpu_shared_repack_pack_reference") == 0) {
+        return (void *)ggml_cpu_shared_repack_pack_reference;
+    }
     if (strcmp(name, "ggml_backend_set_n_threads") == 0) {
         ggml_backend_set_n_threads_t fct = ggml_backend_cpu_set_n_threads;
         return (void *)fct;

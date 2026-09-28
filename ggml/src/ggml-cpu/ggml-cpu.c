@@ -1858,6 +1858,9 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     }
 
     if (ggml_shared_weights_tensor(tensor->src[0])) {
+        if (ggml_cpu_shared_repack_compute(params, tensor)) {
+            return;
+        }
         ggml_compute_forward_shared_htp_q8(params, tensor);
         return;
     }
@@ -3037,7 +3040,8 @@ struct ggml_cplan ggml_graph_plan(
 
         size_t cur = 0;
 
-        if (!ggml_cpu_extra_work_size(n_threads, node, &cur)) {
+        if (!ggml_cpu_shared_repack_work_size(node, &cur, NULL, NULL) &&
+                !ggml_cpu_extra_work_size(n_threads, node, &cur)) {
             switch (node->op) {
                 case GGML_OP_CPY:
                 case GGML_OP_DUP:
