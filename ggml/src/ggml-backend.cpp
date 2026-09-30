@@ -3443,6 +3443,7 @@ static void ggml_op_load_profile_sync_ops_enabled_locked(void) {
         g_op_load_profile.out.ops_enabled[GGML_OP_MUL_MAT]             = 1;
         g_op_load_profile.out.ops_enabled[GGML_OP_MUL_MAT_ID]          = 1;
         g_op_load_profile.out.ops_enabled[GGML_OP_MUL_MAT_SRC0_REGION] = 1;
+        g_op_load_profile.out.ops_enabled[GGML_OP_MUL_MAT_SRC0_COMPOSITE] = 1;
         g_op_load_profile.out.ops_enabled[GGML_OP_CONT]                = 1;
         g_op_load_profile.out.ops_enabled[GGML_OP_SOFT_MAX]            = 1;
         g_op_load_profile.out.ops_enabled[GGML_OP_SET_ROWS]            = 1;
@@ -4154,7 +4155,8 @@ static bool ggml_backend_sched_parse_ffn_parallel_branch_node(
     // tensor after the graph builder names the returned FFN result. Recover the branch
     // identity from its swiglu input so debug-only split isolation can still see it.
     if ((node->op == GGML_OP_MUL_MAT ||
-         node->op == GGML_OP_MUL_MAT_SRC0_REGION) &&
+         node->op == GGML_OP_MUL_MAT_SRC0_REGION ||
+         node->op == GGML_OP_MUL_MAT_SRC0_COMPOSITE) &&
             node->name != nullptr && strncmp(node->name, "ffn_out-", 8) == 0) {
         for (int i = 0; i < GGML_MAX_SRC; ++i) {
             if (node->src[i] != nullptr &&

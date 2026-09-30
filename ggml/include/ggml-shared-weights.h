@@ -61,6 +61,7 @@ struct ggml_shared_weights_repack_event {
     size_t scratch_request_bytes; // per-op weights + activations + required alignment
     double repack_us; // -1 if unavailable; never substitute host submit time
     const char * timing_kind;
+    bool composite; // ranges describe the assembled matrix, not a single cover
 };
 GGML_API void ggml_shared_weights_set_query_id(int query_id);
 GGML_API void ggml_shared_weights_set_phase(int phase);

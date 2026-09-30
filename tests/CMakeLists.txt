@@ -206,6 +206,13 @@ target_include_directories(test-shared-weights PRIVATE ${PROJECT_SOURCE_DIR}/src
 llama_test(test-shared-weights)
 llama_test(test-shared-weights NAME test-shared-weights-native-repack ARGS --native-repack)
 llama_build_and_test(test-shared-weights-opencl-pack.cpp)
+llama_build_and_test(test-shared-weights-composite.cpp)
+if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    llama_build_and_test(test-shared-weights-composite-graph.cpp)
+    target_include_directories(test-shared-weights-composite-graph PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    llama_test(test-shared-weights-composite-graph NAME test-shared-weights-composite-graph-disabled ARGS --repack-disabled)
+endif()
+
 if (NOT WIN32)
     llama_build_and_test(test-shared-weights-memory.cpp)
 endif()

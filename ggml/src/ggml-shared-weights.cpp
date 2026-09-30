@@ -92,7 +92,13 @@ ggml_shared_weights_repack_event ggml_shared_weights_repack_begin(
     event.scratch_request_bytes = scratch_request_bytes;
     event.repack_us = -1;
     event.timing_kind = timing_kind;
-    if (op && op->src[0]) {
+    if (op && op->op == GGML_OP_MUL_MAT_SRC0_COMPOSITE) {
+        ggml_mul_mat_src0_composite_params p;
+        GGML_ASSERT(ggml_mul_mat_src0_composite_get_params(op, &p));
+        event.composite = true;
+        event.k_size = op->src[1]->ne[0];
+        event.out_size = op->ne[0];
+    } else if (op && op->src[0]) {
         ggml_mul_mat_src0_region_params r = {
             GGML_MUL_MAT_SRC0_REGION_PARAMS_VERSION, 0, 0, op->src[0]->ne[0], 0, op->src[0]->ne[1]};
         if (op->op == GGML_OP_MUL_MAT_SRC0_REGION) {
@@ -144,6 +150,12 @@ bool ggml_shared_weights_tensor(const ggml_tensor * tensor) {
     return tensor && tensor->buffer && ggml_shared_weights_is_buft(ggml_backend_buffer_get_type(tensor->buffer));
 }
 bool ggml_shared_weights_supports_op(const ggml_tensor * op) {
+    if (op && op->op == GGML_OP_MUL_MAT_SRC0_COMPOSITE) {
+        ggml_mul_mat_src0_composite_params p;
+        return ggml_shared_weights_repack_enabled() &&
+            ggml_mul_mat_src0_composite_get_params(op, &p) &&
+            (ggml_shared_weights_tensor(op->src[0]) != ggml_shared_weights_tensor(op->src[2]));
+    }
     if (!op || (op->op != GGML_OP_MUL_MAT && op->op != GGML_OP_MUL_MAT_SRC0_REGION) ||
             !op->src[0] || !op->src[1] || op->src[0]->type != GGML_TYPE_Q8_0 ||
             op->src[1]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 ||
@@ -280,6 +292,11 @@ void ggml_shared_weights_log(const char * event, const ggml_tensor * tensor,
 void ggml_shared_weights_log_repack(const ggml_tensor * weight, const char * backend,
         const ggml_shared_weights_repack_event * event) {
     if (!event || !ggml_shared_weights_timing_enabled()) { return; }
+    if (event->composite) {
+        shared_weights_log_row("repack", weight, backend, -1, 0, 0,
+            "native scratch composite; ranges describe assembled matrix", event);
+        return;
+    }
     const bool k_slice = weight && event->k_size != weight->ne[0];
     shared_weights_log_row("repack", weight, backend, k_slice ? 0 : 1,
         k_slice ? event->k_start : event->out_start,

@@ -1,111 +1,122 @@
-// Execute the actual packing kernel as a host function. This checks only its
-// byte mapping and bounds, not OpenCL compilation, scheduling, or performance.
+// Execute the actual pack helpers in load/barrier/store phases on the host.
+// This verifies mapping and bounds, not device scheduling or performance.
 #include <array>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <vector>
-
 using uchar = unsigned char;
 using ushort = unsigned short;
 using uint = unsigned int;
 using ulong = unsigned long;
 static_assert(sizeof(uint) == 4 && sizeof(ushort) == 2, "OpenCL scalar widths");
-
 struct char4 { char values[4]; };
 static size_t work_item;
 static size_t get_global_id(unsigned) { return work_item; }
-static char4 vload4(size_t offset, const char * pointer) {
-    char4 value;
-    std::memcpy(value.values, pointer + 4 * offset, sizeof(value));
-    return value;
-}
-static uint as_uint(char4 value) {
-    uint bits;
-    std::memcpy(&bits, value.values, sizeof(bits));
-    return bits;
-}
+static char4 vload4(size_t offset, const char * p) { char4 v; std::memcpy(v.values, p + 4 * offset, 4); return v; }
+static uint as_uint(char4 v) { uint bits; std::memcpy(&bits, v.values, 4); return bits; }
 #define __global
+#define __local
 #define __kernel static
+#define GGML_HTP_PACK_HOST_TEST
 #include "../ggml/src/ggml-opencl/kernels/repack_htp_q8.cl"
+#undef GGML_HTP_PACK_HOST_TEST
 #undef __global
+#undef __local
 #undef __kernel
 
-static bool check_case(int parent_k, int k_start, int k_size, int rows, int out_start, size_t offset) {
-    const size_t stride = parent_k + (parent_k / 32) * sizeof(ushort);
-    const int parent_rows = out_start + rows + 3;
-    std::vector<uchar> source(offset + parent_rows * stride + 256, 0xCD);
-    // Include signed zero, negative scales, subnormals, infinities, and NaN
-    // payloads. Packing must preserve their bits without floating conversion.
-    constexpr ushort scales[] = {
-        0x0000, 0x8000, 0x3C00, 0xBC00, 0x0001, 0x8001,
-        0x7C00, 0xFC00, 0x7E01, 0xFE55, 0x7BFF,
-    };
-    for (int row = 0; row < parent_rows; ++row) {
-        for (int k = 0; k < parent_k; ++k) {
-            source[offset + row * stride + k] = (uchar) ((row * 31 + k * 17 + 128) & 255);
-        }
-        for (int block = 0; block < parent_k / 32; ++block) {
-            const ushort bits = scales[(row + block) % (sizeof(scales) / sizeof(scales[0]))];
-            std::memcpy(source.data() + offset + row * stride + parent_k + block * 2, &bits, 2);
-        }
-    }
-    const auto original = source;
-    const size_t q_count = (size_t) (k_size / 4) * rows;
-    const size_t d_count = (size_t) (k_size / 32) * rows;
-    constexpr size_t guard = 8;
-    std::vector<uint> quants(q_count + 2 * guard, 0xAAAAAAAA);
-    std::vector<ushort> scale_bits(d_count + 2 * guard, 0xBBBB);
-    const size_t rounded_work_items = (q_count + 63) / 64 * 64;
-    // Reverse order also checks that no work item depends on another item's writes.
-    for (size_t remaining = rounded_work_items; remaining > 0; --remaining) {
-        work_item = remaining - 1;
-        kernel_repack_htp_q8_native(source.data(), offset, parent_k, stride,
-            k_start, k_size, out_start, rows, quants.data() + guard, scale_bits.data() + guard);
-    }
-    for (int row = 0; row < rows; ++row) {
-        for (int k = 0; k < k_size; ++k) {
-            // Independent byte-level reference: a native uint word contains
-            // four consecutive K bytes, and consecutive words enumerate rows.
-            const size_t native_byte = ((size_t) (k / 4) * rows + row) * 4 + k % 4;
-            const uchar actual = reinterpret_cast<const uchar *>(quants.data() + guard)[native_byte];
-            if (actual != original[offset + (out_start + row) * stride + k_start + k]) { return false; }
-        }
-        for (int block = 0; block < k_size / 32; ++block) {
-            ushort expected;
-            std::memcpy(&expected, original.data() + offset + (out_start + row) * stride +
-                parent_k + (k_start / 32 + block) * 2, 2);
-            if (scale_bits[guard + (size_t) block * rows + row] != expected) { return false; }
+struct source {
+    int k, m;
+    size_t stride, offset;
+    std::vector<uchar> htp;
+    std::vector<uint> q;
+    std::vector<ushort> d;
+    source(int nk, int nm, size_t off, int seed) : k(nk), m(nm), stride(nk + nk / 16), offset(off),
+        htp(off + nm * stride + 256, 0xCD), q((size_t) nk / 4 * nm), d((size_t) nk / 32 * nm) {
+        constexpr ushort bits[] = {0, 0x8000, 0x3C00, 0xBC00, 1, 0x8001, 0x7C00, 0xFC00, 0x7E01, 0xFE55, 0x7BFF};
+        for (int r = 0; r < m; ++r) {
+            for (int i = 0; i < k; ++i) htp[offset + r * stride + i] = (uchar) ((r * 31 + i * 17 + seed) & 255);
+            for (int i = 0; i < k / 32; ++i) {
+                const ushort scale = bits[(r + i + seed) % (sizeof(bits) / sizeof(bits[0]))];
+                std::memcpy(htp.data() + offset + r * stride + k + i * 2, &scale, 2);
+                d[(size_t) i * m + r] = scale;
+            }
+            for (int i = 0; i < k / 4; ++i) std::memcpy(&q[(size_t) i * m + r], htp.data() + offset + r * stride + 4 * i, 4);
         }
     }
-    for (size_t i = 0; i < guard; ++i) {
-        if (quants[i] != 0xAAAAAAAA || quants[guard + q_count + i] != 0xAAAAAAAA ||
-            scale_bits[i] != 0xBBBB || scale_bits[guard + d_count + i] != 0xBBBB) { return false; }
+};
+struct destination {
+    static constexpr size_t guard = 8;
+    int k, m;
+    std::vector<uint> q, expected_q;
+    std::vector<ushort> d, expected_d;
+    destination(int nk, int nm) : k(nk), m(nm), q((size_t) nk / 4 * nm + 2 * guard, 0xAAAAAAAA),
+        expected_q(q), d((size_t) nk / 32 * nm + 2 * guard, 0xBBBB), expected_d(d) {}
+    bool valid() const { return q == expected_q && d == expected_d; }
+};
+static void pack(const source & src, destination & dst, bool native, int ks, int kn, int os, int on, int dk, int dm) {
+    if (native) {
+        const size_t count = ((size_t) kn / 4 * on + 63) / 64 * 64;
+        for (size_t n = count; n > 0; --n) {
+            work_item = n - 1;
+            kernel_repack_q8_native_region(src.q.data(), src.d.data(), src.m, ks, kn, os, on,
+                dst.m, dk, dm, dst.q.data() + destination::guard, dst.d.data() + destination::guard);
+        }
+    } else {
+        for (int qb = 0; qb < kn / 4; qb += 16) for (int rb = 0; rb < on; rb += 16) {
+            std::array<uint, 16 * 17> tile_q{};
+            std::array<ushort, 16 * 2> tile_d{};
+            for (int tid = 63; tid >= 0; --tid) ggml_htp_q8_pack_load_tile(src.htp.data(), src.offset, src.k, src.stride,
+                ks, kn, os, on, qb, rb, tid, tile_q.data(), tile_d.data());
+            // The device's local-memory barrier separates these exact helper calls.
+            for (int tid = 0; tid < 64; ++tid) ggml_htp_q8_pack_store_tile(kn, on, qb, rb, tid,
+                dst.m, dk, dm, tile_q.data(), tile_d.data(), dst.q.data() + destination::guard, dst.d.data() + destination::guard);
+        }
     }
-    return source == original;
+    // Independent byte-level reference, including all untouched destination bytes.
+    auto * expected = reinterpret_cast<uchar *>(dst.expected_q.data() + destination::guard);
+    for (int row = 0; row < on; ++row) {
+        for (int k = 0; k < kn; ++k) {
+            const size_t to = ((size_t) ((dk + k) / 4) * dst.m + dm + row) * 4 + (dk + k) % 4;
+            expected[to] = src.htp[src.offset + (os + row) * src.stride + ks + k];
+        }
+        for (int b = 0; b < kn / 32; ++b) {
+            ushort value;
+            std::memcpy(&value, src.htp.data() + src.offset + (os + row) * src.stride + src.k + (ks / 32 + b) * 2, 2);
+            dst.expected_d[destination::guard + (size_t) (dk / 32 + b) * dst.m + dm + row] = value;
+        }
+    }
 }
-
 int main() {
-    const std::array<std::array<int, 3>, 7> shapes = {{
-        {32, 0, 32}, {96, 32, 32}, {256, 32, 192}, {1024, 256, 512},
-        {6656, 2688, 1792}, {8192, 960, 2048}, {3072, 0, 3072},
-    }};
     int count = 0;
-    for (const auto & shape : shapes) {
-        for (int rows : {1, 3, 4, 7, 32, 35, 128}) {
-            for (int out_start : {0, 3, 17}) {
-                for (size_t offset : {size_t(0), size_t(256), size_t(4096)}) {
-                    if (!check_case(shape[0], shape[1], shape[2], rows, out_start, offset)) {
-                        std::cerr << "HTP OpenCL pack mismatch: parent_k=" << shape[0]
-                            << " k_start=" << shape[1] << " k_size=" << shape[2]
-                            << " rows=" << rows << " out_start=" << out_start << " offset=" << offset << '\n';
-                        return 1;
-                    }
-                    ++count;
+    const std::array<std::array<int, 3>, 7> shapes = {{{32,0,32},{96,32,32},{256,32,192},{1024,256,512},
+        {6656,2688,1792},{8192,960,2048},{3072,0,3072}}};
+    for (auto s : shapes) for (int rows : {1,3,4,7,32,35,128}) for (int origin : {0,3,17})
+        for (size_t offset : {size_t(0),size_t(256),size_t(4096)}) {
+            source src(s[0], origin + rows + 3, offset, 128);
+            const auto original_htp = src.htp; const auto original_q = src.q; const auto original_d = src.d;
+            for (bool native : {false,true}) for (bool shifted : {false,true}) {
+                destination dst(s[2] + (shifted ? 96 : 0), rows + (shifted ? 11 : 0));
+                pack(src,dst,native,s[1],s[2],origin,rows,shifted ? 64 : 0,shifted ? 3 : 0);
+                if (!dst.valid() || src.htp != original_htp || src.q != original_q || src.d != original_d) {
+                    std::cerr << "Pack mismatch in single region " << count << '\n'; return 1;
                 }
+                ++count;
             }
         }
+    // Whole-branch gate/up row concat and down K concat, both source orders.
+    for (bool reversed : {false,true}) {
+        source up0(3072, 1000, 256, 17), up1(3072, 2100, 4096, 31);
+        destination up(3072,3008);
+        pack(up0,up,!reversed,0,3072,40,960,0,0);
+        pack(up1,up,reversed,0,3072,17,2048,0,960);
+        if (!up.valid()) { std::cerr << "Whole-branch row concat mismatch\n"; return 1; }
+        source down0(1024,3072,256,17), down1(3072,3072,4096,31);
+        destination down(3008,3072);
+        pack(down0,down,!reversed,64,960,0,3072,0,0);
+        pack(down1,down,reversed,512,2048,0,3072,960,0);
+        if (!down.valid()) { std::cerr << "Whole-branch K concat mismatch\n"; return 1; }
+        count += 2;
     }
-    std::cout << count << " exact HTP-to-OpenCL native pack cases passed; source and guards preserved\n";
-    return 0;
+    std::cout << count << " exact tiled/native/whole-branch pack cases passed; source and guards preserved\n";
 }

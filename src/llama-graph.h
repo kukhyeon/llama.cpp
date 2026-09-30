@@ -42,6 +42,29 @@ ggml_tensor * llm_graph_try_build_ffn_fused_add3(
         ggml_tensor * c,
         const char * reduce_backend);
 
+// Physical pieces of one logical FFN branch, in channel order. The local
+// offset addresses matching up/gate output rows and down input columns.
+struct llm_graph_ffn_segment {
+    ggml_tensor * up = nullptr;
+    ggml_tensor * gate = nullptr;
+    ggml_tensor * down = nullptr;
+    int64_t local_start = 0;
+    int64_t size = 0;
+    int64_t global_start = 0;
+};
+
+// The production FFN builder and its host-only topology test share this helper.
+// Eligible shared/native pairs form three composite matmuls and one SwiGLU;
+// unsupported backends/shapes retain the existing per-segment graph.
+ggml_tensor * llm_graph_build_ffn_segment_branch(
+        ggml_context * ctx,
+        ggml_tensor * input,
+        const std::vector<llm_graph_ffn_segment> & segments,
+        const std::string & backend_hint,
+        const std::string & branch_suffix,
+        ggml_backend_t backend,
+        const std::function<void(ggml_tensor *, const char *, const char *)> & callback);
+
 // Default-off ADD4 fusion controls and the pure topology preflight used by
 // runtime-route graph construction. Runtime fusion is safe only when every
 // profile exposes the same three logical branch slots and reduce backend.

@@ -21,6 +21,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
+#include <limits>
 #include <numeric>
 #include <sstream>
 #include <unordered_set>
@@ -87,6 +89,167 @@ static bool ffn_is_hybrid_prefix_backend(const std::string & backend) {
     const std::string key = ffn_backend_key(backend);
     return key.find("htp") != std::string::npos ||
            key.find("hexagon") != std::string::npos;
+}
+
+static ggml_tensor ffn_composite_probe(
+        ggml_tensor * first, ggml_tensor * second, ggml_tensor * input,
+        int axis, int64_t start0, int64_t size0, int64_t start1, int64_t size1) {
+    ggml_tensor probe = *input;
+    probe.type = GGML_TYPE_F32;
+    probe.op = GGML_OP_MUL_MAT_SRC0_COMPOSITE;
+    probe.ne[0] = axis == 1 ? size0 + size1 : first->ne[1];
+    probe.nb[0] = sizeof(float);
+    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+        probe.nb[i] = probe.nb[i - 1] * probe.ne[i - 1];
+    }
+    probe.buffer = nullptr;
+    probe.data = nullptr;
+    probe.view_src = nullptr;
+    probe.view_offs = 0;
+    probe.extra = nullptr;
+    std::fill(std::begin(probe.src), std::end(probe.src), nullptr);
+    probe.src[0] = first;
+    probe.src[1] = input;
+    probe.src[2] = second;
+    const ggml_mul_mat_src0_composite_params params = {
+        GGML_MUL_MAT_SRC0_COMPOSITE_PARAMS_VERSION, axis,
+        {start0, start1}, {size0, size1},
+    };
+    std::memcpy(probe.op_params, &params, sizeof(params));
+    return probe;
+}
+
+static bool ffn_composite_eligible(
+        ggml_tensor * input,
+        const std::vector<llm_graph_ffn_segment> & segments,
+        const std::string & backend_hint,
+        ggml_backend_t backend) {
+    if (!ggml_shared_weights_repack_enabled() || !backend || !input ||
+            segments.size() != 2 || input->type != GGML_TYPE_F32 ||
+            input->ne[1] < 4 || input->ne[2] != 1 || input->ne[3] != 1 ||
+            !ggml_is_contiguous(input)) {
+        return false;
+    }
+    const std::string key = ffn_backend_key(backend_hint);
+    if (key != "cpu_repack" && key != "opencl") {
+        return false;
+    }
+    const auto & first = segments[0];
+    const auto & second = segments[1];
+    const bool first_shared = ggml_shared_weights_tensor(first.up);
+    if (first_shared == ggml_shared_weights_tensor(second.up)) {
+        return false;
+    }
+    for (size_t i = 0; i < segments.size(); ++i) {
+        const auto & segment = segments[i];
+        if (segment.local_start < 0 || segment.size <= 0 ||
+                segment.local_start % 32 != 0 || segment.size % 32 != 0 ||
+                segment.global_start < 0 ||
+                segment.global_start > std::numeric_limits<int64_t>::max() - segment.size) {
+            return false;
+        }
+        const bool shared = i == 0 ? first_shared : !first_shared;
+        for (const ggml_tensor * weight : {segment.up, segment.gate, segment.down}) {
+            if (!weight || weight->type != GGML_TYPE_Q8_0 || weight->view_src ||
+                    weight->ne[2] != 1 || weight->ne[3] != 1 ||
+                    ggml_shared_weights_tensor(weight) != shared) {
+                return false;
+            }
+        }
+        if (segment.up->ne[0] != input->ne[0] || segment.gate->ne[0] != input->ne[0] ||
+                segment.up->ne[1] != segment.gate->ne[1] ||
+                segment.up->ne[1] != segment.down->ne[0] ||
+                segment.local_start > segment.up->ne[1] - segment.size ||
+                segment.down->ne[1] % 4 != 0) {
+            return false;
+        }
+    }
+    if (first.global_start + first.size != second.global_start ||
+            first.size > std::numeric_limits<int64_t>::max() - second.size ||
+            first.down->ne[1] != second.down->ne[1]) {
+        return false;
+    }
+    // Probe every weighted operation before attaching any node. A CPU without
+    // native repack instructions, or an incompatible GPU/native source layout,
+    // must retain the complete segmented branch rather than a partial rewrite.
+    auto up = ffn_composite_probe(first.up, second.up, input, 1,
+            first.local_start, first.size, second.local_start, second.size);
+    auto gate = ffn_composite_probe(first.gate, second.gate, input, 1,
+            first.local_start, first.size, second.local_start, second.size);
+    ggml_tensor activation = up;
+    activation.op = GGML_OP_GLU;
+    std::fill(std::begin(activation.src), std::end(activation.src), nullptr);
+    auto down = ffn_composite_probe(first.down, second.down, &activation, 0,
+            first.local_start, first.size, second.local_start, second.size);
+    return ggml_backend_supports_op(backend, &up) &&
+        ggml_backend_supports_op(backend, &gate) &&
+        ggml_backend_supports_op(backend, &down);
+}
+
+ggml_tensor * llm_graph_build_ffn_segment_branch(
+        ggml_context * ctx,
+        ggml_tensor * input,
+        const std::vector<llm_graph_ffn_segment> & segments,
+        const std::string & backend_hint,
+        const std::string & branch_suffix,
+        ggml_backend_t backend,
+        const std::function<void(ggml_tensor *, const char *, const char *)> & callback) {
+    const bool composite = ffn_composite_eligible(input, segments, backend_hint, backend);
+    const auto emit = [&](ggml_tensor * node, const char * stage, const std::string & suffix) {
+        callback(node, (std::string(stage) + suffix).c_str(), backend_hint.c_str());
+    };
+    ggml_tensor * result = nullptr;
+    if (composite) {
+        const auto & first = segments[0];
+        const auto & second = segments[1];
+        auto * up = ggml_mul_mat_src0_composite(ctx, first.up, second.up, input, 1,
+                first.local_start, first.size, second.local_start, second.size);
+        emit(up, "ffn_up", branch_suffix);
+        auto * gate = ggml_mul_mat_src0_composite(ctx, first.gate, second.gate, input, 1,
+                first.local_start, first.size, second.local_start, second.size);
+        emit(gate, "ffn_gate", branch_suffix);
+        auto * activation = ggml_swiglu_split(ctx, gate, up);
+        emit(activation, "ffn_swiglu", branch_suffix);
+        result = ggml_mul_mat_src0_composite(ctx, first.down, second.down, activation, 0,
+                first.local_start, first.size, second.local_start, second.size);
+        emit(result, "ffn_down", branch_suffix);
+    } else {
+        for (size_t i = 0; i < segments.size(); ++i) {
+            const auto & segment = segments[i];
+            const std::string suffix = branch_suffix +
+                (segments.size() > 1 ? ".segment" + std::to_string(i) : "");
+            auto * up = ggml_mul_mat_src0_region(ctx, segment.up, input,
+                    0, segment.up->ne[0], segment.local_start, segment.size);
+            emit(up, "ffn_up", suffix);
+            auto * gate = ggml_mul_mat_src0_region(ctx, segment.gate, input,
+                    0, segment.gate->ne[0], segment.local_start, segment.size);
+            emit(gate, "ffn_gate", suffix);
+            auto * activation = ggml_swiglu_split(ctx, gate, up);
+            emit(activation, "ffn_swiglu", suffix);
+            auto * partial = ggml_mul_mat_src0_region(ctx, segment.down, activation,
+                    segment.local_start, segment.size, 0, segment.down->ne[1]);
+            emit(partial, "ffn_down", suffix);
+            if (!result) { result = partial; }
+            else {
+                result = ggml_add(ctx, result, partial);
+                emit(result, "ffn_segment_sum", branch_suffix);
+            }
+        }
+    }
+    if (ggml_shared_weights_enabled()) {
+        for (size_t i = 0; i < segments.size(); ++i) {
+            const auto & segment = segments[i];
+            const std::string detail = branch_suffix +
+                (segments.size() > 1 ? ".segment" + std::to_string(i) : "") +
+                (composite ? ".composite" : "");
+            for (auto * weight : {segment.up, segment.gate, segment.down}) {
+                ggml_shared_weights_log("bind", weight, backend_hint.c_str(),
+                        weight == segment.down ? 0 : 1,
+                        segment.global_start, segment.size, detail.c_str());
+            }
+        }
+    }
+    return result;
 }
 
 bool llm_graph_ffn_add4_policies_eligible(
@@ -2337,7 +2500,8 @@ ggml_tensor * llm_graph_context::build_ffn(
                 if (segments.empty()) { valid = false; break; }
                 const std::string branch_suffix = route_suffix + "." +
                     (split.id.empty() ? split.backend : split.id);
-                ggml_tensor * branch_sum = nullptr;
+                std::vector<llm_graph_ffn_segment> branch_segments;
+                branch_segments.reserve(segments.size());
                 for (size_t si = 0; si < segments.size(); ++si) {
                     const auto & up_cover = segments[si];
                     const int64_t start = up_cover.cover_start + up_cover.local_start;
@@ -2354,33 +2518,22 @@ ggml_tensor * llm_graph_context::build_ffn(
                             down_cover.tensor->ne[1] != down->ne[1]) {
                         valid = false; break;
                     }
-                    const std::string suffix = branch_suffix +
-                        (segments.size() > 1 ? ".segment" + std::to_string(si) : "");
-                    ggml_tensor * up_cur = ggml_mul_mat_src0_region(ctx0, up_cover.tensor, cur,
-                        0, up_cover.tensor->ne[0], up_cover.local_start, size);
-                    cb_parallel(up_cur, ("ffn_up" + suffix).c_str(), split.backend.c_str());
-                    ggml_tensor * gate_cur = ggml_mul_mat_src0_region(ctx0, gate_cover.tensor, cur,
-                        0, gate_cover.tensor->ne[0], gate_cover.local_start, size);
-                    cb_parallel(gate_cur, ("ffn_gate" + suffix).c_str(), split.backend.c_str());
-                    ggml_tensor * act = ggml_swiglu_split(ctx0, gate_cur, up_cur);
-                    cb_parallel(act, ("ffn_swiglu" + suffix).c_str(), split.backend.c_str());
-                    ggml_tensor * partial = ggml_mul_mat_src0_region(ctx0, down_cover.tensor, act,
-                        down_cover.local_start, size, 0, down_cover.tensor->ne[1]);
-                    cb_parallel(partial, ("ffn_down" + suffix).c_str(), split.backend.c_str());
-                    if (!branch_sum) { branch_sum = partial; }
-                    else {
-                        branch_sum = ggml_add(ctx0, branch_sum, partial);
-                        cb_parallel(branch_sum, ("ffn_segment_sum" + branch_suffix).c_str(), split.backend.c_str());
-                    }
-                    if (ggml_shared_weights_enabled()) {
-                        for (auto * weight : {up_cover.tensor, gate_cover.tensor, down_cover.tensor}) {
-                            ggml_shared_weights_log("bind", weight, split.backend.c_str(),
-                                weight == down_cover.tensor ? 0 : 1, start, size, suffix.c_str());
+                    branch_segments.push_back({up_cover.tensor, gate_cover.tensor, down_cover.tensor,
+                            up_cover.local_start, size, start});
+                }
+                if (!valid) { break; }
+                ggml_backend_t branch_backend = nullptr;
+                if (sched != nullptr) {
+                    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+                        auto candidate = ggml_backend_sched_get_backend(sched, i);
+                        if (llama_backend_policy_backend_matches(candidate, split.backend)) {
+                            branch_backend = candidate;
+                            break;
                         }
                     }
                 }
-                if (!valid) { break; }
-                branch_outs.push_back(branch_sum);
+                branch_outs.push_back(llm_graph_build_ffn_segment_branch(ctx0, cur, branch_segments,
+                        split.backend, branch_suffix, branch_backend, cb_parallel));
             }
             if (!valid && ggml_shared_weights_enabled()) {
                 GGML_ABORT("shared HTP FFN graph has incomplete physical segments at layer %d", il);

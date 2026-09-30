@@ -591,6 +591,9 @@ extern "C" {
         // Appended to preserve the numeric values of all existing operations.
         GGML_OP_ADD4,
 
+        // Inference-only concatenation of two physical weight regions.
+        GGML_OP_MUL_MAT_SRC0_COMPOSITE,
+
         GGML_OP_COUNT,
     };
 
@@ -1474,6 +1477,33 @@ extern "C" {
     GGML_API bool ggml_mul_mat_src0_region_get_params(
             const struct ggml_tensor                  * tensor,
             struct ggml_mul_mat_src0_region_params    * params);
+
+    // Inference-only matmul over two physical weight covers, concatenated in
+    // logical order along K (axis 0) or output rows (axis 1). Source tensors
+    // retain their full parent shapes and physical layouts; no packed views.
+#define GGML_MUL_MAT_SRC0_COMPOSITE_PARAMS_VERSION 1
+    struct ggml_mul_mat_src0_composite_params {
+        int32_t version;
+        int32_t axis;
+        int64_t start[2];
+        int64_t size[2];
+    };
+
+    // Graph sources are weight0, activation, weight1, in that order.
+    GGML_API struct ggml_tensor * ggml_mul_mat_src0_composite(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * weight0,
+            struct ggml_tensor  * weight1,
+            struct ggml_tensor  * activation,
+            int                   axis,
+            int64_t               start0,
+            int64_t               size0,
+            int64_t               start1,
+            int64_t               size1);
+
+    GGML_API bool ggml_mul_mat_src0_composite_get_params(
+            const struct ggml_tensor                     * tensor,
+            struct ggml_mul_mat_src0_composite_params     * params);
 
     // change the precision of a matrix multiplication
     // set to GGML_PREC_F32 for higher precision (useful for phi-2)

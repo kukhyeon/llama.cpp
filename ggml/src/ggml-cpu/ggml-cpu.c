@@ -1857,10 +1857,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         return;
     }
 
-    if (ggml_shared_weights_tensor(tensor->src[0])) {
+    if (tensor->op == GGML_OP_MUL_MAT_SRC0_COMPOSITE || ggml_shared_weights_tensor(tensor->src[0])) {
         if (ggml_cpu_shared_repack_compute(params, tensor)) {
             return;
         }
+        GGML_ASSERT(tensor->op != GGML_OP_MUL_MAT_SRC0_COMPOSITE);
         ggml_compute_forward_shared_htp_q8(params, tensor);
         return;
     }
@@ -1994,6 +1995,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_MUL_MAT_SRC0_REGION:
             {
                 ggml_compute_forward_mul_mat_src0_region(params, tensor);
+            } break;
+        case GGML_OP_MUL_MAT_SRC0_COMPOSITE:
+            {
+                // Supported composites are handled by the native assembler above.
+                GGML_ABORT("unsupported CPU composite matmul");
             } break;
         case GGML_OP_MUL_MAT_ID:
             {
@@ -2465,6 +2471,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CONCAT:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_SRC0_REGION:
+        case GGML_OP_MUL_MAT_SRC0_COMPOSITE:
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_OUT_PROD:
             {
@@ -3256,6 +3263,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         /*.wdata      =*/ cplan->work_data,
         /*.threadpool =*/ tp,
         /*.use_ref    =*/ cplan->use_ref,
+        /*.prev_node  =*/ NULL,
+        /*.shared_repack_skip_quantize =*/ false,
     };
 
 #ifdef GGML_USE_OPENMP
@@ -3281,6 +3290,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         const int64_t profile_t0_us = time_node && state->ith == 0 ? ggml_time_us() : 0;
 
         ggml_compute_forward(&params, node);
+        params.prev_node = node;
 
         if (state->ith == 0 && cplan->abort_callback &&
                 cplan->abort_callback(cplan->abort_callback_data)) {

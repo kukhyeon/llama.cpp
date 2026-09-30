@@ -491,6 +491,10 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         return true;
     }
 
+    if (op->op == GGML_OP_MUL_MAT_SRC0_COMPOSITE) {
+        return ggml_cpu_shared_repack_work_size(op, nullptr, nullptr, nullptr);
+    }
+
     if (ggml_shared_weights_tensor(src0)) {
         return ggml_shared_weights_supports_op(op);
     }
@@ -739,6 +743,12 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (strcmp(name, "ggml_backend_cpu_shared_repack_pack_reference") == 0) {
         return (void *)ggml_cpu_shared_repack_pack_reference;
+    }
+    if (strcmp(name, "ggml_backend_cpu_shared_repack_test_source_layout") == 0) {
+        return (void *)ggml_cpu_shared_repack_test_source_layout;
+    }
+    if (strcmp(name, "ggml_backend_cpu_shared_repack_test_input_stats") == 0) {
+        return (void *)ggml_cpu_shared_repack_test_input_stats;
     }
     if (strcmp(name, "ggml_backend_set_n_threads") == 0) {
         ggml_backend_set_n_threads_t fct = ggml_backend_cpu_set_n_threads;

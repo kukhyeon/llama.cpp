@@ -543,6 +543,20 @@ struct ggml_backend_opencl_context {
     std::shared_ptr<_cl_kernel> shared_kernel;
     std::shared_ptr<_cl_kernel> shared_mm_kernel;
     std::shared_ptr<_cl_kernel> shared_repack_kernel;
+    std::shared_ptr<_cl_kernel> shared_native_copy_kernel;
+    struct native_activation_reuse {
+        cl_mem image = nullptr;
+        const ggml_tensor * source = nullptr;
+        cl_mem source_buffer = nullptr;
+        cl_ulong offset = 0;
+        size_t stride = 0;
+        int k = 0, n = 0;
+    } native_activation;
+    bool native_activation_graph_active = false;
+    void clear_native_activation() {
+        if (native_activation.image) { CL_CHECK(clReleaseMemObject(native_activation.image)); }
+        native_activation = {};
+    }
     // A single reusable native weight slot, consumed before the next pack on
     // the same in-order queue. No per-tensor/per-policy weight cache.
     ggml_cl_buffer shared_native_q;
@@ -551,7 +565,8 @@ struct ggml_backend_opencl_context {
     size_t shared_activation_request_bytes = 0;
     size_t shared_request_bytes = 0;
     struct shared_repack_pending {
-        cl_event event;
+        cl_event events[2];
+        int event_count;
         ggml_tensor weight;
         ggml_shared_weights_repack_event timing;
         std::string node_name;
@@ -562,21 +577,23 @@ struct ggml_backend_opencl_context {
         // Called only after the backend's existing queue barrier (or teardown).
         // Profiling START/END excludes host dispatch and queue waiting.
         for (auto & pending : shared_repack_events) {
-            cl_ulong start = 0, end = 0;
-            const cl_int start_status = clGetEventProfilingInfo(pending.event,
-                CL_PROFILING_COMMAND_START, sizeof(start), &start, nullptr);
-            const cl_int end_status = clGetEventProfilingInfo(pending.event,
-                CL_PROFILING_COMMAND_END, sizeof(end), &end, nullptr);
-            pending.timing.node_name = pending.node_name.c_str();
-            if (start_status == CL_SUCCESS && end_status == CL_SUCCESS && end >= start) {
-                pending.timing.repack_us = (end - start) / 1000.0;
-            } else {
-                // An unavailable measurement must never appear as a zero-cost pack.
-                pending.timing.repack_us = -1.0;
-                pending.timing.timing_kind = "opencl_event_unavailable";
+            cl_ulong elapsed_ns = 0;
+            bool available = true;
+            for (int i = 0; i < pending.event_count; ++i) {
+                cl_ulong start = 0, end = 0;
+                const cl_int start_status = clGetEventProfilingInfo(pending.events[i],
+                    CL_PROFILING_COMMAND_START, sizeof(start), &start, nullptr);
+                const cl_int end_status = clGetEventProfilingInfo(pending.events[i],
+                    CL_PROFILING_COMMAND_END, sizeof(end), &end, nullptr);
+                if (start_status == CL_SUCCESS && end_status == CL_SUCCESS && end >= start) {
+                    elapsed_ns += end - start;
+                } else { available = false; }
+                CL_CHECK(clReleaseEvent(pending.events[i]));
             }
+            pending.timing.node_name = pending.node_name.c_str();
+            pending.timing.repack_us = available ? elapsed_ns / 1000.0 : -1.0;
+            if (!available) { pending.timing.timing_kind = "opencl_event_unavailable"; }
             ggml_shared_weights_log_repack(&pending.weight, "OpenCL", &pending.timing);
-            CL_CHECK(clReleaseEvent(pending.event));
         }
         shared_repack_events.clear();
     }
@@ -998,6 +1015,12 @@ struct ggml_backend_opencl_context {
 
     void enqueue_ndrange_kernel(cl_kernel kernel, cl_uint work_dim, size_t *global_work_size,
             size_t *local_work_size, const ggml_tensor * tensor, cl_event * retained_event = nullptr) {
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+        if (kernel != kernel_mul_mm_q8_0_f32_8x4_region && kernel != kernel_transpose_32_16_region &&
+                kernel != shared_repack_kernel.get() && kernel != shared_native_copy_kernel.get()) {
+            clear_native_activation();
+        }
+#endif
         const bool op_load = ggml_backend_op_load_profile_should_measure(tensor->op, tensor->name);
         const bool node_wall_trace = node_wall_trace_dispatch;
         const bool breakdown = ggml_backend_op_load_profile_breakdown_enabled();
@@ -1100,6 +1123,8 @@ struct ggml_backend_opencl_context {
             write_profiling_info();
             profiling_info.clear();
 #endif
+            clear_native_activation();
+            native_activation_graph_active = false;
             // Device contexts outlive their backend handles, so the buffer
             // destructors are not reached here. Release this slot explicitly.
             // Queued commands retain their own references until completion.
@@ -4785,6 +4810,12 @@ static void ggml_cl_concat3(
 
 static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+    backend_ctx->clear_native_activation();
+    backend_ctx->native_activation_graph_active = true;
+    struct activation_graph_scope {
+        ggml_backend_opencl_context * ctx;
+        ~activation_graph_scope() { ctx->clear_native_activation(); ctx->native_activation_graph_active = false; }
+    } activation_scope{backend_ctx};
     const bool breakdown = ggml_backend_op_load_profile_breakdown_enabled();
     const int64_t graph_t0_us = breakdown ? ggml_time_us() : 0;
     const bool node_wall_trace = cgraph->trace_graph_id >= 0 &&
@@ -4814,6 +4845,12 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
+        // Reuse is restricted to adjacent eligible matmuls in this submission.
+        // Even a metadata node breaks the chain; no graph/query cache survives.
+        if (node->op != GGML_OP_MUL_MAT_SRC0_COMPOSITE && node->op != GGML_OP_MUL_MAT_SRC0_REGION &&
+                !(node->op == GGML_OP_MUL_MAT && ggml_shared_weights_tensor(node->src[0]))) {
+            backend_ctx->clear_native_activation();
+        }
 
         // NOTE: this may oversynchronize by synchronizing with
         //       backends/devices which don't compute 'cgraph's
@@ -5095,10 +5132,41 @@ static bool ggml_backend_opencl_prepare_shared_weight(ggml_backend_dev_t dev, co
     return ggml_opencl_import_shared_weight(ggml_cl2_init(dev), tensor) != nullptr;
 }
 
+static const char * ggml_backend_opencl_buffer_type_get_name(ggml_backend_buffer_type_t buffer_type);
+
+static bool ggml_opencl_supports_composite(ggml_backend_dev_t dev, const ggml_tensor * op) {
+#if defined(GGML_OPENCL_USE_ADRENO_KERNELS) && defined(GGML_OPENCL_SOA_Q)
+    auto * dev_ctx = static_cast<ggml_backend_opencl_device_context *>(dev->context);
+    auto * ctx = dev_ctx->backend_ctx;
+    if (!ggml_shared_weights_repack_enabled() || !ctx || ctx->gpu_family != GPU_FAMILY::ADRENO ||
+            !ctx->shared_external_host_ptr || !ggml_shared_weights_supports_op(op) ||
+            op->ne[0] % 4 != 0 || op->ne[0] > INT_MAX ||
+            op->src[1]->ne[0] > INT_MAX || op->ne[1] > INT_MAX) { return false; }
+    bool have_shared = false;
+    for (int index : {0, 2}) {
+        const ggml_tensor * w = op->src[index];
+        if (w->ne[0] > INT_MAX || w->ne[1] > INT_MAX) { return false; }
+        if (ggml_shared_weights_tensor(w)) { have_shared = true; continue; }
+        // Native data must already belong to this OpenCL context and use the
+        // transposed SOA layout. A CPU/HTP pointer cannot be treated as q/d.
+        if (!w->buffer || w->buffer->buft->iface.get_name != ggml_backend_opencl_buffer_type_get_name ||
+                ggml_cl2_init(w->buffer->buft->device)->context != ctx->context ||
+                !enable_adreno_trans_weight(ctx, w)) { return false; }
+    }
+    return have_shared;
+#else
+    GGML_UNUSED(dev); GGML_UNUSED(op);
+    return false;
+#endif
+}
+
 static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     ggml_backend_opencl_device_context * dev_ctx     = (ggml_backend_opencl_device_context *)dev->context;
     ggml_backend_opencl_context *        backend_ctx = dev_ctx->backend_ctx;
 
+    if (op->op == GGML_OP_MUL_MAT_SRC0_COMPOSITE) {
+        return ggml_opencl_supports_composite(dev, op);
+    }
     if (ggml_shared_weights_tensor(op->src[0])) {
         return backend_ctx->shared_external_host_ptr && ggml_shared_weights_supports_op(op);
     }
@@ -12488,10 +12556,7 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno_region_buffers(
         const ggml_mul_mat_src0_region_params & params);
 #endif
 
-static void ggml_cl_mul_mat_shared_htp(
-        ggml_backend_t backend, const ggml_tensor * w, const ggml_tensor * x, ggml_tensor * dst) {
-    GGML_ASSERT(ggml_shared_weights_supports_op(dst));
-    auto * ctx = static_cast<ggml_backend_opencl_context *>(backend->context);
+static void ggml_cl_prepare_shared_kernels(ggml_backend_opencl_context * ctx) {
     std::call_once(ctx->shared_kernel_once, [ctx]() {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string source {
@@ -12513,8 +12578,97 @@ static void ggml_cl_mul_mat_shared_htp(
         kernel = clCreateKernel(program, "kernel_repack_htp_q8_native", &err);
         CL_CHECK(err);
         ctx->shared_repack_kernel = std::shared_ptr<_cl_kernel>(kernel, [](cl_kernel k) { clReleaseKernel(k); });
+        kernel = clCreateKernel(program, "kernel_repack_q8_native_region", &err);
+        CL_CHECK(err);
+        ctx->shared_native_copy_kernel = std::shared_ptr<_cl_kernel>(kernel, [](cl_kernel k) { clReleaseKernel(k); });
         CL_CHECK(clReleaseProgram(program));
     });
+}
+
+static void ggml_cl_mul_mat_shared_composite(ggml_backend_t backend, ggml_tensor * dst) {
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+    GGML_ASSERT(ggml_opencl_supports_composite(backend->device, dst));
+    auto * ctx = static_cast<ggml_backend_opencl_context *>(backend->context);
+    ggml_mul_mat_src0_composite_params p;
+    GGML_ASSERT(ggml_mul_mat_src0_composite_get_params(dst, &p));
+    ggml_cl_prepare_shared_kernels(ctx);
+    const int full_k = (int) dst->src[1]->ne[0], full_m = (int) dst->ne[0], nt = (int) dst->ne[1];
+    const size_t q_bytes = (size_t) full_k * full_m;
+    const size_t d_bytes = q_bytes / 32 * sizeof(ggml_fp16_t);
+    const size_t activation_bytes = nt > 1 ? (size_t) full_k * CEIL_DIV(nt, 8) * 8 * sizeof(ggml_fp16_t) : 0;
+    ctx->shared_native_q.allocate(ctx->context, q_bytes);
+    ctx->shared_native_d.allocate(ctx->context, d_bytes);
+    ctx->shared_weight_request_bytes = std::max(ctx->shared_weight_request_bytes, q_bytes + d_bytes);
+    ctx->shared_activation_request_bytes = std::max(ctx->shared_activation_request_bytes, activation_bytes);
+    ctx->shared_request_bytes = std::max(ctx->shared_request_bytes, q_bytes + d_bytes + activation_bytes);
+    const bool timing = ggml_shared_weights_timing_enabled();
+    ggml_shared_weights_repack_event measurement = {};
+    if (timing) { measurement = ggml_shared_weights_repack_begin(dst, "opencl_event_sum",
+        q_bytes + d_bytes, q_bytes + d_bytes + activation_bytes); }
+    cl_event events[2] = {nullptr, nullptr};
+    const ggml_tensor * shared_identity = nullptr;
+    int destination_start = 0;
+    for (int part = 0; part < 2; ++part) {
+        const ggml_tensor * w = dst->src[part == 0 ? 0 : 2];
+        const bool htp = ggml_shared_weights_tensor(w);
+        const int ks = p.axis == 0 ? (int) p.start[part] : 0;
+        const int kn = p.axis == 0 ? (int) p.size[part] : full_k;
+        const int os = p.axis == 1 ? (int) p.start[part] : 0;
+        const int on = p.axis == 1 ? (int) p.size[part] : full_m;
+        const int destination_k = p.axis == 0 ? destination_start : 0;
+        const int destination_row = p.axis == 1 ? destination_start : 0;
+        cl_kernel kernel = htp ? ctx->shared_repack_kernel.get() : ctx->shared_native_copy_kernel.get();
+        int arg = 0;
+        auto set = [&](size_t size, const void * ptr) { CL_CHECK(clSetKernelArg(kernel, arg++, size, ptr)); };
+        if (htp) {
+            shared_identity = w;
+            const auto * desc = ggml_shared_weights_buffer(w->buffer);
+            auto * imported = static_cast<ggml_opencl_shared_import *>(ggml_shared_weights_attachment(w->buffer, ctx->context));
+            GGML_ASSERT(desc && imported);
+            const cl_ulong offset = (const char *) w->data - (const char *) desc->base;
+            const cl_ulong stride = w->nb[1];
+            const int parent_k = (int) w->ne[0];
+            set(sizeof(cl_mem), &imported->mem); set(sizeof(offset), &offset);
+            set(sizeof(parent_k), &parent_k); set(sizeof(stride), &stride);
+        } else {
+            auto * extra = static_cast<ggml_tensor_extra_cl_q8_0 *>(w->extra);
+            GGML_ASSERT(extra && extra->q && extra->d);
+            const int parent_m = (int) w->ne[1];
+            set(sizeof(cl_mem), &extra->q); set(sizeof(cl_mem), &extra->d); set(sizeof(parent_m), &parent_m);
+        }
+        set(sizeof(ks), &ks); set(sizeof(kn), &kn); set(sizeof(os), &os); set(sizeof(on), &on);
+        set(sizeof(full_m), &full_m); set(sizeof(destination_k), &destination_k); set(sizeof(destination_row), &destination_row);
+        set(sizeof(cl_mem), &ctx->shared_native_q.buffer); set(sizeof(cl_mem), &ctx->shared_native_d.buffer);
+        if (htp) {
+            size_t local[] = {16, 4};
+            size_t global[] = {CEIL_DIV((size_t) kn / 4, 16) * 16, CEIL_DIV((size_t) on, 16) * 4};
+            ctx->enqueue_ndrange_kernel(kernel, 2, global, local, dst, timing ? &events[part] : nullptr);
+        } else {
+            size_t local[] = {64};
+            size_t global[] = {CEIL_DIV((size_t) kn / 4 * on, local[0]) * local[0]};
+            ctx->enqueue_ndrange_kernel(kernel, 1, global, local, dst, timing ? &events[part] : nullptr);
+        }
+        destination_start += (int) p.size[part];
+    }
+    if (timing) {
+        GGML_ASSERT(shared_identity);
+        ctx->shared_repack_events.push_back({{events[0], events[1]}, 2, *shared_identity, measurement,
+            measurement.node_name ? measurement.node_name : dst->name});
+    }
+    const ggml_mul_mat_src0_region_params compact = {GGML_MUL_MAT_SRC0_REGION_PARAMS_VERSION, 0, 0, full_k, 0, full_m};
+    ggml_cl_mul_mat_q8_0_f32_adreno_region_buffers(backend, dst->src[1], dst,
+        ctx->shared_native_q.buffer, ctx->shared_native_d.buffer, full_k, full_m, compact);
+#else
+    GGML_UNUSED(backend); GGML_UNUSED(dst);
+    GGML_ABORT("OpenCL composite weights require Adreno kernels");
+#endif
+}
+
+static void ggml_cl_mul_mat_shared_htp(
+        ggml_backend_t backend, const ggml_tensor * w, const ggml_tensor * x, ggml_tensor * dst) {
+    GGML_ASSERT(ggml_shared_weights_supports_op(dst));
+    auto * ctx = static_cast<ggml_backend_opencl_context *>(backend->context);
+    ggml_cl_prepare_shared_kernels(ctx);
     auto * imported = static_cast<ggml_opencl_shared_import *>(
         ggml_shared_weights_attachment(w->buffer, ctx->context));
     // Import must happen during preparation, never while CPU/HTP readers run.
@@ -12554,6 +12708,8 @@ static void ggml_cl_mul_mat_shared_htp(
         set(sizeof(cl_mem), &imported->mem); set(sizeof(wo), &wo);
         set(sizeof(pk), &pk); set(sizeof(ws), &ws);
         set(sizeof(ks), &ks); set(sizeof(kn), &kn); set(sizeof(os), &os); set(sizeof(on), &on);
+        const int zero = 0;
+        set(sizeof(on), &on); set(sizeof(zero), &zero); set(sizeof(zero), &zero);
         set(sizeof(cl_mem), &ctx->shared_native_q.buffer);
         set(sizeof(cl_mem), &ctx->shared_native_d.buffer);
         const bool timing = ggml_shared_weights_timing_enabled();
@@ -12562,12 +12718,12 @@ static void ggml_cl_mul_mat_shared_htp(
             measurement = ggml_shared_weights_repack_begin(dst, "opencl_event", q_bytes + d_bytes,
                 q_bytes + d_bytes + activation_bytes);
         }
-        size_t local[] = {64};
-        size_t global[] = {CEIL_DIV((size_t) kn / 4 * on, local[0]) * local[0]};
+        size_t local[] = {16, 4};
+        size_t global[] = {CEIL_DIV((size_t) kn / 4, 16) * 16, CEIL_DIV((size_t) on, 16) * 4};
         cl_event event = nullptr;
-        ctx->enqueue_ndrange_kernel(pack, 1, global, local, dst, timing ? &event : nullptr);
+        ctx->enqueue_ndrange_kernel(pack, 2, global, local, dst, timing ? &event : nullptr);
         if (timing) {
-            ctx->shared_repack_events.push_back({event, *w, measurement,
+            ctx->shared_repack_events.push_back({{event, nullptr}, 1, *w, measurement,
                 measurement.node_name ? measurement.node_name : dst->name});
         }
         const ggml_mul_mat_src0_region_params compact = {
@@ -12581,6 +12737,7 @@ static void ggml_cl_mul_mat_shared_htp(
         ggml_shared_weights_log("direct", w, "OpenCL", -1, 0, 0,
             nt == 1 ? "single-token direct HTP" : "native scratch unsupported for this device/shape");
     }
+    ctx->clear_native_activation();
     const bool tiled = nt >= 8;
     cl_kernel kernel = tiled ? ctx->shared_mm_kernel.get() : ctx->shared_kernel.get();
     int arg = 0;
@@ -12630,6 +12787,7 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno_region_buffers(
     cl_buffer_region buffer_region;
 
     if (n == 1) {
+        backend_ctx->clear_native_activation();
         cl_mem q_img = nullptr;
         cl_mem b_sub_buf = nullptr;
         cl_mem b_img = nullptr;
@@ -12687,56 +12845,74 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno_region_buffers(
     cl_mem b_sub_buf_trans = nullptr;
     cl_mem b_img = nullptr;
     cl_mem b_img_trans = nullptr;
+    const int padded_n = CEIL_DIV(n, 8) * 8;
+    const size_t input_bytes = (size_t) k_size * n * sizeof(float);
+    const size_t output_bytes = (size_t) out_size * n * sizeof(float);
+    const bool overwrites_input = extra1->data_device == extrad->data_device &&
+        offset1 < offsetd + output_bytes && offsetd < offset1 + input_bytes;
+    const auto & cached = backend_ctx->native_activation;
+    const bool can_cache = backend_ctx->native_activation_graph_active && !overwrites_input;
+    const bool reuse = can_cache && cached.image && cached.source == src1 &&
+        cached.source_buffer == extra1->data_device && cached.offset == offset1 &&
+        cached.stride == src1->nb[1] && cached.k == k_size && cached.n == n;
+    if (reuse) {
+        b_img_trans = cached.image;
+        CL_CHECK(clRetainMemObject(b_img_trans));
+    } else {
+        backend_ctx->clear_native_activation();
+        buffer_region.origin = offset1;
+        buffer_region.size = (size_t) k_size * n * sizeof(float);
+        CL_CHECK((b_sub_buf = clCreateSubBuffer(
+            extra1->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION,
+            &buffer_region, &err), err));
 
-    buffer_region.origin = offset1;
-    buffer_region.size = (size_t) k_size * n * sizeof(float);
-    CL_CHECK((b_sub_buf = clCreateSubBuffer(
-        extra1->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION,
-        &buffer_region, &err), err));
+        img_fmt = { CL_RGBA, CL_FLOAT };
+        memset(&img_desc, 0, sizeof(img_desc));
+        img_desc.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+        img_desc.image_width = (size_t) k_size * n / 4;
+        img_desc.buffer = b_sub_buf;
+        CL_CHECK((b_img = clCreateImage(
+            context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
 
-    img_fmt = { CL_RGBA, CL_FLOAT };
-    memset(&img_desc, 0, sizeof(img_desc));
-    img_desc.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
-    img_desc.image_width = (size_t) k_size * n / 4;
-    img_desc.buffer = b_sub_buf;
-    CL_CHECK((b_img = clCreateImage(
-        context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
+        buffer_region.origin = 0;
+        buffer_region.size = (size_t) k_size * padded_n * sizeof(float) / 2;
+        backend_ctx->prealloc_act_trans.allocate(context, buffer_region.size);
+        CL_CHECK((b_sub_buf_trans = clCreateSubBuffer(
+            backend_ctx->prealloc_act_trans.buffer, 0,
+            CL_BUFFER_CREATE_TYPE_REGION, &buffer_region, &err), err));
 
-    const int padding = n % 8 == 0 ? 0 : 8 - n % 8;
-    const int padded_n = n + padding;
+        img_fmt = { CL_RGBA, CL_HALF_FLOAT };
+        memset(&img_desc, 0, sizeof(img_desc));
+        img_desc.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+        img_desc.image_width = (size_t) k_size * padded_n / 4;
+        img_desc.buffer = b_sub_buf_trans;
+        CL_CHECK((b_img_trans = clCreateImage(
+            context, 0, &img_fmt, &img_desc, NULL, &err), err));
 
-    buffer_region.origin = 0;
-    buffer_region.size = (size_t) k_size * padded_n * sizeof(float) / 2;
-    backend_ctx->prealloc_act_trans.allocate(context, buffer_region.size);
-    CL_CHECK((b_sub_buf_trans = clCreateSubBuffer(
-        backend_ctx->prealloc_act_trans.buffer, 0,
-        CL_BUFFER_CREATE_TYPE_REGION, &buffer_region, &err), err));
+        const int width_b = k_size / 4;
+        const int padded_height_b = padded_n / 4;
 
-    img_fmt = { CL_RGBA, CL_HALF_FLOAT };
-    memset(&img_desc, 0, sizeof(img_desc));
-    img_desc.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
-    img_desc.image_width = (size_t) k_size * padded_n / 4;
-    img_desc.buffer = b_sub_buf_trans;
-    CL_CHECK((b_img_trans = clCreateImage(
-        context, 0, &img_fmt, &img_desc, NULL, &err), err));
+        cl_kernel transpose = backend_ctx->kernel_transpose_32_16_region;
+        CL_CHECK(clSetKernelArg(transpose, 0, sizeof(cl_mem), &b_img));
+        CL_CHECK(clSetKernelArg(transpose, 1, sizeof(cl_mem), &b_img_trans));
+        CL_CHECK(clSetKernelArg(transpose, 2, sizeof(int),    &n));
+        CL_CHECK(clSetKernelArg(transpose, 3, sizeof(int),    &width_b));
+        CL_CHECK(clSetKernelArg(transpose, 4, sizeof(int),    &padded_height_b));
 
-    const int width_b = k_size / 4;
-    const int padded_height_b = padded_n / 4;
+        size_t transpose_local[]  = { 1, 16 };
+        size_t transpose_global[] = {
+            (size_t) width_b,
+            CEIL_DIV((size_t) padded_height_b, transpose_local[1]) * transpose_local[1]
+        };
+        backend_ctx->enqueue_ndrange_kernel(
+            transpose, 2, transpose_global, transpose_local, dst);
 
-    cl_kernel transpose = backend_ctx->kernel_transpose_32_16_region;
-    CL_CHECK(clSetKernelArg(transpose, 0, sizeof(cl_mem), &b_img));
-    CL_CHECK(clSetKernelArg(transpose, 1, sizeof(cl_mem), &b_img_trans));
-    CL_CHECK(clSetKernelArg(transpose, 2, sizeof(int),    &n));
-    CL_CHECK(clSetKernelArg(transpose, 3, sizeof(int),    &width_b));
-    CL_CHECK(clSetKernelArg(transpose, 4, sizeof(int),    &padded_height_b));
-
-    size_t transpose_local[]  = { 1, 16 };
-    size_t transpose_global[] = {
-        (size_t) width_b,
-        CEIL_DIV((size_t) padded_height_b, transpose_local[1]) * transpose_local[1]
-    };
-    backend_ctx->enqueue_ndrange_kernel(
-        transpose, 2, transpose_global, transpose_local, dst);
+        if (can_cache) {
+            CL_CHECK(clRetainMemObject(b_img_trans));
+            backend_ctx->native_activation = {b_img_trans, src1, extra1->data_device,
+                offset1, src1->nb[1], k_size, n};
+        }
+    }
 
     cl_kernel kernel = backend_ctx->kernel_mul_mm_q8_0_f32_8x4_region;
     CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &weight_q));
@@ -12763,9 +12939,9 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno_region_buffers(
         kernel, 3, global_work_size, local_work_size, dst);
 
     CL_CHECK(clReleaseMemObject(b_img_trans));
-    CL_CHECK(clReleaseMemObject(b_sub_buf_trans));
-    CL_CHECK(clReleaseMemObject(b_img));
-    CL_CHECK(clReleaseMemObject(b_sub_buf));
+    if (b_sub_buf_trans) { CL_CHECK(clReleaseMemObject(b_sub_buf_trans)); }
+    if (b_img) { CL_CHECK(clReleaseMemObject(b_img)); }
+    if (b_sub_buf) { CL_CHECK(clReleaseMemObject(b_sub_buf)); }
 }
 #endif
 
@@ -16767,6 +16943,11 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
     ggml_tensor * src0 = tensor->src[0];
     ggml_tensor * src1 = tensor->src[1];
 
+    if (tensor->op == GGML_OP_MUL_MAT_SRC0_COMPOSITE) {
+        if (!ggml_opencl_supports_composite(backend->device, tensor)) { return false; }
+        ggml_cl_mul_mat_shared_composite(backend, tensor);
+        return true;
+    }
     if (ggml_shared_weights_tensor(src0)) {
         if (!ggml_shared_weights_supports_op(tensor)) { return false; }
         ggml_cl_mul_mat_shared_htp(backend, src0, src1, tensor);

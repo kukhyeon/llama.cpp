@@ -1081,9 +1081,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "MUL_MAT_SRC0_REGION",
     "ADD4",
+    "MUL_MAT_SRC0_COMPOSITE",
 };
 
-static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
+static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1194,9 +1195,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "X[k0:k1,o0:o1]*Y",
     "(x+(y+z))+w",
+    "concat(X0,X1)*Y",
 };
 
-static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
+static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3383,6 +3385,90 @@ bool ggml_mul_mat_src0_region_get_params(
         return false;
     }
 
+    *params = decoded;
+    return true;
+}
+
+static bool ggml_mul_mat_src0_composite_params_are_valid(
+        const struct ggml_tensor                        * tensor,
+        const struct ggml_mul_mat_src0_composite_params * params) {
+    if (!tensor || !params || tensor->op != GGML_OP_MUL_MAT_SRC0_COMPOSITE ||
+            !tensor->src[0] || !tensor->src[1] || !tensor->src[2] ||
+            params->version != GGML_MUL_MAT_SRC0_COMPOSITE_PARAMS_VERSION ||
+            (params->axis != 0 && params->axis != 1)) {
+        return false;
+    }
+    const struct ggml_tensor * weights[2] = { tensor->src[0], tensor->src[2] };
+    const struct ggml_tensor * x = tensor->src[1];
+    for (int i = 0; i < 2; ++i) {
+        const struct ggml_tensor * w = weights[i];
+        if (w->type != GGML_TYPE_Q8_0 || w->view_src ||
+                w->ne[0] <= 0 || w->ne[1] <= 0 || w->ne[2] != 1 || w->ne[3] != 1 ||
+                w->ne[0] % 32 != 0 || !ggml_is_contiguous(w) ||
+                params->start[i] < 0 || params->size[i] <= 0 ||
+                params->size[i] > w->ne[params->axis] ||
+                params->start[i] > w->ne[params->axis] - params->size[i] ||
+                (params->axis == 0 && (params->start[i] % 32 || params->size[i] % 32))) {
+            return false;
+        }
+    }
+    if (params->size[0] > INT64_MAX - params->size[1] ||
+            weights[0]->ne[1 - params->axis] != weights[1]->ne[1 - params->axis]) {
+        return false;
+    }
+    const int64_t combined = params->size[0] + params->size[1];
+    const int64_t k = params->axis == 0 ? combined : weights[0]->ne[0];
+    const int64_t m = params->axis == 1 ? combined : weights[0]->ne[1];
+    return x->type == GGML_TYPE_F32 && tensor->type == GGML_TYPE_F32 &&
+           x->ne[0] == k && x->ne[1] > 0 && x->ne[2] == 1 && x->ne[3] == 1 &&
+           tensor->ne[0] == m && tensor->ne[1] == x->ne[1] &&
+           tensor->ne[2] == 1 && tensor->ne[3] == 1 &&
+           ggml_is_contiguous(x) && ggml_is_contiguous(tensor);
+}
+
+struct ggml_tensor * ggml_mul_mat_src0_composite(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * weight0,
+        struct ggml_tensor  * weight1,
+        struct ggml_tensor  * activation,
+        int                   axis,
+        int64_t               start0,
+        int64_t               size0,
+        int64_t               start1,
+        int64_t               size1) {
+    GGML_ASSERT(weight0 && weight1 && activation);
+    GGML_ASSERT(axis == 0 || axis == 1);
+    GGML_ASSERT(size0 > 0 && size1 > 0 && size0 <= INT64_MAX - size1);
+    const struct ggml_mul_mat_src0_composite_params params = {
+        .version = GGML_MUL_MAT_SRC0_COMPOSITE_PARAMS_VERSION,
+        .axis = axis,
+        .start = { start0, start1 },
+        .size = { size0, size1 },
+    };
+    static_assert(sizeof(params) == 40, "composite matmul parameter ABI changed; bump its version");
+    static_assert(sizeof(params) <= GGML_MAX_OP_PARAMS, "composite matmul parameters do not fit");
+    const int64_t ne[2] = { axis == 1 ? size0 + size1 : weight0->ne[1], activation->ne[1] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 2, ne);
+    result->op = GGML_OP_MUL_MAT_SRC0_COMPOSITE;
+    result->src[0] = weight0;
+    result->src[1] = activation;
+    result->src[2] = weight1;
+    memcpy(result->op_params, &params, sizeof(params));
+    GGML_ASSERT(ggml_mul_mat_src0_composite_params_are_valid(result, &params));
+    return result;
+}
+
+bool ggml_mul_mat_src0_composite_get_params(
+        const struct ggml_tensor                    * tensor,
+        struct ggml_mul_mat_src0_composite_params    * params) {
+    if (!tensor || !params || tensor->op != GGML_OP_MUL_MAT_SRC0_COMPOSITE) {
+        return false;
+    }
+    struct ggml_mul_mat_src0_composite_params decoded;
+    memcpy(&decoded, tensor->op_params, sizeof(decoded));
+    if (!ggml_mul_mat_src0_composite_params_are_valid(tensor, &decoded)) {
+        return false;
+    }
     *params = decoded;
     return true;
 }

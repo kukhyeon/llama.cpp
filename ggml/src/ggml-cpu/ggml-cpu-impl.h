@@ -27,6 +27,10 @@ struct ggml_compute_params {
 
     // use reference implementation
     bool use_ref;
+
+    // Execution-local only: never retain activation contents across graphs.
+    const struct ggml_tensor * prev_node;
+    bool shared_repack_skip_quantize;
 };
 
 // Shared HTP Q8 weights use an operation-sized native CPU_REPACK scratch.
@@ -42,6 +46,8 @@ bool ggml_cpu_shared_repack_pack(const struct ggml_tensor * op, int interleave,
         void * dst, size_t capacity);
 bool ggml_cpu_shared_repack_pack_reference(const struct ggml_tensor * canonical, int interleave,
         void * dst, size_t capacity);
+bool ggml_cpu_shared_repack_test_source_layout(struct ggml_tensor * tensor, int interleave);
+void ggml_cpu_shared_repack_test_input_stats(uint64_t * prepared, uint64_t * reused, bool reset);
 
 
 #if defined(_MSC_VER)

@@ -18,6 +18,7 @@
 #include <cstdio>  // for GGML_ASSERT
 #include <atomic>
 #include <limits>
+#include <type_traits>
 
 #include "repack.h"
 
@@ -4157,9 +4158,18 @@ class tensor_traits_base : public ggml::cpu::tensor_traits {
   public:
     virtual int repack(struct ggml_tensor * t, const void * data, size_t data_size) = 0;
     virtual bool supports_src0_region(const struct ggml_tensor * op) const = 0;
+    virtual bool q8_layout(int & interleave, int & rows) const = 0;
 };
 
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PARAM_TYPE> class tensor_traits : public tensor_traits_base {
+    bool q8_layout(int & interleave, int & rows) const override {
+        if constexpr (std::is_same<BLOC_TYPE, block_q8_0>::value) {
+            interleave = INTER_SIZE;
+            rows = NB_COLS;
+            return true;
+        }
+        return false;
+    }
 
     bool work_size(int /* n_threads */, const struct ggml_tensor * op, size_t & size) override {
         // not realy a GGML_TYPE_Q8_0 but same size.
@@ -4329,18 +4339,20 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         // INFO: Quantization is done in planes to avoid extra complexity in chunking.
         // Flattening dimensions not multiple of INTER_SIZE would require extra handling depending on how
         // the planes are broadcast.
-        for (int64_t i12 = 0; i12 < ne12; i12++) {
-            char * data_ptr  = (char *) src1->data + i12 * nb12;
-            char * wdata_ptr = wdata + i12 * nbw2;
+        if (!params->shared_repack_skip_quantize) {
+            for (int64_t i12 = 0; i12 < ne12; i12++) {
+                char * data_ptr  = (char *) src1->data + i12 * nb12;
+                char * wdata_ptr = wdata + i12 * nbw2;
 
-            for (int64_t i11 = ith * 4; i11 < ne11 - ne11 % 4; i11 += nth * 4) {
-                ggml_quantize_mat_t<INTER_SIZE, PARAM_TYPE>((float *) (data_ptr + i11 * nb11),
-                                                            (void *) (wdata_ptr + i11 * nbw1), 4, ne10);
-            }
+                for (int64_t i11 = ith * 4; i11 < ne11 - ne11 % 4; i11 += nth * 4) {
+                    ggml_quantize_mat_t<INTER_SIZE, PARAM_TYPE>((float *) (data_ptr + i11 * nb11),
+                                                                (void *) (wdata_ptr + i11 * nbw1), 4, ne10);
+                }
 
-            const int64_t i11_processed = ne11 - ne11 % 4;
-            for (int64_t i11 = i11_processed + ith; i11 < ne11; i11 += nth) {
-                from_float((float *) (data_ptr + i11 * nb11), (void *) (wdata_ptr + i11 * nbw1), ne10);
+                const int64_t i11_processed = ne11 - ne11 % 4;
+                for (int64_t i11 = i11_processed + ith; i11 < ne11; i11 += nth) {
+                    from_float((float *) (data_ptr + i11 * nb11), (void *) (wdata_ptr + i11 * nbw1), ne10);
+                }
             }
         }
 
@@ -4975,9 +4987,21 @@ namespace {
 std::atomic<bool> shared_repack_test_enabled{false};
 constexpr size_t shared_repack_alignment = 64;
 
+enum class shared_repack_source_kind { htp, canonical, packed };
+
+struct shared_repack_source {
+    const ggml_tensor * tensor;
+    shared_repack_source_kind kind;
+    int interleave = 0;
+    int rows = 0;
+};
+
 struct shared_repack_layout {
     ggml_mul_mat_src0_region_params region;
-    ggml::cpu::tensor_traits * traits;
+    ggml_mul_mat_src0_composite_params composite;
+    bool is_composite = false;
+    shared_repack_source sources[2];
+    ggml::cpu::tensor_traits * traits = nullptr;
     int interleave;
     size_t weight_bytes;
     size_t activation_bytes;
@@ -4985,29 +5009,78 @@ struct shared_repack_layout {
     size_t work_bytes;
 };
 
+std::atomic<uint64_t> shared_input_prepared{0};
+std::atomic<uint64_t> shared_input_reused{0};
+
 bool shared_repack_region(const ggml_tensor * op, ggml_mul_mat_src0_region_params & r) {
     if (!ggml_shared_weights_supports_op(op)) {
         return false;
     }
     r = {GGML_MUL_MAT_SRC0_REGION_PARAMS_VERSION, 0, 0, op->src[0]->ne[0], 0, op->src[0]->ne[1]};
-    if (op->op == GGML_OP_MUL_MAT_SRC0_REGION && !ggml_mul_mat_src0_region_get_params(op, &r)) {
+    if (op->op == GGML_OP_MUL_MAT_SRC0_COMPOSITE) {
+        r.k_size = op->src[1]->ne[0];
+        r.out_size = op->ne[0];
+    } else if (op->op == GGML_OP_MUL_MAT_SRC0_REGION && !ggml_mul_mat_src0_region_get_params(op, &r)) {
         return false;
     }
     return r.k_size > 0 && r.out_size > 0 && r.out_size % 4 == 0 &&
         r.k_size <= INT32_MAX && r.out_size <= INT32_MAX;
 }
 
+bool shared_repack_describe_source(const ggml_tensor * tensor, shared_repack_source & source) {
+    source.tensor = tensor;
+    if (!tensor || tensor->type != GGML_TYPE_Q8_0 || tensor->view_src ||
+            tensor->ne[2] != 1 || tensor->ne[3] != 1) {
+        return false;
+    }
+    if (ggml_shared_weights_tensor(tensor)) {
+        source.kind = shared_repack_source_kind::htp;
+        return true;
+    }
+    if (tensor->buffer && ggml_backend_buffer_get_type(tensor->buffer) == ggml_backend_cpu_repack_buffer_type()) {
+        if (!tensor->extra) { return false; }
+        auto * traits = static_cast<ggml::cpu::repack::tensor_traits_base *>(tensor->extra);
+        if (!traits->q8_layout(source.interleave, source.rows) || source.interleave <= 0 || source.rows <= 0 ||
+                QK8_0 % source.interleave != 0 || tensor->ne[1] % source.rows != 0) {
+            return false;
+        }
+        source.kind = shared_repack_source_kind::packed;
+        return true;
+    }
+    if (tensor->buffer && !ggml_backend_buft_is_host(ggml_backend_buffer_get_type(tensor->buffer))) {
+        return false;
+    }
+    source.kind = shared_repack_source_kind::canonical;
+    return ggml_is_contiguous(tensor);
+}
+
+bool shared_repack_describe_op(const ggml_tensor * op, shared_repack_layout & l) {
+    if (!shared_repack_region(op, l.region)) { return false; }
+    l.is_composite = op->op == GGML_OP_MUL_MAT_SRC0_COMPOSITE;
+    if (!shared_repack_describe_source(op->src[0], l.sources[0])) { return false; }
+    if (l.is_composite) {
+        if (!ggml_mul_mat_src0_composite_get_params(op, &l.composite) ||
+                !shared_repack_describe_source(op->src[2], l.sources[1])) {
+            return false;
+        }
+        if (l.composite.axis == 0 &&
+                ((l.composite.start[0] | l.composite.start[1] |
+                  l.composite.size[0] | l.composite.size[1]) % QK8_0 != 0)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool shared_repack_get_layout(const ggml_tensor * op, shared_repack_layout & l) {
-    if (!ggml_shared_weights_repack_enabled() || !op ||
-            !ggml_shared_weights_tensor(op->src[0]) || op->ne[1] < 4 ||
-            op->ne[1] > INT32_MAX || !shared_repack_region(op, l.region)) {
+    if (!ggml_shared_weights_repack_enabled() || !op || op->ne[1] < 4 || op->ne[1] > INT32_MAX ||
+            (op->op != GGML_OP_MUL_MAT_SRC0_COMPOSITE && !ggml_shared_weights_tensor(op->src[0])) ||
+            !shared_repack_describe_op(op, l)) {
         return false;
     }
 
-    l.traits = nullptr;
 #ifdef GGML_USE_CPU_REPACK
-    // These are the same traits and GEMM/GEMV entry points used by CPU_REPACK.
-    // Only the source-to-packed copy differs; no new integer matmul is used.
+    // Same traits and GEMM/GEMV entry points as CPU_REPACK; only assembly differs.
     if (ggml_cpu_has_neon() && ggml_cpu_has_matmul_int8()) {
         static ggml::cpu::repack::tensor_traits<block_q8_0, 8, 4, GGML_TYPE_Q8_0> q8_4x8;
         l.traits = &q8_4x8;
@@ -5018,15 +5091,14 @@ bool shared_repack_get_layout(const ggml_tensor * op, shared_repack_layout & l) 
         l.interleave = 4;
     }
 #endif
-    if (!l.traits && shared_repack_test_enabled.load(std::memory_order_relaxed)) {
-        // Explicit host-test opt-in, never selected by production configuration.
-        static ggml::cpu::repack::tensor_traits<block_q8_0, 4, 4, GGML_TYPE_Q8_0> q8_test;
-        l.traits = &q8_test;
+    if (!l.traits && (l.is_composite || shared_repack_test_enabled.load(std::memory_order_relaxed))) {
+        // Composite ops also need a portable implementation. Ordinary shared
+        // weights keep their direct FP32 fallback on unsupported architectures.
+        static ggml::cpu::repack::tensor_traits<block_q8_0, 4, 4, GGML_TYPE_Q8_0> q8_generic;
+        l.traits = &q8_generic;
         l.interleave = 4;
     }
-    if (!l.traits) {
-        return false;
-    }
+    if (!l.traits) { return false; }
 
     const size_t row_bytes = ggml_row_size(GGML_TYPE_Q8_0, l.region.k_size);
     const size_t limit = std::numeric_limits<size_t>::max();
@@ -5040,37 +5112,208 @@ bool shared_repack_get_layout(const ggml_tensor * op, shared_repack_layout & l) 
         return false;
     }
     l.activation_offset = GGML_PAD(l.weight_bytes, shared_repack_alignment);
-    // The work allocator is not guaranteed to align its base to a cache line.
     l.work_bytes = shared_repack_alignment - 1 + l.activation_offset + l.activation_bytes;
     return true;
 }
 
-void shared_repack_copy_groups(const ggml_tensor * source,
-        const ggml_mul_mat_src0_region_params & r, int interleave,
-        void * packed, int ith, int nth) {
-    auto * dst = static_cast<block_q8_0x4 *>(packed);
-    const int64_t blocks = r.k_size / QK8_0;
-    for (int64_t group = ith; group < r.out_size / 4; group += nth) {
-        const int8_t * rows[4];
-        const char * scales[4];
-        for (int row = 0; row < 4; ++row) {
-            rows[row] = static_cast<const int8_t *>(source->data) +
-                (r.out_start + group * 4 + row) * source->nb[1];
-            // HTP scales follow the complete parent K, not the active K slice.
-            scales[row] = reinterpret_cast<const char *>(rows[row] + source->ne[0]);
-        }
-        for (int64_t block = 0; block < blocks; ++block) {
-            block_q8_0x4 & out = dst[group * blocks + block];
-            const int64_t k = r.k_start + block * QK8_0;
-            for (int row = 0; row < 4; ++row) {
-                memcpy(&out.d[row], scales[row] + (k / QK8_0) * sizeof(ggml_half), sizeof(ggml_half));
-                for (int j = 0; j < QK8_0; j += interleave) {
-                    memcpy(out.qs + (j / interleave * 4 + row) * interleave,
-                            rows[row] + k + j, interleave);
-                }
+void shared_repack_copy_row_block(const shared_repack_source & source, int64_t row, int64_t k,
+        block_q8_0x4 & out, int dst_row, int dst_interleave) {
+    const ggml_tensor * tensor = source.tensor;
+    const auto * base = static_cast<const char *>(tensor->data);
+    const char * scales;
+    const int8_t * quants;
+    int src_row = 0;
+    if (source.kind == shared_repack_source_kind::packed) {
+        const size_t block_bytes = sizeof(block_q8_0) * source.rows;
+        const char * block = base + ((row / source.rows) * (tensor->ne[0] / QK8_0) + k / QK8_0) * block_bytes;
+        src_row = row % source.rows;
+        scales = block + src_row * sizeof(ggml_half);
+        quants = reinterpret_cast<const int8_t *>(block + source.rows * sizeof(ggml_half));
+    } else if (source.kind == shared_repack_source_kind::htp) {
+        const char * row_data = base + row * tensor->nb[1];
+        scales = row_data + tensor->ne[0] + (k / QK8_0) * sizeof(ggml_half);
+        quants = reinterpret_cast<const int8_t *>(row_data + k);
+    } else {
+        const auto * block = reinterpret_cast<const block_q8_0 *>(base + row * tensor->nb[1]) + k / QK8_0;
+        scales = reinterpret_cast<const char *>(&block->d);
+        quants = block->qs;
+    }
+    memcpy(&out.d[dst_row], scales, sizeof(ggml_half));
+    for (int j = 0; j < QK8_0; j += dst_interleave) {
+        int8_t * target = out.qs + (j / dst_interleave * 4 + dst_row) * dst_interleave;
+        if (source.kind != shared_repack_source_kind::packed) {
+            memcpy(target, quants + j, dst_interleave);
+        } else {
+            for (int copied = 0; copied < dst_interleave;) {
+                const int pos = j + copied;
+                const int n = MIN(dst_interleave - copied, source.interleave - pos % source.interleave);
+                const int offset = (pos / source.interleave * source.rows + src_row) * source.interleave +
+                    pos % source.interleave;
+                memcpy(target + copied, quants + offset, n);
+                copied += n;
             }
         }
     }
+}
+
+void shared_repack_copy_groups_generic(const shared_repack_layout & l, int interleave,
+        void * packed, int ith, int nth) {
+    auto * dst = static_cast<block_q8_0x4 *>(packed);
+    const int64_t blocks = l.region.k_size / QK8_0;
+    for (int64_t group = ith; group < l.region.out_size / 4; group += nth) {
+        for (int64_t block = 0; block < blocks; ++block) {
+            block_q8_0x4 & out = dst[group * blocks + block];
+            for (int row = 0; row < 4; ++row) {
+                int part = 0;
+                int64_t source_row = l.region.out_start + group * 4 + row;
+                int64_t source_k = l.region.k_start + block * QK8_0;
+                if (l.is_composite) {
+                    int64_t & position = l.composite.axis == 0 ? source_k : source_row;
+                    part = position >= l.composite.size[0] ? 1 : 0;
+                    position = l.composite.start[part] + position - (part ? l.composite.size[0] : 0);
+                }
+                shared_repack_copy_row_block(l.sources[part], source_row, source_k, out, row, interleave);
+            }
+        }
+    }
+}
+
+// All rectangles passed here own complete destination row groups. Keep the
+// global group % nth assignment, including a composite's second row segment.
+// Source layout and segment selection are invariant across the inner K loop.
+template <int INTERLEAVE>
+void shared_repack_copy_region(const shared_repack_source & source,
+        const ggml_mul_mat_src0_region_params & r,
+        int64_t destination_k, int64_t destination_out, int64_t destination_k_size,
+        void * packed, int ith, int nth) {
+    static_assert(INTERLEAVE == 4 || INTERLEAVE == 8, "unsupported Q8 interleave");
+    GGML_ASSERT(r.out_size % 4 == 0 && destination_out % 4 == 0);
+    const auto * tensor = source.tensor;
+    auto * dst = static_cast<block_q8_0x4 *>(packed);
+    const int64_t source_block = r.k_start / QK8_0;
+    const int64_t blocks = r.k_size / QK8_0;
+    const int64_t destination_blocks = destination_k_size / QK8_0;
+    const int64_t destination_block = destination_k / QK8_0;
+    const int64_t destination_group = destination_out / 4;
+    const int64_t groups = r.out_size / 4;
+    const int64_t first_group = (ith + nth - destination_group % nth) % nth;
+
+    if (source.kind == shared_repack_source_kind::packed && source.rows == 4 &&
+            source.interleave == INTERLEAVE && r.out_start % 4 == 0) {
+        // Native weights already have the destination layout. Gate/up copy
+        // whole row groups; down copies a contiguous K run within each group.
+        // The physical parent stride may differ from the assembled K stride.
+        const auto * src = static_cast<const block_q8_0x4 *>(tensor->data);
+        const int64_t parent_blocks = tensor->ne[0] / QK8_0;
+        const int64_t source_group = r.out_start / 4;
+        const size_t bytes = (size_t) blocks * sizeof(block_q8_0x4);
+        for (int64_t group = first_group; group < groups; group += nth) {
+            memcpy(dst + (destination_group + group) * destination_blocks + destination_block,
+                   src + (source_group + group) * parent_blocks + source_block, bytes);
+        }
+        return;
+    }
+
+    if (source.kind == shared_repack_source_kind::htp) {
+        for (int64_t group = first_group; group < groups; group += nth) {
+            const int8_t * rows[4];
+            const char * scales[4];
+            for (int row = 0; row < 4; ++row) {
+                const auto * parent_row = static_cast<const int8_t *>(tensor->data) +
+                    (r.out_start + group * 4 + row) * tensor->nb[1];
+                rows[row] = parent_row + r.k_start;
+                // Scales follow the complete parent K, not the active slice.
+                scales[row] = reinterpret_cast<const char *>(parent_row + tensor->ne[0]) +
+                    source_block * sizeof(ggml_half);
+            }
+            auto * group_dst = dst + (destination_group + group) * destination_blocks + destination_block;
+            for (int64_t block = 0; block < blocks; ++block) {
+                block_q8_0x4 & out = group_dst[block];
+                for (int row = 0; row < 4; ++row) {
+                    memcpy(&out.d[row], scales[row] + block * sizeof(ggml_half), sizeof(ggml_half));
+                    // Compile-time sizes avoid variable-length tiny memcpy and
+                    // interleave divisions in this frequently executed loop.
+                    for (int j = 0; j < QK8_0; j += INTERLEAVE) {
+                        memcpy(out.qs + (j / INTERLEAVE * 4 + row) * INTERLEAVE,
+                               rows[row] + block * QK8_0 + j, INTERLEAVE);
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    // Canonical or differently packed native sources retain exact byte mapping.
+    // Unlike a split row group, this rectangle still has a single source.
+    for (int64_t group = first_group; group < groups; group += nth) {
+        auto * group_dst = dst + (destination_group + group) * destination_blocks + destination_block;
+        for (int64_t block = 0; block < blocks; ++block) {
+            for (int row = 0; row < 4; ++row) {
+                shared_repack_copy_row_block(source, r.out_start + group * 4 + row,
+                    r.k_start + block * QK8_0, group_dst[block], row, INTERLEAVE);
+            }
+        }
+    }
+}
+
+template <int INTERLEAVE>
+void shared_repack_copy_regions(const shared_repack_layout & l, void * packed, int ith, int nth) {
+    if (!l.is_composite) {
+        shared_repack_copy_region<INTERLEAVE>(l.sources[0], l.region,
+            0, 0, l.region.k_size, packed, ith, nth);
+        return;
+    }
+    int64_t destination_start = 0;
+    for (int part = 0; part < 2; ++part) {
+        const bool k_axis = l.composite.axis == 0;
+        const ggml_mul_mat_src0_region_params region = {
+            GGML_MUL_MAT_SRC0_REGION_PARAMS_VERSION, 0,
+            k_axis ? l.composite.start[part] : 0,
+            k_axis ? l.composite.size[part] : l.region.k_size,
+            k_axis ? 0 : l.composite.start[part],
+            k_axis ? l.region.out_size : l.composite.size[part],
+        };
+        shared_repack_copy_region<INTERLEAVE>(l.sources[part], region,
+            k_axis ? destination_start : 0, k_axis ? 0 : destination_start,
+            l.region.k_size, packed, ith, nth);
+        destination_start += l.composite.size[part];
+    }
+}
+
+void shared_repack_copy_groups(const shared_repack_layout & l, int interleave,
+        void * packed, int ith, int nth) {
+    // Decide before writing either segment: a destination row group crossing
+    // the source boundary must be assembled by the generic row-wise reader.
+    if (l.is_composite && l.composite.axis == 1 &&
+            (l.composite.size[0] % 4 != 0 || l.composite.size[1] % 4 != 0)) {
+        shared_repack_copy_groups_generic(l, interleave, packed, ith, nth);
+    } else if (interleave == 4) {
+        shared_repack_copy_regions<4>(l, packed, ith, nth);
+    } else {
+        GGML_ASSERT(interleave == 8);
+        shared_repack_copy_regions<8>(l, packed, ith, nth);
+    }
+}
+
+bool shared_repack_input_reusable(const ggml_compute_params * params, const ggml_tensor * op,
+        const shared_repack_layout & layout) {
+    const ggml_tensor * prev = params->prev_node;
+    if (!prev || prev->src[1] != op->src[1] || !prev->data || !op->src[1]->data) { return false; }
+    // An aliased previous output could have changed this otherwise identical input.
+    const uintptr_t input = (uintptr_t) op->src[1]->data;
+    const uintptr_t output = (uintptr_t) prev->data;
+    const size_t input_bytes = ggml_nbytes(op->src[1]);
+    const size_t output_bytes = ggml_nbytes(prev);
+    const uintptr_t limit = std::numeric_limits<uintptr_t>::max();
+    if (input_bytes > limit - input || output_bytes > limit - output ||
+            (input < output + output_bytes && output < input + input_bytes)) { return false; }
+    shared_repack_layout previous;
+    return shared_repack_get_layout(prev, previous) &&
+        previous.region.k_size == layout.region.k_size &&
+        previous.interleave == layout.interleave &&
+        previous.weight_bytes == layout.weight_bytes &&
+        previous.activation_offset == layout.activation_offset &&
+        previous.activation_bytes == layout.activation_bytes;
 }
 
 } // namespace
@@ -5080,15 +5323,13 @@ void ggml_cpu_shared_repack_test_mode(bool enabled) {
 }
 
 bool ggml_cpu_shared_repack_pack(const ggml_tensor * op, int interleave, void * dst, size_t capacity) {
-    ggml_mul_mat_src0_region_params r;
-    if (!dst || (interleave != 4 && interleave != 8) || !shared_repack_region(op, r) || !op->src[0]->data) {
-        return false;
-    }
-    const size_t row_bytes = ggml_row_size(GGML_TYPE_Q8_0, r.k_size);
-    if ((size_t) r.out_size > capacity / row_bytes) {
-        return false;
-    }
-    shared_repack_copy_groups(op->src[0], r, interleave, dst, 0, 1);
+    shared_repack_layout layout;
+    if (!dst || (interleave != 4 && interleave != 8) || !shared_repack_describe_op(op, layout) ||
+            !layout.sources[0].tensor->data ||
+            (layout.is_composite && !layout.sources[1].tensor->data)) { return false; }
+    const size_t row_bytes = ggml_row_size(GGML_TYPE_Q8_0, layout.region.k_size);
+    if ((size_t) layout.region.out_size > capacity / row_bytes) { return false; }
+    shared_repack_copy_groups(layout, interleave, dst, 0, 1);
     return true;
 }
 
@@ -5103,6 +5344,26 @@ bool ggml_cpu_shared_repack_pack_reference(const ggml_tensor * canonical, int in
     ggml_tensor packed = *canonical;
     packed.data = dst;
     return repack_q8_0_to_q8_0_4_bl(&packed, interleave, canonical->data, ggml_nbytes(canonical)) == 0;
+}
+
+bool ggml_cpu_shared_repack_test_source_layout(ggml_tensor * tensor, int interleave) {
+    if (!tensor || !tensor->buffer || tensor->type != GGML_TYPE_Q8_0 ||
+            ggml_backend_buffer_get_type(tensor->buffer) != ggml_backend_cpu_repack_buffer_type() ||
+            tensor->ne[1] % 4 != 0) { return false; }
+    static ggml::cpu::repack::tensor_traits<block_q8_0, 4, 4, GGML_TYPE_Q8_0> q8_4x4;
+    static ggml::cpu::repack::tensor_traits<block_q8_0, 8, 4, GGML_TYPE_Q8_0> q8_4x8;
+    if (interleave == 4) { tensor->extra = &q8_4x4; return true; }
+    if (interleave == 8) { tensor->extra = &q8_4x8; return true; }
+    return false;
+}
+
+void ggml_cpu_shared_repack_test_input_stats(uint64_t * prepared, uint64_t * reused, bool reset) {
+    const uint64_t p = reset ? shared_input_prepared.exchange(0, std::memory_order_relaxed) :
+        shared_input_prepared.load(std::memory_order_relaxed);
+    const uint64_t r = reset ? shared_input_reused.exchange(0, std::memory_order_relaxed) :
+        shared_input_reused.load(std::memory_order_relaxed);
+    if (prepared) { *prepared = p; }
+    if (reused) { *reused = r; }
 }
 
 bool ggml_cpu_shared_repack_work_size(const ggml_tensor * op, size_t * size,
@@ -5137,12 +5398,13 @@ bool ggml_cpu_shared_repack_compute(ggml_compute_params * params, ggml_tensor * 
         // Include worker arrival and completion in the repack wall time.
         ggml_barrier(params->threadpool);
     }
-    shared_repack_copy_groups(op->src[0], layout.region, layout.interleave,
-            packed_data, params->ith, params->nth);
+    const bool reuse_input = shared_repack_input_reusable(params, op, layout);
+    shared_repack_copy_groups(layout, layout.interleave, packed_data, params->ith, params->nth);
     ggml_barrier(params->threadpool);
     if (timing && params->ith == 0) {
         event.repack_us = double(ggml_time_us() - start_us);
-        ggml_shared_weights_log_repack(op->src[0], "CPU_REPACK", &event);
+        const ggml_tensor * shared = ggml_shared_weights_tensor(op->src[0]) ? op->src[0] : op->src[2];
+        ggml_shared_weights_log_repack(shared, "CPU_REPACK", &event);
     }
 
     ggml_tensor weights = *op->src[0];
@@ -5164,6 +5426,10 @@ bool ggml_cpu_shared_repack_compute(ggml_compute_params * params, ggml_tensor * 
     ggml_compute_params native_params = *params;
     native_params.wdata = packed_data + layout.activation_offset;
     native_params.wsize = params->wsize - alignment_bytes - layout.activation_offset;
+    native_params.shared_repack_skip_quantize = reuse_input;
+    if (params->ith == 0 && shared_repack_test_enabled.load(std::memory_order_relaxed)) {
+        (reuse_input ? shared_input_reused : shared_input_prepared).fetch_add(1, std::memory_order_relaxed);
+    }
     GGML_ASSERT(layout.traits->compute_forward(&native_params, &native_op));
     return true;
 }
