@@ -978,6 +978,7 @@ using ggml_backend_async_staging_buffer_type_t =
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
+    bool alloc_plan_stale; // diagnostic splitting or an incomplete reserve invalidated the live plan
 
     int n_backends;
 
@@ -6186,16 +6187,22 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         }
     }
 
-    // allocate graph
-    if (backend_ids_changed || !ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
+    // Both allocation paths can replace the plan before a buffer allocation
+    // fails. Keep it invalid until all buffers are backed, so a same-shape
+    // retry cannot trust a plan left with a null or partially allocated buffer.
+    const bool alloc_plan_stale = sched->alloc_plan_stale;
+    sched->alloc_plan_stale = true;
+    if (alloc_plan_stale || backend_ids_changed || !ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
 #ifndef NDEBUG
-        GGML_LOG_DEBUG("%s: failed to allocate graph, reserving (backend_ids_changed = %d)\n", __func__, backend_ids_changed);
+        GGML_LOG_DEBUG("%s: reserving graph (backend_ids_changed = %d, plan_stale = %d)\n",
+                __func__, backend_ids_changed, alloc_plan_stale);
 #endif
 
         if (sched->debug_realloc > 0) {
             // we are interested only in situations where the graph was reallocated even though its size remained the same [GGML_SCHED_DEBUG_REALLOC]
             // example: https://github.com/ggml-org/llama.cpp/pull/17143
-            const bool unexpected = !backend_ids_changed && sched->debug_prev_graph_size == sched->debug_graph_size;
+            const bool unexpected = !alloc_plan_stale && !backend_ids_changed &&
+                sched->debug_prev_graph_size == sched->debug_graph_size;
 
             if (unexpected || sched->debug_realloc > 1) {
                 GGML_ABORT("%s: unexpected graph reallocation (graph size = %d, nodes = %d, leafs = %d), debug_realloc = %d\n", __func__,
@@ -6209,13 +6216,17 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             ggml_backend_synchronize(sched->backends[i]);
         }
 
-        ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
+        if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
+            GGML_LOG_ERROR("%s: failed to reserve graph buffers\n", __func__);
+            return false;
+        }
         if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             return false;
         }
     }
 
+    sched->alloc_plan_stale = false;
     return true;
 }
 
@@ -10021,9 +10032,17 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
 
     ggml_backend_sched_synchronize(sched);
 
+    // Splitting updates the backend-ID comparison history. The next real
+    // allocation must refresh its plan even when the measured shape matches.
+    sched->alloc_plan_stale = true;
     ggml_backend_sched_split_graph(sched, measure_graph);
 
-    ggml_gallocr_reserve_n_size(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
+    // Size-only planning must not replace the live allocator's plan or free
+    // its buffers. A matching plan without backing buffers cannot be used by
+    // the subsequent alloc_graph fast path.
+    ggml_gallocr_t measure = ggml_gallocr_new_n(sched->bufts, sched->n_backends);
+    ggml_gallocr_reserve_n_size(measure, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
+    ggml_gallocr_free(measure);
 }
 
 bool ggml_backend_sched_reserve_route_sizes(
@@ -10042,6 +10061,7 @@ bool ggml_backend_sched_reserve_route_sizes(
         sched->layer_checkpoints != nullptr && sched->layer_checkpoints->enabled;
 
     ggml_backend_sched_synchronize(sched);
+    sched->alloc_plan_stale = true;
     ggml_backend_sched_route_base_capture base;
     ggml_backend_sched_split_graph_impl(sched, measure_graph, &base);
 
@@ -10060,15 +10080,18 @@ bool ggml_backend_sched_reserve_route_sizes(
     base_graph.nodes = base.nodes.data();
     base_graph.leafs = base.leafs.data();
 
+    // Use a disposable planner for both measurements; the live allocator is
+    // reserved only when an executable graph actually needs compute buffers.
+    ggml_gallocr_t measure = ggml_gallocr_new_n(sched->bufts, sched->n_backends);
     ggml_gallocr_reserve_n_size(
-            sched->galloc, &base_graph,
+            measure, &base_graph,
             base.node_backend_ids.data(), base.leaf_backend_ids.data(),
             base_sizes);
-    // Leave the allocator sized for the complete routed graph.
     ggml_gallocr_reserve_n_size(
-            sched->galloc, &sched->graph,
+            measure, &sched->graph,
             sched->node_backend_ids, sched->leaf_backend_ids,
             routed_sizes);
+    ggml_gallocr_free(measure);
     return true;
 }
 
@@ -10078,11 +10101,15 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
 
     ggml_backend_sched_synchronize(sched);
 
+    // Reserve can install a new plan and then fail to allocate its buffers.
+    // Preserve the invalid state on failure, including across scheduler reset.
+    sched->alloc_plan_stale = true;
     ggml_backend_sched_split_graph(sched, measure_graph);
 
     if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
         return false;
     }
+    sched->alloc_plan_stale = false;
 
     ggml_backend_sched_reset(sched);
 

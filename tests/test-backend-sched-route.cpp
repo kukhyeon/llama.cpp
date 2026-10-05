@@ -275,6 +275,7 @@ struct queued_commit_control {
     int flush_calls = 0;
     int synchronize_calls = 0;
     int fail_async_copy_call = 0;
+    int fail_buffer_allocations = 0;
     int direct_scatter_calls = 0;
     ggml_tensor * direct_scatter_dst = nullptr;
 };
@@ -436,6 +437,10 @@ static const char * isolated_buffer_name(ggml_backend_buffer_type_t) {
 
 static ggml_backend_buffer_t isolated_buffer_alloc(ggml_backend_buffer_type_t buft, size_t size) {
     auto * ctx = static_cast<queued_commit_backend_context *>(buft->context);
+    if (size > 0 && ctx->control->fail_buffer_allocations > 0) {
+        --ctx->control->fail_buffer_allocations;
+        return nullptr;
+    }
     auto * buffer = ggml_backend_buft_alloc_buffer(
             ggml_backend_get_default_buffer_type(ctx->inner), size);
     if (buffer != nullptr) {
@@ -2622,6 +2627,261 @@ struct metadata_fixture {
     }
 };
 
+// A size-only reserve must neither install an unbacked allocation plan nor
+// evict existing compute buffers. Exercise the same-shape fast path, then a
+// larger graph and a smaller graph, through both public sizing entry points.
+static bool run_deferred_compute_reserve_case(bool routed) {
+    const char * scenario = routed ? "deferred-routed-reserve" : "deferred-plain-reserve";
+    metadata_fixture fixture;
+    // Refresh after diagnostic sizing is expected even for the identical
+    // graph shape; it must also work with unexpected-reallocation checks on.
+    const char * old_debug = std::getenv("GGML_SCHED_DEBUG_REALLOC");
+    const std::string saved_debug = old_debug != nullptr ? old_debug : "";
+#if defined(_WIN32)
+    (void) _putenv_s("GGML_SCHED_DEBUG_REALLOC", "1");
+#else
+    (void) setenv("GGML_SCHED_DEBUG_REALLOC", "1", 1);
+#endif
+    const bool initialized = fixture.init(true, false);
+#if defined(_WIN32)
+    (void) _putenv_s("GGML_SCHED_DEBUG_REALLOC", saved_debug.c_str());
+#else
+    if (old_debug != nullptr) {
+        (void) setenv("GGML_SCHED_DEBUG_REALLOC", saved_debug.c_str(), 1);
+    } else {
+        (void) unsetenv("GGML_SCHED_DEBUG_REALLOC");
+    }
+#endif
+    if (!check(initialized, scenario, "scheduler setup failed")) {
+        return false;
+    }
+
+    int backend_id = 0;
+    auto build_graph = [&](int64_t elements, ggml_tensor ** input, ggml_tensor ** output) {
+        ggml_backend_sched_reset(fixture.sched);
+        auto * ctx = fixture.new_context(16, 32);
+        if (ctx == nullptr) {
+            return static_cast<ggml_cgraph *>(nullptr);
+        }
+        auto * graph = ggml_new_graph_custom(ctx, 32, false);
+        auto * x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, elements);
+        ggml_set_input(x);
+        ggml_set_name(x, "deferred-input");
+        auto * canonical = ggml_scale(ctx, x, 2.0f);
+        ggml_set_name(canonical, "deferred-canonical");
+        ggml_build_forward_expand(graph, canonical);
+        if (routed) {
+            auto * alternate = ggml_scale(ctx, x, 3.0f);
+            ggml_set_name(alternate, "deferred-alternate");
+            ggml_build_forward_expand(graph, alternate);
+            if (!ggml_backend_sched_register_route_subgraph(
+                        fixture.sched, canonical, canonical, canonical, canonical, 0, 0) ||
+                    !ggml_backend_sched_register_route_subgraph(
+                        fixture.sched, canonical, canonical, alternate, alternate, 1, 0)) {
+                return static_cast<ggml_cgraph *>(nullptr);
+            }
+            ggml_backend_sched_layer_checkpoint_set_plan_id(fixture.sched, 1);
+        }
+        auto * result = ggml_scale(ctx, canonical, 4.0f);
+        ggml_set_name(result, "deferred-output");
+        ggml_set_output(result);
+        ggml_build_forward_expand(graph, result);
+        ggml_backend_sched_set_tensor_backend(fixture.sched, x, fixture.backends[backend_id]);
+        for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+            ggml_backend_sched_set_tensor_backend(fixture.sched,
+                    ggml_graph_node(graph, i), fixture.backends[backend_id]);
+        }
+        *input = x;
+        *output = result;
+        return graph;
+    };
+
+    auto measure_graph = [&](ggml_cgraph * graph, size_t * sizes) {
+        if (routed) {
+            size_t base_sizes[2] = {};
+            return ggml_backend_sched_reserve_route_sizes(fixture.sched, graph, base_sizes, sizes);
+        }
+        ggml_backend_sched_reserve_size(fixture.sched, graph, sizes);
+        return true;
+    };
+
+    for (int64_t elements : { 16, 16384, 32, 32 }) {
+        size_t reserved_before[2] = {};
+        for (int i = 0; i < 2; ++i) {
+            reserved_before[i] = ggml_backend_sched_get_buffer_size(fixture.sched, fixture.backends[i]);
+        }
+        if (elements == 16 &&
+                !check(reserved_before[0] == 0 && reserved_before[1] == 0,
+                    scenario, "compute buffers were allocated before first use")) {
+            return false;
+        }
+
+        // Reserving a larger diagnostic graph must not grow or free the live
+        // buffers; the following executable graph only needs its own shape.
+        ggml_tensor * diagnostic_input = nullptr;
+        ggml_tensor * diagnostic_output = nullptr;
+        auto * diagnostic = build_graph(elements * 8, &diagnostic_input, &diagnostic_output);
+        size_t diagnostic_sizes[2] = {};
+        if (!check(diagnostic != nullptr && measure_graph(diagnostic, diagnostic_sizes),
+                    scenario, "diagnostic graph sizing failed") ||
+                !check(diagnostic_input->data == nullptr && diagnostic_output->data == nullptr,
+                    scenario, "size-only reserve allocated tensor data")) {
+            return false;
+        }
+        for (int i = 0; i < 2; ++i) {
+            if (!check(ggml_backend_sched_get_buffer_size(fixture.sched, fixture.backends[i]) == reserved_before[i],
+                        scenario, "diagnostic reserve changed existing compute buffers")) {
+                return false;
+            }
+        }
+
+        ggml_tensor * input = nullptr;
+        ggml_tensor * output = nullptr;
+        auto * graph = build_graph(elements, &input, &output);
+        size_t sizes[2] = {};
+        if (!check(graph != nullptr && measure_graph(graph, sizes), scenario, "execution graph sizing failed") ||
+                !check(sizes[0] + sizes[1] > 0 &&
+                    diagnostic_sizes[0] + diagnostic_sizes[1] > sizes[0] + sizes[1],
+                    scenario, "planned bytes did not follow the actual graph shape")) {
+            return false;
+        }
+        for (int i = 0; i < 2; ++i) {
+            if (!check(ggml_backend_sched_get_buffer_size(fixture.sched, fixture.backends[i]) == reserved_before[i],
+                        scenario, "execution graph sizing changed existing compute buffers")) {
+                return false;
+            }
+        }
+
+        // Plain reserve_size retains its legacy reset, so only routed sizing
+        // preserves explicit backend assignments. The last routed transition
+        // changes placement without changing shape, exercising plan refresh.
+        // Deliberately allocate the exact graph just measured. A live allocator
+        // left with the size-only plan can otherwise skip allocating buffers.
+        if (!check(ggml_backend_sched_alloc_graph(fixture.sched, graph),
+                    scenario, "allocation after same-shape sizing failed")) {
+            return false;
+        }
+        for (int i = 0; i < 2; ++i) {
+            const size_t reserved = ggml_backend_sched_get_buffer_size(fixture.sched, fixture.backends[i]);
+            if (!check(reserved >= sizes[i] && reserved <= std::max(reserved_before[i], sizes[i]),
+                        scenario, "compute allocation inherited the oversized diagnostic reserve")) {
+                return false;
+            }
+        }
+        if (routed && !check(ggml_backend_buffer_get_type(output->buffer) ==
+                    ggml_backend_get_default_buffer_type(fixture.backends[backend_id]),
+                    scenario, "same-shaped graph reused the previous backend's allocation plan")) {
+            return false;
+        }
+        std::vector<float> values((size_t) elements);
+        std::vector<float> actual((size_t) elements);
+        for (int run = 0; run < 2; ++run) {
+            for (int64_t i = 0; i < elements; ++i) {
+                values[(size_t) i] = float(i % 17 - 8) + 0.25f * run;
+            }
+            ggml_backend_tensor_set(input, values.data(), 0, values.size() * sizeof(float));
+            if (!check(ggml_backend_sched_graph_compute(fixture.sched, graph) == GGML_STATUS_SUCCESS,
+                        scenario, "execution after size-only reserve failed")) {
+                return false;
+            }
+            ggml_backend_tensor_get(output, actual.data(), 0, actual.size() * sizeof(float));
+            for (size_t i = 0; i < actual.size(); ++i) {
+                if (!check(actual[i] == values[i] * (routed ? 12.0f : 8.0f),
+                            scenario, "size-only reserve changed graph output")) {
+                    return false;
+                }
+            }
+        }
+        backend_id = 1 - backend_id;
+    }
+    return true;
+}
+
+// A failed reserve installs a plan before it discovers an unavailable
+// backend buffer. Retry on the same scheduler after that backend recovers,
+// including when an earlier backend already completed its allocation.
+static bool run_compute_reserve_retry_case(bool explicit_reserve, bool parallel) {
+    const char * scenario = explicit_reserve
+        ? (parallel ? "explicit-reserve-retry-pipeline" : "explicit-reserve-retry")
+        : (parallel ? "alloc-graph-retry-pipeline" : "alloc-graph-retry");
+    metadata_fixture fixture;
+    if (!check(fixture.init(true, parallel), scenario, "scheduler setup failed")) {
+        return false;
+    }
+
+    auto build_graph = [&](int64_t elements, ggml_tensor ** input, ggml_tensor ** output) {
+        ggml_backend_sched_reset(fixture.sched);
+        auto * ctx = fixture.new_context(16, 32);
+        if (ctx == nullptr) {
+            return static_cast<ggml_cgraph *>(nullptr);
+        }
+        auto * graph = ggml_new_graph_custom(ctx, 32, false);
+        auto * x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, elements);
+        ggml_set_input(x);
+        auto * intermediate = ggml_scale(ctx, x, 2.0f);
+        auto * result = ggml_scale(ctx, intermediate, 3.0f);
+        ggml_set_output(result);
+        ggml_build_forward_expand(graph, result);
+        ggml_backend_sched_set_tensor_backend(fixture.sched, x, fixture.backends[0]);
+        ggml_backend_sched_set_tensor_backend(fixture.sched, intermediate, fixture.backends[0]);
+        ggml_backend_sched_set_tensor_backend(fixture.sched, result, fixture.backends[1]);
+        *input = x;
+        *output = result;
+        return graph;
+    };
+
+    for (int64_t elements : { 16, 16384 }) {
+        ggml_tensor * input = nullptr;
+        ggml_tensor * output = nullptr;
+        auto * graph = build_graph(elements, &input, &output);
+        if (!check(graph != nullptr, scenario, "graph construction failed")) {
+            return false;
+        }
+        if (elements > 16) {
+            // Backend zero allocates first, then backend one fails once. The
+            // retry uses a fresh graph of the same shape and the same scheduler.
+            fixture.controls[1].fail_buffer_allocations = 1;
+            const bool allocated = explicit_reserve
+                ? ggml_backend_sched_reserve(fixture.sched, graph)
+                : ggml_backend_sched_alloc_graph(fixture.sched, graph);
+            if (!check(!allocated, scenario, "injected allocation failure was not reported") ||
+                    !check(fixture.controls[1].fail_buffer_allocations == 0,
+                        scenario, "allocation did not reach the failing backend")) {
+                return false;
+            }
+            graph = build_graph(elements, &input, &output);
+            if (!check(graph != nullptr, scenario, "retry graph construction failed")) {
+                return false;
+            }
+        }
+        if (!check(ggml_backend_sched_alloc_graph(fixture.sched, graph),
+                    scenario, "allocation after backend recovery failed")) {
+            return false;
+        }
+
+        std::vector<float> values((size_t) elements);
+        std::vector<float> actual((size_t) elements);
+        for (int run = 0; run < 2; ++run) {
+            for (size_t i = 0; i < values.size(); ++i) {
+                values[i] = float(int(i % 17) - 8) + 0.25f * run;
+            }
+            ggml_backend_tensor_set(input, values.data(), 0, values.size() * sizeof(float));
+            if (!check(ggml_backend_sched_graph_compute(fixture.sched, graph) == GGML_STATUS_SUCCESS,
+                        scenario, "execution after recovered allocation failed")) {
+                return false;
+            }
+            ggml_backend_tensor_get(output, actual.data(), 0, actual.size() * sizeof(float));
+            for (size_t i = 0; i < actual.size(); ++i) {
+                if (!check(actual[i] == values[i] * 6.0f, scenario,
+                            "recovered allocation produced an incorrect result")) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
 static bool check_metadata_accounting(
         ggml_backend_sched_t sched, const char * scenario,
         ggml_backend_sched_metadata_stats * result = nullptr) {
@@ -2909,6 +3169,12 @@ int main() {
     (void) setenv("SCHED_TRACE_PHASE", "both", 1);
 #endif
     bool ok = true;
+    ok = run_deferred_compute_reserve_case(false) && ok;
+    ok = run_deferred_compute_reserve_case(true) && ok;
+    ok = run_compute_reserve_retry_case(false, false) && ok;
+    ok = run_compute_reserve_retry_case(true, false) && ok;
+    ok = run_compute_reserve_retry_case(false, true) && ok;
+    ok = run_compute_reserve_retry_case(true, true) && ok;
     ok = run_metadata_chain_case("metadata-no-copies", false, false, {1, 33, 2, 65}) && ok;
     ok = run_metadata_chain_case("metadata-copy-growth", true, false, {1, 33, 2, 65}) && ok;
     ok = run_metadata_chain_case("metadata-pipeline-growth", true, true, {1, 4, 2, 7}) && ok;

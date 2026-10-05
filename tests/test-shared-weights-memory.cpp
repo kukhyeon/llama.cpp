@@ -8,8 +8,11 @@
 
 #include "../ggml/src/ggml-backend-impl.h"
 #include "../src/llama-arch.h"
+#include "../src/llama-context.h"
+#include "../src/llama-ext.h"
 #include "../src/llama-model-saver.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -113,13 +116,19 @@ llama_model_ptr make_model() {
     return model;
 }
 
-llama_context_ptr make_context(llama_model * model, const std::string & csv_path) {
+llama_context_ptr make_context(
+        llama_model * model, const std::string & csv_path, uint32_t n_ctx = 64, bool memory_stats = true,
+        enum llama_pooling_type pooling = LLAMA_POOLING_TYPE_UNSPECIFIED) {
     llama_context_params params = llama_context_default_params();
-    params.n_ctx = params.n_batch = params.n_ubatch = 64;
+    params.n_ctx = n_ctx;
+    params.n_batch = params.n_ubatch = 64;
     params.n_threads = params.n_threads_batch = 1;
     params.no_perf = false;
     params.offload_kqv = params.op_offload = false;
-    params.graph_memory_stats = true;
+    params.memory_stats = memory_stats;
+    params.embeddings = pooling != LLAMA_POOLING_TYPE_UNSPECIFIED;
+    params.pooling_type = pooling;
+    params.graph_memory_stats = !csv_path.empty();
     REQUIRE(csv_path.size() < sizeof(params.graph_memory_stats_path));
     std::snprintf(params.graph_memory_stats_path, sizeof(params.graph_memory_stats_path), "%s", csv_path.c_str());
     llama_context_ptr ctx(llama_init_from_model(model, params));
@@ -127,16 +136,58 @@ llama_context_ptr make_context(llama_model * model, const std::string & csv_path
     return ctx;
 }
 
-void run_tokens(llama_context * ctx, int32_t n_tokens) {
-    llama_memory_clear(llama_get_memory(ctx), true);
+std::vector<float> run_tokens(
+        llama_context * ctx, int32_t n_tokens, bool all_outputs = false,
+        llama_pos pos_start = 0, bool clear_memory = true) {
+    if (clear_memory) { llama_memory_clear(llama_get_memory(ctx), true); }
     llama_batch batch = llama_batch_init(n_tokens, 0, 1);
     for (int32_t i = 0; i < n_tokens; ++i) {
-        common_batch_add(batch, llama_token(i + 1), llama_pos(i), {0}, i + 1 == n_tokens);
+        common_batch_add(batch, llama_token((pos_start + i + 1) % 128), pos_start + i,
+                {0}, all_outputs || i + 1 == n_tokens);
     }
     const int status = llama_decode(ctx, batch);
     llama_batch_free(batch);
     REQUIRE(status == 0);
-    REQUIRE(llama_get_logits_ith(ctx, -1) != nullptr);
+    const float * logits = llama_get_logits_ith(ctx, -1);
+    REQUIRE(logits != nullptr);
+    std::vector<float> result(logits, logits + 128);
+    for (float value : result) { REQUIRE(std::isfinite(value)); }
+    return result;
+}
+
+void require_same_logits(const std::vector<float> & a, const std::vector<float> & b) {
+    REQUIRE(a.size() == b.size());
+    for (size_t i = 0; i < a.size(); ++i) {
+        REQUIRE(std::abs(a[i] - b[i]) <= 1.0e-6f * std::max(1.0f, std::abs(a[i])));
+    }
+}
+
+struct compute_snapshot {
+    size_t reserved = 0;
+    size_t base = 0;
+    size_t full = 0;
+    bool measured = false;
+};
+
+compute_snapshot read_compute(llama_context * ctx) {
+    compute_snapshot result;
+    for (const auto & entry : llama_get_memory_breakdown(ctx)) {
+        result.reserved += entry.second.compute;
+        result.base += entry.second.compute_graph_base;
+        result.full += entry.second.compute_graph_routed;
+        result.measured = result.measured || entry.second.compute_graph_measurement_valid;
+    }
+    return result;
+}
+
+void require_actual_compute(const compute_snapshot & actual) {
+    REQUIRE(actual.measured);
+    REQUIRE(actual.full > 0);
+    REQUIRE(actual.reserved >= actual.full);
+    // This fixture has one CPU buffer; allow its alignment without accepting
+    // a retained maximum-batch or all-logits allocation.
+    REQUIRE(actual.reserved - actual.full <= 256);
+    REQUIRE(actual.base == actual.full);
 }
 
 std::vector<std::string> split_csv(const std::string & line) {
@@ -240,6 +291,303 @@ csv_snapshot read_and_validate(const std::string & path) {
     return result;
 }
 
+void test_output_selection_and_eviction(llama_model * model) {
+    // With one cache slot, replacing a large graph must release its compute
+    // buffers before a smaller graph is built. Exercise the memory API with
+    // CSV logging disabled, as used by memory_stats-only applications.
+    set_env("LLAMA_GRAPH_CACHE_CAPACITY", "1");
+    auto ctx = make_context(model, "");
+    REQUIRE(read_compute(ctx.get()).reserved == 0);
+
+    const auto last_logits = run_tokens(ctx.get(), 16);
+    const auto last_only = read_compute(ctx.get());
+    require_actual_compute(last_only);
+
+    const auto all_logits = run_tokens(ctx.get(), 16, true);
+    const auto all_outputs = read_compute(ctx.get());
+    require_actual_compute(all_outputs);
+    REQUIRE(all_outputs.full > last_only.full);
+    require_same_logits(last_logits, all_logits);
+
+    run_tokens(ctx.get(), 64, true);
+    const auto largest = read_compute(ctx.get());
+    require_actual_compute(largest);
+    REQUIRE(largest.reserved > all_outputs.reserved);
+
+    const auto replay = run_tokens(ctx.get(), 16);
+    const auto small_again = read_compute(ctx.get());
+    require_actual_compute(small_again);
+    REQUIRE(small_again.reserved == last_only.reserved);
+    REQUIRE(small_again.full == last_only.full);
+    require_same_logits(last_logits, replay);
+
+    // Reuse of an unchanged graph keeps its allocation and updates inputs.
+    const auto reuse_before = llama_perf_context(ctx.get()).n_reused;
+    require_same_logits(last_logits, run_tokens(ctx.get(), 16));
+    REQUIRE(llama_perf_context(ctx.get()).n_reused == reuse_before + 1);
+    REQUIRE(read_compute(ctx.get()).reserved == small_again.reserved);
+
+    // The first real inference must not inherit a larger warmup allocation.
+    llama_set_warmup(ctx.get(), true);
+    run_tokens(ctx.get(), 64, true);
+    REQUIRE(read_compute(ctx.get()).reserved > last_only.reserved);
+    llama_set_warmup(ctx.get(), false);
+    require_same_logits(last_logits, run_tokens(ctx.get(), 16));
+    const auto after_warmup = read_compute(ctx.get());
+    require_actual_compute(after_warmup);
+    REQUIRE(after_warmup.reserved == last_only.reserved);
+
+    // Buffer sizing must also work when neither diagnostic mode is enabled.
+    auto no_stats = make_context(model, "", 64, false);
+    REQUIRE(read_compute(no_stats.get()).reserved == 0);
+    require_same_logits(last_logits, run_tokens(no_stats.get(), 16));
+    REQUIRE(read_compute(no_stats.get()).reserved == last_only.reserved);
+}
+
+void test_rebuild_without_reuse(llama_model * model) {
+    set_env("LLAMA_GRAPH_CACHE_CAPACITY", "4");
+    set_env("LLAMA_GRAPH_REUSE_DISABLE", "1");
+    temporary_csv csv;
+    auto ctx = make_context(model, csv.path);
+    set_env("LLAMA_GRAPH_REUSE_DISABLE", nullptr);
+    const auto logits = run_tokens(ctx.get(), 16);
+    const auto small = read_compute(ctx.get());
+    require_actual_compute(small);
+    const auto builds_before = read_and_validate(csv.path).totals.size();
+
+    require_same_logits(logits, run_tokens(ctx.get(), 16));
+    REQUIRE(llama_perf_context(ctx.get()).n_reused == 0);
+    REQUIRE(read_and_validate(csv.path).totals.size() == builds_before + 1);
+    REQUIRE(read_compute(ctx.get()).reserved == small.reserved);
+    require_actual_compute(read_compute(ctx.get()));
+
+    run_tokens(ctx.get(), 64, true);
+    REQUIRE(read_compute(ctx.get()).reserved > small.reserved);
+    require_same_logits(logits, run_tokens(ctx.get(), 16));
+    REQUIRE(llama_perf_context(ctx.get()).n_reused == 0);
+    require_actual_compute(read_compute(ctx.get()));
+    REQUIRE(read_compute(ctx.get()).reserved == small.reserved);
+}
+
+std::vector<float> run_embeddings(llama_context * ctx, int32_t n_tokens, int32_t token_offset) {
+    llama_memory_clear(llama_get_memory(ctx), true);
+    llama_batch batch = llama_batch_init(n_tokens, 0, 1);
+    for (int32_t i = 0; i < n_tokens; ++i) {
+        common_batch_add(batch, llama_token((i + token_offset + 1) % 128), i, {0}, true);
+    }
+    const int status = llama_decode(ctx, batch);
+    llama_batch_free(batch);
+    REQUIRE(status == 0);
+    const float * embeddings = llama_get_embeddings_seq(ctx, 0);
+    REQUIRE(embeddings != nullptr);
+    std::vector<float> result(embeddings, embeddings + 32);
+    for (float value : result) { REQUIRE(std::isfinite(value)); }
+    return result;
+}
+
+void test_compute_compatibility_guards() {
+    // An uncached attention graph must be rebuilt, but its mask allocation can
+    // survive a rebuild only when the complete shape and attention mode match.
+    llm_graph_result result(64);
+    llm_graph_params params {};
+    params.arch = LLM_ARCH_LLAMA;
+    params.ubatch.n_tokens = params.ubatch.n_seq_tokens = 16;
+    params.ubatch.n_seqs = params.ubatch.n_seqs_unq = 1;
+    params.n_outputs = 1;
+    result.set_params(params);
+    auto input = std::make_unique<llm_graph_input_attn_no_cache>(params.hparams, params.cparams);
+    auto * attention = input.get();
+    attention->self_kq_mask = ggml_new_tensor_2d(result.get_ctx(), GGML_TYPE_F32, 16, 16);
+    result.add_input(std::move(input));
+    REQUIRE(!result.can_reuse(params));
+    REQUIRE(result.can_reuse_compute(params));
+
+    auto changed = params;
+    changed.ubatch.n_tokens = changed.ubatch.n_seq_tokens = 32;
+    REQUIRE(!result.can_reuse_compute(changed));
+    changed = params;
+    changed.n_outputs = 16;
+    REQUIRE(!result.can_reuse_compute(changed));
+    changed = params;
+    changed.cparams.flash_attn = true;
+    REQUIRE(!result.can_reuse_compute(changed));
+    changed = params;
+    changed.cparams.causal_attn = true;
+    REQUIRE(!result.can_reuse_compute(changed));
+    changed = params;
+    changed.hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
+    REQUIRE(!result.can_reuse_compute(changed));
+
+    auto * mask = attention->self_kq_mask;
+    attention->self_kq_mask = ggml_new_tensor_2d(result.get_ctx(), GGML_TYPE_F32, 8, 32);
+    REQUIRE(!result.can_reuse_compute(params)); // Same element count, different layout.
+    attention->self_kq_mask = ggml_new_tensor_2d(result.get_ctx(), GGML_TYPE_F16, 16, 16);
+    REQUIRE(!result.can_reuse_compute(params));
+    attention->self_kq_mask = mask;
+
+    auto swa_params = params;
+    swa_params.hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
+    llm_graph_input_attn_no_cache swa(swa_params.hparams, swa_params.cparams);
+    swa.self_kq_mask = mask;
+    REQUIRE(!swa.can_reuse_compute(swa_params)); // Missing second mask.
+    swa.self_kq_mask_swa = ggml_new_tensor_2d(result.get_ctx(), GGML_TYPE_F32, 16, 16);
+    REQUIRE(swa.can_reuse_compute(swa_params));
+    swa.self_kq_mask_swa = ggml_new_tensor_2d(result.get_ctx(), GGML_TYPE_F32, 16, 8);
+    REQUIRE(!swa.can_reuse_compute(swa_params));
+
+    // Inputs with no implemented compatibility check must continue rejecting
+    // compute reuse, even when every known input matches.
+    struct unknown_input : llm_graph_input_i {
+        void set_input(const llama_ubatch *) override {}
+    };
+    result.add_input(std::make_unique<unknown_input>());
+    REQUIRE(!result.can_reuse_compute(params));
+}
+
+void test_pooling_rebuild_keeps_compute(llama_model * model) {
+    // Pooling inputs still require graph rebuilding. Their stable shapes must
+    // nevertheless retain compute allocations, including with diagnostics off.
+    for (auto pooling : {LLAMA_POOLING_TYPE_MEAN, LLAMA_POOLING_TYPE_CLS}) {
+        for (bool disable_reuse : {false, true}) {
+            for (bool diagnostics : {false, true}) {
+                set_env("LLAMA_GRAPH_CACHE_CAPACITY", "1");
+                set_env("LLAMA_GRAPH_REUSE_DISABLE", disable_reuse ? "1" : nullptr);
+                temporary_csv csv;
+                auto ctx = make_context(model, diagnostics ? csv.path : "", 64, diagnostics, pooling);
+                set_env("LLAMA_GRAPH_REUSE_DISABLE", nullptr);
+                REQUIRE(read_compute(ctx.get()).reserved == 0);
+
+                size_t builds = 0;
+                const auto check_run = [&](int32_t n_tokens, int32_t token_offset) {
+                    const auto embedding = run_embeddings(ctx.get(), n_tokens, token_offset);
+                    // A fresh context has no previous graph or buffer bindings.
+                    auto fresh = make_context(model, "", 64, false, pooling);
+                    require_same_logits(embedding, run_embeddings(fresh.get(), n_tokens, token_offset));
+                    REQUIRE(llama_perf_context(ctx.get()).n_reused == 0);
+                    const auto snapshot = read_compute(ctx.get());
+                    REQUIRE(snapshot.reserved > 0);
+                    if (diagnostics) {
+                        require_actual_compute(snapshot);
+                        const auto rows = read_and_validate(csv.path);
+                        const size_t actual_builds = std::count_if(rows.totals.begin(), rows.totals.end(),
+                                [](const row & values) { return values.at("event") == "build"; });
+                        REQUIRE(actual_builds == ++builds);
+                        REQUIRE(number(rows.totals.back(), "cache_entry_count") == 1);
+                    }
+                    return snapshot;
+                };
+
+                const auto small = check_run(16, 0);
+                const auto small_scheduler = ctx->get_sched();
+                const auto repeated = check_run(16, 3);
+                REQUIRE(ctx->get_sched() == small_scheduler);
+                REQUIRE(repeated.reserved == small.reserved);
+
+                const auto large = check_run(64, 7);
+                REQUIRE(large.reserved > small.reserved);
+                const auto large_scheduler = ctx->get_sched();
+                const auto large_repeated = check_run(64, 11);
+                REQUIRE(ctx->get_sched() == large_scheduler);
+                REQUIRE(large_repeated.reserved == large.reserved);
+
+                const auto small_again = check_run(16, 0);
+                REQUIRE(small_again.reserved == small.reserved);
+                const auto small_again_scheduler = ctx->get_sched();
+                const auto replay = check_run(16, 13);
+                REQUIRE(ctx->get_sched() == small_again_scheduler);
+                REQUIRE(replay.reserved == small.reserved);
+            }
+        }
+    }
+}
+
+void shift_prefix(llama_context * ctx) {
+    const auto memory = llama_get_memory(ctx);
+    REQUIRE(llama_memory_can_shift(memory));
+    REQUIRE(llama_memory_seq_rm(memory, 0, 0, 16));
+    llama_memory_seq_add(memory, 0, 16, 32, -16);
+}
+
+void test_kv_shift(llama_model * model) {
+    set_env("LLAMA_GRAPH_CACHE_CAPACITY", "4");
+    temporary_csv csv;
+    auto ctx = make_context(model, csv.path);
+    run_tokens(ctx.get(), 16);
+    const auto small = read_compute(ctx.get());
+    run_tokens(ctx.get(), 32);
+    const auto before_shift = read_and_validate(csv.path);
+    REQUIRE(number(before_shift.totals.back(), "cache_entry_count") == 2);
+    size_t largest_reserve_plan = 0;
+    for (const auto & reserved : before_shift.reserves) {
+        largest_reserve_plan = std::max(largest_reserve_plan, number(reserved, "full_planned_peak_bytes"));
+    }
+    REQUIRE(largest_reserve_plan > 0);
+
+    // Applying this pending key-position shift during decode executes the
+    // memory-maintenance graph and then restores scheduler topology.
+    shift_prefix(ctx.get());
+    const auto shifted_logits = run_tokens(ctx.get(), 16, false, 16, false);
+    const auto after_shift = read_and_validate(csv.path);
+    REQUIRE(after_shift.reserves.size() > before_shift.reserves.size());
+    const auto & restored_reserve = after_shift.reserves.back();
+    // The maintenance reserve restores topology without measuring its plan;
+    // compare its retained allocation with the startup worst-case plan.
+    REQUIRE(number(restored_reserve, "active_compute_reserved_bytes") < largest_reserve_plan);
+    REQUIRE(number(after_shift.totals.back(), "cache_entry_count") == 1);
+    require_actual_compute(read_compute(ctx.get()));
+    REQUIRE(read_compute(ctx.get()).reserved == small.reserved);
+
+    // An independent context with graph reuse disabled must produce the same
+    // logits after applying the identical KV edit and follow-up decode.
+    set_env("LLAMA_GRAPH_REUSE_DISABLE", "1");
+    auto fresh = make_context(model, "");
+    set_env("LLAMA_GRAPH_REUSE_DISABLE", nullptr);
+    run_tokens(fresh.get(), 32);
+    shift_prefix(fresh.get());
+    require_same_logits(shifted_logits, run_tokens(fresh.get(), 16, false, 16, false));
+    require_actual_compute(read_compute(fresh.get()));
+}
+
+void test_kv_growth(llama_model * model) {
+    set_env("LLAMA_GRAPH_CACHE_CAPACITY", "4");
+    temporary_csv csv;
+    auto cached = make_context(model, csv.path, 512);
+    REQUIRE(read_compute(cached.get()).reserved == 0);
+
+    // n_kv is rounded in groups of 256. These two P16 executions have the
+    // same token/output counts but need different attention shapes.
+    const auto first_logits = run_tokens(cached.get(), 16);
+    const auto first = read_and_validate(csv.path).totals.front();
+    run_tokens(cached.get(), 64, false, 16, false);
+    run_tokens(cached.get(), 64, false, 80, false);
+    run_tokens(cached.get(), 64, false, 144, false);
+    run_tokens(cached.get(), 32, false, 208, false);
+    run_tokens(cached.get(), 16, false, 240, false);
+    const auto reused_before_growth = llama_perf_context(cached.get()).n_reused;
+    const auto grown_logits = run_tokens(cached.get(), 16, false, 256, false);
+    REQUIRE(llama_perf_context(cached.get()).n_reused == reused_before_growth);
+    const auto grown = read_and_validate(csv.path).totals.back();
+    REQUIRE(grown.at("event") == "build");
+    REQUIRE(number(grown, "n_tokens") == 16);
+    REQUIRE(number(grown, "n_outputs") == 1);
+    REQUIRE(number(grown, "full_planned_peak_bytes") > number(first, "full_planned_peak_bytes"));
+    REQUIRE(number(grown, "active_compute_reserved_bytes") >= number(grown, "full_planned_peak_bytes"));
+    REQUIRE(number(grown, "active_compute_reserved_bytes") - number(grown, "full_planned_peak_bytes") <= 256);
+
+    // Compare against a context without an inactive graph cache, which
+    // rebuilds both P16 shapes, to catch stale cached buffer bindings.
+    set_env("LLAMA_GRAPH_CACHE_CAPACITY", "1");
+    auto fresh = make_context(model, "", 512);
+    require_same_logits(first_logits, run_tokens(fresh.get(), 16));
+    run_tokens(fresh.get(), 64, false, 16, false);
+    run_tokens(fresh.get(), 64, false, 80, false);
+    run_tokens(fresh.get(), 64, false, 144, false);
+    run_tokens(fresh.get(), 32, false, 208, false);
+    run_tokens(fresh.get(), 16, false, 240, false);
+    require_same_logits(grown_logits, run_tokens(fresh.get(), 16, false, 256, false));
+    require_actual_compute(read_compute(fresh.get()));
+}
+
 } // namespace
 
 int main() {
@@ -255,9 +603,12 @@ int main() {
         llama_model_ptr model = make_model();
         llama_context_ptr ctx = make_context(model.get(), csv.path);
         REQUIRE(llama_warmup_min_tokens(ctx.get()) == 1);
+        REQUIRE(read_compute(ctx.get()).reserved == 0);
         llama_perf_context_reset(ctx.get());
 
-        run_tokens(ctx.get(), 16);
+        const auto logits_16 = run_tokens(ctx.get(), 16);
+        const auto compute_16 = read_compute(ctx.get());
+        require_actual_compute(compute_16);
         auto initial = read_and_validate(csv.path);
         REQUIRE(initial.reserves.size() >= 3);
         REQUIRE(initial.reserves.front().at("warmup") == "0");
@@ -265,12 +616,21 @@ int main() {
             REQUIRE(number(reserved, "n_outputs") == number(reserved, "n_tokens"));
             REQUIRE(number(reserved, "context_metadata_capacity_bytes") ==
                 2 * number(reserved, "active_metadata_capacity_bytes"));
+            REQUIRE(number(reserved, "active_compute_reserved_bytes") == 0);
+            REQUIRE(number(reserved, "context_compute_reserved_bytes") == 0);
         }
         REQUIRE(initial.totals.size() == 2);
         REQUIRE(initial.totals.front().at("event") == "build");
         REQUIRE(initial.totals.back().at("event") == "compute");
         REQUIRE(number(initial.totals.front(), "backend_scratch_reserved_bytes") == 0);
         REQUIRE(number(initial.totals.back(), "backend_scratch_reserved_bytes") == 0);
+        REQUIRE(number(initial.totals.front(), "active_compute_reserved_bytes") == compute_16.reserved);
+        REQUIRE(number(initial.totals.front(), "full_planned_peak_bytes") == compute_16.full);
+        size_t largest_reserve_plan = 0;
+        for (const auto & reserved : initial.reserves) {
+            largest_reserve_plan = std::max(largest_reserve_plan, number(reserved, "full_planned_peak_bytes"));
+        }
+        REQUIRE(compute_16.reserved < largest_reserve_plan);
 
         scratch.grow(256, 64, 48, 128);
         run_tokens(ctx.get(), 16);
@@ -302,9 +662,17 @@ int main() {
         REQUIRE(cached.totals.back().at("event") == "build");
         REQUIRE(number(cached.totals.back(), "cache_entry_count") >= 2);
         REQUIRE(number(cached.totals.back(), "backend_scratch_reserved_bytes") == 256);
+        const size_t compute_32 = number(cached.totals.back(), "active_compute_reserved_bytes");
+        REQUIRE(compute_32 > compute_16.reserved);
+        REQUIRE(compute_32 >= number(cached.totals.back(), "full_planned_peak_bytes"));
+        REQUIRE(compute_32 - number(cached.totals.back(), "full_planned_peak_bytes") <= 256);
+        REQUIRE(number(cached.totals.back(), "context_compute_reserved_bytes") == compute_16.reserved + compute_32);
+        REQUIRE(read_compute(ctx.get()).reserved == compute_16.reserved + compute_32);
+        const size_t cached_full_plan = compute_16.full + number(cached.totals.back(), "full_planned_peak_bytes");
+        REQUIRE(read_compute(ctx.get()).full == cached_full_plan);
 
         scratch.grow(1024, 256, 384, 768);
-        run_tokens(ctx.get(), 16);
+        require_same_logits(logits_16, run_tokens(ctx.get(), 16));
         REQUIRE(llama_perf_context(ctx.get()).n_reused == 4);
         auto restored = read_and_validate(csv.path);
         REQUIRE(restored.totals.size() == 6);
@@ -312,11 +680,20 @@ int main() {
         REQUIRE(last.at("event") == "compute");
         REQUIRE(number(last, "cache_entry_count") >= 2);
         REQUIRE(number(last, "backend_scratch_reserved_bytes") == 1024);
+        REQUIRE(number(last, "active_compute_reserved_bytes") == compute_16.reserved);
+        REQUIRE(number(last, "context_compute_reserved_bytes") == compute_16.reserved + compute_32);
+        REQUIRE(read_compute(ctx.get()).full == cached_full_plan);
         for (const char * key : {"metadata_empty_used_bytes", "metadata_build_bytes",
                 "base_planned_peak_bytes", "full_planned_peak_bytes"}) {
             REQUIRE(last.at(key) == initial.totals.front().at(key));
         }
-        std::puts("PASS graph-memory schema 4: scheduler descriptors, reserve events, scratch capacities, graph reuse");
+        test_output_selection_and_eviction(model.get());
+        test_rebuild_without_reuse(model.get());
+        test_compute_compatibility_guards();
+        test_pooling_rebuild_keeps_compute(model.get());
+        test_kv_shift(model.get());
+        test_kv_growth(model.get());
+        std::puts("PASS graph-memory: actual compute sizes, cache reuse/eviction, output counts, pooling rebuilds, warmup, KV shift/growth, scratch schema");
         return 0;
     } catch (const std::exception & error) {
         std::fprintf(stderr, "shared weight memory test failed: %s\n", error.what());
