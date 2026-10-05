@@ -411,6 +411,24 @@ extern "C" {
     // Bytes retained by scheduler-owned bookkeeping allocations and auxiliary
     // staging buffers. These exclude the graph allocator's compute buffers,
     // which are reported by ggml_backend_sched_get_buffer_size().
+    // Counts describe the last prepared graph, including inactive route
+    // candidates. Capacities include reusable space retained from earlier
+    // graphs; context bytes contain tensor descriptors, not tensor data.
+    struct ggml_backend_sched_metadata_stats {
+        size_t total_metadata_bytes;
+        size_t context_used_bytes;
+        size_t context_capacity_bytes;
+        size_t copy_tensor_count;
+        size_t input_dependency_count;
+        size_t route_dependency_count;
+        size_t graph_node_count;
+        size_t graph_leaf_count;
+        size_t backend_id_capacity_bytes;
+        size_t graph_pointer_capacity_bytes;
+        size_t max_split_inputs;
+    };
+    GGML_API void                 ggml_backend_sched_get_metadata_stats(
+            ggml_backend_sched_t sched, struct ggml_backend_sched_metadata_stats * stats);
     GGML_API size_t               ggml_backend_sched_get_metadata_size(ggml_backend_sched_t sched);
     GGML_API size_t               ggml_backend_sched_get_auxiliary_buffer_size(ggml_backend_sched_t sched);
 

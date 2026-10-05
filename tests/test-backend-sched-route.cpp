@@ -284,6 +284,8 @@ struct queued_commit_backend_context {
     ggml_backend_t wrapper = nullptr;
     ggml_backend_dev_t device = nullptr;
     queued_commit_control * control = nullptr;
+    bool isolated_buffers = false;
+    ggml_backend_buffer_type isolated_buft = {};
     std::vector<std::pair<const ggml_tensor *, ggml_tensor *>> pending_copies;
 };
 
@@ -403,7 +405,9 @@ static ggml_backend_t queued_commit_device_init(ggml_backend_dev_t, const char *
 
 static ggml_backend_buffer_type_t queued_commit_device_buffer_type(
         ggml_backend_dev_t device) {
-    return ggml_backend_get_default_buffer_type(queued_commit_device_ctx(device)->inner);
+    auto * ctx = queued_commit_device_ctx(device);
+    return ctx->isolated_buffers ? &ctx->isolated_buft :
+        ggml_backend_get_default_buffer_type(ctx->inner);
 }
 
 static ggml_backend_buffer_type_t queued_commit_device_host_buffer_type(
@@ -420,7 +424,34 @@ static bool queued_commit_device_supports_op(
 static bool queued_commit_device_supports_buft(
         ggml_backend_dev_t device, ggml_backend_buffer_type_t buft) {
     const queued_commit_backend_context * ctx = queued_commit_device_ctx(device);
+    if (ctx->isolated_buffers) {
+        return buft == &ctx->isolated_buft;
+    }
     return ggml_backend_dev_supports_buft(ggml_backend_get_device(ctx->inner), buft);
+}
+
+static const char * isolated_buffer_name(ggml_backend_buffer_type_t) {
+    return "IsolatedHostTest";
+}
+
+static ggml_backend_buffer_t isolated_buffer_alloc(ggml_backend_buffer_type_t buft, size_t size) {
+    auto * ctx = static_cast<queued_commit_backend_context *>(buft->context);
+    auto * buffer = ggml_backend_buft_alloc_buffer(
+            ggml_backend_get_default_buffer_type(ctx->inner), size);
+    if (buffer != nullptr) {
+        // Keep CPU host storage but use a distinct type to force input copies.
+        buffer->buft = buft;
+    }
+    return buffer;
+}
+
+static size_t isolated_buffer_alignment(ggml_backend_buffer_type_t buft) {
+    auto * ctx = static_cast<queued_commit_backend_context *>(buft->context);
+    return ggml_backend_buft_get_alignment(ggml_backend_get_default_buffer_type(ctx->inner));
+}
+
+static bool isolated_buffer_is_host(ggml_backend_buffer_type_t) {
+    return true;
 }
 
 static bool queued_commit_device_offload_op(ggml_backend_dev_t, const ggml_tensor *) {
@@ -532,10 +563,12 @@ static ggml_guid_t queued_commit_backend_guid() {
     return &guid;
 }
 
-static ggml_backend_t make_queued_commit_backend(queued_commit_control * control) {
+static ggml_backend_t make_queued_commit_backend(
+        queued_commit_control * control, bool isolated_buffers = false) {
     auto * ctx = new queued_commit_backend_context;
     ctx->inner = ggml_backend_cpu_init();
     ctx->control = control;
+    ctx->isolated_buffers = isolated_buffers;
     if (ctx->inner == nullptr) {
         delete ctx;
         return nullptr;
@@ -544,6 +577,14 @@ static ggml_backend_t make_queued_commit_backend(queued_commit_control * control
     ctx->device = new ggml_backend_device {
         /* .iface   = */ queued_commit_device_iface,
         /* .reg     = */ &queued_commit_registry,
+        /* .context = */ ctx,
+    };
+    ctx->isolated_buft = {
+        /* .iface = */ {
+            isolated_buffer_name, isolated_buffer_alloc, isolated_buffer_alignment,
+            nullptr, nullptr, isolated_buffer_is_host,
+        },
+        /* .device  = */ ctx->device,
         /* .context = */ ctx,
     };
     ctx->wrapper = new ggml_backend {
@@ -2538,6 +2579,327 @@ static bool run_measured_alloc_case() {
         check_output(fixture, 2, scenario);
 }
 
+// The wrappers execute real CPU graphs while isolated buffer types force the
+// scheduler through its cross-backend copy path without a device dependency.
+struct metadata_fixture {
+    queued_commit_control controls[2];
+    ggml_backend_t backends[2] = { nullptr, nullptr };
+    ggml_backend_sched_t sched = nullptr;
+    std::vector<ggml_context *> contexts;
+
+    ~metadata_fixture() {
+        ggml_backend_sched_free(sched);
+        for (auto * backend : backends) {
+            ggml_backend_free(backend);
+        }
+        for (auto * ctx : contexts) {
+            ggml_free(ctx);
+        }
+    }
+
+    bool init(bool isolated, bool parallel) {
+        backends[0] = make_queued_commit_backend(&controls[0], isolated);
+        backends[1] = make_queued_commit_backend(&controls[1], isolated);
+        if (!backends[0] || !backends[1]) {
+            return false;
+        }
+        // A loose builder ceiling must not eagerly allocate 61 * G ID arrays
+        // or a corresponding temporary tensor arena.
+        sched = ggml_backend_sched_new(backends, nullptr, 2, 65536, parallel, true);
+        return sched != nullptr;
+    }
+
+    ggml_context * new_context(size_t tensors, size_t graph_capacity) {
+        const ggml_init_params params = {
+            tensors * ggml_tensor_overhead() + ggml_graph_overhead_custom(graph_capacity, false),
+            nullptr, true,
+        };
+        auto * ctx = ggml_init(params);
+        if (ctx) {
+            contexts.push_back(ctx);
+        }
+        return ctx;
+    }
+};
+
+static bool check_metadata_accounting(
+        ggml_backend_sched_t sched, const char * scenario,
+        ggml_backend_sched_metadata_stats * result = nullptr) {
+    ggml_backend_sched_metadata_stats stats = {};
+    ggml_backend_sched_get_metadata_stats(sched, &stats);
+    const size_t descriptors = stats.copy_tensor_count + stats.input_dependency_count +
+        stats.route_dependency_count;
+    const bool ok =
+        check(stats.context_used_bytes == descriptors * ggml_tensor_overhead(),
+            scenario, "temporary tensor descriptor accounting does not close") &&
+        check(stats.context_capacity_bytes >= stats.context_used_bytes,
+            scenario, "temporary tensor arena is smaller than its used bytes") &&
+        check(stats.backend_id_capacity_bytes < 65536 * sizeof(int),
+            scenario, "backend ID capacity still follows the constructor graph ceiling");
+    if (!ok) {
+        std::fprintf(stderr,
+                "  context used/capacity=%zu/%zu copy/input/route=%zu/%zu/%zu IDs=%zu nodes/leafs=%zu/%zu\n",
+                stats.context_used_bytes, stats.context_capacity_bytes,
+                stats.copy_tensor_count, stats.input_dependency_count, stats.route_dependency_count,
+                stats.backend_id_capacity_bytes, stats.graph_node_count, stats.graph_leaf_count);
+    }
+    if (result) {
+        *result = stats;
+    }
+    return ok;
+}
+
+static bool run_metadata_chain_case(
+        const char * scenario, bool isolated, bool parallel,
+        const std::vector<int> & lengths) {
+    metadata_fixture fixture;
+    if (!check(fixture.init(isolated, parallel), scenario, "scheduler setup failed")) {
+        return false;
+    }
+    ggml_backend_sched_metadata_stats initial = {};
+    ggml_backend_sched_get_metadata_stats(fixture.sched, &initial);
+    if (!check(initial.context_capacity_bytes == 0 && initial.backend_id_capacity_bytes == 0 &&
+                initial.graph_pointer_capacity_bytes == 0,
+                scenario, "unbuilt scheduler eagerly allocated graph-dependent metadata")) {
+        return false;
+    }
+
+    for (int steps : lengths) {
+        ggml_backend_sched_reset(fixture.sched);
+        const size_t graph_capacity = (size_t) steps * 4 + 16;
+        auto * ctx = fixture.new_context((size_t) steps * 3 + 16, graph_capacity);
+        if (!check(ctx != nullptr, scenario, "graph context setup failed")) {
+            return false;
+        }
+        auto * graph = ggml_new_graph_custom(ctx, graph_capacity, false);
+        auto * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+        ggml_set_name(input, "metadata-chain-input");
+        ggml_set_input(input);
+        ggml_backend_sched_set_tensor_backend(fixture.sched, input, fixture.backends[1]);
+        auto * output = input;
+        std::vector<ggml_tensor *> biases;
+        for (int i = 0; i < steps; ++i) {
+            auto * backend = fixture.backends[i % 2];
+            auto * doubled = ggml_add(ctx, output, output);
+            ggml_backend_sched_set_tensor_backend(fixture.sched, doubled, backend);
+            auto * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+            ggml_backend_sched_set_tensor_backend(fixture.sched, bias, backend);
+            biases.push_back(bias);
+            output = ggml_add(ctx, doubled, bias);
+            ggml_backend_sched_set_tensor_backend(fixture.sched, output, backend);
+        }
+        ggml_set_output(output);
+        ggml_build_forward_expand(graph, output);
+        if (!check(ggml_backend_sched_alloc_graph(fixture.sched, graph),
+                    scenario, "graph allocation failed")) {
+            return false;
+        }
+        ggml_backend_sched_metadata_stats stats = {};
+        if (!check_metadata_accounting(fixture.sched, scenario, &stats) ||
+                !check(stats.graph_node_count >= (size_t) ggml_graph_n_nodes(graph) &&
+                    stats.graph_leaf_count >= (size_t) steps + 1,
+                    scenario, "expanded graph accounting lost original nodes or leafs")) {
+            return false;
+        }
+        if (isolated) {
+            if (!check(stats.input_dependency_count == (size_t) steps && stats.max_split_inputs == 1,
+                        scenario, "repeated source operands created duplicate input attachments")) {
+                return false;
+            }
+        } else if (!check(stats.input_dependency_count == 0,
+                    scenario, "host-compatible inputs unexpectedly required copies")) {
+            return false;
+        }
+        if (parallel) {
+            if (!check(ggml_backend_sched_get_n_copies(fixture.sched) > 1 &&
+                        stats.copy_tensor_count > 0 &&
+                        stats.graph_leaf_count > (size_t) steps + 1,
+                        scenario, "pipeline input-copy leafs were not accounted for")) {
+                return false;
+            }
+        } else if (!isolated &&
+                !check(stats.context_used_bytes == 0 && stats.copy_tensor_count == 0,
+                    scenario, "copy-free graph allocated temporary tensor descriptors")) {
+            return false;
+        }
+        // Refresh inputs and run the same prepared graph twice. Growth/shrink
+        // transitions must preserve valid current/previous backend-ID entries.
+        for (int run = 0; run < 2; ++run) {
+            float expected[4] = { 1.0f + run, -2.0f - run, 0.5f + run, 3.0f + run };
+            ggml_backend_tensor_set(input, expected, 0, sizeof(expected));
+            for (int i = 0; i < steps; ++i) {
+                const float bias[4] = { 0.25f, -0.5f, 0.125f, 0.75f };
+                ggml_backend_tensor_set(biases[(size_t) i], bias, 0, sizeof(bias));
+                for (int j = 0; j < 4; ++j) {
+                    expected[j] = 2.0f * expected[j] + bias[j];
+                }
+            }
+            if (!check(ggml_backend_sched_graph_compute(fixture.sched, graph) == GGML_STATUS_SUCCESS,
+                        scenario, "graph execution failed after metadata resize")) {
+                return false;
+            }
+            float actual[4] = {};
+            ggml_backend_tensor_get(output, actual, 0, sizeof(actual));
+            for (int j = 0; j < 4; ++j) {
+                if (!check(std::fabs(actual[j] - expected[j]) <= 1e-5f * std::max(1.0f, std::fabs(expected[j])),
+                            scenario, "copy refresh or backend-ID resize changed the result")) {
+                    std::fprintf(stderr, "  steps=%d run=%d element=%d actual=%g expected=%g\n",
+                            steps, run, j, actual[j], expected[j]);
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+static bool run_metadata_split_input_limit_case() {
+    const char * scenario = "metadata-split-input-limit";
+    constexpr int input_count = 40;
+    metadata_fixture fixture;
+    if (!check(fixture.init(true, false), scenario, "scheduler setup failed")) {
+        return false;
+    }
+    auto * ctx = fixture.new_context(2 * input_count + 8, 128);
+    if (!check(ctx != nullptr, scenario, "graph context setup failed")) {
+        return false;
+    }
+    auto * graph = ggml_new_graph_custom(ctx, 128, false);
+    std::vector<ggml_tensor *> inputs;
+    ggml_tensor * output = nullptr;
+    for (int i = 0; i < input_count; ++i) {
+        auto * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+        ggml_set_input(input);
+        ggml_format_name(input, "metadata-limit-input-%d", i);
+        ggml_backend_sched_set_tensor_backend(fixture.sched, input, fixture.backends[1]);
+        inputs.push_back(input);
+        if (output == nullptr) {
+            output = input;
+        } else {
+            output = ggml_add(ctx, output, input);
+            ggml_backend_sched_set_tensor_backend(fixture.sched, output, fixture.backends[0]);
+        }
+    }
+    ggml_set_output(output);
+    ggml_build_forward_expand(graph, output);
+    if (!check(ggml_backend_sched_alloc_graph(fixture.sched, graph),
+                scenario, "allocation failed at the split-input boundary")) {
+        return false;
+    }
+    ggml_backend_sched_metadata_stats stats = {};
+    if (!check_metadata_accounting(fixture.sched, scenario, &stats) ||
+            !check(stats.max_split_inputs > 0 && stats.max_split_inputs <= 30 &&
+                ggml_backend_sched_get_n_splits(fixture.sched) >= 2,
+                scenario, "foreign inputs did not split at the existing 30-input limit") ||
+            !check(stats.copy_tensor_count == input_count && stats.input_dependency_count == input_count,
+                scenario, "a copy was lost or duplicated when starting another split")) {
+        return false;
+    }
+    for (int run = 0; run < 2; ++run) {
+        float expected[4] = {};
+        for (int i = 0; i < input_count; ++i) {
+            const float values[4] = {
+                float(i + run), -float(i + run), 0.25f * (i + run), 1.0f + run,
+            };
+            ggml_backend_tensor_set(inputs[(size_t) i], values, 0, sizeof(values));
+            for (int j = 0; j < 4; ++j) {
+                expected[j] += values[j];
+            }
+        }
+        if (!check(ggml_backend_sched_graph_compute(fixture.sched, graph) == GGML_STATUS_SUCCESS,
+                    scenario, "split-input boundary graph execution failed")) {
+            return false;
+        }
+        float actual[4] = {};
+        ggml_backend_tensor_get(output, actual, 0, sizeof(actual));
+        for (int j = 0; j < 4; ++j) {
+            if (!check(std::fabs(actual[j] - expected[j]) < 1e-5f,
+                        scenario, "input was stale or omitted across the split-input boundary")) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool run_metadata_route_refresh_case() {
+    const char * scenario = "metadata-route-refresh";
+    metadata_fixture fixture;
+    if (!check(fixture.init(true, false), scenario, "scheduler setup failed")) {
+        return false;
+    }
+    auto * ctx = fixture.new_context(48, 64);
+    if (!check(ctx != nullptr, scenario, "graph context setup failed")) {
+        return false;
+    }
+    auto * graph = ggml_new_graph_custom(ctx, 64, false);
+    auto * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+    ggml_set_input(input);
+    ggml_set_name(input, "metadata-route-input");
+    ggml_backend_sched_set_tensor_backend(fixture.sched, input, fixture.backends[0]);
+    ggml_tensor * terminals[3][3] = {};
+    const float factors[3][3] = { { 1, 2, 3 }, { 2, 3, 4 }, { 5, 6, 7 } };
+    for (int variant = 0; variant < 3; ++variant) {
+        for (int lane = 0; lane < 3; ++lane) {
+            terminals[variant][lane] = ggml_scale(ctx, input, factors[variant][lane]);
+            ggml_format_name(terminals[variant][lane], "metadata-route-%d-%d", variant, lane);
+            ggml_backend_sched_set_tensor_backend(fixture.sched, terminals[variant][lane],
+                    fixture.backends[variant == 0 ? 0 : 1]);
+            ggml_build_forward_expand(graph, terminals[variant][lane]);
+        }
+    }
+    auto * output = ggml_add4(ctx,
+            terminals[0][0], terminals[0][1], terminals[0][2], input);
+    ggml_set_output(output);
+    ggml_backend_sched_set_tensor_backend(fixture.sched, output, fixture.backends[0]);
+    ggml_build_forward_expand(graph, output);
+    for (int variant = 0; variant < 3; ++variant) {
+        if (!check(ggml_backend_sched_register_route_subgraph_bundle(
+                    fixture.sched, terminals[0][0], terminals[0],
+                    terminals[variant][0], terminals[variant], 3, (uint64_t) variant, 0),
+                    scenario, "route bundle registration failed")) {
+            return false;
+        }
+    }
+    ggml_backend_sched_layer_checkpoint_set_plan_id(fixture.sched, 0);
+    if (!check(ggml_backend_sched_alloc_graph(fixture.sched, graph), scenario, "graph allocation failed")) {
+        return false;
+    }
+    ggml_backend_sched_metadata_stats stats = {};
+    if (!check_metadata_accounting(fixture.sched, scenario, &stats) ||
+            !check(stats.copy_tensor_count == 1 && stats.input_dependency_count == 2,
+                scenario, "alternate variants did not share one copy with two refresh points") ||
+            !check(stats.route_dependency_count == 6,
+                scenario, "three-output alternate bundles lost their lifetime dependencies")) {
+        return false;
+    }
+    // Both alternates use one physical input-copy tensor. Each selected variant
+    // must refresh it even when the previous owner was skipped or used old data.
+    const int plans[] = { 0, 2, 1, 0, 1, 2 };
+    for (int run = 0; run < 6; ++run) {
+        const int plan = plans[run];
+        const float input_values[4] = { 1.0f + run, -2.0f - run, 0.25f + run, 3.0f + run };
+        ggml_backend_tensor_set(input, input_values, 0, sizeof(input_values));
+        ggml_backend_sched_layer_checkpoint_set_plan_id(fixture.sched, (uint64_t) plan);
+        if (!check(ggml_backend_sched_graph_compute(fixture.sched, graph) == GGML_STATUS_SUCCESS,
+                    scenario, "route execution failed")) {
+            return false;
+        }
+        float actual[4] = {};
+        ggml_backend_tensor_get(output, actual, 0, sizeof(actual));
+        const float multiplier = factors[plan][0] + factors[plan][1] + factors[plan][2] + 1.0f;
+        for (int j = 0; j < 4; ++j) {
+            if (!check(std::fabs(actual[j] - multiplier * input_values[j]) < 1e-5f,
+                        scenario, "route refresh or multi-output lifetime produced stale output")) {
+                std::fprintf(stderr, "  plan=%d run=%d actual=%g expected=%g\n",
+                        plan, run, actual[j], multiplier * input_values[j]);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 int main() {
@@ -2547,6 +2909,11 @@ int main() {
     (void) setenv("SCHED_TRACE_PHASE", "both", 1);
 #endif
     bool ok = true;
+    ok = run_metadata_chain_case("metadata-no-copies", false, false, {1, 33, 2, 65}) && ok;
+    ok = run_metadata_chain_case("metadata-copy-growth", true, false, {1, 33, 2, 65}) && ok;
+    ok = run_metadata_chain_case("metadata-pipeline-growth", true, true, {1, 4, 2, 7}) && ok;
+    ok = run_metadata_route_refresh_case() && ok;
+    ok = run_metadata_split_input_limit_case() && ok;
     ok = run_measured_alloc_case() && ok;
     ok = run_default_off_case() && ok;
     ok = run_two_layer_case(

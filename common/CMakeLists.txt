@@ -105,6 +105,7 @@ add_library(${TARGET}
     speculative.h
     unicode.cpp
     unicode.h
+    warmup.h
     jinja/lexer.cpp
     jinja/lexer.h
     jinja/parser.cpp

@@ -1140,6 +1140,11 @@ extern "C" {
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.
     LLAMA_API void llama_set_warmup(struct llama_context * ctx, bool warmup);
 
+    // Recommended minimum decoder warmup batch size for the current context.
+    // Returns 1 normally, or 4 for shared-weight FFN routes that use native repacking.
+    // This is a recommendation, not a minimum accepted by llama_decode().
+    LLAMA_API uint32_t llama_warmup_min_tokens(const struct llama_context * ctx);
+
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
 

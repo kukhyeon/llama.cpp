@@ -114,6 +114,7 @@ struct llama_context {
     void set_embeddings (bool value);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
+    uint32_t warmup_min_tokens() const;
 
     void set_ignite_params(
             const llama_igparams * cfg);
@@ -358,7 +359,8 @@ private:
             ggml_cgraph * graph,
             size_t metadata_empty_used_bytes,
             const std::vector<size_t> & base_planned_sizes,
-            const std::vector<size_t> & full_planned_sizes);
+            const std::vector<size_t> & full_planned_sizes,
+            int32_t reported_n_outputs = -1);
 
     // TODO: read/write lora adapters and cvec
     size_t state_write_data(llama_io_write_i & io);

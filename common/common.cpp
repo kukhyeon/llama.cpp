@@ -8,6 +8,7 @@
 #include "llama.h"
 #include "sampling.h"
 #include "unicode.h"
+#include "warmup.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -1426,6 +1427,11 @@ common_init_result_ptr common_init_from_params(common_params & params) {
         if (tmp.empty()) {
             tmp.push_back(0);
         }
+
+        // Shared FFN candidates use native composite GEMM from four rows onward.
+        // Keep the default last-token output selection, including the final FFN.
+        common_warmup_expand_tokens(tmp, llama_warmup_min_tokens(lctx),
+                llama_n_batch(lctx), llama_n_ubatch(lctx));
 
         if (llama_model_has_encoder(model)) {
             llama_encode(lctx, llama_batch_get_one(tmp.data(), tmp.size()));

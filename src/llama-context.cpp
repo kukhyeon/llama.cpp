@@ -1279,7 +1279,12 @@ void llama_context::graph_memory_stats_initialize() {
         "policy_profile,route_mode,cache_entry_count,n_nodes,metadata_empty_used_bytes,"
         "metadata_arena_used_bytes,metadata_build_bytes,active_metadata_capacity_bytes,"
         "context_metadata_capacity_bytes,active_scheduler_metadata_bytes,"
-        "context_scheduler_metadata_bytes,active_auxiliary_buffer_bytes,"
+        "context_scheduler_metadata_bytes,active_scheduler_context_used_bytes,"
+        "active_scheduler_context_capacity_bytes,active_scheduler_copy_tensor_count,"
+        "active_scheduler_input_dependency_count,active_scheduler_route_dependency_count,"
+        "active_scheduler_graph_nodes,active_scheduler_graph_leafs,"
+        "active_scheduler_backend_id_capacity_bytes,active_scheduler_graph_pointer_capacity_bytes,"
+        "active_scheduler_max_split_inputs,active_auxiliary_buffer_bytes,"
         "context_auxiliary_buffer_bytes,reachable_owned_storage_count,"
         "logical_unique_storage_bytes,logical_metadata_plus_storage_bytes,row_scope,backend,buffer_type,"
         "base_planned_peak_bytes,full_planned_peak_bytes,active_compute_reserved_bytes,"
@@ -1297,7 +1302,8 @@ void llama_context::graph_memory_stats_record(
         ggml_cgraph * graph,
         size_t metadata_empty_used_bytes,
         const std::vector<size_t> & base_planned_sizes,
-        const std::vector<size_t> & full_planned_sizes) {
+        const std::vector<size_t> & full_planned_sizes,
+        int32_t reported_n_outputs) {
     if (!graph_memory_stats_enabled || result == nullptr || graph == nullptr || sched == nullptr) {
         return;
     }
@@ -1392,6 +1398,10 @@ void llama_context::graph_memory_stats_record(
     if (gf_res_reserve != nullptr && gf_res_reserve.get() != result) {
         context_metadata_capacity_bytes += gf_res_reserve->get_metadata_capacity_bytes();
     }
+    if (gf_res_prev != nullptr && gf_res_prev.get() != result &&
+            gf_res_prev.get() != gf_res_reserve.get()) {
+        context_metadata_capacity_bytes += gf_res_prev->get_metadata_capacity_bytes();
+    }
     for (const auto & entry : graph_cache_entries) {
         if (entry.result != nullptr && entry.result.get() != result &&
                 entry.result.get() != gf_res_reserve.get()) {
@@ -1399,8 +1409,9 @@ void llama_context::graph_memory_stats_record(
         }
     }
 
-    const size_t active_scheduler_metadata_bytes =
-        ggml_backend_sched_get_metadata_size(sched.get());
+    ggml_backend_sched_metadata_stats scheduler_metadata = {};
+    ggml_backend_sched_get_metadata_stats(sched.get(), &scheduler_metadata);
+    const size_t active_scheduler_metadata_bytes = scheduler_metadata.total_metadata_bytes;
     const size_t active_auxiliary_buffer_bytes =
         ggml_backend_sched_get_auxiliary_buffer_size(sched.get());
     size_t context_scheduler_metadata_bytes = active_scheduler_metadata_bytes;
@@ -1474,13 +1485,13 @@ void llama_context::graph_memory_stats_record(
             const std::string & backend,
             const std::string & buffer_type) {
         output
-            << 3 << ','
+            << 4 << ','
             << event_id << ',' << event << ','
             << (ubatch.n_tokens > 1 ? "prefill" : "decode") << ','
             << (cparams.warmup ? 1 : 0) << ','
             << (int) gtype << ','
             << ubatch.n_tokens << ','
-            << n_outputs << ','
+            << (reported_n_outputs >= 0 ? reported_n_outputs : n_outputs) << ','
             << ubatch.n_seqs << ','
             << llama_graph_memory_csv_field(backend_policy_profile) << ','
             << llama_graph_memory_csv_field(route_mode) << ','
@@ -1493,6 +1504,16 @@ void llama_context::graph_memory_stats_record(
             << context_metadata_capacity_bytes << ','
             << active_scheduler_metadata_bytes << ','
             << context_scheduler_metadata_bytes << ','
+            << scheduler_metadata.context_used_bytes << ','
+            << scheduler_metadata.context_capacity_bytes << ','
+            << scheduler_metadata.copy_tensor_count << ','
+            << scheduler_metadata.input_dependency_count << ','
+            << scheduler_metadata.route_dependency_count << ','
+            << scheduler_metadata.graph_node_count << ','
+            << scheduler_metadata.graph_leaf_count << ','
+            << scheduler_metadata.backend_id_capacity_bytes << ','
+            << scheduler_metadata.graph_pointer_capacity_bytes << ','
+            << scheduler_metadata.max_split_inputs << ','
             << active_auxiliary_buffer_bytes << ','
             << context_auxiliary_buffer_bytes << ','
             << logical.tensor_count << ','
@@ -2396,6 +2417,24 @@ void llama_context::set_causal_attn(bool value) {
     cparams.causal_attn = value;
 
     sched_need_reserve = true;
+}
+
+uint32_t llama_context::warmup_min_tokens() const {
+    constexpr uint32_t composite_tokens = 4;
+    if (!runtime_routes_configured || !ggml_shared_weights_repack_enabled() ||
+            model.arch != LLM_ARCH_LLAMA || llama_model_has_encoder(&model) || !llama_model_has_decoder(&model) ||
+            cparams.n_batch < composite_tokens || cparams.n_ubatch < composite_tokens ||
+            cparams.embeddings || cparams.pipeline_parallel || cparams.cb_eval != nullptr || lp_enable ||
+            llama_module_bench_phase_matches(cparams, true) || (loras && !loras->empty())) {
+        return 1;
+    }
+    llama_backend_policy_runtime_routes routes;
+    if (!llama_backend_policy_resolve_runtime_routes(true, routes) ||
+            (routes.mode != "clock" && routes.mode != "fixed")) {
+        return 1;
+    }
+    return std::find(routes.candidate_kinds.begin(), routes.candidate_kinds.end(), "ffn_block") !=
+            routes.candidate_kinds.end() ? composite_tokens : 1;
 }
 
 void llama_context::set_warmup(bool value) {
@@ -4756,6 +4795,8 @@ ggml_cgraph * llama_context::graph_reserve(
             route_base_sizes != nullptr ? (reserve_is_prefill ? 1 : 0) : -1);
 
     res->reset();
+    const size_t metadata_empty_used_bytes = graph_memory_stats_enabled
+        ? ggml_used_mem(res->get_ctx()) : 0;
 
     if (runtime_routes_configured) {
         runtime_route_graph_begin(reserve_is_prefill);
@@ -4790,6 +4831,21 @@ ggml_cgraph * llama_context::graph_reserve(
         GGML_ASSERT(!sizes);
         LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
         return nullptr;
+    }
+
+    if (graph_memory_stats_enabled) {
+        std::vector<size_t> base_planned_sizes;
+        std::vector<size_t> full_planned_sizes;
+        if (sizes != nullptr) {
+            full_planned_sizes.assign(sizes, sizes + backend_ptrs.size());
+        }
+        if (route_base_sizes != nullptr) {
+            base_planned_sizes.assign(route_base_sizes, route_base_sizes + backend_ptrs.size());
+        }
+        graph_memory_stats_record(
+                "reserve", ubatch, LLM_GRAPH_TYPE_DEFAULT,
+                llama_backend_policy_active_profile(), res, gf,
+                metadata_empty_used_bytes, base_planned_sizes, full_planned_sizes, n_outputs);
     }
 
     return gf;
@@ -6359,6 +6415,10 @@ void llama_set_embeddings(llama_context * ctx, bool embeddings) {
 
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
     ctx->set_causal_attn(causal_attn);
+}
+
+uint32_t llama_warmup_min_tokens(const llama_context * ctx) {
+    return ctx->warmup_min_tokens();
 }
 
 void llama_set_warmup(llama_context * ctx, bool warmup) {

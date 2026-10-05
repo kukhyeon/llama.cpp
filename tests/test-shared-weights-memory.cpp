@@ -161,6 +161,7 @@ size_t number(const row & values, const char * key) { return std::stoull(values.
 
 struct csv_snapshot {
     std::vector<row> totals;
+    std::vector<row> reserves;
     size_t row_count = 0;
 };
 
@@ -170,7 +171,7 @@ csv_snapshot read_and_validate(const std::string & path) {
     std::string line;
     REQUIRE(bool(std::getline(input, line)));
     const auto header = split_csv(line);
-    REQUIRE(header.size() == 38);
+    REQUIRE(header.size() == 48);
     std::map<std::string, std::vector<row>> events;
     csv_snapshot result;
     while (std::getline(input, line)) {
@@ -179,9 +180,11 @@ csv_snapshot read_and_validate(const std::string & path) {
         row values;
         for (size_t i = 0; i < fields.size(); ++i) { values.emplace(header[i], fields[i]); }
         REQUIRE(values.size() == header.size());
-        REQUIRE(values.at("schema_version") == "3");
+        REQUIRE(values.at("schema_version") == "4");
         events[values.at("event_id")].push_back(values);
-        if (values.at("row_scope") == "total") { result.totals.push_back(values); }
+        if (values.at("row_scope") == "total") {
+            (values.at("event") == "reserve" ? result.reserves : result.totals).push_back(values);
+        }
         ++result.row_count;
     }
     for (const auto & event : events) {
@@ -216,6 +219,17 @@ csv_snapshot read_and_validate(const std::string & path) {
             }
         }
         REQUIRE(count_total == 1 && count_scratch == 1);
+        const size_t descriptors = number(*total, "active_scheduler_copy_tensor_count") +
+            number(*total, "active_scheduler_input_dependency_count") +
+            number(*total, "active_scheduler_route_dependency_count");
+        const size_t context_used = number(*total, "active_scheduler_context_used_bytes");
+        const size_t context_capacity = number(*total, "active_scheduler_context_capacity_bytes");
+        REQUIRE(context_used == descriptors * ggml_tensor_overhead());
+        REQUIRE(context_capacity >= context_used);
+        REQUIRE(number(*total, "active_scheduler_graph_nodes") >= number(*total, "n_nodes"));
+        REQUIRE(number(*total, "active_scheduler_metadata_bytes") >= context_capacity +
+            number(*total, "active_scheduler_backend_id_capacity_bytes") +
+            number(*total, "active_scheduler_graph_pointer_capacity_bytes"));
         REQUIRE(number(*total, "weight_request_peak_bytes") == weights);
         REQUIRE(number(*total, "activation_request_peak_bytes") == activations);
         REQUIRE(number(*total, "scratch_request_peak_bytes") == requests);
@@ -240,10 +254,18 @@ int main() {
         temporary_csv csv;
         llama_model_ptr model = make_model();
         llama_context_ptr ctx = make_context(model.get(), csv.path);
+        REQUIRE(llama_warmup_min_tokens(ctx.get()) == 1);
         llama_perf_context_reset(ctx.get());
 
         run_tokens(ctx.get(), 16);
         auto initial = read_and_validate(csv.path);
+        REQUIRE(initial.reserves.size() >= 3);
+        REQUIRE(initial.reserves.front().at("warmup") == "0");
+        for (const auto & reserved : initial.reserves) {
+            REQUIRE(number(reserved, "n_outputs") == number(reserved, "n_tokens"));
+            REQUIRE(number(reserved, "context_metadata_capacity_bytes") ==
+                2 * number(reserved, "active_metadata_capacity_bytes"));
+        }
         REQUIRE(initial.totals.size() == 2);
         REQUIRE(initial.totals.front().at("event") == "build");
         REQUIRE(initial.totals.back().at("event") == "compute");
@@ -294,7 +316,7 @@ int main() {
                 "base_planned_peak_bytes", "full_planned_peak_bytes"}) {
             REQUIRE(last.at(key) == initial.totals.front().at(key));
         }
-        std::puts("PASS graph-memory schema 3: requests/capacities, lazy growth, active/inactive graph reuse");
+        std::puts("PASS graph-memory schema 4: scheduler descriptors, reserve events, scratch capacities, graph reuse");
         return 0;
     } catch (const std::exception & error) {
         std::fprintf(stderr, "shared weight memory test failed: %s\n", error.what());
