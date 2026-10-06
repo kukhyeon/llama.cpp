@@ -322,6 +322,8 @@ private:
         bool valid = false;
         // Retained across invalidation until the old runtime allocation is replaced.
         bool compute_allocated = false;
+        // Capacity was planned with this batch/output shape and maximum KV.
+        bool compute_reserved_full_kv = false;
         bool is_prefill = false;
         uint32_t n_tokens = 0;
         uint32_t n_outputs = 0;
@@ -348,6 +350,8 @@ private:
     ggml_backend_sched_ptr graph_cache_create_scheduler(size_t max_nodes);
     void graph_cache_swap_active(graph_cache_entry & entry);
     void graph_cache_prepare_miss(size_t max_nodes, bool reuse_compute);
+    bool graph_reserve_full_kv(const llama_ubatch & ubatch, llm_graph_type gtype,
+                              const llama_memory_context_i * mctx);
     void graph_cache_capture_active_route();
     void graph_cache_clear_inactive();
     void graph_cache_invalidate();

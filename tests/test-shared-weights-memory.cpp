@@ -118,9 +118,10 @@ llama_model_ptr make_model() {
 
 llama_context_ptr make_context(
         llama_model * model, const std::string & csv_path, uint32_t n_ctx = 64, bool memory_stats = true,
-        enum llama_pooling_type pooling = LLAMA_POOLING_TYPE_UNSPECIFIED) {
+        enum llama_pooling_type pooling = LLAMA_POOLING_TYPE_UNSPECIFIED, uint32_t n_seq_max = 1) {
     llama_context_params params = llama_context_default_params();
     params.n_ctx = n_ctx;
+    params.n_seq_max = n_seq_max;
     params.n_batch = params.n_ubatch = 64;
     params.n_threads = params.n_threads_batch = 1;
     params.no_perf = false;
@@ -442,6 +443,7 @@ void test_compute_compatibility_guards() {
     };
     result.add_input(std::make_unique<unknown_input>());
     REQUIRE(!result.can_reuse_compute(params));
+    REQUIRE(!result.can_reuse_compute(params, true));
 }
 
 void test_pooling_rebuild_keeps_compute(llama_model * model) {
@@ -558,14 +560,19 @@ void test_kv_growth(llama_model * model) {
     // same token/output counts but need different attention shapes.
     const auto first_logits = run_tokens(cached.get(), 16);
     const auto first = read_and_validate(csv.path).totals.front();
+    const auto first_scheduler = cached->get_sched();
+    REQUIRE(number(first, "active_compute_reserved_bytes") > number(first, "full_planned_peak_bytes"));
     run_tokens(cached.get(), 64, false, 16, false);
     run_tokens(cached.get(), 64, false, 80, false);
     run_tokens(cached.get(), 64, false, 144, false);
     run_tokens(cached.get(), 32, false, 208, false);
     run_tokens(cached.get(), 16, false, 240, false);
+    REQUIRE(cached->get_sched() == first_scheduler);
+    const auto before_growth = read_and_validate(csv.path).totals.back();
     const auto reused_before_growth = llama_perf_context(cached.get()).n_reused;
     const auto grown_logits = run_tokens(cached.get(), 16, false, 256, false);
     REQUIRE(llama_perf_context(cached.get()).n_reused == reused_before_growth);
+    REQUIRE(cached->get_sched() == first_scheduler);
     const auto grown = read_and_validate(csv.path).totals.back();
     REQUIRE(grown.at("event") == "build");
     REQUIRE(number(grown, "n_tokens") == 16);
@@ -573,19 +580,97 @@ void test_kv_growth(llama_model * model) {
     REQUIRE(number(grown, "full_planned_peak_bytes") > number(first, "full_planned_peak_bytes"));
     REQUIRE(number(grown, "active_compute_reserved_bytes") >= number(grown, "full_planned_peak_bytes"));
     REQUIRE(number(grown, "active_compute_reserved_bytes") - number(grown, "full_planned_peak_bytes") <= 256);
+    REQUIRE(number(grown, "active_compute_reserved_bytes") == number(first, "active_compute_reserved_bytes"));
+    REQUIRE(number(grown, "context_compute_reserved_bytes") == number(before_growth, "context_compute_reserved_bytes"));
+    REQUIRE(number(grown, "cache_entry_count") == 3); // P16/P32/P64, not another entry for KV=512.
+
+    // P32's inactive entry also has a smaller execution KV shape. Recover
+    // its full-KV allocation and rebuild in that slot without a fourth entry.
+    const auto grown_32_logits = run_tokens(cached.get(), 32, false, 272, false);
+    const auto grown_32 = read_and_validate(csv.path).totals.back();
+    REQUIRE(grown_32.at("event") == "build");
+    REQUIRE(number(grown_32, "cache_entry_count") == 3);
+    REQUIRE(number(grown_32, "context_compute_reserved_bytes") == number(grown, "context_compute_reserved_bytes"));
+
+    // A new independent query still computes over the shorter KV range.
+    require_same_logits(first_logits, run_tokens(cached.get(), 16));
+    REQUIRE(cached->get_sched() == first_scheduler);
+    const auto cleared = read_and_validate(csv.path).totals.back();
+    REQUIRE(number(cleared, "full_planned_peak_bytes") == number(first, "full_planned_peak_bytes"));
+    REQUIRE(number(cleared, "active_compute_reserved_bytes") == number(first, "active_compute_reserved_bytes"));
 
     // Compare against a context without an inactive graph cache, which
     // rebuilds both P16 shapes, to catch stale cached buffer bindings.
     set_env("LLAMA_GRAPH_CACHE_CAPACITY", "1");
     auto fresh = make_context(model, "", 512);
     require_same_logits(first_logits, run_tokens(fresh.get(), 16));
+    REQUIRE(read_compute(fresh.get()).reserved == number(first, "active_compute_reserved_bytes"));
     run_tokens(fresh.get(), 64, false, 16, false);
     run_tokens(fresh.get(), 64, false, 80, false);
     run_tokens(fresh.get(), 64, false, 144, false);
     run_tokens(fresh.get(), 32, false, 208, false);
     run_tokens(fresh.get(), 16, false, 240, false);
+    const auto fresh_scheduler = fresh->get_sched();
+    const auto fresh_reserved = read_compute(fresh.get()).reserved;
     require_same_logits(grown_logits, run_tokens(fresh.get(), 16, false, 256, false));
+    REQUIRE(fresh->get_sched() == fresh_scheduler);
+    REQUIRE(read_compute(fresh.get()).reserved == fresh_reserved);
     require_actual_compute(read_compute(fresh.get()));
+    require_same_logits(grown_32_logits, run_tokens(fresh.get(), 32, false, 272, false));
+}
+
+void test_decode_full_kv_reserve(llama_model * model) {
+    set_env("LLAMA_GRAPH_CACHE_CAPACITY", "1");
+    // Exercise the production path with all memory diagnostics disabled.
+    auto ctx = make_context(model, "", 512, false);
+    const auto fill_prefix = [&](llama_context * target) {
+        run_tokens(target, 64);
+        run_tokens(target, 64, false, 64, false);
+        run_tokens(target, 64, false, 128, false);
+        run_tokens(target, 62, false, 192, false);
+    };
+    fill_prefix(ctx.get());
+    run_tokens(ctx.get(), 1, false, 254, false);
+    const auto scheduler = ctx->get_sched();
+    const auto reserved = read_compute(ctx.get()).reserved;
+    REQUIRE(reserved > 0);
+    run_tokens(ctx.get(), 1, false, 255, false);
+    const auto reused = llama_perf_context(ctx.get()).n_reused;
+    const auto logits = run_tokens(ctx.get(), 1, false, 256, false);
+    REQUIRE(llama_perf_context(ctx.get()).n_reused == reused);
+    REQUIRE(ctx->get_sched() == scheduler);
+    REQUIRE(read_compute(ctx.get()).reserved == reserved);
+
+    set_env("LLAMA_GRAPH_REUSE_DISABLE", "1");
+    auto fresh = make_context(model, "", 512, false);
+    set_env("LLAMA_GRAPH_REUSE_DISABLE", nullptr);
+    fill_prefix(fresh.get());
+    run_tokens(fresh.get(), 1, false, 254, false);
+    run_tokens(fresh.get(), 1, false, 255, false);
+    require_same_logits(logits, run_tokens(fresh.get(), 1, false, 256, false));
+}
+
+void test_full_kv_batch_shape(llama_model * model) {
+    set_env("LLAMA_GRAPH_CACHE_CAPACITY", "1");
+    auto ctx = make_context(model, "", 512);
+    const auto logits = run_tokens(ctx.get(), 16);
+    const auto small = read_compute(ctx.get());
+    REQUIRE(small.reserved > small.full);
+    require_same_logits(logits, run_tokens(ctx.get(), 16, true));
+    REQUIRE(read_compute(ctx.get()).reserved > small.reserved);
+    run_tokens(ctx.get(), 64, true);
+    REQUIRE(read_compute(ctx.get()).reserved > small.reserved);
+    require_same_logits(logits, run_tokens(ctx.get(), 16));
+    REQUIRE(read_compute(ctx.get()).reserved == small.reserved);
+
+    // More configured streams than active streams: using memory->init_full()
+    // here would incorrectly widen the stream dimension of the reserve graph.
+    auto multi = make_context(model, "", 2048, true, LLAMA_POOLING_TYPE_UNSPECIFIED, 4);
+    require_same_logits(logits, run_tokens(multi.get(), 16));
+    REQUIRE(read_compute(multi.get()).reserved == small.reserved);
+    const auto scheduler = multi->get_sched();
+    require_same_logits(logits, run_tokens(multi.get(), 16));
+    REQUIRE(multi->get_sched() == scheduler);
 }
 
 } // namespace
@@ -693,7 +778,9 @@ int main() {
         test_pooling_rebuild_keeps_compute(model.get());
         test_kv_shift(model.get());
         test_kv_growth(model.get());
-        std::puts("PASS graph-memory: actual compute sizes, cache reuse/eviction, output counts, pooling rebuilds, warmup, KV shift/growth, scratch schema");
+        test_decode_full_kv_reserve(model.get());
+        test_full_kv_batch_shape(model.get());
+        std::puts("PASS graph-memory: actual batch/output sizes, maximum-KV reserve, cache reuse/eviction, pooling rebuilds, warmup, KV shift/growth, scratch schema");
         return 0;
     } catch (const std::exception & error) {
         std::fprintf(stderr, "shared weight memory test failed: %s\n", error.what());

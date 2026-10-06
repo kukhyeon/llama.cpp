@@ -1153,7 +1153,8 @@ void llama_context::graph_cache_swap_active(graph_cache_entry & entry) {
 
 void llama_context::graph_cache_prepare_miss(size_t max_nodes, bool reuse_compute) {
     const bool cache_current = graph_cache_active_state.valid &&
-        graph_cache_capacity > 1 && !graph_reuse_disable && !cparams.warmup && opt_ctx == nullptr;
+        graph_cache_capacity > 1 && !graph_reuse_disable && !cparams.warmup && opt_ctx == nullptr &&
+        !(reuse_compute && graph_cache_active_state.compute_reserved_full_kv);
 
     if (!cache_current) {
         if (sched != nullptr) {
@@ -1164,7 +1165,7 @@ void llama_context::graph_cache_prepare_miss(size_t max_nodes, bool reuse_comput
             graph_cache_active_state.compute_allocated && !reuse_compute;
         if (sched == nullptr || gf_res_prev == nullptr ||
                 graph_cache_active_state.max_nodes < max_nodes || replace_compute) {
-            // Incompatible input/output/KV shapes must not inherit an old
+            // Incompatible input/output shapes must not inherit an old
             // allocator's high-water mark when only one cache slot is kept.
             // The optimizer retains its scheduler pointer; pipeline execution
             // keeps its existing eager-reservation/fallback contract.
@@ -1177,11 +1178,13 @@ void llama_context::graph_cache_prepare_miss(size_t max_nodes, bool reuse_comput
         } else {
             const size_t active_max_nodes = graph_cache_active_state.max_nodes;
             const bool compute_allocated = graph_cache_active_state.compute_allocated;
+            const bool full_kv = reuse_compute && graph_cache_active_state.compute_reserved_full_kv;
             ggml_backend_sched_reset(sched.get());
             gf_res_prev->reset();
             graph_cache_active_state = {};
             graph_cache_active_state.max_nodes = active_max_nodes;
             graph_cache_active_state.compute_allocated = compute_allocated;
+            graph_cache_active_state.compute_reserved_full_kv = full_kv;
         }
         return;
     }
@@ -2625,8 +2628,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         const auto active_gparams = graph_params(res, ubatch, mctx, gtype);
         reuse_graph = res->can_reuse(active_gparams);
         const bool rebuild_in_place = graph_cache_capacity == 1 || graph_reuse_disable;
+        const bool full_kv = graph_cache_active_state.compute_reserved_full_kv;
         reuse_compute = reuse_graph ||
-            (rebuild_in_place && !cparams.pipeline_parallel && res->can_reuse_compute(active_gparams));
+            ((rebuild_in_place || full_kv) && !cparams.pipeline_parallel &&
+             res->can_reuse_compute(active_gparams, full_kv));
     }
     if (!graph_reuse_disable && !cparams.warmup && opt_ctx == nullptr) {
         if (reuse_graph) {
@@ -2675,6 +2680,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 break;
             }
 
+            // A maximum-KV reservation can serve the new KV shape, although
+            // its execution graph still needs rebuilding. Reuse that cache
+            // entry in place instead of keeping one full buffer per KV size.
+            if (!cparams.pipeline_parallel && graph_cache_active_state.compute_reserved_full_kv &&
+                    res->can_reuse_compute(cached_gparams, true)) {
+                reuse_compute = true;
+                if (!graph_cache_entries[index].state.valid) {
+                    graph_cache_entries[index].scheduler.reset();
+                    graph_cache_entries[index].result.reset();
+                    graph_cache_entries.erase(graph_cache_entries.begin() + index);
+                }
+                break;
+            }
+
             // A quick-key collision is possible for different KV-mask shapes
             // or sampler topology. Restore the original active pair without
             // resetting either scheduler and continue the search.
@@ -2712,6 +2731,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
         const bool profile_backend_compute = igparams.backend_compute_profile;
         const int64_t t_build_us = profile_backend_compute ? ggml_time_us() : 0;
+
+        try {
+            if (!graph_reserve_full_kv(ubatch, gtype, mctx)) {
+                ret = GGML_STATUS_ALLOC_FAILED;
+                return nullptr;
+            }
+        } catch (const std::exception & error) {
+            LLAMA_LOG_ERROR("%s: failed to reserve maximum-KV compute buffers: %s\n", __func__, error.what());
+            ret = GGML_STATUS_ALLOC_FAILED;
+            return nullptr;
+        }
 
         const auto build_gparams = graph_params(res, ubatch, mctx, gtype);
         if (runtime_routes_configured) {
@@ -4873,6 +4903,49 @@ ggml_cgraph * llama_context::graph_reserve(
     }
 
     return gf;
+}
+
+bool llama_context::graph_reserve_full_kv(
+        const llama_ubatch & ubatch, llm_graph_type gtype, const llama_memory_context_i * mctx) {
+    // Pipeline/optimizer reservation contracts stay unchanged. Warmup uses
+    // its own actual batch size, just like any other newly allocated entry.
+    if (!mctx || cparams.pipeline_parallel || opt_ctx != nullptr ||
+            graph_cache_active_state.compute_reserved_full_kv) {
+        return true;
+    }
+    auto reserve_mctx = mctx->clone_for_reserve();
+    if (!reserve_mctx) {
+        return true;
+    }
+
+    const size_t max_nodes = graph_cache_active_state.max_nodes;
+    if (!gf_res_reserve || (size_t) gf_res_reserve->get_max_nodes() < max_nodes) {
+        gf_res_reserve.reset(new llm_graph_result(max_nodes));
+    }
+    auto * res = gf_res_reserve.get();
+    res->reset();
+    if (runtime_routes_configured) {
+        runtime_route_graph_begin(lp_is_prefill);
+    }
+    // Unlike the startup reserve graph, keep the real ubatch, sequence set,
+    // output count and graph type. Only the KV extent is enlarged.
+    auto * gf = model.build_graph(graph_params(res, ubatch, reserve_mctx.get(), gtype));
+    if (!gf || (runtime_routes_configured && !runtime_route_prepare_graph(res, gf, lp_is_prefill))) {
+        LLAMA_LOG_ERROR("%s: failed to build maximum-KV reserve graph\n", __func__);
+        return false;
+    }
+
+    // Failed multi-backend reservation can leave partial allocations. Mark
+    // ownership before attempting it so a retry replaces those buffers.
+    graph_cache_active_state.compute_allocated = true;
+    if (!ggml_backend_sched_reserve(sched.get(), gf)) {
+        LLAMA_LOG_ERROR("%s: failed to allocate maximum-KV compute buffers\n", __func__);
+        return false;
+    }
+    graph_cache_active_state.compute_reserved_full_kv = true;
+    // reserve() resets the scheduler. The caller now builds/registers the
+    // actual graph and its routes against the real memory context.
+    return true;
 }
 
 llm_graph_params llama_context::graph_params(

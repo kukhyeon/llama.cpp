@@ -49,14 +49,14 @@ static bool can_reuse_kq_mask(
         ggml_tensor * kq_mask,
         const llama_kv_cache_context * mctx,
         const llama_ubatch & ubatch,
-        const llama_cparams & cparams) {
+        const llama_cparams & cparams, bool full_kv_reserved = false) {
     const auto n_kv     = mctx->get_n_kv();
     const auto n_tokens = ubatch.n_tokens;
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 
     bool res = true;
 
-    res &= (kq_mask->ne[0] == n_kv);
+    res &= full_kv_reserved || (kq_mask->ne[0] == n_kv);
     res &= (kq_mask->ne[1] == n_tokens/n_stream);
     res &= (kq_mask->ne[2] == 1);
     res &= (kq_mask->ne[3] == n_stream);
@@ -901,6 +901,14 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+bool llm_graph_input_attn_kv::can_reuse_compute_full_kv(const llm_graph_params & params) {
+    const auto * current = static_cast<const llama_kv_cache_context *>(params.mctx);
+    return current != nullptr && self_k_idxs->ne[0] == params.ubatch.n_tokens &&
+        cparams.flash_attn == params.cparams.flash_attn &&
+        cparams.kv_unified == params.cparams.kv_unified &&
+        can_reuse_kq_mask(self_kq_mask, current, params.ubatch, params.cparams, true);
+}
+
 void llm_graph_input_attn_k::set_input(const llama_ubatch * ubatch) {
     if (tensor_is_allocated(self_k_idxs)) {
         mctx->set_input_k_idxs(self_k_idxs, ubatch);
@@ -923,6 +931,14 @@ bool llm_graph_input_attn_k::can_reuse(const llm_graph_params & params) {
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
 
     return res;
+}
+
+bool llm_graph_input_attn_k::can_reuse_compute_full_kv(const llm_graph_params & params) {
+    const auto * current = static_cast<const llama_kv_cache_context *>(params.mctx);
+    return current != nullptr && self_k_idxs->ne[0] == params.ubatch.n_tokens &&
+        cparams.flash_attn == params.cparams.flash_attn &&
+        cparams.kv_unified == params.cparams.kv_unified &&
+        can_reuse_kq_mask(self_kq_mask, current, params.ubatch, params.cparams, true);
 }
 
 void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
@@ -1328,12 +1344,12 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
-bool llm_graph_result::can_reuse_compute(const llm_graph_params & params) {
+bool llm_graph_result::can_reuse_compute(const llm_graph_params & params, bool full_kv) {
     if (!this->params.allow_reuse(params)) {
         return false;
     }
     for (auto & input : inputs) {
-        if (!input->can_reuse_compute(params)) {
+        if (!(full_kv ? input->can_reuse_compute_full_kv(params) : input->can_reuse_compute(params))) {
             return false;
         }
     }

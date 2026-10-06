@@ -161,6 +161,12 @@ public:
     virtual bool can_reuse_compute(const llm_graph_params & params) {
         return can_reuse(params);
     }
+
+    // Only called when this scheduler has reserved maximum-KV capacity.
+    // Unknown inputs still require their complete allocation-shape check.
+    virtual bool can_reuse_compute_full_kv(const llm_graph_params & params) {
+        return can_reuse_compute(params);
+    }
 protected:
     // env: LLAMA_GRAPH_INPUT_DEBUG
     int debug = 0;
@@ -381,6 +387,7 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
+    bool can_reuse_compute_full_kv(const llm_graph_params & params) override;
 
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
     ggml_tensor * get_v_idxs() const { return self_v_idxs; }
@@ -423,6 +430,7 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
+    bool can_reuse_compute_full_kv(const llm_graph_params & params) override;
 
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
 
@@ -780,7 +788,7 @@ public:
 
     // Check whether rebuilding the graph can keep its compute allocation.
     // This does not allow reusing the existing graph or its input objects.
-    bool can_reuse_compute(const llm_graph_params & params);
+    bool can_reuse_compute(const llm_graph_params & params, bool full_kv = false);
 
     llm_graph_input_i * add_input(llm_graph_input_ptr input);
 

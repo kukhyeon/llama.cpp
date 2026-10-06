@@ -2356,6 +2356,15 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
 // llama_kv_cache_context
 //
 
+llama_memory_context_ptr llama_kv_cache_context::clone_for_reserve() const {
+    // init_full() on the cache includes every stream. Here only KV length
+    // changes: an actual ubatch may use a subset of the configured streams.
+    auto result = std::make_unique<llama_kv_cache_context>(
+            kv, slot_info_vec_t { sinfos.at(i_cur) }, std::vector<llama_ubatch> { ubatches.at(i_cur) });
+    result->n_kv = kv->get_size();
+    return result;
+}
+
 llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : status(status) {}
 
 llama_kv_cache_context::llama_kv_cache_context(
