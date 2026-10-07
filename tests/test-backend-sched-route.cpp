@@ -2627,6 +2627,199 @@ struct metadata_fixture {
     }
 };
 
+struct allocation_trace_observer {
+    ggml_backend_sched_t sched = nullptr;
+    const ggml_tensor * original_input = nullptr;
+    size_t actual_events = 0;
+    size_t full_events = 0;
+    size_t actual_copy_tensors = 0;
+    size_t full_copy_tensors = 0;
+    std::vector<uint64_t> actual_plan_ids;
+    bool invalid = false;
+};
+
+static void observe_allocation_trace(
+        const char * kind, const ggml_gallocr_chunk_trace * trace, void * data) {
+    auto & observer = *static_cast<allocation_trace_observer *>(data);
+    const bool actual = std::strcmp(kind, "actual") == 0;
+    const bool full = std::strcmp(kind, "full") == 0;
+    if (!actual && !full) {
+        observer.invalid = true; // Canonical base-only plans must not be forwarded.
+        return;
+    }
+    (actual ? observer.actual_events : observer.full_events)++;
+    if (actual && (observer.actual_plan_ids.empty() || observer.actual_plan_ids.back() != trace->plan_id)) {
+        observer.actual_plan_ids.push_back(trace->plan_id);
+    }
+    if (observer.original_input != nullptr &&
+            ggml_backend_sched_is_copy_tensor(observer.sched, observer.original_input)) {
+        observer.invalid = true;
+    }
+    for (size_t i = 0; i < trace->n_tensors; ++i) {
+        const auto * tensor = trace->tensors[i].tensor;
+        if (ggml_backend_sched_is_copy_tensor(observer.sched, tensor)) {
+            (actual ? observer.actual_copy_tensors : observer.full_copy_tensors)++;
+        }
+    }
+}
+
+static bool run_allocation_trace_copy_case(bool parallel) {
+    const char * scenario = parallel ? "allocation-trace-pipeline" : "allocation-trace-copy";
+    metadata_fixture fixture;
+    if (!check(fixture.init(true, parallel), scenario, "scheduler setup failed")) {
+        return false;
+    }
+    const uint64_t scheduler_id = ggml_backend_sched_get_logging_id(fixture.sched);
+    auto * sibling = ggml_backend_sched_new(fixture.backends, nullptr, 2, 16, false, true);
+    const bool distinct_id = sibling != nullptr && scheduler_id > 0 &&
+        ggml_backend_sched_get_logging_id(sibling) > scheduler_id;
+    ggml_backend_sched_free(sibling);
+    if (!check(distinct_id, scenario, "scheduler logging IDs are not distinct and monotonic")) {
+        return false;
+    }
+
+    auto * ctx = fixture.new_context(16, 32);
+    if (!check(ctx != nullptr, scenario, "graph context setup failed")) {
+        return false;
+    }
+    auto * graph = ggml_new_graph_custom(ctx, 32, false);
+    auto * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 32);
+    ggml_set_name(input, "trace-input-without-backend-prefix");
+    ggml_set_input(input);
+    auto * output = ggml_scale(ctx, input, 3.0f);
+    ggml_set_output(output);
+    ggml_build_forward_expand(graph, output);
+    ggml_backend_sched_set_tensor_backend(fixture.sched, input, fixture.backends[1]);
+    ggml_backend_sched_set_tensor_backend(fixture.sched, output, fixture.backends[0]);
+    allocation_trace_observer observer;
+    observer.sched = fixture.sched;
+    observer.original_input = input;
+    ggml_backend_sched_set_allocation_trace_callback(fixture.sched, observe_allocation_trace, &observer);
+    for (auto * backend : fixture.backends) {
+        if (!check(ggml_backend_sched_get_buffer_generation(fixture.sched, backend) == 0,
+                    scenario, "new scheduler already has an allocation generation")) {
+            return false;
+        }
+    }
+    size_t base_sizes[2] = {};
+    size_t full_sizes[2] = {};
+    if (!check(ggml_backend_sched_alloc_graph_measure(fixture.sched, graph, base_sizes, full_sizes),
+                scenario, "measured allocation failed") ||
+            !check(!observer.invalid && observer.full_events == 2 && observer.actual_events == 2,
+                scenario, "expected one full and actual event per buffer, without base events") ||
+            !check(observer.full_copy_tensors > 0 && observer.actual_copy_tensors > 0,
+                scenario, "allocator snapshots did not identify scheduler-created copies")) {
+        return false;
+    }
+    const auto * transfer_copy = output->src[0];
+    if (!check(transfer_copy != input && ggml_backend_sched_is_copy_tensor(fixture.sched, transfer_copy),
+                scenario, "foreign input copy was not registered") ||
+            !check(!ggml_backend_sched_is_copy_tensor(fixture.sched, input) &&
+                !ggml_backend_sched_is_copy_tensor(fixture.sched, output),
+                scenario, "original graph tensors were classified as scheduler copies")) {
+        return false;
+    }
+
+    uint64_t generations[2] = {};
+    for (int b = 0; b < 2; ++b) {
+        generations[b] = ggml_backend_sched_get_buffer_generation(fixture.sched, fixture.backends[b]);
+        if (!check(generations[b] > 0, scenario, "physical allocation did not change generation")) {
+            return false;
+        }
+    }
+    std::vector<float> values(32), result(32);
+    for (size_t i = 0; i < values.size(); ++i) { values[i] = float(int(i) - 16); }
+    ggml_backend_tensor_set(input, values.data(), 0, values.size() * sizeof(float));
+    if (!check(ggml_backend_sched_graph_compute(fixture.sched, graph) == GGML_STATUS_SUCCESS,
+                scenario, "traced graph execution failed")) {
+        return false;
+    }
+    ggml_backend_tensor_get(output, result.data(), 0, result.size() * sizeof(float));
+    for (size_t i = 0; i < result.size(); ++i) {
+        if (!check(result[i] == values[i] * 3.0f, scenario, "tracing changed numerical output")) {
+            return false;
+        }
+    }
+    for (int b = 0; b < 2; ++b) {
+        if (!check(generations[b] == ggml_backend_sched_get_buffer_generation(fixture.sched, fixture.backends[b]),
+                    scenario, "graph execution changed allocation generation")) {
+            return false;
+        }
+    }
+    if (!check(observer.actual_events == 2 && observer.full_events == 2,
+                scenario, "graph execution unexpectedly repeated allocator callbacks")) {
+        return false;
+    }
+
+    ggml_backend_sched_set_allocation_trace_callback(fixture.sched, nullptr, nullptr);
+    if (!check(!ggml_backend_sched_is_copy_tensor(fixture.sched, transfer_copy),
+                scenario, "disabled tracing retained its copy registry")) {
+        return false;
+    }
+    // Late enable must reconstruct membership from the scheduler's copy table.
+    ggml_backend_sched_set_allocation_trace_callback(fixture.sched, observe_allocation_trace, &observer);
+    if (!check(ggml_backend_sched_is_copy_tensor(fixture.sched, transfer_copy) &&
+                !ggml_backend_sched_is_copy_tensor(fixture.sched, input),
+                scenario, "late trace enable lost copy identity")) {
+        return false;
+    }
+    ggml_backend_sched_reset(fixture.sched);
+    return check(ggml_backend_sched_get_logging_id(fixture.sched) == scheduler_id &&
+            !ggml_backend_sched_is_copy_tensor(fixture.sched, transfer_copy),
+            scenario, "reset changed scheduler identity or retained stale copy pointers");
+}
+
+static bool run_allocation_trace_auto_retry_case() {
+    const char * scenario = "allocation-trace-auto-retry";
+    metadata_fixture fixture;
+    if (!check(fixture.init(true, false), scenario, "backend setup failed")) {
+        return false;
+    }
+    ggml_backend_sched_free(fixture.sched);
+    fixture.sched = ggml_backend_sched_new(fixture.backends, nullptr, 1, 32, false, true);
+    if (!check(fixture.sched != nullptr, scenario, "single-backend scheduler setup failed")) {
+        return false;
+    }
+    auto * ctx = fixture.new_context(16, 32);
+    if (!check(ctx != nullptr, scenario, "graph context setup failed")) {
+        return false;
+    }
+    auto * graph = ggml_new_graph_custom(ctx, 32, false);
+    auto * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 16);
+    ggml_set_input(input);
+    auto * output = ggml_scale(ctx, input, 5.0f);
+    ggml_set_output(output);
+    ggml_build_forward_expand(graph, output);
+    allocation_trace_observer observer;
+    observer.sched = fixture.sched;
+    observer.original_input = input;
+    ggml_backend_sched_set_allocation_trace_callback(fixture.sched, observe_allocation_trace, &observer);
+    fixture.controls[0].fail_buffer_allocations = 1;
+    // The single-buffer allocator first attempts an implicit reserve. After
+    // its injected failure, the scheduler explicitly reserves once more in
+    // this same API call. Consumers must distinguish both planning epochs.
+    if (!check(ggml_backend_sched_alloc_graph(fixture.sched, graph),
+                scenario, "automatic allocation retry did not recover") ||
+            !check(fixture.controls[0].fail_buffer_allocations == 0 && !observer.invalid &&
+                observer.actual_events == 2 && observer.full_events == 0 &&
+                observer.actual_plan_ids.size() == 2 &&
+                observer.actual_plan_ids[1] > observer.actual_plan_ids[0],
+                scenario, "retry plans were not forwarded with distinct epochs") ||
+            !check(ggml_backend_sched_get_buffer_generation(fixture.sched, fixture.backends[0]) == 2,
+                scenario, "allocation generation did not include failed and successful attempts")) {
+        return false;
+    }
+    std::vector<float> values(16, 2.0f), result(16);
+    ggml_backend_tensor_set(input, values.data(), 0, values.size() * sizeof(float));
+    if (!check(ggml_backend_sched_graph_compute(fixture.sched, graph) == GGML_STATUS_SUCCESS,
+                scenario, "execution after automatic retry failed")) {
+        return false;
+    }
+    ggml_backend_tensor_get(output, result.data(), 0, result.size() * sizeof(float));
+    return check(std::all_of(result.begin(), result.end(), [](float value) { return value == 10.0f; }),
+            scenario, "traced automatic retry changed numerical output");
+}
+
 // A size-only reserve must neither install an unbacked allocation plan nor
 // evict existing compute buffers. Exercise the same-shape fast path, then a
 // larger graph and a smaller graph, through both public sizing entry points.
@@ -2656,6 +2849,9 @@ static bool run_deferred_compute_reserve_case(bool routed) {
         return false;
     }
 
+    allocation_trace_observer observer;
+    observer.sched = fixture.sched;
+    ggml_backend_sched_set_allocation_trace_callback(fixture.sched, observe_allocation_trace, &observer);
     int backend_id = 0;
     auto build_graph = [&](int64_t elements, ggml_tensor ** input, ggml_tensor ** output) {
         ggml_backend_sched_reset(fixture.sched);
@@ -2707,8 +2903,12 @@ static bool run_deferred_compute_reserve_case(bool routed) {
 
     for (int64_t elements : { 16, 16384, 32, 32 }) {
         size_t reserved_before[2] = {};
+        uint64_t generations_before[2] = {};
+        const size_t full_before = observer.full_events;
+        const size_t actual_before = observer.actual_events;
         for (int i = 0; i < 2; ++i) {
             reserved_before[i] = ggml_backend_sched_get_buffer_size(fixture.sched, fixture.backends[i]);
+            generations_before[i] = ggml_backend_sched_get_buffer_generation(fixture.sched, fixture.backends[i]);
         }
         if (elements == 16 &&
                 !check(reserved_before[0] == 0 && reserved_before[1] == 0,
@@ -2752,13 +2952,28 @@ static bool run_deferred_compute_reserve_case(bool routed) {
             }
         }
 
+        for (int i = 0; i < 2; ++i) {
+            if (!check(generations_before[i] ==
+                        ggml_backend_sched_get_buffer_generation(fixture.sched, fixture.backends[i]),
+                        scenario, "diagnostic sizing changed physical allocation generation")) {
+                return false;
+            }
+        }
+        if (!check(!observer.invalid && observer.full_events > full_before &&
+                    observer.actual_events == actual_before,
+                    scenario, "sizing did not forward only full diagnostic plans")) {
+            return false;
+        }
+
         // Plain reserve_size retains its legacy reset, so only routed sizing
         // preserves explicit backend assignments. The last routed transition
         // changes placement without changing shape, exercising plan refresh.
         // Deliberately allocate the exact graph just measured. A live allocator
         // left with the size-only plan can otherwise skip allocating buffers.
         if (!check(ggml_backend_sched_alloc_graph(fixture.sched, graph),
-                    scenario, "allocation after same-shape sizing failed")) {
+                    scenario, "allocation after same-shape sizing failed") ||
+                !check(!observer.invalid && observer.actual_events > actual_before,
+                    scenario, "live allocator plan was not forwarded as actual")) {
             return false;
         }
         for (int i = 0; i < 2; ++i) {
@@ -2840,13 +3055,18 @@ static bool run_compute_reserve_retry_case(bool explicit_reserve, bool parallel)
         if (elements > 16) {
             // Backend zero allocates first, then backend one fails once. The
             // retry uses a fresh graph of the same shape and the same scheduler.
+            const uint64_t failed_generation_before =
+                ggml_backend_sched_get_buffer_generation(fixture.sched, fixture.backends[1]);
             fixture.controls[1].fail_buffer_allocations = 1;
             const bool allocated = explicit_reserve
                 ? ggml_backend_sched_reserve(fixture.sched, graph)
                 : ggml_backend_sched_alloc_graph(fixture.sched, graph);
             if (!check(!allocated, scenario, "injected allocation failure was not reported") ||
                     !check(fixture.controls[1].fail_buffer_allocations == 0,
-                        scenario, "allocation did not reach the failing backend")) {
+                        scenario, "allocation did not reach the failing backend") ||
+                    !check(ggml_backend_sched_get_buffer_generation(fixture.sched, fixture.backends[1]) ==
+                        failed_generation_before + 1,
+                        scenario, "failed physical allocation did not increment generation")) {
                 return false;
             }
             graph = build_graph(elements, &input, &output);
@@ -3169,6 +3389,9 @@ int main() {
     (void) setenv("SCHED_TRACE_PHASE", "both", 1);
 #endif
     bool ok = true;
+    ok = run_allocation_trace_copy_case(false) && ok;
+    ok = run_allocation_trace_copy_case(true) && ok;
+    ok = run_allocation_trace_auto_retry_case() && ok;
     ok = run_deferred_compute_reserve_case(false) && ok;
     ok = run_deferred_compute_reserve_case(true) && ok;
     ok = run_compute_reserve_retry_case(false, false) && ok;

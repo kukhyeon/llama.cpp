@@ -154,19 +154,6 @@ public:
         GGML_UNUSED(params);
         return false;
     }
-
-    // Allocation compatibility is separate from retaining this input object.
-    // Unknown inputs remain conservative; an override must validate every
-    // input dimension that can change the rebuilt graph's allocation layout.
-    virtual bool can_reuse_compute(const llm_graph_params & params) {
-        return can_reuse(params);
-    }
-
-    // Only called when this scheduler has reserved maximum-KV capacity.
-    // Unknown inputs still require their complete allocation-shape check.
-    virtual bool can_reuse_compute_full_kv(const llm_graph_params & params) {
-        return can_reuse_compute(params);
-    }
 protected:
     // env: LLAMA_GRAPH_INPUT_DEBUG
     int debug = 0;
@@ -289,8 +276,6 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override;
 
-    bool can_reuse_compute(const llm_graph_params & params) override;
-
     ggml_tensor * mean; // F32 [n_batch, n_batch]
 
     const llama_cparams cparams;
@@ -302,8 +287,6 @@ public:
     virtual ~llm_graph_input_cls() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
-
-    bool can_reuse_compute(const llm_graph_params & params) override;
 
     ggml_tensor * cls; // I32 [n_batch]
 
@@ -357,8 +340,6 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override;
 
-    bool can_reuse_compute(const llm_graph_params & params) override;
-
     ggml_tensor * get_kq_mask()     const { return self_kq_mask_cnv; }
     ggml_tensor * get_kq_mask_swa() const { return self_kq_mask_swa_cnv; }
 
@@ -387,7 +368,6 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
-    bool can_reuse_compute_full_kv(const llm_graph_params & params) override;
 
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
     ggml_tensor * get_v_idxs() const { return self_v_idxs; }
@@ -430,7 +410,6 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
-    bool can_reuse_compute_full_kv(const llm_graph_params & params) override;
 
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
 
@@ -785,10 +764,6 @@ public:
     //   contexts of the input tensors of the graph and we can reuse it for another computation
     // return true if the graph was updated and can be reused
     bool can_reuse(const llm_graph_params & params);
-
-    // Check whether rebuilding the graph can keep its compute allocation.
-    // This does not allow reusing the existing graph or its input objects.
-    bool can_reuse_compute(const llm_graph_params & params, bool full_kv = false);
 
     llm_graph_input_i * add_input(llm_graph_input_ptr input);
 

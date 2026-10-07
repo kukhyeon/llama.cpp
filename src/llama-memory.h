@@ -59,11 +59,6 @@ struct llama_memory_context_i {
 
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
-
-    // Optional planning-only context: retain the current batch/streams but
-    // expose maximum KV length. Never apply or execute this context.
-    // Memory types without this contract keep their existing allocation path.
-    virtual std::unique_ptr<llama_memory_context_i> clone_for_reserve() const { return nullptr; }
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;

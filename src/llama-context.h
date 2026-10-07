@@ -44,7 +44,7 @@ struct llama_memory_buffer {
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
 struct llama_context {
-    // initialize scheduler and plan worst-case graphs; allocate compute for actual execution
+    // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
             const llama_model & model,
                   llama_context_params params);
@@ -251,7 +251,8 @@ public:
     ggml_cgraph * graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs,
         const llama_memory_context_i * mctx, bool split_only = false,
-        size_t * sizes = nullptr, size_t * route_base_sizes = nullptr);
+        size_t * sizes = nullptr, size_t * route_base_sizes = nullptr,
+        const char * reserve_reason = "explicit_reserve");
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
@@ -320,10 +321,6 @@ private:
 
     struct graph_cache_state {
         bool valid = false;
-        // Retained across invalidation until the old runtime allocation is replaced.
-        bool compute_allocated = false;
-        // Capacity was planned with this batch/output shape and maximum KV.
-        bool compute_reserved_full_kv = false;
         bool is_prefill = false;
         uint32_t n_tokens = 0;
         uint32_t n_outputs = 0;
@@ -349,9 +346,7 @@ private:
 
     ggml_backend_sched_ptr graph_cache_create_scheduler(size_t max_nodes);
     void graph_cache_swap_active(graph_cache_entry & entry);
-    void graph_cache_prepare_miss(size_t max_nodes, bool reuse_compute);
-    bool graph_reserve_full_kv(const llama_ubatch & ubatch, llm_graph_type gtype,
-                              const llama_memory_context_i * mctx);
+    void graph_cache_prepare_miss(size_t max_nodes);
     void graph_cache_capture_active_route();
     void graph_cache_clear_inactive();
     void graph_cache_invalidate();

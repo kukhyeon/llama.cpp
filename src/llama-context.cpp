@@ -2,12 +2,17 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-alloc.h"
 #include "llama-arch.h"
 #include "llama-backend-policy.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-kv-cache.h"
+#include "llama-kv-cache-iswa.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -128,6 +133,268 @@ static std::string llama_graph_memory_csv_field(const std::string & value) {
     result.push_back('"');
     return result;
 }
+
+// Original summary rows also carry their scheduler identity. Detailed
+// allocation rows share this CSV, but are not additional "total" rows.
+static constexpr size_t llama_graph_memory_base_columns = 48;
+static constexpr size_t llama_graph_memory_trace_columns = 22;
+
+static std::string llama_graph_memory_kv_extent(const llama_memory_context_i * mctx) {
+    if (const auto * kv = dynamic_cast<const llama_kv_cache_context *>(mctx)) {
+        return std::to_string(kv->get_n_kv());
+    }
+    if (const auto * kv = dynamic_cast<const llama_kv_cache_iswa_context *>(mctx)) {
+        return "base=" + llama_graph_memory_kv_extent(kv->get_base()) +
+            "|swa=" + llama_graph_memory_kv_extent(kv->get_swa());
+    }
+    if (const auto * mem = dynamic_cast<const llama_memory_hybrid_context *>(mctx)) {
+        return llama_graph_memory_kv_extent(mem->get_attn());
+    }
+    if (const auto * mem = dynamic_cast<const llama_memory_hybrid_iswa_context *>(mctx)) {
+        return llama_graph_memory_kv_extent(mem->get_attn());
+    }
+    // Recurrent/no-memory models have no scalar KV attention extent.
+    return {};
+}
+
+// One instance covers one scheduler planning/allocation call. It never survives
+// graph destruction or writes from a compute kernel. Only the logging-enabled
+// path constructs this object or enables allocator lifetime tracking.
+class llama_compute_reservation_trace {
+    struct tensor_snapshot {
+        std::string name, op, shape, role;
+        size_t offset, bytes;
+    };
+    struct peak_snapshot {
+        int buffer_id, chunk_id, node_index;
+        std::string node_name;
+        size_t required, live, gap;
+        std::vector<tensor_snapshot> tensors;
+    };
+    struct buffer_snapshot {
+        ggml_backend_buffer_type_t buft;
+        int backend_id;
+        std::string backend_names;
+        size_t before;
+        uint64_t generation;
+    };
+    using csv_row = std::array<std::string,
+        llama_graph_memory_base_columns + llama_graph_memory_trace_columns>;
+
+    ggml_backend_sched_t scheduler;
+    const std::vector<ggml_backend_t> & backends;
+    std::string path;
+    csv_row common = {};
+    std::vector<buffer_snapshot> buffers;
+    std::vector<peak_snapshot> full_peaks, actual_peaks;
+    uint64_t full_plan_id = 0, actual_plan_id = 0;
+    bool finished = false;
+    bool trace_failed = false;
+
+    static const char * tensor_role(ggml_backend_sched_t sched, const ggml_tensor * tensor) {
+        if (ggml_backend_sched_is_copy_tensor(sched, tensor)) {
+            return "backend_copy";
+        }
+        // These labels help group the exact tensor rows. Unrecognized model
+        // names remain "other"; they are not silently assigned to Attention.
+        const std::string name = tensor->name;
+        if (name.find("ffn_down") != std::string::npos || name.find("ffn_parallel_sum") != std::string::npos ||
+                name.find("ffn_parallel_add4") != std::string::npos || name.find("ffn_parallel_out") != std::string::npos) {
+            return "ffn_output";
+        }
+        if (name.find("ffn_up") != std::string::npos) { return "ffn_up"; }
+        if (name.find("ffn_gate") != std::string::npos) { return "ffn_gate"; }
+        if (name.find("ffn_inp") != std::string::npos || name.find("ffn_norm") != std::string::npos) {
+            return "ffn_input";
+        }
+        if (name.find("ffn_") != std::string::npos) {
+            return "ffn_intermediate";
+        }
+        if (name.find("result_output") != std::string::npos || name.find("logits") != std::string::npos) {
+            return "logits";
+        }
+        if (name.find("Qcur") != std::string::npos || name.find("Kcur") != std::string::npos ||
+                name.find("Vcur") != std::string::npos || name.find("attn_") != std::string::npos ||
+                name.find("kq") != std::string::npos || name.find("KQ") != std::string::npos) {
+            return "attention_qkv";
+        }
+        return "other";
+    }
+
+    static void capture(const char * kind, const ggml_gallocr_chunk_trace * trace, void * data) {
+        auto & self = *static_cast<llama_compute_reservation_trace *>(data);
+        if (self.trace_failed) {
+            return;
+        }
+        try {
+            const bool actual = strcmp(kind, "actual") == 0;
+            auto & peaks = actual ? self.actual_peaks : self.full_peaks;
+            auto & plan_id = actual ? self.actual_plan_id : self.full_plan_id;
+            if (plan_id != trace->plan_id) {
+                // A failed automatic reserve may be retried inside the same
+                // scheduler call. Keep the final plan, not a sum of attempts.
+                peaks.clear();
+                plan_id = trace->plan_id;
+            }
+            if (actual) { self.full_peaks.clear(); }
+            peak_snapshot peak = { trace->buffer_id, trace->chunk_id, trace->peak_node_index,
+                trace->peak_node ? trace->peak_node->name : "", trace->required_bytes,
+                trace->live_bytes, trace->gap_bytes, {} };
+            peak.tensors.reserve(trace->n_tensors);
+            for (size_t i = 0; i < trace->n_tensors; ++i) {
+                const auto & allocation = trace->tensors[i];
+                const auto * tensor = allocation.tensor;
+                std::string shape;
+                for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                    if (d) { shape += 'x'; }
+                    shape += std::to_string(tensor->ne[d]);
+                }
+                peak.tensors.push_back({ tensor->name, ggml_op_name(tensor->op), std::move(shape),
+                    tensor_role(self.scheduler, tensor), allocation.offset, allocation.allocation_bytes });
+            }
+            peaks.push_back(std::move(peak));
+        } catch (const std::bad_alloc &) {
+            self.trace_failed = true;
+            self.full_peaks.clear();
+            self.actual_peaks.clear();
+            LLAMA_LOG_WARN("compute reservation trace: unable to retain allocator snapshot\n");
+        }
+    }
+
+    static void write_row(std::ostream & output, const csv_row & row) {
+        for (size_t i = 0; i < row.size(); ++i) {
+            if (i) { output << ','; }
+            output << llama_graph_memory_csv_field(row[i]);
+        }
+        output << '\n';
+    }
+
+public:
+    llama_compute_reservation_trace(
+            const std::string & path, ggml_backend_sched_t scheduler,
+            const std::vector<ggml_backend_t> & backends,
+            const std::vector<ggml_backend_buffer_type_t> & bufts,
+            const char * reason, bool warmup, llm_graph_type gtype,
+            const llama_ubatch & ubatch, int32_t n_outputs,
+            const llama_memory_context_i * mctx, ggml_cgraph * graph,
+            const std::string & profile, bool enable_capture = true) :
+        scheduler(scheduler), backends(backends), path(path) {
+        uint64_t id;
+        {
+            std::lock_guard<std::mutex> lock(llama_graph_memory_stats_file_mutex);
+            id = llama_graph_memory_stats_next_event_id++;
+        }
+        common[0] = "5";
+        common[1] = std::to_string(id);
+        common[2] = "compute_reservation";
+        common[3] = ubatch.n_tokens > 1 ? "prefill" : "decode";
+        common[4] = warmup ? "1" : "0";
+        common[5] = std::to_string((int) gtype);
+        common[6] = std::to_string(ubatch.n_tokens);
+        common[7] = std::to_string(n_outputs);
+        common[8] = std::to_string(ubatch.n_seqs);
+        common[9] = profile;
+        common[12] = std::to_string(ggml_graph_n_nodes(graph));
+        common[48] = std::to_string(ggml_backend_sched_get_logging_id(scheduler));
+        common[49] = std::to_string(id);
+        common[50] = reason;
+        common[52] = llama_graph_memory_kv_extent(mctx);
+        for (size_t i = 0; i < bufts.size(); ++i) {
+            auto found = std::find_if(buffers.begin(), buffers.end(), [&](const buffer_snapshot & b) {
+                return b.buft == bufts[i];
+            });
+            if (found != buffers.end()) {
+                found->backend_names += '|';
+                found->backend_names += ggml_backend_name(backends[i]);
+                continue;
+            }
+            buffers.push_back({ bufts[i], (int) i, ggml_backend_name(backends[i]),
+                ggml_backend_sched_get_buffer_size(scheduler, backends[i]),
+                ggml_backend_sched_get_buffer_generation(scheduler, backends[i]) });
+        }
+        if (enable_capture) {
+            ggml_backend_sched_set_allocation_trace_callback(scheduler, capture, this);
+        }
+    }
+
+    ~llama_compute_reservation_trace() {
+        ggml_backend_sched_set_allocation_trace_callback(scheduler, nullptr, nullptr);
+    }
+
+    void finish(bool success, bool measurement_only = false, const size_t * fallback_sizes = nullptr) {
+        if (finished) { return; }
+        finished = true;
+        ggml_backend_sched_set_allocation_trace_callback(scheduler, nullptr, nullptr);
+        // Prefer the live allocator's actual plan. The temporary full plan
+        // explains fast-path reuse, where the allocator does not plan again.
+        const auto & peaks = actual_peaks.empty() ? full_peaks : actual_peaks;
+        common[51] = trace_failed ? "trace_unavailable" :
+            !actual_peaks.empty() ? "actual" : !full_peaks.empty() ? "full" :
+            fallback_sizes ? "cached_full" : "none";
+        common[54] = success ? "1" : "0";
+        std::lock_guard<std::mutex> lock(llama_graph_memory_stats_file_mutex);
+        std::ofstream output(path, std::ios::out | std::ios::app);
+        if (!output) {
+            LLAMA_LOG_WARN("compute reservation trace: unable to append %s\n", path.c_str());
+            return;
+        }
+        for (const auto & buffer : buffers) {
+            csv_row row = common;
+            row[35] = "compute_reservation";
+            row[36] = buffer.backend_names;
+            row[37] = ggml_backend_buft_name(buffer.buft);
+            const size_t after = ggml_backend_sched_get_buffer_size(scheduler, backends[buffer.backend_id]);
+            const bool replaced = buffer.generation !=
+                ggml_backend_sched_get_buffer_generation(scheduler, backends[buffer.backend_id]);
+            // The callback enumerates every used chunk in the completed
+            // plan. An owner absent from that enumeration requires zero.
+            bool has_plan = fallback_sizes != nullptr || !peaks.empty();
+            size_t required = 0;
+            for (const auto & peak : peaks) {
+                if (peak.buffer_id == buffer.backend_id) {
+                    has_plan = true;
+                    required += peak.required;
+                }
+            }
+            if (peaks.empty() && fallback_sizes != nullptr) {
+                required = fallback_sizes[buffer.backend_id];
+            }
+            row[53] = measurement_only ? (has_plan ? "measurement_only" : "split_only") :
+                replaced ? (buffer.generation == 0 ? "allocate" : "reallocate") : "reuse";
+            if (has_plan && !trace_failed) { row[55] = std::to_string(required); }
+            row[56] = std::to_string(buffer.before);
+            row[57] = std::to_string(after);
+            if (success && !measurement_only && has_plan && !trace_failed && after >= required) {
+                row[58] = std::to_string(after - required);
+            }
+            write_row(output, row);
+            for (const auto & peak : peaks) {
+                if (peak.buffer_id != buffer.backend_id) { continue; }
+                row[35] = "compute_peak";
+                row[55] = std::to_string(peak.required);
+                row[59] = std::to_string(peak.chunk_id);
+                row[60] = std::to_string(peak.node_index);
+                row[61] = peak.node_name;
+                row[62] = std::to_string(peak.live);
+                row[63] = std::to_string(peak.gap);
+                // Reservation values belong to the owner, not to each chunk.
+                row[56].clear(); row[57].clear(); row[58].clear();
+                write_row(output, row);
+                for (const auto & tensor : peak.tensors) {
+                    auto tensor_row = row;
+                    tensor_row[35] = "compute_peak_tensor";
+                    tensor_row[64] = tensor.name;
+                    tensor_row[65] = tensor.op;
+                    tensor_row[66] = tensor.shape;
+                    tensor_row[67] = tensor.role;
+                    tensor_row[68] = std::to_string(tensor.offset);
+                    tensor_row[69] = std::to_string(tensor.bytes);
+                    write_row(output, tensor_row);
+                }
+            }
+        }
+    }
+};
 
 struct llama_graph_logical_storage {
     size_t tensor_count = 0;
@@ -1151,24 +1418,20 @@ void llama_context::graph_cache_swap_active(graph_cache_entry & entry) {
     }
 }
 
-void llama_context::graph_cache_prepare_miss(size_t max_nodes, bool reuse_compute) {
+void llama_context::graph_cache_prepare_miss(size_t max_nodes) {
     const bool cache_current = graph_cache_active_state.valid &&
-        graph_cache_capacity > 1 && !graph_reuse_disable && !cparams.warmup && opt_ctx == nullptr &&
-        !(reuse_compute && graph_cache_active_state.compute_reserved_full_kv);
+        graph_cache_capacity > 1 && !graph_reuse_disable && !cparams.warmup && opt_ctx == nullptr;
 
     if (!cache_current) {
         if (sched != nullptr) {
             ggml_backend_sched_synchronize(sched.get());
         }
 
-        const bool replace_compute = !cparams.pipeline_parallel && opt_ctx == nullptr &&
-            graph_cache_active_state.compute_allocated && !reuse_compute;
         if (sched == nullptr || gf_res_prev == nullptr ||
-                graph_cache_active_state.max_nodes < max_nodes || replace_compute) {
-            // Incompatible input/output shapes must not inherit an old
-            // allocator's high-water mark when only one cache slot is kept.
-            // The optimizer retains its scheduler pointer; pipeline execution
-            // keeps its existing eager-reservation/fallback contract.
+                graph_cache_active_state.max_nodes < max_nodes) {
+            // An invalidated entry can have originated from a smaller graph.
+            // Reusing that scheduler/result for a larger topology would exceed
+            // both metadata capacities even though no reusable graph remains.
             auto next_scheduler = graph_cache_create_scheduler(max_nodes);
             llm_graph_result_ptr next_result(new llm_graph_result(max_nodes));
             sched = std::move(next_scheduler);
@@ -1177,14 +1440,10 @@ void llama_context::graph_cache_prepare_miss(size_t max_nodes, bool reuse_comput
             graph_cache_active_state.max_nodes = max_nodes;
         } else {
             const size_t active_max_nodes = graph_cache_active_state.max_nodes;
-            const bool compute_allocated = graph_cache_active_state.compute_allocated;
-            const bool full_kv = reuse_compute && graph_cache_active_state.compute_reserved_full_kv;
             ggml_backend_sched_reset(sched.get());
             gf_res_prev->reset();
             graph_cache_active_state = {};
             graph_cache_active_state.max_nodes = active_max_nodes;
-            graph_cache_active_state.compute_allocated = compute_allocated;
-            graph_cache_active_state.compute_reserved_full_kv = full_kv;
         }
         return;
     }
@@ -1246,7 +1505,6 @@ void llama_context::graph_cache_clear_inactive() {
 
 void llama_context::graph_cache_invalidate() {
     const size_t active_max_nodes = graph_cache_active_state.max_nodes;
-    const bool compute_allocated = graph_cache_active_state.compute_allocated;
     if (sched != nullptr) {
         ggml_backend_sched_synchronize(sched.get());
     }
@@ -1259,7 +1517,6 @@ void llama_context::graph_cache_invalidate() {
     }
     graph_cache_active_state = {};
     graph_cache_active_state.max_nodes = active_max_nodes;
-    graph_cache_active_state.compute_allocated = compute_allocated;
     graph_cache_clock = 0;
 }
 
@@ -1300,7 +1557,12 @@ void llama_context::graph_memory_stats_initialize() {
         "base_planned_peak_bytes,full_planned_peak_bytes,active_compute_reserved_bytes,"
         "context_compute_reserved_bytes,tracked_context_graph_reserved_bytes,"
         "weight_request_peak_bytes,activation_request_peak_bytes,scratch_request_peak_bytes,"
-        "backend_scratch_reserved_bytes,graph_plus_backend_scratch_reserved_bytes\n";
+        "backend_scratch_reserved_bytes,graph_plus_backend_scratch_reserved_bytes,"
+        "scheduler_id,reservation_id,reserve_reason,plan_kind,kv_extent,allocation_action,"
+        "allocation_success,planned_required_bytes,reserved_before_bytes,reserved_after_bytes,"
+        "reserved_excess_bytes,chunk_id,peak_node_index,peak_node_name,live_allocated_bytes,"
+        "free_gap_bytes,tensor_name,tensor_op,tensor_shape,tensor_role,tensor_offset_bytes,"
+        "tensor_allocation_bytes\n";
 }
 
 void llama_context::graph_memory_stats_record(
@@ -1495,7 +1757,7 @@ void llama_context::graph_memory_stats_record(
             const std::string & backend,
             const std::string & buffer_type) {
         output
-            << 4 << ','
+            << 5 << ','
             << event_id << ',' << event << ','
             << (ubatch.n_tokens > 1 ? "prefill" : "decode") << ','
             << (cparams.warmup ? 1 : 0) << ','
@@ -1540,7 +1802,9 @@ void llama_context::graph_memory_stats_record(
             << metrics.base_planned << ','
             << metrics.full_planned << ','
             << metrics.active_reserved << ','
-            << metrics.context_reserved << ",,,,,,\n";
+            << metrics.context_reserved << ",,,,,,"
+            << ',' << ggml_backend_sched_get_logging_id(sched.get())
+            << std::string(llama_graph_memory_trace_columns - 1, ',') << '\n';
     }
 
     for (const auto & [owner, metrics] : scratch) {
@@ -1550,7 +1814,9 @@ void llama_context::graph_memory_stats_record(
             << metrics.stats.weight_request_bytes << ','
             << metrics.stats.activation_request_bytes << ','
             << metrics.stats.request_bytes << ','
-            << metrics.stats.allocation_bytes << ",\n";
+            << metrics.stats.allocation_bytes << ','
+            << ',' << ggml_backend_sched_get_logging_id(sched.get())
+            << std::string(llama_graph_memory_trace_columns - 1, ',') << '\n';
     }
 
     write_prefix("total", "ALL", "ALL");
@@ -1564,7 +1830,9 @@ void llama_context::graph_memory_stats_record(
         << total_activation_request << ','
         << total_scratch_request << ','
         << total_scratch_reserved << ','
-        << tracked_context_graph_reserved_bytes + total_scratch_reserved << '\n';
+        << tracked_context_graph_reserved_bytes + total_scratch_reserved
+        << ',' << ggml_backend_sched_get_logging_id(sched.get())
+        << std::string(llama_graph_memory_trace_columns - 1, ',') << '\n';
     output.flush();
     if (after_compute) {
         graph_memory_scratch_last_sample = std::move(scratch_sample);
@@ -1649,7 +1917,7 @@ void llama_context::sched_reserve() {
 
     // resolve automatic Flash Attention use
     if (cparams.auto_fa) {
-        auto * gf = graph_reserve(1, n_seqs, n_outputs, mctx.get(), true);
+        auto * gf = graph_reserve(1, n_seqs, n_outputs, mctx.get(), true, nullptr, nullptr, "support_check");
         if (!gf) {
             throw std::runtime_error("failed to reserve graph for Flash Attention check");
         }
@@ -1692,7 +1960,7 @@ void llama_context::sched_reserve() {
         LLAMA_LOG_INFO("%s: resolving fused Gated Delta Net support:\n", __func__);
 
         if (cparams.fused_gdn_ar) {
-            auto * gf = graph_reserve(1, n_seqs, n_outputs, mctx.get(), true);
+            auto * gf = graph_reserve(1, n_seqs, n_outputs, mctx.get(), true, nullptr, nullptr, "support_check");
             if (!gf) {
                 throw std::runtime_error("failed to reserve graph for fused Gated Delta Net check (autoregressive)");
             }
@@ -1733,7 +2001,7 @@ void llama_context::sched_reserve() {
             // it with t_embd which is reduced to [n_outputs, ...] via out_ids. if n_outputs != n_tokens,
             // the ggml_mul_mat assertion fails. this matches the pp reservation below (line ~553).
             const uint32_t n_tokens_ch = 16*n_seqs;
-            auto * gf = graph_reserve(n_tokens_ch, n_seqs, n_tokens_ch, mctx.get(), true);
+            auto * gf = graph_reserve(n_tokens_ch, n_seqs, n_tokens_ch, mctx.get(), true, nullptr, nullptr, "support_check");
             if (!gf) {
                 throw std::runtime_error("failed to reserve graph for fused Gated Delta Net check (chunked)");
             }
@@ -1770,11 +2038,7 @@ void llama_context::sched_reserve() {
         cparams.auto_fgdn = false;
     }
 
-    // Normal inference allocates compute buffers from each actual graph. Keep
-    // worst-case graphs for backend support checks and dry-run size estimates.
-    // Pipeline mode retains eager allocation and its startup OOM fallback.
-    const bool defer_compute = !model.hparams.no_alloc && !cparams.pipeline_parallel;
-    const bool plan_only = model.hparams.no_alloc || defer_compute;
+    // reserve worst-case graph
     int n_splits_pp = -1;
     int n_nodes_pp  = -1;
 
@@ -1798,7 +2062,7 @@ void llama_context::sched_reserve() {
 
         auto * gf_measure = graph_reserve(
                 n_tokens, n_seqs, n_tokens, mctx.get(), true,
-                routed_sizes.data(), base_sizes.data());
+                routed_sizes.data(), base_sizes.data(), "startup_measurement");
         const bool measured = gf_measure != nullptr;
 
         if (!measured) {
@@ -1817,10 +2081,11 @@ void llama_context::sched_reserve() {
 
     measure_prefill_graph_memory();
 
-    // Plan pp (prompt processing); normal compute allocation happens in process_ubatch.
+    // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
         auto * gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get(),
-                plan_only, plan_only ? backend_buf_exp_size.data() : nullptr);
+                model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr,
+                nullptr, "startup_prefill");
         if (!gf) {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
@@ -1830,7 +2095,7 @@ void llama_context::sched_reserve() {
                 // pipeline-parallel scheduler. Re-measure against the actual
                 // scheduler before retrying the normal reserve.
                 measure_prefill_graph_memory();
-                gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get());
+                gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get(), false, nullptr, nullptr, "startup_prefill_retry");
             }
             if (!gf) {
                 throw std::runtime_error("failed to allocate compute pp buffers");
@@ -1843,7 +2108,8 @@ void llama_context::sched_reserve() {
 
     // reserve with tg (token generation) graph to get the number of splits and nodes
     {
-        auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), plan_only);
+        auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.hparams.no_alloc,
+                nullptr, nullptr, "startup_decode");
         if (!gf) {
             throw std::runtime_error("failed to allocate compute tg buffers");
         }
@@ -1852,13 +2118,14 @@ void llama_context::sched_reserve() {
         n_nodes_tg  = ggml_graph_n_nodes(gf);
     }
 
-    // Restore the pp scheduler topology after inspecting the decode graph.
+    // reserve again with pp graph to avoid ggml-alloc reallocations during inference
     {
         // TODO: not sure if the following graph would be worst case for multi-stream KV caches:
         //
         // auto * gf = graph_reserve(n_tokens, 1, n_tokens, mctx.get());
         //
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get(), plan_only);
+        auto * gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get(), model.hparams.no_alloc,
+                nullptr, nullptr, "startup_prefill_restore");
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
         }
@@ -1867,13 +2134,12 @@ void llama_context::sched_reserve() {
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
         ggml_backend_t             backend = backend_ptrs[i];
         ggml_backend_buffer_type_t buft    = backend_buft[i];
-        if (!plan_only) {
+        if (!model.hparams.no_alloc) {
             backend_buf_exp_size[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend);
         }
         if (backend_buf_exp_size[i] > 1) {
-            LLAMA_LOG_INFO("%s: %10s %s = %8.2f MiB\n", __func__,
+            LLAMA_LOG_INFO("%s: %10s compute buffer size = %8.2f MiB\n", __func__,
                     ggml_backend_buft_name(buft),
-                    defer_compute ? "maximum compute plan (allocation deferred)" : "compute buffer size",
                     backend_buf_exp_size[i] / 1024.0 / 1024.0);
         }
     }
@@ -2113,12 +2379,9 @@ bool llama_context::memory_update(bool optimize) {
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
         }
-        // Memory-maintenance graphs may have used the same allocator. Replace
-        // that allocation before building the next ordinary execution graph.
-        graph_cache_active_state.compute_allocated = true;
     }
 
-    // Restore scheduler topology without allocating a worst-case compute buffer.
+    // if the memory module did any computation, we have to reserve a new worst-case graph
     {
         const auto mctx = memory->init_full();
         if (!mctx) {
@@ -2128,8 +2391,7 @@ bool llama_context::memory_update(bool optimize) {
         const uint32_t n_seqs = cparams.n_seq_max;
         const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get(),
-                model.hparams.no_alloc || !cparams.pipeline_parallel);
+        auto * gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get(), false, nullptr, nullptr, "memory_update");
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to reserve graph after the memory update\n", __func__);
         }
@@ -2612,6 +2874,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             state.backend_policy_profile == backend_policy_profile;
     };
 
+    const uint64_t previous_scheduler_id = graph_memory_stats_enabled
+        ? ggml_backend_sched_get_logging_id(sched.get()) : 0;
     bool reused = false;
     size_t graph_metadata_empty_used_bytes = 0;
     std::vector<size_t> graph_base_planned_sizes;
@@ -2619,22 +2883,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     auto * res = gf_res_prev.get();
     auto * gf = res->get_gf();
 
-    // Graph inputs without object-reuse support (for example pooling) may
-    // still have an identical allocation layout. Keep these decisions separate
-    // so rebuilding such a graph need not recreate its scheduler and buffers.
-    bool reuse_graph = false;
-    bool reuse_compute = false;
-    if (!cparams.warmup && opt_ctx == nullptr && cache_key_matches(graph_cache_active_state)) {
+    if (!graph_reuse_disable && !cparams.warmup && opt_ctx == nullptr &&
+            cache_key_matches(graph_cache_active_state)) {
+        // The full graph/input compatibility check remains authoritative. The
+        // small cache key only skips unrelated token shapes and policy profiles.
         const auto active_gparams = graph_params(res, ubatch, mctx, gtype);
-        reuse_graph = res->can_reuse(active_gparams);
-        const bool rebuild_in_place = graph_cache_capacity == 1 || graph_reuse_disable;
-        const bool full_kv = graph_cache_active_state.compute_reserved_full_kv;
-        reuse_compute = reuse_graph ||
-            ((rebuild_in_place || full_kv) && !cparams.pipeline_parallel &&
-             res->can_reuse_compute(active_gparams, full_kv));
-    }
-    if (!graph_reuse_disable && !cparams.warmup && opt_ctx == nullptr) {
-        if (reuse_graph) {
+        if (res->can_reuse(active_gparams)) {
             // With pipeline parallelism, the previous graph_compute_async may
             // still be reading its input tensors.
             if (cparams.pipeline_parallel) {
@@ -2680,20 +2934,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 break;
             }
 
-            // A maximum-KV reservation can serve the new KV shape, although
-            // its execution graph still needs rebuilding. Reuse that cache
-            // entry in place instead of keeping one full buffer per KV size.
-            if (!cparams.pipeline_parallel && graph_cache_active_state.compute_reserved_full_kv &&
-                    res->can_reuse_compute(cached_gparams, true)) {
-                reuse_compute = true;
-                if (!graph_cache_entries[index].state.valid) {
-                    graph_cache_entries[index].scheduler.reset();
-                    graph_cache_entries[index].result.reset();
-                    graph_cache_entries.erase(graph_cache_entries.begin() + index);
-                }
-                break;
-            }
-
             // A quick-key collision is possible for different KV-mask shapes
             // or sampler topology. Restore the original active pair without
             // resetting either scheduler and continue the search.
@@ -2706,7 +2946,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (!reused) {
         const size_t max_nodes = this->graph_max_nodes(ubatch.n_tokens);
         try {
-            graph_cache_prepare_miss(max_nodes, reuse_compute);
+            graph_cache_prepare_miss(max_nodes);
         } catch (const std::bad_alloc &) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph-cache entry\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -2731,17 +2971,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
         const bool profile_backend_compute = igparams.backend_compute_profile;
         const int64_t t_build_us = profile_backend_compute ? ggml_time_us() : 0;
-
-        try {
-            if (!graph_reserve_full_kv(ubatch, gtype, mctx)) {
-                ret = GGML_STATUS_ALLOC_FAILED;
-                return nullptr;
-            }
-        } catch (const std::exception & error) {
-            LLAMA_LOG_ERROR("%s: failed to reserve maximum-KV compute buffers: %s\n", __func__, error.what());
-            ret = GGML_STATUS_ALLOC_FAILED;
-            return nullptr;
-        }
 
         const auto build_gparams = graph_params(res, ubatch, mctx, gtype);
         if (runtime_routes_configured) {
@@ -2768,14 +2997,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         const int64_t t_alloc_us = profile_backend_compute ? ggml_time_us() : 0;
-        // A failed multi-backend allocation can still leave partial buffers.
-        // Treat those as runtime allocations too, so a retry can replace them.
-        graph_cache_active_state.compute_allocated = true;
+        std::unique_ptr<llama_compute_reservation_trace> reservation_trace;
+        if (graph_memory_stats_enabled) {
+            reservation_trace.reset(new llama_compute_reservation_trace(
+                    graph_memory_stats_path, sched.get(), backend_ptrs, backend_buft,
+                    cparams.warmup ? "warmup_build" : "runtime_build", cparams.warmup,
+                    gtype, ubatch, n_outputs, mctx, gf, backend_policy_profile));
+        }
         const bool alloc_ok = (graph_memory_stats_enabled || memory_stats_enabled)
             ? ggml_backend_sched_alloc_graph_measure(
                     sched.get(), gf,
                     graph_base_planned_sizes.data(), graph_full_planned_sizes.data())
             : ggml_backend_sched_alloc_graph(sched.get(), gf);
+        if (reservation_trace) {
+            reservation_trace->finish(alloc_ok, false, graph_full_planned_sizes.data());
+        }
         if (profile_backend_compute) {
             ggml_backend_sched_profile_add_build_ms((ggml_time_us() - t_alloc_us) / 1000.0);
         }
@@ -2801,6 +3037,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 graph_cache_active_state.metadata_empty_used_bytes,
                 graph_cache_active_state.base_planned_sizes,
                 graph_cache_active_state.full_planned_sizes);
+    }
+
+    if (reused && graph_memory_stats_enabled &&
+            previous_scheduler_id != ggml_backend_sched_get_logging_id(sched.get())) {
+        llama_compute_reservation_trace trace(
+                graph_memory_stats_path, sched.get(), backend_ptrs, backend_buft,
+                "runtime_cache_reuse", cparams.warmup, gtype, ubatch, n_outputs,
+                mctx, gf, backend_policy_profile, false);
+        trace.finish(true, false, graph_cache_active_state.full_planned_sizes.empty()
+                ? nullptr : graph_cache_active_state.full_planned_sizes.data());
     }
 
     // set the input data for the input tensors
@@ -4781,7 +5027,7 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
 ggml_cgraph * llama_context::graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs,
         const llama_memory_context_i * mctx, bool split_only, size_t * sizes,
-        size_t * route_base_sizes) {
+        size_t * route_base_sizes, const char * reserve_reason) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
     GGML_ASSERT(n_outputs >= 1);
 
@@ -4863,12 +5109,21 @@ ggml_cgraph * llama_context::graph_reserve(
 
     this->n_outputs = save_n_outputs;
 
+    std::unique_ptr<llama_compute_reservation_trace> reservation_trace;
+    if (graph_memory_stats_enabled && gf != nullptr) {
+        reservation_trace.reset(new llama_compute_reservation_trace(
+                graph_memory_stats_path, sched.get(), backend_ptrs, backend_buft,
+                reserve_reason, cparams.warmup, LLM_GRAPH_TYPE_DEFAULT, ubatch, n_outputs,
+                mctx, gf, llama_backend_policy_active_profile()));
+    }
+
     // initialize scheduler with the specified graph
     if (split_only) {
         if (sizes) {
             if (route_base_sizes != nullptr) {
                 if (!ggml_backend_sched_reserve_route_sizes(
                             sched.get(), gf, route_base_sizes, sizes)) {
+                    if (reservation_trace) { reservation_trace->finish(false, true); }
                     return nullptr;
                 }
             } else {
@@ -4880,12 +5135,13 @@ ggml_cgraph * llama_context::graph_reserve(
     } else {
         GGML_ASSERT(!sizes);
         if (!ggml_backend_sched_reserve(sched.get(), gf)) {
+            if (reservation_trace) { reservation_trace->finish(false); }
             LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
             return nullptr;
         }
-        // An explicit reserve keeps the capacity requested by its caller.
-        graph_cache_active_state.compute_allocated = false;
     }
+
+    if (reservation_trace) { reservation_trace->finish(true, split_only, sizes); }
 
     if (graph_memory_stats_enabled) {
         std::vector<size_t> base_planned_sizes;
@@ -4903,49 +5159,6 @@ ggml_cgraph * llama_context::graph_reserve(
     }
 
     return gf;
-}
-
-bool llama_context::graph_reserve_full_kv(
-        const llama_ubatch & ubatch, llm_graph_type gtype, const llama_memory_context_i * mctx) {
-    // Pipeline/optimizer reservation contracts stay unchanged. Warmup uses
-    // its own actual batch size, just like any other newly allocated entry.
-    if (!mctx || cparams.pipeline_parallel || opt_ctx != nullptr ||
-            graph_cache_active_state.compute_reserved_full_kv) {
-        return true;
-    }
-    auto reserve_mctx = mctx->clone_for_reserve();
-    if (!reserve_mctx) {
-        return true;
-    }
-
-    const size_t max_nodes = graph_cache_active_state.max_nodes;
-    if (!gf_res_reserve || (size_t) gf_res_reserve->get_max_nodes() < max_nodes) {
-        gf_res_reserve.reset(new llm_graph_result(max_nodes));
-    }
-    auto * res = gf_res_reserve.get();
-    res->reset();
-    if (runtime_routes_configured) {
-        runtime_route_graph_begin(lp_is_prefill);
-    }
-    // Unlike the startup reserve graph, keep the real ubatch, sequence set,
-    // output count and graph type. Only the KV extent is enlarged.
-    auto * gf = model.build_graph(graph_params(res, ubatch, reserve_mctx.get(), gtype));
-    if (!gf || (runtime_routes_configured && !runtime_route_prepare_graph(res, gf, lp_is_prefill))) {
-        LLAMA_LOG_ERROR("%s: failed to build maximum-KV reserve graph\n", __func__);
-        return false;
-    }
-
-    // Failed multi-backend reservation can leave partial allocations. Mark
-    // ownership before attempting it so a retry replaces those buffers.
-    graph_cache_active_state.compute_allocated = true;
-    if (!ggml_backend_sched_reserve(sched.get(), gf)) {
-        LLAMA_LOG_ERROR("%s: failed to allocate maximum-KV compute buffers\n", __func__);
-        return false;
-    }
-    graph_cache_active_state.compute_reserved_full_kv = true;
-    // reserve() resets the scheduler. The caller now builds/registers the
-    // actual graph and its routes against the real memory context.
-    return true;
 }
 
 llm_graph_params llama_context::graph_params(
@@ -6051,10 +6264,8 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
         for (const auto & entry : graph_cache_entries) {
             add_plan(entry.state);
         }
-    } else if (backend_buf_graph_measurement_valid &&
-            (model.hparams.no_alloc || cparams.pipeline_parallel)) {
-        // Only eager/dry-run contexts report the startup worst-case plan here.
-        // Deferred contexts have no active plan until an actual graph is built.
+    } else if (backend_buf_graph_measurement_valid) {
+        // Before an execution graph is available, report the startup reserve plan.
         for (const auto & [buft, size] : backend_buf_graph_base_size) {
             ret[buft].compute_graph_base = size;
             ret[buft].compute_graph_measurement_valid = true;

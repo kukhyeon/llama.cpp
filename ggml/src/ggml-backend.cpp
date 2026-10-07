@@ -986,6 +986,11 @@ struct ggml_backend_sched {
     ggml_backend_buffer_type_t bufts[GGML_SCHED_MAX_BACKENDS];
     ggml_gallocr_t galloc;
 
+    uint64_t logging_id;
+    ggml_backend_sched_allocation_trace_callback allocation_trace_callback;
+    void * allocation_trace_user_data;
+    std::unordered_set<const ggml_tensor *> * allocation_trace_copies;
+
     // hash map of the nodes in the graph
     struct ggml_hash_set  hash_set;
     int                 * hv_tensor_backend_ids; // [hash_set.size]
@@ -1064,6 +1069,22 @@ struct ggml_backend_sched {
     int debug_graph_size;
     int debug_prev_graph_size;
 };
+
+static void ggml_backend_sched_trace_actual(
+        const ggml_gallocr_chunk_trace * trace, void * user_data) {
+    auto * sched = static_cast<ggml_backend_sched_t>(user_data);
+    if (sched->allocation_trace_callback != nullptr) {
+        sched->allocation_trace_callback("actual", trace, sched->allocation_trace_user_data);
+    }
+}
+
+static void ggml_backend_sched_trace_full(
+        const ggml_gallocr_chunk_trace * trace, void * user_data) {
+    auto * sched = static_cast<ggml_backend_sched_t>(user_data);
+    if (sched->allocation_trace_callback != nullptr) {
+        sched->allocation_trace_callback("full", trace, sched->allocation_trace_user_data);
+    }
+}
 
 static ggml_backend_sched_layer_checkpoint_state * ggml_backend_sched_ensure_layer_checkpoint_state(
         ggml_backend_sched_t sched) {
@@ -5084,6 +5105,11 @@ static void ggml_backend_sched_split_graph_impl(
         route_base->leaf_backend_ids.clear();
     }
 
+    // Trace pointers belong to the descriptors materialized for this split.
+    if (sched->allocation_trace_copies != nullptr) {
+        sched->allocation_trace_copies->clear();
+    }
+
     // reset splits
     sched->n_splits = 0;
     sched->n_graph_inputs = 0;
@@ -5905,6 +5931,9 @@ static void ggml_backend_sched_split_graph_impl(
                 ggml_set_output(tensor_copy);
             }
             tensor_id_copy(request.source_id, request.backend_id, c) = tensor_copy;
+            if (sched->allocation_trace_copies != nullptr && tensor_copy != request.source) {
+                sched->allocation_trace_copies->insert(tensor_copy);
+            }
             SET_CAUSE(tensor_copy, "4.cpy");
         }
     }
@@ -9718,6 +9747,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     struct ggml_backend_sched * sched = (ggml_backend_sched *) calloc(1, sizeof(struct ggml_backend_sched));
     GGML_ASSERT(sched != nullptr);
+    static std::atomic<uint64_t> next_logging_id { 1 };
+    sched->logging_id = next_logging_id.fetch_add(1, std::memory_order_relaxed);
+    GGML_ASSERT(sched->logging_id != 0);
 
     const char * GGML_SCHED_DEBUG = getenv("GGML_SCHED_DEBUG");
     sched->debug = GGML_SCHED_DEBUG ? atoi(GGML_SCHED_DEBUG) : 0;
@@ -9976,6 +10008,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         }
     }
     ggml_gallocr_free(sched->galloc);
+    delete sched->allocation_trace_copies;
     ggml_free(sched->ctx);
     ggml_hash_set_free(&sched->hash_set);
     free(sched->splits);
@@ -9991,6 +10024,52 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched);
 }
 
+void ggml_backend_sched_set_allocation_trace_callback(
+        ggml_backend_sched_t sched, ggml_backend_sched_allocation_trace_callback callback, void * user_data) {
+    GGML_ASSERT(sched != nullptr);
+    sched->allocation_trace_callback = callback;
+    sched->allocation_trace_user_data = callback != nullptr ? user_data : nullptr;
+    ggml_gallocr_set_trace_callback(sched->galloc,
+            callback != nullptr ? ggml_backend_sched_trace_actual : nullptr,
+            callback != nullptr ? sched : nullptr);
+    if (callback == nullptr) {
+        delete sched->allocation_trace_copies;
+        sched->allocation_trace_copies = nullptr;
+        return;
+    }
+    if (sched->allocation_trace_copies == nullptr) {
+        sched->allocation_trace_copies = new std::unordered_set<const ggml_tensor *>();
+    }
+    sched->allocation_trace_copies->clear();
+    // Enabling diagnostics after splitting also supports current-graph lookup.
+    if (!sched->is_reset) {
+        for (size_t id = 0; id < sched->hash_set.size; ++id) {
+            if (!ggml_bitset_get(sched->hash_set.used, id)) {
+                continue;
+            }
+            for (int b = 0; b < sched->n_backends; ++b) {
+                for (int c = 0; c < sched->n_copies; ++c) {
+                    const ggml_tensor * copy = tensor_id_copy(id, b, c);
+                    if (copy != nullptr && copy != sched->hash_set.keys[id]) {
+                        sched->allocation_trace_copies->insert(copy);
+                    }
+                }
+            }
+        }
+    }
+}
+
+uint64_t ggml_backend_sched_get_logging_id(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched != nullptr);
+    return sched->logging_id;
+}
+
+bool ggml_backend_sched_is_copy_tensor(ggml_backend_sched_t sched, const ggml_tensor * tensor) {
+    GGML_ASSERT(sched != nullptr);
+    return tensor != nullptr && sched->allocation_trace_copies != nullptr &&
+        sched->allocation_trace_copies->find(tensor) != sched->allocation_trace_copies->end();
+}
+
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     // Reset may invalidate copy tensors and graph-owned scratch. Do not retain
@@ -10001,6 +10080,9 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     }
     if (sched->route_candidates != nullptr) {
         sched->route_candidates->clear_configuration();
+    }
+    if (sched->allocation_trace_copies != nullptr) {
+        sched->allocation_trace_copies->clear();
     }
     // reset state for the next run
     if (!sched->is_reset) {
@@ -10041,6 +10123,9 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
     // its buffers. A matching plan without backing buffers cannot be used by
     // the subsequent alloc_graph fast path.
     ggml_gallocr_t measure = ggml_gallocr_new_n(sched->bufts, sched->n_backends);
+    if (sched->allocation_trace_callback != nullptr) {
+        ggml_gallocr_set_trace_callback(measure, ggml_backend_sched_trace_full, sched);
+    }
     ggml_gallocr_reserve_n_size(measure, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
     ggml_gallocr_free(measure);
 }
@@ -10080,13 +10165,16 @@ bool ggml_backend_sched_reserve_route_sizes(
     base_graph.nodes = base.nodes.data();
     base_graph.leafs = base.leafs.data();
 
-    // Use a disposable planner for both measurements; the live allocator is
-    // reserved only when an executable graph actually needs compute buffers.
+    // Diagnostic measurements must not replace the live allocation plan
+    // or release its already reserved compute buffers.
     ggml_gallocr_t measure = ggml_gallocr_new_n(sched->bufts, sched->n_backends);
     ggml_gallocr_reserve_n_size(
             measure, &base_graph,
             base.node_backend_ids.data(), base.leaf_backend_ids.data(),
             base_sizes);
+    if (sched->allocation_trace_callback != nullptr) {
+        ggml_gallocr_set_trace_callback(measure, ggml_backend_sched_trace_full, sched);
+    }
     ggml_gallocr_reserve_n_size(
             measure, &sched->graph,
             sched->node_backend_ids, sched->leaf_backend_ids,
@@ -10160,6 +10248,9 @@ static bool ggml_backend_sched_alloc_graph_impl(
                 measure, &base_graph,
                 base.node_backend_ids.data(), base.leaf_backend_ids.data(),
                 base_sizes);
+        if (sched->allocation_trace_callback != nullptr) {
+            ggml_gallocr_set_trace_callback(measure, ggml_backend_sched_trace_full, sched);
+        }
         ggml_gallocr_reserve_n_size(
                 measure, &sched->graph,
                 sched->node_backend_ids, sched->leaf_backend_ids,
@@ -10817,6 +10908,13 @@ size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
 
     return ggml_gallocr_get_buffer_size(sched->galloc, backend_index);
+}
+
+uint64_t ggml_backend_sched_get_buffer_generation(ggml_backend_sched_t sched, ggml_backend_t backend) {
+    GGML_ASSERT(sched != nullptr);
+    const int backend_index = ggml_backend_sched_backend_id(sched, backend);
+    GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
+    return ggml_gallocr_get_buffer_generation(sched->galloc, backend_index);
 }
 
 void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend) {

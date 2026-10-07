@@ -115,6 +115,16 @@ struct tallocr_chunk {
     struct free_block free_blocks[MAX_FREE_BLOCKS];
     int n_free_blocks;
     size_t max_size;
+
+    struct ggml_gallocr_tensor_trace * trace_live;
+    size_t trace_live_count;
+    size_t trace_live_capacity;
+    struct ggml_gallocr_tensor_trace * trace_peak;
+    size_t trace_peak_count;
+    size_t trace_peak_capacity;
+    size_t trace_peak_live_bytes;
+    int trace_peak_node_index;
+    const struct ggml_tensor * trace_peak_node;
 };
 
 struct ggml_dyn_tallocr {
@@ -122,6 +132,10 @@ struct ggml_dyn_tallocr {
     size_t max_chunk_size;
     struct tallocr_chunk * chunks[GGML_VBUFFER_MAX_CHUNKS];
     int n_chunks;
+    bool trace_enabled;
+    int trace_node_index;
+    const struct ggml_tensor * trace_node;
+    uint64_t buffer_generation;
 
 #ifdef GGML_ALLOCATOR_DEBUG
     struct {
@@ -130,6 +144,90 @@ struct ggml_dyn_tallocr {
     } allocated_tensors[1024];
 #endif
 };
+
+static void ggml_dyn_tallocr_trace_grow(
+        struct ggml_gallocr_tensor_trace ** entries, size_t * capacity, size_t required) {
+    if (required <= *capacity) {
+        return;
+    }
+    size_t next_capacity = MAX(required, MAX((size_t) 16, *capacity * 2));
+    void * next = realloc(*entries, next_capacity * sizeof(**entries));
+    GGML_ASSERT(next != NULL);
+    *entries = next;
+    *capacity = next_capacity;
+}
+
+static void ggml_dyn_tallocr_trace_alloc(
+        struct ggml_dyn_tallocr * alloc, struct buffer_address addr, size_t size,
+        const struct ggml_tensor * tensor) {
+    if (!alloc->trace_enabled || size == 0) {
+        return;
+    }
+    struct tallocr_chunk * chunk = alloc->chunks[addr.chunk];
+    ggml_dyn_tallocr_trace_grow(&chunk->trace_live, &chunk->trace_live_capacity, chunk->trace_live_count + 1);
+    chunk->trace_live[chunk->trace_live_count++] = (struct ggml_gallocr_tensor_trace) {
+        .tensor = tensor, .offset = addr.offset, .allocation_bytes = size,
+    };
+    if (addr.offset + size > chunk->max_size) {
+        ggml_dyn_tallocr_trace_grow(&chunk->trace_peak, &chunk->trace_peak_capacity, chunk->trace_live_count);
+        memcpy(chunk->trace_peak, chunk->trace_live, chunk->trace_live_count * sizeof(*chunk->trace_peak));
+        chunk->trace_peak_count = chunk->trace_live_count;
+        chunk->trace_peak_live_bytes = 0;
+        for (size_t i = 0; i < chunk->trace_peak_count; ++i) {
+            chunk->trace_peak_live_bytes += chunk->trace_peak[i].allocation_bytes;
+        }
+        chunk->trace_peak_node_index = alloc->trace_node_index;
+        chunk->trace_peak_node = alloc->trace_node;
+    }
+}
+
+// Both complete frees and the tail returned by an in-place resize come here.
+static void ggml_dyn_tallocr_trace_free(
+        struct ggml_dyn_tallocr * alloc, struct buffer_address addr, size_t size) {
+    if (!alloc->trace_enabled || size == 0) {
+        return;
+    }
+    struct tallocr_chunk * chunk = alloc->chunks[addr.chunk];
+    for (size_t i = 0; i < chunk->trace_live_count; ++i) {
+        struct ggml_gallocr_tensor_trace * entry = &chunk->trace_live[i];
+        if (entry->offset <= addr.offset && entry->offset + entry->allocation_bytes == addr.offset + size) {
+            if (entry->offset == addr.offset) {
+                chunk->trace_live[i] = chunk->trace_live[--chunk->trace_live_count];
+            } else {
+                entry->allocation_bytes -= size;
+            }
+            return;
+        }
+    }
+    GGML_ABORT("allocation trace: freed storage was not found");
+}
+
+static void ggml_dyn_tallocr_trace_reuse(
+        struct ggml_dyn_tallocr * alloc, struct buffer_address addr, const struct ggml_tensor * tensor) {
+    if (!alloc->trace_enabled) {
+        return;
+    }
+    struct tallocr_chunk * chunk = alloc->chunks[addr.chunk];
+    for (size_t i = 0; i < chunk->trace_live_count; ++i) {
+        if (chunk->trace_live[i].offset == addr.offset) {
+            chunk->trace_live[i].tensor = tensor;
+            return;
+        }
+    }
+    GGML_ASSERT(ggml_nbytes(tensor) == 0 && "allocation trace: reused storage was not found");
+}
+
+static void ggml_dyn_tallocr_trace_clear(struct tallocr_chunk * chunk) {
+    free(chunk->trace_live);
+    free(chunk->trace_peak);
+    chunk->trace_live = NULL;
+    chunk->trace_peak = NULL;
+    chunk->trace_live_count = chunk->trace_live_capacity = 0;
+    chunk->trace_peak_count = chunk->trace_peak_capacity = 0;
+    chunk->trace_peak_live_bytes = 0;
+    chunk->trace_peak_node_index = -1;
+    chunk->trace_peak_node = NULL;
+}
 
 static void ggml_dyn_tallocr_insert_block(struct tallocr_chunk * chunk, size_t offset, size_t size) {
     GGML_ASSERT(chunk->n_free_blocks < MAX_FREE_BLOCKS && "out of free blocks");
@@ -300,6 +398,7 @@ static struct buffer_address ggml_dyn_tallocr_alloc(struct ggml_dyn_tallocr * al
     }
 #endif
 
+    ggml_dyn_tallocr_trace_alloc(alloc, addr, size, tensor);
     chunk->max_size = MAX(chunk->max_size, addr.offset + size);
 
     return addr;
@@ -310,6 +409,7 @@ static struct buffer_address ggml_dyn_tallocr_alloc(struct ggml_dyn_tallocr * al
 // this is a very naive implementation, but for our case the number of free blocks should be very small
 static void ggml_dyn_tallocr_free_bytes(struct ggml_dyn_tallocr * alloc, struct buffer_address addr, size_t size) {
     size = aligned_offset(NULL, size, alloc->alignment);
+    ggml_dyn_tallocr_trace_free(alloc, addr, size);
 
     struct tallocr_chunk * chunk = alloc->chunks[addr.chunk];
 
@@ -350,10 +450,15 @@ static void ggml_dyn_tallocr_free_bytes(struct ggml_dyn_tallocr * alloc, struct 
 
 static void ggml_dyn_tallocr_reset(struct ggml_dyn_tallocr * alloc) {
     for (int i = 0; i < GGML_VBUFFER_MAX_CHUNKS; i++) {
+        if (alloc->chunks[i] != NULL) {
+            ggml_dyn_tallocr_trace_clear(alloc->chunks[i]);
+        }
         free(alloc->chunks[i]);
         alloc->chunks[i] = NULL;
     }
     alloc->n_chunks = 0;
+    alloc->trace_node_index = -1;
+    alloc->trace_node = NULL;
 
 #ifdef GGML_ALLOCATOR_DEBUG
     for (int i = 0; i < 1024; i++) {
@@ -370,6 +475,10 @@ static struct ggml_dyn_tallocr * ggml_dyn_tallocr_new(size_t alignment, size_t m
         /*.max_chunk_size = */ MIN(max_buffer_size, SIZE_MAX/2), // clamp to avoid overflows
         /*.chunks         = */ {NULL},
         /*.n_chunks       = */ 0,
+        /*.trace_enabled  = */ false,
+        /*.trace_node_index = */ -1,
+        /*.trace_node     = */ NULL,
+        /*.buffer_generation = */ 0,
 #ifdef GGML_ALLOCATOR_DEBUG
         /*.allocated_tensors = */ {{0}},
 #endif
@@ -381,9 +490,7 @@ static struct ggml_dyn_tallocr * ggml_dyn_tallocr_new(size_t alignment, size_t m
 }
 
 static void ggml_dyn_tallocr_free(struct ggml_dyn_tallocr * alloc) {
-    for (int i = 0; i < alloc->n_chunks; ++i) {
-        free(alloc->chunks[i]);
-    }
+    ggml_dyn_tallocr_reset(alloc);
     free(alloc);
 }
 
@@ -492,7 +599,21 @@ struct ggml_gallocr {
 
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
+    ggml_gallocr_trace_callback trace_callback;
+    void * trace_user_data;
+    uint64_t trace_plan_id;
 };
+
+void ggml_gallocr_set_trace_callback(
+        ggml_gallocr_t galloc, ggml_gallocr_trace_callback callback, void * user_data) {
+    galloc->trace_callback = callback;
+    galloc->trace_user_data = user_data;
+}
+
+uint64_t ggml_gallocr_get_buffer_generation(ggml_gallocr_t galloc, int buffer_id) {
+    GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+    return galloc->buf_tallocs[buffer_id]->buffer_generation;
+}
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
     ggml_gallocr_t galloc = (ggml_gallocr_t)calloc(1, sizeof(struct ggml_gallocr));
@@ -665,6 +786,7 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
                             p_hn->allocated = false; // avoid freeing the parent
                             view_src_hn->allocated = false;
                             ggml_gallocr_free_extra_space(galloc, node, view_src);
+                            ggml_dyn_tallocr_trace_reuse(galloc->buf_tallocs[hn->buffer_id], hn->addr, node);
                             return;
                         }
                     } else {
@@ -673,6 +795,7 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
                         hn->addr = p_hn->addr;
                         p_hn->allocated = false; // avoid freeing the parent
                         ggml_gallocr_free_extra_space(galloc, node, parent);
+                        ggml_dyn_tallocr_trace_reuse(galloc->buf_tallocs[hn->buffer_id], hn->addr, node);
                         return;
                     }
                 }
@@ -763,6 +886,12 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
         int buffer_id = get_node_buffer_id(node_buffer_ids, i);
+        if (galloc->trace_callback != NULL) {
+            for (int b = 0; b < galloc->n_buffers; ++b) {
+                galloc->buf_tallocs[b]->trace_node_index = i;
+                galloc->buf_tallocs[b]->trace_node = node;
+            }
+        }
 
         // allocate parents (only leafs need to be allocated at this point)
         for (int j = 0; j < GGML_MAX_SRC; j++) {
@@ -823,6 +952,9 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
 
 static bool ggml_gallocr_reserve_n_impl(
         ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, bool no_alloc) {
+    if (galloc->trace_callback != NULL) {
+        ++galloc->trace_plan_id;
+    }
     size_t min_hash_size = graph->n_nodes + graph->n_leafs;
     // add 25% margin to avoid hash collisions
     min_hash_size += min_hash_size / 4;
@@ -841,10 +973,46 @@ static bool ggml_gallocr_reserve_n_impl(
     // reset allocators
     for (int i = 0; i < galloc->n_buffers; i++) {
         ggml_dyn_tallocr_reset(galloc->buf_tallocs[i]);
+        galloc->buf_tallocs[i]->trace_enabled = galloc->trace_callback != NULL;
     }
 
     // allocate in hash table
     ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids);
+
+    if (galloc->trace_callback != NULL) {
+        for (int b = 0; b < galloc->n_buffers; ++b) {
+            struct ggml_dyn_tallocr * alloc = galloc->buf_tallocs[b];
+            bool duplicate = false;
+            for (int j = 0; j < b; ++j) {
+                if (galloc->buf_tallocs[j] == alloc) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) {
+                continue;
+            }
+            for (int c = 0; c < alloc->n_chunks; ++c) {
+                struct tallocr_chunk * chunk = alloc->chunks[c];
+                GGML_ASSERT(chunk->max_size >= chunk->trace_peak_live_bytes);
+                const struct ggml_gallocr_chunk_trace trace = {
+                    .plan_id = galloc->trace_plan_id,
+                    .buffer_id = b,
+                    .chunk_id = c,
+                    .peak_node_index = chunk->trace_peak_count ? chunk->trace_peak_node_index : -1,
+                    .peak_node = chunk->trace_peak_node,
+                    .required_bytes = chunk->max_size,
+                    .live_bytes = chunk->trace_peak_live_bytes,
+                    .gap_bytes = chunk->max_size - chunk->trace_peak_live_bytes,
+                    .tensors = chunk->trace_peak,
+                    .n_tensors = chunk->trace_peak_count,
+                };
+                galloc->trace_callback(&trace, galloc->trace_user_data);
+                ggml_dyn_tallocr_trace_clear(chunk);
+            }
+            alloc->trace_enabled = false;
+        }
+    }
 
     // set the node_allocs from the hash table
     if (galloc->n_nodes < graph->n_nodes) {
@@ -922,6 +1090,9 @@ static bool ggml_gallocr_reserve_n_impl(
             }
         }
         if (realloc) {
+            if (!no_alloc) {
+                ++galloc->buf_tallocs[i]->buffer_generation;
+            }
 #ifndef NDEBUG
             {
                 size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;

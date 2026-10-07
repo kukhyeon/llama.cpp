@@ -344,8 +344,6 @@ public:
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
-    llama_memory_context_ptr clone_for_reserve() const override;
-
     //
     // llama_kv_cache_context specific API
     //

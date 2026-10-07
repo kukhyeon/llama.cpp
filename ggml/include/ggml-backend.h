@@ -391,6 +391,23 @@ extern "C" {
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
 
+    // Optional synchronous allocator diagnostics. plan_kind is "actual" for
+    // the live allocator and "full" for a complete diagnostic graph. Canonical
+    // base-only measurements are not traced. All tensor pointers in a trace
+    // remain valid only for the callback; the callback must not mutate/reset
+    // this scheduler. Passing NULL disables tracing and its copy registry.
+    typedef void (*ggml_backend_sched_allocation_trace_callback)(
+            const char * plan_kind, const struct ggml_gallocr_chunk_trace * trace, void * user_data);
+    GGML_API void                 ggml_backend_sched_set_allocation_trace_callback(
+            ggml_backend_sched_t sched, ggml_backend_sched_allocation_trace_callback callback, void * user_data);
+    // Monotonic process-local identity, stable for this scheduler's lifetime.
+    GGML_API uint64_t             ggml_backend_sched_get_logging_id(ggml_backend_sched_t sched);
+    // True for scheduler-created copy tensors in the current split graph,
+    // including pipeline copies; excludes original inputs reused as copy slots.
+    // This diagnostic lookup is available while allocation tracing is enabled.
+    GGML_API bool                 ggml_backend_sched_is_copy_tensor(
+            ggml_backend_sched_t sched, const struct ggml_tensor * tensor);
+
     // Initialize backend buffers from a measure graph
     GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
     // Split a routed graph once and measure both its canonical initial-profile
@@ -434,6 +451,9 @@ extern "C" {
 
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
+    // Changes on each physical allocation/reallocation attempt, including a
+    // failed attempt; shared buffer types report their common owner's counter.
+    GGML_API uint64_t                   ggml_backend_sched_get_buffer_generation(ggml_backend_sched_t sched, ggml_backend_t backend);
 
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);

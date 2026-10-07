@@ -222,6 +222,8 @@ llama_build(test-backend-policy-clock.cpp)
 target_include_directories(test-backend-policy-clock PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_test(test-backend-policy-clock)
 llama_build_and_test(test-add4.cpp)
+llama_build_and_test(test-alloc-trace.cpp)
+target_include_directories(test-alloc-trace PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 target_include_directories(test-add4 PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build_and_test(
     test-peg-parser.cpp
