@@ -2858,6 +2858,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
     llama_backend_policy_update_runtime_profile(lp_is_prefill);
     const std::string backend_policy_profile = llama_backend_policy_active_profile();
+    const uint64_t backend_policy_revision = llama_backend_policy_revision();
     ggml_backend_sched_profile_set_phase(lp_is_prefill ? GGML_BACKEND_SCHED_PROFILE_PREFILL : GGML_BACKEND_SCHED_PROFILE_DECODE);
     {
         const int trace_n_past = ubatch.pos && ubatch.n_tokens > 0 ? (int) ubatch.pos[0] : -1;
@@ -2871,6 +2872,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             state.n_tokens == ubatch.n_tokens &&
             state.n_outputs == n_outputs &&
             state.gtype == gtype &&
+            state.backend_policy_revision == backend_policy_revision &&
             state.backend_policy_profile == backend_policy_profile;
     };
 
@@ -3027,6 +3029,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         graph_cache_active_state.n_outputs = n_outputs;
         graph_cache_active_state.gtype = gtype;
         graph_cache_active_state.backend_policy_profile = backend_policy_profile;
+        graph_cache_active_state.backend_policy_revision = backend_policy_revision;
         graph_cache_active_state.last_used = ++graph_cache_clock;
         graph_cache_capture_active_route();
         graph_cache_active_state.metadata_empty_used_bytes = graph_metadata_empty_used_bytes;
@@ -4786,44 +4789,80 @@ uint64_t llama_context::runtime_route_checkpoint_callback(
     return requested_plan_id;
 }
 
-uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
-    uint64_t res;
-    if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) {
-        res = std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
-    } else {
-        res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
-    }
+void llama_context::graph_policy_budget_update() const {
+    for (;;) {
+        const uint64_t revision = llama_backend_policy_revision();
+        const bool shared_weights = ggml_shared_weights_enabled();
+        const bool shared_weights_repack = ggml_shared_weights_repack_enabled();
+        constexpr std::array<const char *, 4> override_names = {
+            "LLAMA_FFN_PARALLEL", "LLAMA_FFN_PARALLEL_SPLITS",
+            "LLAMA_FFN_PARALLEL_ALIGN", "LLAMA_FFN_PARALLEL_REDUCE_BACKEND",
+        };
+        std::array<const char *, 4> overrides;
+        for (size_t i = 0; i < overrides.size(); ++i) {
+            const char * value = getenv(override_names[i]);
+            overrides[i] = value ? value : "";
+        }
 
+        const auto & cached = graph_policy_budget_cache;
+        if (cached.valid && cached.revision == revision &&
+                cached.runtime_routes == runtime_routes_configured &&
+                cached.attn_qkv_shards == cparams.attn_qkv_shards &&
+                cached.attn_out_shards == cparams.attn_out_shards &&
+                cached.shared_weights == shared_weights &&
+                cached.shared_weights_repack == shared_weights_repack &&
+                cached.backend_count == backends.size() &&
+                std::equal(cached.ffn_overrides.begin(), cached.ffn_overrides.end(), overrides.begin())) {
+            return;
+        }
+
+        graph_policy_budget next;
+        next.revision = revision;
+        next.runtime_routes = runtime_routes_configured;
+        next.attn_qkv_shards = cparams.attn_qkv_shards;
+        next.attn_out_shards = cparams.attn_out_shards;
+        next.shared_weights = shared_weights;
+        next.shared_weights_repack = shared_weights_repack;
+        next.backend_count = backends.size();
+        for (size_t i = 0; i < overrides.size(); ++i) {
+            next.ffn_overrides[i] = overrides[i];
+        }
+
+        graph_policy_budget_compile(next);
+
+        // Each policy accessor takes its own lock. If a catalog was published
+        // during compilation, retry instead of caching a mixed-policy budget.
+        if (llama_backend_policy_revision() != revision) {
+            continue;
+        }
+
+        next.valid = true;
+        graph_policy_budget_cache = std::move(next);
+        LLAMA_LOG_DEBUG(
+                "%s: revision=%" PRIu64 " cover=%" PRIu64 " multiplier=%" PRIu64
+                " qkv=%" PRIu64 " ffn_fallback=%" PRIu64 " norm=%" PRIu64 " attn_out=%" PRIu64 "\n",
+                __func__, revision, graph_policy_budget_cache.cover_nodes,
+                graph_policy_budget_cache.prefill_multiplier, graph_policy_budget_cache.qkv_nodes,
+                graph_policy_budget_cache.ffn_nodes, graph_policy_budget_cache.weighted_norm_nodes,
+                graph_policy_budget_cache.attn_out_nodes);
+        return;
+    }
+}
+
+void llama_context::graph_policy_budget_compile(graph_policy_budget & next) const {
     // A cover-backed FFN processor branch has one up, gate, activation, and
     // down node. Reserve against the connected cover union; this is slightly
     // conservative when an active profile uses only part of that union.
     for (uint32_t il = 0; il < model.hparams.n_layer; ++il) {
         llama_backend_policy_residency_plan plan;
         if (llama_backend_policy_build_ffn_residency_plan((int) il, plan)) {
-            res += 4u * plan.covers.size();
+            next.cover_nodes += 4u * plan.covers.size();
         }
-    }
-
-    if (cparams.attn_qkv_shards && n_tokens > 1) {
-        // Three lanes x Q/K/V region matmuls, six concat nodes, and room for
-        // optional scale/bias/clamp plus canonical reshapes.  Keep this
-        // separate from the ordinary three-projection reserve so enabling the
-        // experiment cannot exhaust graph metadata on all-layer prefill.
-        constexpr uint64_t nodes_per_qkv_sharded_layer = 24;
-        res += (uint64_t) model.hparams.n_layer * nodes_per_qkv_sharded_layer;
-    }
-
-    if (cparams.attn_out_shards && n_tokens > 1) {
-        // Input-axis mode uses three slices plus region matmuls and an ADD
-        // reduction. Output-axis mode replaces those slices with two CONCAT
-        // joins. This reserve covers either mode plus scale/bias metadata.
-        constexpr uint64_t nodes_per_attn_out_sharded_layer = 16;
-        res += (uint64_t) model.hparams.n_layer * nodes_per_attn_out_sharded_layer;
     }
 
     if (runtime_routes_configured) {
         llama_backend_policy_runtime_routes routes;
-        const bool active_runtime_routes = n_tokens > 1 &&
+        const bool active_runtime_routes =
             llama_backend_policy_resolve_runtime_routes(true, routes) &&
             (routes.mode == "clock" || routes.mode == "fixed");
 
@@ -4835,20 +4874,22 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
             // have their own bounded reserves below and must not multiply the
             // entire base graph capacity.
             const uint64_t backend_variants = 1u + backends.size();
-            res *= backend_variants;
+            next.prefill_multiplier = backend_variants;
         }
 
         if (active_runtime_routes &&
                 cparams.attn_qkv_shards &&
                 std::find(routes.candidate_kinds.begin(), routes.candidate_kinds.end(),
                         "attn_qkv_block") != routes.candidate_kinds.end()) {
-            // One QKV topology contains nine REGION matmuls, six CONCAT
-            // nodes, optional post-ops, and three 2D route terminals. The
-            // builder deduplicates inherited ratios, but reserve the full
-            // profile catalog so policy changes remain allocation-safe.
             constexpr uint64_t nodes_per_qkv_variant = 24;
-            res += (uint64_t) model.hparams.n_layer * routes.profiles.size() *
-                nodes_per_qkv_variant;
+            for (uint32_t il = 0; il < model.hparams.n_layer; ++il) {
+                // The Llama builder shares equal effective topologies. Other
+                // architectures keep the original full-catalog upper bound.
+                const size_t variants = model.arch == LLM_ARCH_LLAMA
+                    ? llama_backend_policy_count_attn_qkv_topologies(routes.profiles, (int) il, true)
+                    : routes.profiles.size();
+                next.qkv_nodes += variants * nodes_per_qkv_variant;
+            }
         }
         if (active_runtime_routes &&
                 std::find(routes.candidate_kinds.begin(), routes.candidate_kinds.end(),
@@ -4928,17 +4969,91 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
                     const uint64_t active_splits = std::count_if(
                             topology.policy.splits.begin(), topology.policy.splits.end(),
                             [](const auto & split) { return split.size > 0; });
-                    // Two norm nodes, four nodes per active shard, and at most
-                    // N-1 reduction nodes. Shared mode allows two segments
-                    // (eight ops plus their local sum) per active lane.
-                    // Keep four extra slots for probes or
-                    // future post-ops without assuming that FFN has only three
-                    // processor lanes.
-                    reserved_ffn_nodes += 2u + (ggml_shared_weights_enabled() ? 9u : 4u) * active_splits +
+                    const uint64_t nodes_per_split = next.shared_weights ? 9u : 4u;
+                    uint64_t branch_nodes = nodes_per_split * active_splits;
+                    const auto & layer = model.layers[il];
+                    // Only the ordinary Llama dense builder guarantees a
+                    // contiguous two-dimensional F32 weighted-norm input.
+                    // Other architectures, module graphs, or FFN post-ops
+                    // retain the original bound rather than guessing a shape.
+                    bool can_refine = next.shared_weights && model.arch == LLM_ARCH_LLAMA &&
+                        cparams.module_bench_type == LLAMA_MODULE_BENCH_OFF &&
+                        layer.ffn_gate_inp == nullptr && topology.norm_weight != nullptr &&
+                        layer.ffn_up && layer.ffn_gate && layer.ffn_down &&
+                        !layer.ffn_up_b && !layer.ffn_up_s &&
+                        !layer.ffn_gate_b && !layer.ffn_gate_s &&
+                        !layer.ffn_down_b && !layer.ffn_down_s;
+                    std::vector<graph_policy_budget::ffn_branch> branches;
+                    if (can_refine) {
+                        const int64_t n_ff = layer.ffn_up->ne[1];
+                        const int64_t align = std::max<int64_t>(1, topology.policy.align);
+                        can_refine = n_ff > 0 && layer.ffn_gate->ne[1] == n_ff &&
+                            layer.ffn_down->ne[0] == n_ff &&
+                            layer.ffn_up->ne[0] == model.hparams.n_embd &&
+                            layer.ffn_gate->ne[0] == layer.ffn_up->ne[0] &&
+                            layer.ffn_down->ne[1] == model.hparams.n_embd;
+                        std::vector<llama_backend_policy_ffn_split> splits;
+                        for (const auto & split : topology.policy.splits) {
+                            if (split.size < 0) { can_refine = false; }
+                            if (split.size > 0) { splits.push_back(split); }
+                        }
+                        std::sort(splits.begin(), splits.end(), [](const auto & a, const auto & b) {
+                            return a.start < b.start;
+                        });
+                        int64_t covered = 0;
+                        for (const auto & split : splits) {
+                            if (split.start != covered || split.size > n_ff - covered ||
+                                    split.start % align != 0 || split.size % align != 0 ||
+                                    split.size % ggml_blck_size(layer.ffn_up->type) != 0) {
+                                can_refine = false;
+                                break;
+                            }
+                            covered += split.size;
+                        }
+                        can_refine = can_refine && !splits.empty() && covered == n_ff;
+                        if (can_refine) {
+                            branches.reserve(splits.size());
+                            for (const auto & split : splits) {
+                                graph_policy_budget::ffn_branch branch;
+                                if (!llm_graph_get_ffn_segments(model,
+                                            layer.ffn_up, layer.ffn_gate, layer.ffn_down,
+                                            split.backend, split.start, split.size, branch.segments)) {
+                                    can_refine = false;
+                                    break;
+                                }
+                                branch.backend_hint = split.backend;
+                                // The builder uses the first matching scheduler
+                                // backend. This is also safe before sched exists.
+                                for (const auto & backend : backends) {
+                                    if (llama_backend_policy_backend_matches(backend.get(), split.backend)) {
+                                        branch.backend = backend.get();
+                                        break;
+                                    }
+                                }
+                                branch.input_width = layer.ffn_up->ne[0];
+                                branch.last_layer = il + 1 == model.hparams.n_layer;
+                                const uint64_t segmented_nodes = 5u * branch.segments.size() - 1u;
+                                branch.reserved_nodes = std::max(nodes_per_split, segmented_nodes);
+                                // Do not inherit the old two-segment assumption
+                                // if a future residency plan has more pieces.
+                                branch_nodes += branch.reserved_nodes - nodes_per_split;
+                                branches.push_back(std::move(branch));
+                            }
+                        }
+                    }
+                    if (can_refine) {
+                        for (auto & branch : branches) {
+                            next.ffn_branches.push_back(std::move(branch));
+                        }
+                    }
+                    // Retain two norm nodes, the full N-1 reduction chain,
+                    // and four descriptor slots for probes/post-ops. ADD3/4
+                    // fusion savings are deliberately not part of this bound.
+                    reserved_ffn_nodes += 2u + branch_nodes +
                         (active_splits > 0 ? active_splits - 1u : 0u) + 4u;
                 }
             }
-            res += reserved_ffn_nodes;
+            next.ffn_nodes += reserved_ffn_nodes;
         }
         if (active_runtime_routes &&
                 std::find(routes.candidate_kinds.begin(), routes.candidate_kinds.end(),
@@ -4997,21 +5112,103 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
                 reserved_weighted_norm_nodes +=
                     prepared.size() * nodes_per_weighted_norm_variant;
             }
-            res += reserved_weighted_norm_nodes;
+            next.weighted_norm_nodes += reserved_weighted_norm_nodes;
         }
         if (active_runtime_routes && cparams.attn_out_shards &&
                 std::find(routes.candidate_kinds.begin(), routes.candidate_kinds.end(),
                         "attn_out_block") != routes.candidate_kinds.end()) {
-            // A profile-specific W_O variant contains three REGION matmuls,
-            // up to three input VIEW/CONT pairs for the compatibility axis,
-            // two joins, and optional scale/bias/final naming nodes. Most
-            // clock profiles share a topology and are deduplicated by the
-            // Llama graph builder, but reserve the non-deduplicated upper
-            // bound so policy edits cannot exhaust graph metadata.
             constexpr uint64_t nodes_per_attn_out_variant = 16;
-            res += (uint64_t) model.hparams.n_layer * routes.profiles.size() *
-                nodes_per_attn_out_variant;
+            for (uint32_t il = 0; il < model.hparams.n_layer; ++il) {
+                const size_t variants = model.arch == LLM_ARCH_LLAMA
+                    ? llama_backend_policy_count_attn_out_topologies(routes.profiles, (int) il, true)
+                    : routes.profiles.size();
+                next.attn_out_nodes += variants * nodes_per_attn_out_variant;
+            }
         }
+    }
+}
+
+uint64_t llama_context::graph_policy_ffn_nodes(uint32_t n_tokens) const {
+    auto & budget = graph_policy_budget_cache;
+    // Active adapters disable the parallel builder. Keep the original FFN
+    // reserve; the separate adapter reserve below still counts LoRA nodes.
+    if (loras && !loras->empty()) {
+        return budget.ffn_nodes;
+    }
+    const auto cached = budget.ffn_nodes_by_tokens.find(n_tokens);
+    if (cached != budget.ffn_nodes_by_tokens.end()) {
+        return cached->second;
+    }
+    uint64_t nodes = budget.ffn_nodes;
+    for (const auto & branch : budget.ffn_branches) {
+        const uint64_t columns = branch.last_layer ? 1u : n_tokens;
+        if (branch.input_width <= 0 ||
+                (uint64_t) branch.input_width > std::numeric_limits<size_t>::max() / sizeof(float) ||
+                columns > std::numeric_limits<size_t>::max() / sizeof(float) / (uint64_t) branch.input_width) {
+            continue;
+        }
+        // No ggml context or graph is created for this support-only probe.
+        ggml_tensor input = {};
+        input.type = GGML_TYPE_F32;
+        input.ne[0] = branch.input_width;
+        // graph_max_nodes does not receive n_outputs. Reserve the final layer
+        // for one output column, which always disables composite, even when a
+        // particular reservation graph happens to request all token outputs.
+        input.ne[1] = columns;
+        input.ne[2] = input.ne[3] = 1;
+        input.nb[0] = sizeof(float);
+        for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+            input.nb[i] = input.nb[i - 1] * input.ne[i - 1];
+        }
+        const uint64_t branch_nodes = llm_graph_ffn_segment_nodes(
+                &input, branch.segments, branch.backend_hint, branch.backend);
+        // Normally the complete segmented reserve can only shrink. If this
+        // helper ever acquires additional nodes, grow the bound instead of
+        // turning a sizing inconsistency into an undersized graph or an abort.
+        if (branch_nodes <= branch.reserved_nodes) {
+            nodes -= branch.reserved_nodes - branch_nodes;
+        } else {
+            nodes += branch_nodes - branch.reserved_nodes;
+        }
+    }
+    budget.ffn_nodes_by_tokens.emplace(n_tokens, nodes);
+    LLAMA_LOG_DEBUG("%s: n_tokens=%u ffn=%" PRIu64 " fallback=%" PRIu64 "\n",
+            __func__, n_tokens, nodes, budget.ffn_nodes);
+    return nodes;
+}
+
+uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+    graph_policy_budget_update();
+    const auto & budget = graph_policy_budget_cache;
+    uint64_t res;
+    if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) {
+        res = std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
+    } else {
+        res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
+    }
+
+    res += budget.cover_nodes;
+
+    if (cparams.attn_qkv_shards && n_tokens > 1) {
+        // Three lanes x Q/K/V region matmuls, six concat nodes, and room for
+        // optional scale/bias/clamp plus canonical reshapes.  Keep this
+        // separate from the ordinary three-projection reserve so enabling the
+        // experiment cannot exhaust graph metadata on all-layer prefill.
+        constexpr uint64_t nodes_per_qkv_sharded_layer = 24;
+        res += (uint64_t) model.hparams.n_layer * nodes_per_qkv_sharded_layer;
+    }
+
+    if (cparams.attn_out_shards && n_tokens > 1) {
+        // Input-axis mode uses three slices plus region matmuls and an ADD
+        // reduction. Output-axis mode replaces those slices with two CONCAT
+        // joins. This reserve covers either mode plus scale/bias metadata.
+        constexpr uint64_t nodes_per_attn_out_sharded_layer = 16;
+        res += (uint64_t) model.hparams.n_layer * nodes_per_attn_out_sharded_layer;
+    }
+
+    if (n_tokens > 1) {
+        res = res * budget.prefill_multiplier + budget.qkv_nodes + graph_policy_ffn_nodes(n_tokens) +
+            budget.weighted_norm_nodes + budget.attn_out_nodes;
     }
 
     for (const auto & lora : model.loras) {

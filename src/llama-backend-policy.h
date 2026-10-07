@@ -3,6 +3,7 @@
 #include "ggml-backend.h"
 #include "ggml.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -166,6 +167,10 @@ struct llama_backend_policy_runtime_route_selection {
     double distance = -1.0;
 };
 
+// Catalog revision changes on successful load and clear, not runtime profile
+// selection. It is independent of the process-global policy state's lifetime.
+uint64_t llama_backend_policy_revision();
+
 bool llama_backend_policy_weights_enabled();
 bool llama_backend_policy_ops_enabled();
 bool llama_backend_policy_residency_enabled();
@@ -275,6 +280,19 @@ bool llama_backend_policy_match_attn_qkv_shards_for_profile(
         bool is_prefill,
         llama_backend_policy_attn_qkv_shards & out);
 
+// Share the effective topology equality used by graph construction and
+// metadata reservation. Diagnostic source labels do not affect the topology.
+bool llama_backend_policy_same_attn_qkv_topology(
+        const llama_backend_policy_attn_qkv_shards & lhs,
+        const llama_backend_policy_attn_qkv_shards & rhs);
+
+// Count unique resolved topologies, retaining one conservative slot for each
+// profile that cannot be resolved for this layer and phase.
+size_t llama_backend_policy_count_attn_qkv_topologies(
+        const std::vector<std::string> & profiles,
+        int il,
+        bool is_prefill);
+
 // Resolve the root-level, prefill-only attention output projection policy for
 // one layer. This remains the static fallback when no routed profile is used.
 bool llama_backend_policy_match_attn_out_shards(
@@ -290,6 +308,15 @@ bool llama_backend_policy_match_attn_out_shards_for_profile(
         int il,
         bool is_prefill,
         llama_backend_policy_attn_out_shards & out);
+
+bool llama_backend_policy_same_attn_out_topology(
+        const llama_backend_policy_attn_out_shards & lhs,
+        const llama_backend_policy_attn_out_shards & rhs);
+
+size_t llama_backend_policy_count_attn_out_topologies(
+        const std::vector<std::string> & profiles,
+        int il,
+        bool is_prefill);
 
 // Resolve one prepared profile without mutating the legacy process-global
 // active profile. Layer-boundary plans use this while constructing all FFN

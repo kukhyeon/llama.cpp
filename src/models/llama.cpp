@@ -608,28 +608,6 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                 std::vector<prepared_qkv_topology> prepared;
                 prepared.reserve(runtime_route_profiles.size());
 
-                const auto same_topology = [](const auto & lhs, const auto & rhs) {
-                    if (lhs.enabled != rhs.enabled || lhs.phase != rhs.phase ||
-                            lhs.layer_start != rhs.layer_start || lhs.layer_end != rhs.layer_end ||
-                            lhs.head_dim != rhs.head_dim ||
-                            lhs.lane_activity != rhs.lane_activity ||
-                            lhs.assemble_backend != rhs.assemble_backend ||
-                            lhs.splits.size() != rhs.splits.size()) {
-                        return false;
-                    }
-                    for (size_t i = 0; i < lhs.splits.size(); ++i) {
-                        const auto & a = lhs.splits[i];
-                        const auto & b = rhs.splits[i];
-                        if (a.id != b.id || a.backend != b.backend ||
-                                a.q_start != b.q_start || a.q_size != b.q_size ||
-                                a.k_start != b.k_start || a.k_size != b.k_size ||
-                                a.v_start != b.v_start || a.v_size != b.v_size) {
-                            return false;
-                        }
-                    }
-                    return true;
-                };
-
                 llm_graph_qkv canonical_outputs = {};
                 llama_backend_policy_attn_qkv_shards canonical_policy;
                 for (const std::string & profile : runtime_route_profiles) {
@@ -643,7 +621,7 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
 
                     auto existing = std::find_if(
                             prepared.begin(), prepared.end(), [&](const auto & candidate) {
-                                return same_topology(candidate.policy, policy);
+                                return llama_backend_policy_same_attn_qkv_topology(candidate.policy, policy);
                             });
                     if (existing == prepared.end()) {
                         char route_tag[20];
@@ -798,26 +776,6 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                 std::vector<prepared_attn_out_topology> prepared;
                 prepared.reserve(runtime_route_profiles.size());
 
-                const auto same_topology = [](const auto & lhs, const auto & rhs) {
-                    if (lhs.enabled != rhs.enabled || lhs.phase != rhs.phase ||
-                            lhs.partition_axis != rhs.partition_axis ||
-                            lhs.layer_start != rhs.layer_start || lhs.layer_end != rhs.layer_end ||
-                            lhs.head_dim != rhs.head_dim ||
-                            lhs.reduce_backend != rhs.reduce_backend ||
-                            lhs.splits.size() != rhs.splits.size()) {
-                        return false;
-                    }
-                    for (size_t i = 0; i < lhs.splits.size(); ++i) {
-                        const auto & a = lhs.splits[i];
-                        const auto & b = rhs.splits[i];
-                        if (a.id != b.id || a.start != b.start || a.size != b.size ||
-                                a.backend != b.backend) {
-                            return false;
-                        }
-                    }
-                    return true;
-                };
-
                 ggml_tensor * canonical_out = nullptr;
                 for (const std::string & profile : runtime_route_profiles) {
                     llama_backend_policy_attn_out_shards policy;
@@ -830,7 +788,7 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
 
                     auto existing = std::find_if(
                             prepared.begin(), prepared.end(), [&](const auto & candidate) {
-                                return same_topology(candidate.policy, policy);
+                                return llama_backend_policy_same_attn_out_topology(candidate.policy, policy);
                             });
                     if (existing == prepared.end()) {
                         char route_tag[20];

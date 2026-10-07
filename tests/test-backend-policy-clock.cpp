@@ -2513,9 +2513,207 @@ bool test_compact_unified_ffn_routes(const char * policy_path) {
     return true;
 }
 
+bool test_attention_topology_equality() {
+    llama_backend_policy_attn_qkv_shards qkv;
+    qkv.enabled = true;
+    qkv.phase = "prefill";
+    qkv.layer_start = 0;
+    qkv.layer_end = 27;
+    qkv.lane_activity = "per_projection";
+    qkv.assemble_backend = "OpenCL";
+    qkv.splits = {
+        { "cpu", "CPU", 0, 128, 0, 128, 0, 128 },
+        { "gpu", "OpenCL", 128, 128, 128, 128, 128, 128 },
+    };
+    auto labelled_qkv = qkv;
+    labelled_qkv.source = "profiles.same-ranges.attn_qkv_shards";
+    CHECK(llama_backend_policy_same_attn_qkv_topology(qkv, labelled_qkv));
+
+    const auto qkv_changed = [&](const auto & change) {
+        auto changed = qkv;
+        change(changed);
+        return !llama_backend_policy_same_attn_qkv_topology(qkv, changed) &&
+               !llama_backend_policy_same_attn_qkv_topology(changed, qkv);
+    };
+    // A changed reshape geometry, execution lane, projection ownership, or
+    // join location must not reuse the previous graph variant.
+    CHECK(qkv_changed([](auto & p) { p.head_dim = 64; }));
+    CHECK(qkv_changed([](auto & p) { p.lane_activity = "whole_qkv"; }));
+    CHECK(qkv_changed([](auto & p) { p.assemble_backend = "CPU"; }));
+    CHECK(qkv_changed([](auto & p) { std::swap(p.splits[0], p.splits[1]); }));
+    CHECK(qkv_changed([](auto & p) { p.splits[0].id = "another-lane"; }));
+    CHECK(qkv_changed([](auto & p) { p.splits[0].backend = "HTP0-REPACK"; }));
+    CHECK(qkv_changed([](auto & p) {
+        p.splits[0].q_size = 256;
+        p.splits[1].q_start = 256;
+        p.splits[1].q_size = 0;
+    }));
+    CHECK(qkv_changed([](auto & p) {
+        p.splits[0].k_size = 0;
+        p.splits[1].k_start = 0;
+        p.splits[1].k_size = 256;
+    }));
+    CHECK(qkv_changed([](auto & p) {
+        p.splits[0].v_size = 256;
+        p.splits[1].v_start = 256;
+        p.splits[1].v_size = 0;
+    }));
+
+    llama_backend_policy_attn_out_shards out;
+    out.enabled = true;
+    out.phase = "prefill";
+    out.partition_axis = "output";
+    out.layer_start = 0;
+    out.layer_end = 27;
+    out.reduce_backend = "OpenCL";
+    out.splits = { { "cpu", 0, 128, "CPU" }, { "gpu", 128, 128, "OpenCL" } };
+    auto labelled_out = out;
+    labelled_out.source = "profiles.same-ranges.attn_out_shards";
+    CHECK(llama_backend_policy_same_attn_out_topology(out, labelled_out));
+
+    const auto out_changed = [&](const auto & change) {
+        auto changed = out;
+        change(changed);
+        return !llama_backend_policy_same_attn_out_topology(out, changed) &&
+               !llama_backend_policy_same_attn_out_topology(changed, out);
+    };
+    // Input-axis partial reduction and output-axis concatenation have
+    // different graph/allocation shapes even with identical split widths.
+    CHECK(out_changed([](auto & p) { p.partition_axis = "input"; }));
+    CHECK(out_changed([](auto & p) { p.head_dim = 64; }));
+    CHECK(out_changed([](auto & p) { p.reduce_backend = "CPU"; }));
+    CHECK(out_changed([](auto & p) { std::swap(p.splits[0], p.splits[1]); }));
+    CHECK(out_changed([](auto & p) { p.splits[0].id = "another-lane"; }));
+    CHECK(out_changed([](auto & p) { p.splits[0].backend = "HTP0-REPACK"; }));
+    CHECK(out_changed([](auto & p) {
+        p.splits[0].size = 256;
+        p.splits[1].start = 256;
+        p.splits[1].size = 0;
+    }));
+    return true;
+}
+
+bool test_policy_revision(const char * valid_path, const char * invalid_path) {
+    const uint64_t before_clear = llama_backend_policy_revision();
+    llama_backend_policy_clear();
+    CHECK(llama_backend_policy_revision() > before_clear);
+    const uint64_t cleared = llama_backend_policy_revision();
+    CHECK(llama_backend_policy_load(valid_path, false, false));
+    const uint64_t loaded = llama_backend_policy_revision();
+    CHECK(loaded > cleared);
+
+    const auto selected = llama_backend_policy_select_ffn_clock_profile(
+            10, 4, 1000, 1000, 1000000);
+    CHECK(selected_profile(selected, "slow"));
+    llama_backend_policy_update_runtime_profile(true);
+    CHECK(llama_backend_policy_revision() == loaded);
+    const std::string active_before = llama_backend_policy_active_profile();
+    CHECK(!llama_backend_policy_load(invalid_path, false, false));
+    CHECK(llama_backend_policy_revision() == loaded);
+    CHECK(std::string(llama_backend_policy_active_profile()) == active_before);
+    CHECK(llama_backend_policy_ffn_clock_switch_enabled());
+
+    llama_backend_policy_reset_ffn_clock_profile();
+    llama_backend_policy_update_runtime_profile(false);
+    CHECK(llama_backend_policy_revision() == loaded);
+    // Republishing the same file is still a new policy snapshot for a bound
+    // cache, even when its authored profiles happen to be unchanged.
+    CHECK(llama_backend_policy_load(valid_path, false, false));
+    CHECK(llama_backend_policy_revision() > loaded);
+    const uint64_t reloaded = llama_backend_policy_revision();
+    llama_backend_policy_clear();
+    CHECK(llama_backend_policy_revision() > reloaded);
+    return true;
+}
+
+bool test_attention_topology_catalog(
+        const char * policy_path, size_t expected_profiles,
+        size_t expected_qkv, size_t expected_out) {
+    llama_backend_policy_clear();
+    // Weighted norm routes require their authored op rules to be enabled even
+    // though this test only resolves policy data and executes no graph.
+    CHECK(llama_backend_policy_load(policy_path, false, true));
+    std::vector<std::string> profiles;
+    CHECK(llama_backend_policy_list_runtime_route_profiles(true, profiles));
+    CHECK(profiles.size() == expected_profiles);
+    for (int il = 0; il < 28; ++il) {
+        CHECK(llama_backend_policy_count_attn_qkv_topologies(profiles, il, true) == expected_qkv);
+        CHECK(llama_backend_policy_count_attn_out_topologies(profiles, il, true) == expected_out);
+    }
+    llama_backend_policy_clear();
+    return true;
+}
+
+bool test_inherited_attention_topology_catalog() {
+    static constexpr char policy[] = R"JSON(
+{
+  "enabled": true,
+  "attn_qkv_shards": {
+    "enabled": true, "head_dim": 128, "layer_range": [0,27], "assemble_backend": "OpenCL",
+    "split_layout": [{"id":"cpu","backend":"CPU","align":128},
+                     {"id":"gpu","backend":"OpenCL","align":128},
+                     {"id":"npu","backend":"HTP0-REPACK","align":256}],
+    "split_sizes": {"q":{"cpu":256,"gpu":256,"npu":0},
+                    "k":{"cpu":256,"gpu":256,"npu":0},
+                    "v":{"cpu":256,"gpu":256,"npu":0}}
+  },
+  "attn_out_shards": {
+    "enabled": true, "partition_axis": "output", "head_dim": 128, "layer_range": [0,27],
+    "reduce_backend": "OpenCL",
+    "split_layout": [{"id":"cpu","backend":"CPU","align":128},
+                     {"id":"gpu","backend":"OpenCL","align":128},
+                     {"id":"npu","backend":"HTP0-REPACK","align":256}],
+    "split_sizes": {"cpu":256,"gpu":256,"npu":0}
+  },
+  "profiles": {
+    "inherited": {},
+    "duplicate": {
+      "attn_qkv_shards": {"split_sizes":{"q":{"cpu":256,"gpu":256,"npu":0},
+                                          "k":{"cpu":256,"gpu":256,"npu":0},
+                                          "v":{"cpu":256,"gpu":256,"npu":0}}},
+      "attn_out_shards": {"split_sizes":{"cpu":256,"gpu":256,"npu":0}}
+    },
+    "qkv-shifted": {
+      "attn_qkv_shards": {"split_sizes":{"q":{"cpu":384,"gpu":128,"npu":0},
+                                          "k":{"cpu":256,"gpu":256,"npu":0},
+                                          "v":{"cpu":256,"gpu":256,"npu":0}}}
+    },
+    "out-shifted": {"attn_out_shards":{"split_sizes":{"cpu":128,"gpu":384,"npu":0}}}
+  },
+  "runtime_routes": {
+    "enabled": true, "mode": "fixed", "phase": "prefill",
+    "initial_profile": "inherited",
+    "profiles": ["inherited","duplicate","qkv-shifted","out-shifted"],
+    "transitions": "complete", "candidate_kinds": ["attn_qkv_block","attn_out_block"]
+  }
+}
+)JSON";
+    temporary_policy_file file("test-backend-policy-inherited-topologies.json", policy);
+    // Four differently named profiles create only two distinct topologies in
+    // each attention module. Inheritance and explicit duplicate overrides
+    // must not multiply the graph's metadata bound.
+    CHECK(test_attention_topology_catalog(file.path(), 4, 2, 2));
+    CHECK(llama_backend_policy_load(file.path(), false, true));
+    std::vector<std::string> profiles;
+    CHECK(llama_backend_policy_list_runtime_route_profiles(true, profiles));
+    // An unmatched layer/phase is not an empty topology that can be merged:
+    // reserve a conservative slot for every unresolved candidate instead.
+    CHECK(llama_backend_policy_count_attn_qkv_topologies(profiles, 28, true) == 4);
+    CHECK(llama_backend_policy_count_attn_out_topologies(profiles, 28, true) == 4);
+    CHECK(llama_backend_policy_count_attn_qkv_topologies(profiles, 0, false) == 4);
+    CHECK(llama_backend_policy_count_attn_out_topologies(profiles, 0, false) == 4);
+    const std::vector<std::string> mixed = { "inherited", "duplicate", "missing-a", "missing-b" };
+    CHECK(llama_backend_policy_count_attn_qkv_topologies(mixed, 0, true) == 3);
+    CHECK(llama_backend_policy_count_attn_out_topologies(mixed, 0, true) == 3);
+    CHECK(llama_backend_policy_count_attn_qkv_topologies({}, 0, true) == 0);
+    CHECK(llama_backend_policy_count_attn_out_topologies({}, 0, true) == 0);
+    llama_backend_policy_clear();
+    return true;
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char ** argv) {
     static const char * valid_policy = R"JSON(
 {
   "enabled": true,
@@ -3229,6 +3427,22 @@ int main() {
             return 1;
         }
         if (!test_compact_unified_ffn_routes(compact_unified_ffn_route_file.path())) {
+            llama_backend_policy_clear();
+            return 1;
+        }
+        if (!test_attention_topology_equality() ||
+                !test_inherited_attention_topology_catalog() ||
+                !test_policy_revision(valid_file.path(), invalid_file.path())) {
+            llama_backend_policy_clear();
+            return 1;
+        }
+        // Optional host-only validation of an existing catalog; its policy
+        // contents are read in place, never copied into a test fixture.
+        if (argc != 1 && (argc != 6 || std::string(argv[1]) != "--catalog")) {
+            throw std::runtime_error("usage: test-backend-policy-clock [--catalog path profiles qkv out]");
+        }
+        if (argc == 6 && !test_attention_topology_catalog(
+                argv[2], std::stoull(argv[3]), std::stoull(argv[4]), std::stoull(argv[5]))) {
             llama_backend_policy_clear();
             return 1;
         }

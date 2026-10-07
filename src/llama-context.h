@@ -266,6 +266,45 @@ public:
             void * user_data);
 
 private:
+    // Model residency and the full route catalog determine these bounds.
+    // Ordinary clock-profile selection does not change the prepared union.
+    struct graph_policy_budget {
+        bool valid = false;
+        uint64_t revision = 0;
+        bool runtime_routes = false;
+        bool attn_qkv_shards = false;
+        bool attn_out_shards = false;
+        bool shared_weights = false;
+        bool shared_weights_repack = false;
+        size_t backend_count = 0;
+        std::array<std::string, 4> ffn_overrides;
+
+        uint64_t cover_nodes = 0;
+        uint64_t prefill_multiplier = 1;
+        uint64_t qkv_nodes = 0;
+        uint64_t ffn_nodes = 0; // full segmented fallback, before shape-specific savings
+        uint64_t weighted_norm_nodes = 0;
+        uint64_t attn_out_nodes = 0;
+
+        struct ffn_branch {
+            std::vector<llm_graph_ffn_segment> segments;
+            std::string backend_hint;
+            ggml_backend_t backend = nullptr;
+            int64_t input_width = 0;
+            uint64_t reserved_nodes = 0;
+            bool last_layer = false;
+        };
+        std::vector<ffn_branch> ffn_branches;
+        // Capability probes use the exact token shape, once per shape. The
+        // physical residency catalog above is compiled only once per policy.
+        std::map<uint32_t, uint64_t> ffn_nodes_by_tokens;
+    };
+
+    mutable graph_policy_budget graph_policy_budget_cache;
+    void graph_policy_budget_update() const;
+    void graph_policy_budget_compile(graph_policy_budget & budget) const;
+    uint64_t graph_policy_ffn_nodes(uint32_t n_tokens) const;
+
     llm_graph_params graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
@@ -326,6 +365,7 @@ private:
         uint32_t n_outputs = 0;
         llm_graph_type gtype = LLM_GRAPH_TYPE_DEFAULT;
         std::string backend_policy_profile;
+        uint64_t backend_policy_revision = 0;
         size_t max_nodes = 0;
         uint64_t last_used = 0;
         graph_cache_route_state route;

@@ -5,6 +5,7 @@
 
 #include "../ggml/src/ggml-backend-impl.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstdlib>
@@ -38,6 +39,7 @@ struct fixture {
     ggml_backend_device device {};
     ggml_backend backend {};
     int probes = 0;
+    bool reject_all = false;
     bool reject_down = false;
 
     fixture() : ctx(ggml_init({1024 * 1024, nullptr, true})) {
@@ -52,7 +54,7 @@ struct fixture {
             ggml_mul_mat_src0_composite_params params;
             REQUIRE(ggml_mul_mat_src0_composite_get_params(op, &params));
             REQUIRE(ggml_shared_weights_supports_op(op));
-            return !(self.reject_down && params.axis == 0);
+            return !self.reject_all && !(self.reject_down && params.axis == 0);
         };
         backend.device = &device;
     }
@@ -61,11 +63,12 @@ struct fixture {
         ggml_free(ctx);
     }
     llm_graph_ffn_segment segment(bool shared, int64_t width,
-            int64_t local_start, int64_t size, int64_t global_start) {
+            int64_t local_start, int64_t size, int64_t global_start,
+            int64_t output_width = 3072) {
         auto * buffer = shared ? &shared_buffer : &native_buffer;
         auto * up = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 3072, width);
         auto * gate = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 3072, width);
-        auto * down = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, width, 3072);
+        auto * down = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, width, output_width);
         up->buffer = gate->buffer = down->buffer = buffer;
         ggml_set_name(up, "weight_up");
         ggml_set_name(gate, "weight_gate");
@@ -81,8 +84,11 @@ struct fixture {
 };
 
 void check_branch(fixture & f, const std::vector<llm_graph_ffn_segment> & segments,
-        int64_t tokens, const std::string & hint, bool composite, bool backend_present = true) {
-    auto * input = ggml_new_tensor_2d(f.ctx, GGML_TYPE_F32, 3072, tokens);
+        int64_t tokens, const std::string & hint, bool composite, bool backend_present = true,
+        ggml_type input_type = GGML_TYPE_F32, bool contiguous_input = true) {
+    REQUIRE(!segments.empty());
+    auto * input = ggml_new_tensor_2d(f.ctx, input_type, 3072, tokens);
+    if (!contiguous_input) { input->nb[1] += ggml_type_size(input_type); }
     ggml_set_name(input, "ffn_input");
     const std::string suffix = ".t256-p15-g15-gpu14." + std::string(hint == "CPU_REPACK" ? "cpu" : "gpu");
     std::vector<std::array<unsigned char, sizeof(ggml_tensor)>> original_weights;
@@ -92,6 +98,12 @@ void check_branch(fixture & f, const std::vector<llm_graph_ffn_segment> & segmen
             std::memcpy(original_weights.back().data(), weight, sizeof(*weight));
         }
     }
+    const int expected_nodes = composite ? 4 : 4 * int(segments.size()) + int(segments.size()) - 1;
+    const size_t used_before_prediction = ggml_used_mem(f.ctx);
+    const uint64_t predicted_nodes = llm_graph_ffn_segment_nodes(
+            input, segments, hint, backend_present ? &f.backend : nullptr);
+    REQUIRE(ggml_used_mem(f.ctx) == used_before_prediction);
+    REQUIRE(predicted_nodes == uint64_t(expected_nodes));
     std::vector<ggml_tensor *> emitted;
     auto * result = llm_graph_build_ffn_segment_branch(f.ctx, input, segments,
             hint, suffix, backend_present ? &f.backend : nullptr,
@@ -100,10 +112,14 @@ void check_branch(fixture & f, const std::vector<llm_graph_ffn_segment> & segmen
                 ggml_set_name(node, name);
                 emitted.push_back(node);
             });
-    REQUIRE(result != nullptr && result->ne[0] == 3072 && result->ne[1] == tokens);
-    auto * graph = ggml_new_graph_custom(f.ctx, 64, false);
+    REQUIRE(result != nullptr && result->ne[0] == segments[0].down->ne[1] && result->ne[1] == tokens);
+    // GGML uses the same capacity for node and leaf arrays. A four-node
+    // composite branch still references six distinct weight leaves plus its
+    // input, so account for those leaves without a fixed oversized capacity.
+    const size_t graph_capacity = std::max<uint64_t>(predicted_nodes, 3 * segments.size() + 1);
+    auto * graph = ggml_new_graph_custom(f.ctx, graph_capacity, false);
     ggml_build_forward_expand(graph, result);
-    const int expected_nodes = composite || segments.size() == 1 ? 4 : 9;
+    REQUIRE(uint64_t(ggml_graph_n_nodes(graph)) <= predicted_nodes);
     REQUIRE(ggml_graph_n_nodes(graph) == expected_nodes);
     REQUIRE(int(emitted.size()) == expected_nodes);
     int allocated_composite_nodes = 0;
@@ -125,9 +141,9 @@ void check_branch(fixture & f, const std::vector<llm_graph_ffn_segment> & segmen
             REQUIRE(std::string(node->name).find(".segment") == std::string::npos);
         }
     }
-    REQUIRE(matmuls == (composite || segments.size() == 1 ? 3 : 6));
-    REQUIRE(glus == (composite || segments.size() == 1 ? 1 : 2));
-    REQUIRE(adds == (composite || segments.size() == 1 ? 0 : 1));
+    REQUIRE(matmuls == (composite ? 3 : 3 * int(segments.size())));
+    REQUIRE(glus == (composite ? 1 : int(segments.size())));
+    REQUIRE(adds == (composite ? 0 : int(segments.size()) - 1));
     if (composite) {
         REQUIRE(emitted[0]->src[1] == input && emitted[1]->src[1] == input);
         REQUIRE(emitted[2]->src[0] == emitted[1] && emitted[2]->src[1] == emitted[0]);
@@ -146,7 +162,7 @@ void check_branch(fixture & f, const std::vector<llm_graph_ffn_segment> & segmen
         }
         REQUIRE(emitted[2]->ne[0] == segments[0].size + segments[1].size);
         REQUIRE(std::string(result->name) == "ffn_down" + suffix);
-    } else if (segments.size() == 2) {
+    } else if (segments.size() > 1) {
         REQUIRE(std::string(result->name) == "ffn_segment_sum" + suffix);
         REQUIRE(std::string(emitted[0]->name) == "ffn_up" + suffix + ".segment0");
         REQUIRE(std::string(emitted[4]->name) == "ffn_up" + suffix + ".segment1");
@@ -166,7 +182,7 @@ void run_tests(bool repack_disabled) {
             fixture f;
             const bool composite = !repack_disabled && tokens >= 4;
             check_branch(f, f.segments(cpu), tokens, hint, composite);
-            REQUIRE(f.probes == (composite ? 3 : 0));
+            REQUIRE(f.probes == (composite ? 6 : 0));
         }
         // Rejecting the final probe must leave a wholly segmented graph with
         // no unreachable composite nodes accidentally emitted by the builder.
@@ -174,7 +190,13 @@ void run_tests(bool repack_disabled) {
             fixture f;
             f.reject_down = true;
             check_branch(f, f.segments(cpu), 256, hint, false);
-            REQUIRE(f.probes == (repack_disabled ? 0 : 3));
+            REQUIRE(f.probes == (repack_disabled ? 0 : 6));
+        }
+        {
+            fixture f;
+            f.reject_all = true;
+            check_branch(f, f.segments(cpu), 256, hint, false);
+            REQUIRE(f.probes == (repack_disabled ? 0 : 2));
         }
         {
             fixture f;
@@ -199,6 +221,48 @@ void run_tests(bool repack_disabled) {
             check_branch(f, segments, 256, hint, false);
             REQUIRE(f.probes == 0);
         }
+        {
+            fixture f;
+            const std::vector<llm_graph_ffn_segment> segments = {
+                f.segment(false, 512, 0, 512, 0),
+                f.segment(true, 6656, 0, 2048, 512),
+                f.segment(false, 448, 0, 448, 2560),
+            };
+            check_branch(f, segments, 256, hint, false);
+            REQUIRE(f.probes == 0);
+        }
+        // These inputs remain valid for the REGION fallback but violate the
+        // narrower composite contract. Prediction must cover the whole graph.
+        {
+            fixture f;
+            check_branch(f, f.segments(cpu), 256, hint, false, true, GGML_TYPE_F16);
+            REQUIRE(f.probes == 0);
+        }
+        {
+            fixture f;
+            check_branch(f, f.segments(cpu), 256, hint, false, true, GGML_TYPE_F32, false);
+            REQUIRE(f.probes == 0);
+        }
+        {
+            fixture f;
+            const std::vector<llm_graph_ffn_segment> segments = {
+                f.segment(false, 960, 0, 960, 0, 3073),
+                f.segment(true, 6656, 0, 2048, 960, 3073),
+            };
+            check_branch(f, segments, 256, hint, false);
+            REQUIRE(f.probes == 0);
+        }
+    }
+    {
+        fixture f;
+        auto * input = ggml_new_tensor_2d(f.ctx, GGML_TYPE_F32, 3072, 256);
+        const size_t used = ggml_used_mem(f.ctx);
+        REQUIRE(llm_graph_ffn_segment_nodes(input, {}, "OpenCL", &f.backend) == 0);
+        REQUIRE(ggml_used_mem(f.ctx) == used);
+        REQUIRE(llm_graph_build_ffn_segment_branch(f.ctx, input, {}, "OpenCL", "", &f.backend,
+                [](ggml_tensor *, const char *, const char *) { REQUIRE(false); }) == nullptr);
+        REQUIRE(ggml_used_mem(f.ctx) == used);
+        REQUIRE(f.probes == 0);
     }
     fixture f;
     check_branch(f, f.segments(false), 256, "HTP0", false);

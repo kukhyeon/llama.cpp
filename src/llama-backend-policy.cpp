@@ -7,6 +7,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -132,6 +133,7 @@ struct policy_state {
 
 std::mutex g_policy_mutex;
 policy_state g_policy;
+std::atomic<uint64_t> g_policy_revision { 0 };
 
 std::string lower(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
@@ -2399,6 +2401,7 @@ bool llama_backend_policy_load(const char * path, bool enable_weights, bool enab
         }
 
         g_policy = std::move(next);
+        g_policy_revision.fetch_add(1, std::memory_order_release);
 
         LLAMA_LOG_INFO("backend_policy: loaded '%s' (weights=%s, weight_rules=%zu, ops=%s, op_rules=%zu, residency=%s, residency_rules=%zu, ffn_parallel=%s, attn_qkv_shards=%s, attn_out_shards=%s, ffn_clock_switch=%s, profiles=%zu)\n",
                 g_policy.path.c_str(),
@@ -2429,6 +2432,11 @@ bool llama_backend_policy_load(const char * path, bool enable_weights, bool enab
 void llama_backend_policy_clear(void) {
     std::lock_guard<std::mutex> lock(g_policy_mutex);
     g_policy = {};
+    g_policy_revision.fetch_add(1, std::memory_order_release);
+}
+
+uint64_t llama_backend_policy_revision() {
+    return g_policy_revision.load(std::memory_order_relaxed);
 }
 
 bool llama_backend_policy_weights_enabled() {
@@ -3010,6 +3018,102 @@ bool llama_backend_policy_match_ffn_parallel(
     }
 
     return true;
+}
+
+bool llama_backend_policy_same_attn_qkv_topology(
+        const llama_backend_policy_attn_qkv_shards & lhs,
+        const llama_backend_policy_attn_qkv_shards & rhs) {
+    if (lhs.enabled != rhs.enabled || lhs.phase != rhs.phase ||
+            lhs.layer_start != rhs.layer_start || lhs.layer_end != rhs.layer_end ||
+            lhs.head_dim != rhs.head_dim ||
+            lhs.lane_activity != rhs.lane_activity ||
+            lhs.assemble_backend != rhs.assemble_backend ||
+            lhs.splits.size() != rhs.splits.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < lhs.splits.size(); ++i) {
+        const auto & a = lhs.splits[i];
+        const auto & b = rhs.splits[i];
+        if (a.id != b.id || a.backend != b.backend ||
+                a.q_start != b.q_start || a.q_size != b.q_size ||
+                a.k_start != b.k_start || a.k_size != b.k_size ||
+                a.v_start != b.v_start || a.v_size != b.v_size) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool llama_backend_policy_same_attn_out_topology(
+        const llama_backend_policy_attn_out_shards & lhs,
+        const llama_backend_policy_attn_out_shards & rhs) {
+    if (lhs.enabled != rhs.enabled || lhs.phase != rhs.phase ||
+            lhs.partition_axis != rhs.partition_axis ||
+            lhs.layer_start != rhs.layer_start || lhs.layer_end != rhs.layer_end ||
+            lhs.head_dim != rhs.head_dim ||
+            lhs.reduce_backend != rhs.reduce_backend ||
+            lhs.splits.size() != rhs.splits.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < lhs.splits.size(); ++i) {
+        const auto & a = lhs.splits[i];
+        const auto & b = rhs.splits[i];
+        if (a.id != b.id || a.start != b.start || a.size != b.size ||
+                a.backend != b.backend) {
+            return false;
+        }
+    }
+    return true;
+}
+
+size_t llama_backend_policy_count_attn_qkv_topologies(
+        const std::vector<std::string> & profiles,
+        int il,
+        bool is_prefill) {
+    std::vector<llama_backend_policy_attn_qkv_shards> prepared;
+    prepared.reserve(profiles.size());
+    size_t unresolved = 0;
+    for (const std::string & profile : profiles) {
+        llama_backend_policy_attn_qkv_shards candidate;
+        if (!llama_backend_policy_match_attn_qkv_shards_for_profile(
+                    profile.c_str(), il, is_prefill, candidate)) {
+            ++unresolved;
+            continue;
+        }
+        const bool duplicate = std::any_of(
+                prepared.begin(), prepared.end(), [&](const auto & existing) {
+                    return llama_backend_policy_same_attn_qkv_topology(existing, candidate);
+                });
+        if (!duplicate) {
+            prepared.push_back(std::move(candidate));
+        }
+    }
+    return unresolved + prepared.size();
+}
+
+size_t llama_backend_policy_count_attn_out_topologies(
+        const std::vector<std::string> & profiles,
+        int il,
+        bool is_prefill) {
+    std::vector<llama_backend_policy_attn_out_shards> prepared;
+    prepared.reserve(profiles.size());
+    size_t unresolved = 0;
+    for (const std::string & profile : profiles) {
+        llama_backend_policy_attn_out_shards candidate;
+        if (!llama_backend_policy_match_attn_out_shards_for_profile(
+                    profile.c_str(), il, is_prefill, candidate)) {
+            ++unresolved;
+            continue;
+        }
+        const bool duplicate = std::any_of(
+                prepared.begin(), prepared.end(), [&](const auto & existing) {
+                    return llama_backend_policy_same_attn_out_topology(existing, candidate);
+                });
+        if (!duplicate) {
+            prepared.push_back(std::move(candidate));
+        }
+    }
+    return unresolved + prepared.size();
 }
 
 bool llama_backend_policy_match_attn_qkv_shards(

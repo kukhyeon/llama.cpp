@@ -186,6 +186,54 @@ static bool ffn_composite_eligible(
         ggml_backend_supports_op(backend, &down);
 }
 
+bool llm_graph_get_ffn_segments(
+        const llama_model & model,
+        ggml_tensor * up, ggml_tensor * gate, ggml_tensor * down,
+        const std::string & backend, int64_t start, int64_t size,
+        std::vector<llm_graph_ffn_segment> & result) {
+    result.clear();
+    if (!up || !gate || !down) {
+        return false;
+    }
+    const auto segments = model.get_backend_policy_resident_segments(up, backend, 1, start, size);
+    if (segments.empty()) {
+        return false;
+    }
+    result.reserve(segments.size());
+    for (const auto & up_cover : segments) {
+        const int64_t segment_start = up_cover.cover_start + up_cover.local_start;
+        const int64_t segment_size = up_cover.active_size;
+        const auto gate_cover = model.get_backend_policy_resident_cover(gate, backend, 1, segment_start, segment_size);
+        const auto down_cover = model.get_backend_policy_resident_cover(down, backend, 0, segment_start, segment_size);
+        if (!gate_cover.tensor || !down_cover.tensor ||
+                up_cover.cover_start != gate_cover.cover_start ||
+                up_cover.cover_start != down_cover.cover_start ||
+                up_cover.cover_size != gate_cover.cover_size ||
+                up_cover.cover_size != down_cover.cover_size ||
+                up_cover.tensor->ne[0] != up->ne[0] ||
+                gate_cover.tensor->ne[0] != gate->ne[0] ||
+                down_cover.tensor->ne[1] != down->ne[1]) {
+            result.clear();
+            return false;
+        }
+        result.push_back({up_cover.tensor, gate_cover.tensor, down_cover.tensor,
+                up_cover.local_start, segment_size, segment_start});
+    }
+    return true;
+}
+
+uint64_t llm_graph_ffn_segment_nodes(
+        ggml_tensor * input,
+        const std::vector<llm_graph_ffn_segment> & segments,
+        const std::string & backend_hint,
+        ggml_backend_t backend) {
+    if (segments.empty()) {
+        return 0;
+    }
+    return ffn_composite_eligible(input, segments, backend_hint, backend)
+        ? 4u : 4u * segments.size() + segments.size() - 1u;
+}
+
 ggml_tensor * llm_graph_build_ffn_segment_branch(
         ggml_context * ctx,
         ggml_tensor * input,
@@ -2495,33 +2543,14 @@ ggml_tensor * llm_graph_context::build_ffn(
             branch_outs.reserve(exec_splits.size());
 
             for (const auto & split : exec_splits) {
-                const auto segments = model->get_backend_policy_resident_segments(
-                    up, split.backend, 1, split.start, split.size);
-                if (segments.empty()) { valid = false; break; }
                 const std::string branch_suffix = route_suffix + "." +
                     (split.id.empty() ? split.backend : split.id);
                 std::vector<llm_graph_ffn_segment> branch_segments;
-                branch_segments.reserve(segments.size());
-                for (size_t si = 0; si < segments.size(); ++si) {
-                    const auto & up_cover = segments[si];
-                    const int64_t start = up_cover.cover_start + up_cover.local_start;
-                    const int64_t size = up_cover.active_size;
-                    const auto gate_cover = model->get_backend_policy_resident_cover(gate, split.backend, 1, start, size);
-                    const auto down_cover = model->get_backend_policy_resident_cover(down, split.backend, 0, start, size);
-                    if (!gate_cover.tensor || !down_cover.tensor ||
-                            up_cover.cover_start != gate_cover.cover_start ||
-                            up_cover.cover_start != down_cover.cover_start ||
-                            up_cover.cover_size != gate_cover.cover_size ||
-                            up_cover.cover_size != down_cover.cover_size ||
-                            up_cover.tensor->ne[0] != up->ne[0] ||
-                            gate_cover.tensor->ne[0] != gate->ne[0] ||
-                            down_cover.tensor->ne[1] != down->ne[1]) {
-                        valid = false; break;
-                    }
-                    branch_segments.push_back({up_cover.tensor, gate_cover.tensor, down_cover.tensor,
-                            up_cover.local_start, size, start});
+                if (!llm_graph_get_ffn_segments(*model, up, gate, down,
+                            split.backend, split.start, split.size, branch_segments)) {
+                    valid = false;
+                    break;
                 }
-                if (!valid) { break; }
                 ggml_backend_t branch_backend = nullptr;
                 if (sched != nullptr) {
                     for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {

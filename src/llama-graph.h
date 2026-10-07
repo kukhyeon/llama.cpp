@@ -53,6 +53,22 @@ struct llm_graph_ffn_segment {
     int64_t global_start = 0;
 };
 
+// Resolve the same physical up/gate/down pieces for construction and sizing.
+// This only reads model residency metadata; it creates no graph tensors.
+bool llm_graph_get_ffn_segments(
+        const llama_model & model,
+        ggml_tensor * up, ggml_tensor * gate, ggml_tensor * down,
+        const std::string & backend, int64_t start, int64_t size,
+        std::vector<llm_graph_ffn_segment> & result);
+
+// Uses the builder's composite preflight, including all backend support probes.
+// Otherwise count every physical segment and its local reduction ADD.
+uint64_t llm_graph_ffn_segment_nodes(
+        ggml_tensor * input,
+        const std::vector<llm_graph_ffn_segment> & segments,
+        const std::string & backend_hint,
+        ggml_backend_t backend);
+
 // The production FFN builder and its host-only topology test share this helper.
 // Eligible shared/native pairs form three composite matmuls and one SwiGLU;
 // unsupported backends/shapes retain the existing per-segment graph.
