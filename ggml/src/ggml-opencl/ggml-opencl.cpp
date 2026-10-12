@@ -9,6 +9,7 @@
 
 #include "ggml-opencl.h"
 #include "ggml-backend.h"
+#include "ggml-e2e-trace.h"
 #include "ggml-shared-weights.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
@@ -730,6 +731,223 @@ struct ggml_backend_opencl_context {
 
     std::vector<ProfilingInfo> profiling_info;
 
+    struct e2e_command_event {
+        cl_event event;
+        int query_id;
+        ggml_e2e_category category;
+        int64_t enqueue_before_us;
+        int64_t enqueue_after_us;
+        const char * detail;
+    };
+    bool e2e_profiling_enabled = false;
+    size_t e2e_timer_resolution_ns = 0;
+    // Retained until the request window closes; the e2e trace collector then
+    // queries device timestamps, so no profiling call runs at sync points.
+    std::mutex e2e_events_mutex;
+    std::vector<e2e_command_event> e2e_events;
+    bool e2e_collector_registered = false;
+    std::map<cl_kernel, std::string> e2e_kernel_names;
+
+    template <typename Enqueue>
+    cl_int enqueue_e2e_command(cl_event * event, ggml_e2e_category category,
+            cl_kernel kernel, const char * detail, Enqueue enqueue) {
+        const bool active = ggml_e2e_trace_active();
+        const int query_id = active ? ggml_e2e_trace_query_id() : -1;
+        if (!active || !e2e_profiling_enabled || e2e_timer_resolution_ns == 0) {
+            if (active) {
+                ggml_e2e_trace_missing(query_id, "OpenCL", "profiling_queue_or_timer_unavailable");
+            }
+            return enqueue(event);
+        }
+
+        if (kernel != nullptr) {
+            try {
+                auto name_it = e2e_kernel_names.find(kernel);
+                if (name_it == e2e_kernel_names.end()) {
+                    char kernel_name[512] = {};
+                    if (clGetKernelInfo(kernel, CL_KERNEL_FUNCTION_NAME, sizeof(kernel_name), kernel_name, nullptr) != CL_SUCCESS) {
+                        ggml_e2e_trace_missing(query_id, "OpenCL", "kernel_name_unavailable");
+                        return enqueue(event);
+                    }
+                    name_it = e2e_kernel_names.emplace(kernel, kernel_name).first;
+                }
+                detail = name_it->second.c_str();
+            } catch (...) {
+                ggml_e2e_trace_missing(query_id, "OpenCL", "kernel_metadata_allocation_failed");
+                return enqueue(event);
+            }
+            if (category == GGML_E2E_COMPUTE) {
+                // Classify before registering an expected model event: a
+                // MUL_MAT dispatch also contains activation/weight transforms.
+                if (strncmp(detail, "kernel_transpose", 16) == 0 ||
+                        strncmp(detail, "kernel_repack", 13) == 0 ||
+                        strncmp(detail, "kernel_convert", 14) == 0 ||
+                        strncmp(detail, "kernel_restore", 14) == 0 ||
+                        strcmp(detail, "kernel_cpy_f16_f32") == 0 ||
+                        strcmp(detail, "kernel_cpy_f32_f16") == 0) {
+                    category = GGML_E2E_TRANSFORM;
+                } else if (strncmp(detail, "kernel_cpy_", 11) == 0 ||
+                        strncmp(detail, "kernel_concat", 13) == 0) {
+                    category = GGML_E2E_COMMUNICATION;
+                }
+            }
+        }
+
+        cl_event trace_event = nullptr;
+        const int64_t before_us = ggml_time_us();
+        const cl_int err = enqueue(event ? event : &trace_event);
+        const int64_t after_us = ggml_time_us();
+        if (err == CL_SUCCESS) {
+            if (event) {
+                trace_event = *event;
+                // Preserve the existing caller's wait/release ownership.
+                if (clRetainEvent(trace_event) != CL_SUCCESS) {
+                    ggml_e2e_trace_missing(query_id, "OpenCL", "trace_event_retain_failed");
+                    return err;
+                }
+            }
+            try {
+                std::lock_guard<std::mutex> lock(e2e_events_mutex);
+                e2e_events.push_back({trace_event, query_id, category, before_us, after_us, detail});
+            } catch (...) {
+                clReleaseEvent(trace_event);
+                ggml_e2e_trace_missing(query_id, "OpenCL", "trace_event_allocation_failed");
+                return err;
+            }
+            if (category == GGML_E2E_COMPUTE) {
+                ggml_e2e_trace_expect_compute(query_id, "OpenCL");
+            }
+        } else {
+            ggml_e2e_trace_missing(query_id, "OpenCL", "command_enqueue_failed");
+        }
+        return err;
+    }
+
+    cl_int enqueue_e2e_kernel(
+            cl_kernel kernel, cl_uint work_dim, const size_t * global_offset,
+            const size_t * global_size, const size_t * local_size,
+            cl_uint wait_count, const cl_event * wait_events, cl_event * event,
+            ggml_e2e_category category = GGML_E2E_TRANSFORM) {
+        return enqueue_e2e_command(event, category, kernel, nullptr, [&](cl_event * output) {
+            return clEnqueueNDRangeKernel(queue, kernel, work_dim, global_offset,
+                    global_size, local_size, wait_count, wait_events, output);
+        });
+    }
+
+    cl_int enqueue_e2e_read_buffer(cl_mem buffer, cl_bool blocking, size_t offset, size_t size,
+            void * data, cl_uint wait_count, const cl_event * wait_events, cl_event * event) {
+        const cl_int err = enqueue_e2e_command(event, GGML_E2E_COMMUNICATION, nullptr, "device_read_buffer", [&](cl_event * output) {
+            return clEnqueueReadBuffer(queue, buffer, blocking, offset, size, data, wait_count, wait_events, output);
+        });
+        return err;
+    }
+
+    cl_int enqueue_e2e_write_buffer(cl_mem buffer, cl_bool blocking, size_t offset, size_t size,
+            const void * data, cl_uint wait_count, const cl_event * wait_events, cl_event * event) {
+        const cl_int err = enqueue_e2e_command(event, GGML_E2E_COMMUNICATION, nullptr, "device_write_buffer", [&](cl_event * output) {
+            return clEnqueueWriteBuffer(queue, buffer, blocking, offset, size, data, wait_count, wait_events, output);
+        });
+        return err;
+    }
+
+    cl_int enqueue_e2e_copy_buffer(cl_mem source, cl_mem destination, size_t source_offset,
+            size_t destination_offset, size_t size, cl_uint wait_count, const cl_event * wait_events, cl_event * event) {
+        return enqueue_e2e_command(event, GGML_E2E_COMMUNICATION, nullptr, "device_copy_buffer", [&](cl_event * output) {
+            return clEnqueueCopyBuffer(queue, source, destination, source_offset, destination_offset,
+                    size, wait_count, wait_events, output);
+        });
+    }
+
+    cl_int enqueue_e2e_copy_buffer_rect(cl_mem source, cl_mem destination,
+            const size_t * source_origin, const size_t * destination_origin, const size_t * region,
+            size_t source_row_pitch, size_t source_slice_pitch, size_t destination_row_pitch,
+            size_t destination_slice_pitch, cl_uint wait_count, const cl_event * wait_events, cl_event * event) {
+        return enqueue_e2e_command(event, GGML_E2E_COMMUNICATION, nullptr, "device_copy_buffer_rect", [&](cl_event * output) {
+            return clEnqueueCopyBufferRect(queue, source, destination, source_origin, destination_origin,
+                    region, source_row_pitch, source_slice_pitch, destination_row_pitch,
+                    destination_slice_pitch, wait_count, wait_events, output);
+        });
+    }
+
+    cl_int enqueue_e2e_write_buffer_rect(cl_mem buffer, cl_bool blocking,
+            const size_t * buffer_origin, const size_t * host_origin, const size_t * region,
+            size_t buffer_row_pitch, size_t buffer_slice_pitch, size_t host_row_pitch,
+            size_t host_slice_pitch, const void * data, cl_uint wait_count, const cl_event * wait_events, cl_event * event) {
+        const cl_int err = enqueue_e2e_command(event, GGML_E2E_COMMUNICATION, nullptr, "device_write_buffer_rect", [&](cl_event * output) {
+            return clEnqueueWriteBufferRect(queue, buffer, blocking, buffer_origin, host_origin,
+                    region, buffer_row_pitch, buffer_slice_pitch, host_row_pitch, host_slice_pitch,
+                    data, wait_count, wait_events, output);
+        });
+        return err;
+    }
+
+    cl_int enqueue_e2e_fill_buffer(cl_mem buffer, const void * pattern, size_t pattern_size,
+            size_t offset, size_t size, cl_uint wait_count, const cl_event * wait_events, cl_event * event) {
+        return enqueue_e2e_command(event, GGML_E2E_COMMUNICATION, nullptr, "device_fill_buffer", [&](cl_event * output) {
+            return clEnqueueFillBuffer(queue, buffer, pattern, pattern_size, offset, size, wait_count, wait_events, output);
+        });
+    }
+
+    static void e2e_collect(void * user_data) {
+        // Commands of a closed request window have completed. Query the
+        // status without waiting, so a stray command is reported, not awaited.
+        static_cast<ggml_backend_opencl_context *>(user_data)->collect_e2e_events(
+                false, "command_incomplete_at_trace_flush");
+    }
+
+    void collect_e2e_events(bool commands_complete, const char * incomplete_reason) {
+        std::lock_guard<std::mutex> lock(e2e_events_mutex);
+        for (const e2e_command_event & info : e2e_events) {
+            cl_int status = CL_COMPLETE;
+            if (!commands_complete &&
+                    (clGetEventInfo(info.event, CL_EVENT_COMMAND_EXECUTION_STATUS,
+                            sizeof(status), &status, nullptr) != CL_SUCCESS || status != CL_COMPLETE)) {
+                // Collection must not introduce a wait solely for this trace.
+                ggml_e2e_trace_missing(info.query_id, "OpenCL", incomplete_reason);
+                CL_CHECK(clReleaseEvent(info.event));
+                continue;
+            }
+
+            cl_ulong queued_ns = 0, start_ns = 0, end_ns = 0;
+            const cl_int err_queued = clGetEventProfilingInfo(info.event, CL_PROFILING_COMMAND_QUEUED,
+                    sizeof(queued_ns), &queued_ns, nullptr);
+            const cl_int err_start = clGetEventProfilingInfo(info.event, CL_PROFILING_COMMAND_START,
+                    sizeof(start_ns), &start_ns, nullptr);
+            const cl_int err_end = clGetEventProfilingInfo(info.event, CL_PROFILING_COMMAND_END,
+                    sizeof(end_ns), &end_ns, nullptr);
+            if (err_queued != CL_SUCCESS || err_start != CL_SUCCESS || err_end != CL_SUCCESS ||
+                    queued_ns > start_ns || start_ns > end_ns ||
+                    info.enqueue_before_us < 0 ||
+                    info.enqueue_before_us > info.enqueue_after_us ||
+                    (end_ns - queued_ns) / 1000 > (cl_ulong) (INT64_MAX - info.enqueue_after_us)) {
+                ggml_e2e_trace_missing(info.query_id, "OpenCL", "command_profiling_or_clock_mapping_unavailable");
+            } else {
+                // QUEUED is the device counter when the host enqueues the
+                // command, so that instant lies inside the enqueue-call
+                // bracket. Use its midpoint, retaining the bracket and timer
+                // quantization as an explicit error bound. No device wait or
+                // OpenCL 2.1 timer API is required.
+                const int64_t bracket_us = info.enqueue_after_us - info.enqueue_before_us;
+                const int64_t midpoint_us = info.enqueue_before_us + bracket_us / 2;
+                const int64_t timer_error_us = (int64_t) (e2e_timer_resolution_ns / 1000) +
+                    (e2e_timer_resolution_ns % 1000 != 0);
+                const int64_t error_us = bracket_us / 2 + bracket_us % 2 + 2 * timer_error_us + 1;
+                // Keep the raw counters so the offset can be re-estimated
+                // offline from every command bracket of the request.
+                const ggml_e2e_raw_clock raw = {
+                    GGML_E2E_RAW_CLOCK_OPENCL_NS, info.enqueue_before_us, info.enqueue_after_us,
+                    (uint64_t) queued_ns, (uint64_t) queued_ns, (uint64_t) start_ns, (uint64_t) end_ns,
+                };
+                ggml_e2e_trace_record_raw(info.query_id, info.category, "OpenCL", info.detail,
+                        midpoint_us + (int64_t) ((start_ns - queued_ns) / 1000),
+                        midpoint_us + (int64_t) ((end_ns - queued_ns) / 1000),
+                        error_us, &raw);
+            }
+            CL_CHECK(clReleaseEvent(info.event));
+        }
+        e2e_events.clear();
+    }
+
     bool node_wall_trace_dispatch = false;
     int trace_query_id = -1;
     int trace_phase = -1;
@@ -1032,9 +1250,9 @@ struct ggml_backend_opencl_context {
         const bool profile = op_load || node_wall_trace;
 #endif
         cl_event evt = nullptr;
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, nullptr,
+        CL_CHECK(enqueue_e2e_kernel(kernel, work_dim, nullptr,
             global_work_size, local_work_size, 0, nullptr,
-            profile || retained_event ? &evt : nullptr));
+            profile || retained_event ? &evt : nullptr, GGML_E2E_COMPUTE));
         if (profile) {
             profiling_info.emplace_back();
             populateProfilingInfo(profiling_info.back(), evt, kernel, work_dim, global_work_size, local_work_size, tensor);
@@ -1118,6 +1336,11 @@ struct ggml_backend_opencl_context {
                 CL_CHECK(clFinish(queue));
                 accumulate_op_load_profiling_info();
                 collect_shared_repack_events();
+            }
+            collect_e2e_events(false, "command_incomplete_at_teardown");
+            if (e2e_collector_registered) {
+                ggml_e2e_trace_remove_collector(&ggml_backend_opencl_context::e2e_collect, this);
+                e2e_collector_registered = false;
             }
 #ifdef GGML_OPENCL_PROFILING
             write_profiling_info();
@@ -3882,10 +4105,19 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
 #endif
     if (ggml_backend_op_load_profile_enabled() || ggml_opencl_csv_op_load_env_enabled() ||
             ggml_backend_node_wall_trace_enabled() ||
+            ggml_e2e_trace_enabled() ||
             (ggml_shared_weights_repack_enabled() && ggml_shared_weights_timing_enabled())) {
         command_queue_props |= CL_QUEUE_PROFILING_ENABLE;
     }
     CL_CHECK((backend_ctx->queue = clCreateCommandQueue(context, device, command_queue_props, &err), err));
+    backend_ctx->e2e_profiling_enabled = (command_queue_props & CL_QUEUE_PROFILING_ENABLE) != 0;
+    if (ggml_e2e_trace_enabled()) {
+        if (clGetDeviceInfo(device, CL_DEVICE_PROFILING_TIMER_RESOLUTION,
+                sizeof(backend_ctx->e2e_timer_resolution_ns), &backend_ctx->e2e_timer_resolution_ns,
+                nullptr) != CL_SUCCESS) {
+            backend_ctx->e2e_timer_resolution_ns = 0;
+        }
+    }
 
     // Load kernels
     load_cl_kernels(backend_ctx.get(), opencl_c_version);
@@ -3920,6 +4152,11 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
 
     backend_ctx->disable_fusion = getenv("GGML_OPENCL_DISABLE_FUSION") != nullptr;
 
+    // Register last, once the context is fully initialized and owned by dev_ctx.
+    if (ggml_e2e_trace_enabled()) {
+        ggml_e2e_trace_add_collector(&ggml_backend_opencl_context::e2e_collect, backend_ctx.get());
+        backend_ctx->e2e_collector_registered = true;
+    }
     dev_ctx->backend_ctx = backend_ctx.release();
     return dev_ctx->backend_ctx;
 }
@@ -3973,15 +4210,15 @@ static void transpose_2d(
 
     size_t local_size[3] = {64, 1, 1};
     size_t global_size[3] = {(size_t)stride, (size_t)rows, 1};;
-    CL_CHECK(clEnqueueNDRangeKernel(backend_ctx->queue, kernel, 3, NULL,
+    CL_CHECK(backend_ctx->enqueue_e2e_kernel(kernel, 3, NULL,
         global_size, local_size, 0, NULL, NULL));
 
     if (blocking) {
-        CL_CHECK(clEnqueueCopyBuffer(backend_ctx->queue, trans, dst, 0, 0, size, 0, NULL, &evt));
+        CL_CHECK(backend_ctx->enqueue_e2e_copy_buffer(trans, dst, 0, 0, size, 0, NULL, &evt));
         CL_CHECK(clWaitForEvents(1, &evt));
         CL_CHECK(clReleaseEvent(evt));
     } else {
-        CL_CHECK(clEnqueueCopyBuffer(backend_ctx->queue, trans, dst, 0, 0, size, 0, NULL, NULL));
+        CL_CHECK(backend_ctx->enqueue_e2e_copy_buffer(trans, dst, 0, 0, size, 0, NULL, NULL));
     }
 
     CL_CHECK(clReleaseMemObject(trans));
@@ -4444,9 +4681,7 @@ static void ggml_backend_opencl_set_tensor_async(ggml_backend_t backend, ggml_te
     }
 
     const size_t device_offset = extra->offset + tensor->view_offs + offset;
-    const cl_int err = clEnqueueWriteBuffer(
-            backend_ctx->queue,
-            extra->data_device,
+    const cl_int err = backend_ctx->enqueue_e2e_write_buffer(extra->data_device,
             CL_FALSE,
             device_offset,
             size,
@@ -5931,7 +6166,6 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
     ggml_backend_opencl_context *backend_ctx = ggml_cl2_init(buffer->buft->device);
 
     cl_context context = backend_ctx->context;
-    cl_command_queue queue = backend_ctx->queue;
 
 #ifdef GGML_OPENCL_SOA_Q
     // We separate the quantized bits and scale from block_q4_0 by using an
@@ -5957,8 +6191,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         cl_mem data_device = clCreateBuffer(context, CL_MEM_READ_WRITE,
             ggml_nbytes(tensor), NULL, &err);
         CL_CHECK(err);
-        CL_CHECK(clEnqueueWriteBuffer(
-            queue, data_device, CL_TRUE, 0,
+        CL_CHECK(backend_ctx->enqueue_e2e_write_buffer(data_device, CL_TRUE, 0,
             ggml_nbytes(tensor), data, 0, NULL, NULL));
 
         // We consider the specified offset arg as always, although For weights
@@ -6016,7 +6249,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         size_t local_work_size[] = {64, 1, 1};
 
         cl_event evt;
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+        CL_CHECK(backend_ctx->enqueue_e2e_kernel(kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
         CL_CHECK(clWaitForEvents(1, &evt));
         CL_CHECK(clReleaseMemObject(data_device));
 
@@ -6138,7 +6371,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
 
         size_t local_size_q[3] = {4, 16, 1};
         size_t global_size_q[3] = {static_cast<size_t>(width_q), static_cast<size_t>(height_q), 1};
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_size_q, local_size_q, 0, NULL, &evt));
+        CL_CHECK(backend_ctx->enqueue_e2e_kernel(kernel, 3, NULL, global_size_q, local_size_q, 0, NULL, &evt));
         CL_CHECK(clWaitForEvents(1, &evt));
 
         // scales
@@ -6157,18 +6390,18 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
 
         size_t local_size_s[3] = {4, 16, 1};
         size_t global_size_s[3] = {static_cast<size_t>(width_s), static_cast<size_t>(height_s), 1};
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_size_s, local_size_s, 0, NULL, &evt));
+        CL_CHECK(backend_ctx->enqueue_e2e_kernel(kernel, 3, NULL, global_size_s, local_size_s, 0, NULL, &evt));
         CL_CHECK(clWaitForEvents(1, &evt));
         // <----------------------------------------------------------------------------------> //
 
         // copy transposed buffer contents to original buffers
         // <----------------------------------------------------------------------------------> //
         // weights
-        CL_CHECK(clEnqueueCopyBuffer(queue, qT_d, extra->q, 0, 0, q_size_bytes, 0, NULL, &evt));
+        CL_CHECK(backend_ctx->enqueue_e2e_copy_buffer(qT_d, extra->q, 0, 0, q_size_bytes, 0, NULL, &evt));
         CL_CHECK(clWaitForEvents(1, &evt));
 
         // scales
-        CL_CHECK(clEnqueueCopyBuffer(queue, dT_d, extra->d, 0, 0, d_size_bytes, 0, NULL, &evt));
+        CL_CHECK(backend_ctx->enqueue_e2e_copy_buffer(dT_d, extra->d, 0, 0, d_size_bytes, 0, NULL, &evt));
         CL_CHECK(clWaitForEvents(1, &evt));
         // <----------------------------------------------------------------------------------> //
 
@@ -6208,8 +6441,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         cl_mem data_device = clCreateBuffer(context, CL_MEM_READ_WRITE,
             ggml_nbytes(tensor), NULL, &err);
         CL_CHECK(err);
-        CL_CHECK(clEnqueueWriteBuffer(
-            queue, data_device, CL_TRUE, 0,
+        CL_CHECK(backend_ctx->enqueue_e2e_write_buffer(data_device, CL_TRUE, 0,
             ggml_nbytes(tensor), data, 0, NULL, NULL));
 
         cl_buffer_region region;
@@ -6260,7 +6492,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         size_t local_work_size[] = {64, 1, 1};
 
         cl_event evt;
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+        CL_CHECK(backend_ctx->enqueue_e2e_kernel(kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
         CL_CHECK(clWaitForEvents(1, &evt));
         CL_CHECK(clReleaseMemObject(data_device));
 
@@ -6300,8 +6532,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         cl_mem data_device = clCreateBuffer(context, CL_MEM_READ_WRITE,
             ggml_nbytes(tensor), NULL, &err);
         CL_CHECK(err);
-        CL_CHECK(clEnqueueWriteBuffer(
-            queue, data_device, CL_TRUE, 0,
+        CL_CHECK(backend_ctx->enqueue_e2e_write_buffer(data_device, CL_TRUE, 0,
             ggml_nbytes(tensor), data, 0, NULL, NULL));
 
         // The original tensor memory is divided into scales and quants, i.e.,
@@ -6343,7 +6574,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
             size_t local_work_size[3] = {64, 2, 1};
 
             cl_event evt;
-            CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+            CL_CHECK(backend_ctx->enqueue_e2e_kernel(kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
             CL_CHECK(clWaitForEvents(1, &evt));
             CL_CHECK(clReleaseMemObject(data_device));
             tensor->extra = extra;
@@ -6373,7 +6604,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         size_t local_work_size[3] = {64, 1, 1};
 
         cl_event evt;
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+        CL_CHECK(backend_ctx->enqueue_e2e_kernel(kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
         CL_CHECK(clWaitForEvents(1, &evt));
         CL_CHECK(clReleaseMemObject(data_device));
 
@@ -6406,8 +6637,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         cl_mem data_device = clCreateBuffer(context, CL_MEM_READ_WRITE,
             ggml_nbytes(tensor), NULL, &err);
         CL_CHECK(err);
-        CL_CHECK(clEnqueueWriteBuffer(
-            queue, data_device, CL_TRUE, 0,
+        CL_CHECK(backend_ctx->enqueue_e2e_write_buffer(data_device, CL_TRUE, 0,
             ggml_nbytes(tensor), data, 0, NULL, NULL));
 
         // The original tensor memory is divided into scales and quants, i.e.,
@@ -6441,7 +6671,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         size_t local_work_size[] = {64, 1, 1};
 
         cl_event evt;
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+        CL_CHECK(backend_ctx->enqueue_e2e_kernel(kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
         CL_CHECK(clWaitForEvents(1, &evt));
         CL_CHECK(clReleaseMemObject(data_device));
 
@@ -6481,8 +6711,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         cl_mem data_device = clCreateBuffer(context, CL_MEM_READ_WRITE,
             ggml_nbytes(tensor), NULL, &err);
         CL_CHECK(err);
-        CL_CHECK(clEnqueueWriteBuffer(
-            queue, data_device, CL_TRUE, 0,
+        CL_CHECK(backend_ctx->enqueue_e2e_write_buffer(data_device, CL_TRUE, 0,
             ggml_nbytes(tensor), data, 0, NULL, NULL));
 
         cl_buffer_region region;
@@ -6527,7 +6756,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         size_t local_work_size[] = {64, 1, 1};
 
         cl_event evt;
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+        CL_CHECK(backend_ctx->enqueue_e2e_kernel(kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
         CL_CHECK(clWaitForEvents(1, &evt));
         CL_CHECK(clReleaseMemObject(data_device));
 
@@ -6565,8 +6794,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         cl_mem data_device = clCreateBuffer(context, CL_MEM_READ_WRITE,
             ggml_nbytes(tensor), NULL, &err);
         CL_CHECK(err);
-        CL_CHECK(clEnqueueWriteBuffer(
-            queue, data_device, CL_TRUE, 0,
+        CL_CHECK(backend_ctx->enqueue_e2e_write_buffer(data_device, CL_TRUE, 0,
             ggml_nbytes(tensor), data, 0, NULL, NULL));
 
         cl_buffer_region region;
@@ -6630,7 +6858,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         size_t local_work_size[] = {64, 1, 1};
 
         cl_event evt;
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+        CL_CHECK(backend_ctx->enqueue_e2e_kernel(kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
         CL_CHECK(clWaitForEvents(1, &evt));
         CL_CHECK(clReleaseMemObject(data_device));
 
@@ -6670,7 +6898,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         cl_int err;
         cl_mem data_device;
         CL_CHECK((data_device = clCreateBuffer(context, CL_MEM_READ_WRITE, ggml_nbytes(tensor), NULL, &err), err));
-        CL_CHECK(clEnqueueWriteBuffer(queue, data_device, CL_TRUE, 0, ggml_nbytes(tensor), data, 0, NULL, NULL));
+        CL_CHECK(backend_ctx->enqueue_e2e_write_buffer(data_device, CL_TRUE, 0, ggml_nbytes(tensor), data, 0, NULL, NULL));
 
         cl_buffer_region region;
 
@@ -6741,7 +6969,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         size_t local_work_size[] = {64, 1, 1};
 
         cl_event evt;
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+        CL_CHECK(backend_ctx->enqueue_e2e_kernel(kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
         CL_CHECK(clWaitForEvents(1, &evt));
         CL_CHECK(clReleaseMemObject(data_device));
 
@@ -6787,7 +7015,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         cl_int err;
         cl_mem data_device;
         CL_CHECK((data_device = clCreateBuffer(context, CL_MEM_READ_WRITE, ggml_nbytes(tensor), NULL, &err), err));
-        CL_CHECK(clEnqueueWriteBuffer(queue, data_device, CL_TRUE, 0, ggml_nbytes(tensor), data, 0, NULL, NULL));
+        CL_CHECK(backend_ctx->enqueue_e2e_write_buffer(data_device, CL_TRUE, 0, ggml_nbytes(tensor), data, 0, NULL, NULL));
 
         cl_buffer_region region;
 
@@ -6840,7 +7068,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         size_t local_work_size[] = {64, 1, 1};
 
         cl_event evt;
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+        CL_CHECK(backend_ctx->enqueue_e2e_kernel(kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
         CL_CHECK(clWaitForEvents(1, &evt));
         CL_CHECK(clReleaseMemObject(data_device));
 
@@ -6880,8 +7108,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
     ggml_tensor_extra_cl * extra = (ggml_tensor_extra_cl *) tensor->extra;
     GGML_ASSERT(extra);
 
-    CL_CHECK(clEnqueueWriteBuffer(
-        queue, extra->data_device, CL_TRUE, extra->offset + tensor->view_offs + offset,
+    CL_CHECK(backend_ctx->enqueue_e2e_write_buffer(extra->data_device, CL_TRUE, extra->offset + tensor->view_offs + offset,
         size, data, 0, NULL, NULL));
 
     GGML_UNUSED(buffer);
@@ -6893,7 +7120,6 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
     ggml_backend_opencl_context *backend_ctx = ggml_cl2_init(buffer->buft->device);
 
     cl_context context = backend_ctx->context;
-    cl_command_queue queue = backend_ctx->queue;
 
     // Make sure all previously submitted commands in other devices are finished.
     sync_with_other_backends(backend_ctx);
@@ -6943,7 +7169,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
             CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_int), &M));
             CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_int), &stride_k_q));
 
-            CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
+            CL_CHECK(backend_ctx->enqueue_e2e_kernel(kernel, 3, NULL,
                 global_size_q, local_size_q, 0, NULL, NULL));
 
             // transpose scales back
@@ -6956,7 +7182,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
             CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_int), &M));
             CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_int), &stride_k_d));
 
-            CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
+            CL_CHECK(backend_ctx->enqueue_e2e_kernel(kernel, 3, NULL,
                 global_size_d, local_size_d, 0, NULL, NULL));
 
             // unpack
@@ -6977,12 +7203,11 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
             CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_uchar), &mask_0F));
             CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_uchar), &mask_F0));
 
-            CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
+            CL_CHECK(backend_ctx->enqueue_e2e_kernel(kernel, 3, NULL,
                 global_work_size, local_work_size, 0, NULL, NULL));
 
             // read back to host
-            CL_CHECK(clEnqueueReadBuffer(
-                queue, data_device, CL_TRUE, offset,
+            CL_CHECK(backend_ctx->enqueue_e2e_read_buffer(data_device, CL_TRUE, offset,
                 size, data, 0, NULL, NULL));
 
             CL_CHECK(clReleaseMemObject(data_device));
@@ -7007,11 +7232,10 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
         size_t local_work_size[] = {1, 1, 1};
 
         cl_event evt;
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
+        CL_CHECK(backend_ctx->enqueue_e2e_kernel(kernel, 3, NULL,
             global_work_size, local_work_size, 0, NULL, &evt));
         CL_CHECK(clWaitForEvents(1, &evt));
-        CL_CHECK(clEnqueueReadBuffer(
-            queue, data_device, CL_TRUE, offset,
+        CL_CHECK(backend_ctx->enqueue_e2e_read_buffer(data_device, CL_TRUE, offset,
             size, data, 0, NULL, NULL));
         CL_CHECK(clReleaseMemObject(data_device));
         return;
@@ -7060,8 +7284,8 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
             CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_uchar), &mask_0F));
             CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_uchar), &mask_F0));
 
-            CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, NULL));
-            CL_CHECK(clEnqueueReadBuffer(queue, buf_unpacked.buffer, CL_TRUE, offset, size, data, 0, NULL, NULL));
+            CL_CHECK(backend_ctx->enqueue_e2e_kernel(kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, NULL));
+            CL_CHECK(backend_ctx->enqueue_e2e_read_buffer(buf_unpacked.buffer, CL_TRUE, offset, size, data, 0, NULL, NULL));
             return;
         }
 #endif
@@ -7081,11 +7305,10 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
         size_t local_work_size[] = {1, 1, 1};
 
         cl_event evt;
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
+        CL_CHECK(backend_ctx->enqueue_e2e_kernel(kernel, 3, NULL,
             global_work_size, local_work_size, 0, NULL, &evt));
         CL_CHECK(clWaitForEvents(1, &evt));
-        CL_CHECK(clEnqueueReadBuffer(
-            queue, data_device, CL_TRUE, offset,
+        CL_CHECK(backend_ctx->enqueue_e2e_read_buffer(data_device, CL_TRUE, offset,
             size, data, 0, NULL, NULL));
         CL_CHECK(clReleaseMemObject(data_device));
         return;
@@ -7115,11 +7338,10 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
             size_t local_work_size[3] = {64, 2, 1};
 
             cl_event evt;
-            CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
+            CL_CHECK(backend_ctx->enqueue_e2e_kernel(kernel, 3, NULL,
                 global_work_size, local_work_size, 0, NULL, &evt));
             CL_CHECK(clWaitForEvents(1, &evt));
-            CL_CHECK(clEnqueueReadBuffer(
-                queue, data_device, CL_TRUE, offset,
+            CL_CHECK(backend_ctx->enqueue_e2e_read_buffer(data_device, CL_TRUE, offset,
                 size, data, 0, NULL, NULL));
             CL_CHECK(clReleaseMemObject(data_device));
             return;
@@ -7135,11 +7357,10 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
         size_t local_work_size[] = {1, 1, 1};
 
         cl_event evt;
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
+        CL_CHECK(backend_ctx->enqueue_e2e_kernel(kernel, 3, NULL,
             global_work_size, local_work_size, 0, NULL, &evt));
         CL_CHECK(clWaitForEvents(1, &evt));
-        CL_CHECK(clEnqueueReadBuffer(
-            queue, data_device, CL_TRUE, offset,
+        CL_CHECK(backend_ctx->enqueue_e2e_read_buffer(data_device, CL_TRUE, offset,
             size, data, 0, NULL, NULL));
         CL_CHECK(clReleaseMemObject(data_device));
         return;
@@ -7171,12 +7392,11 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
             size_t local_work_size[3] = {64, 1, 1};
 
             cl_event evt;
-            CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
+            CL_CHECK(backend_ctx->enqueue_e2e_kernel(kernel, 3, NULL,
                 global_work_size, local_work_size, 0, NULL, &evt));
             CL_CHECK(clWaitForEvents(1, &evt));
 
-            CL_CHECK(clEnqueueReadBuffer(
-                queue, data_device, CL_TRUE, offset,
+            CL_CHECK(backend_ctx->enqueue_e2e_read_buffer(data_device, CL_TRUE, offset,
                 size, data, 0, NULL, NULL));
             CL_CHECK(clReleaseMemObject(data_device));
             return;
@@ -7191,11 +7411,10 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
         size_t local_work_size[] = {1, 1, 1};
 
         cl_event evt;
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
+        CL_CHECK(backend_ctx->enqueue_e2e_kernel(kernel, 3, NULL,
             global_work_size, local_work_size, 0, NULL, &evt));
         CL_CHECK(clWaitForEvents(1, &evt));
-        CL_CHECK(clEnqueueReadBuffer(
-            queue, data_device, CL_TRUE, offset,
+        CL_CHECK(backend_ctx->enqueue_e2e_read_buffer(data_device, CL_TRUE, offset,
             size, data, 0, NULL, NULL));
         CL_CHECK(clReleaseMemObject(data_device));
         return;
@@ -7246,8 +7465,8 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
             size_t global_work_size[] = {(size_t)n_blk, 1, 1};
             size_t local_work_size[] = {1, 1, 1};
 
-            CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, NULL));
-            CL_CHECK(clEnqueueReadBuffer(queue, buf_unpacked.buffer, CL_TRUE, offset, size, data, 0, NULL, NULL));
+            CL_CHECK(backend_ctx->enqueue_e2e_kernel(kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, NULL));
+            CL_CHECK(backend_ctx->enqueue_e2e_read_buffer(buf_unpacked.buffer, CL_TRUE, offset, size, data, 0, NULL, NULL));
             return;
         }
 #endif
@@ -7263,11 +7482,10 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
         size_t local_work_size[] = {1, 1, 1};
 
         cl_event evt;
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
+        CL_CHECK(backend_ctx->enqueue_e2e_kernel(kernel, 3, NULL,
             global_work_size, local_work_size, 0, NULL, &evt));
         CL_CHECK(clWaitForEvents(1, &evt));
-        CL_CHECK(clEnqueueReadBuffer(
-            queue, data_device, CL_TRUE, offset,
+        CL_CHECK(backend_ctx->enqueue_e2e_read_buffer(data_device, CL_TRUE, offset,
             size, data, 0, NULL, NULL));
         CL_CHECK(clReleaseMemObject(data_device));
         return;
@@ -7317,9 +7535,9 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
             size_t global_work_size[] = {(size_t)ggml_nelements(tensor)/ggml_blck_size(tensor->type), 1, 1};
             size_t local_work_size[] = {1, 1, 1};
 
-            CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
+            CL_CHECK(backend_ctx->enqueue_e2e_kernel(kernel, 3, NULL,
                 global_work_size, local_work_size, 0, NULL, NULL));
-            CL_CHECK(clEnqueueReadBuffer(queue, data_device, CL_TRUE, offset,
+            CL_CHECK(backend_ctx->enqueue_e2e_read_buffer(data_device, CL_TRUE, offset,
                 size, data, 0, NULL, NULL));
             CL_CHECK(clReleaseMemObject(data_device));
             return;
@@ -7339,11 +7557,10 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
         size_t local_work_size[] = {1, 1, 1};
 
         cl_event evt;
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
+        CL_CHECK(backend_ctx->enqueue_e2e_kernel(kernel, 3, NULL,
             global_work_size, local_work_size, 0, NULL, &evt));
         CL_CHECK(clWaitForEvents(1, &evt));
-        CL_CHECK(clEnqueueReadBuffer(
-            queue, data_device, CL_TRUE, offset,
+        CL_CHECK(backend_ctx->enqueue_e2e_read_buffer(data_device, CL_TRUE, offset,
             size, data, 0, NULL, NULL));
         CL_CHECK(clReleaseMemObject(data_device));
         return;
@@ -7398,9 +7615,9 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
             size_t global_work_size[] = {(size_t)ggml_nelements(tensor)/ggml_blck_size(tensor->type), 1, 1};
             size_t local_work_size[] = {1, 1, 1};
 
-            CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
+            CL_CHECK(backend_ctx->enqueue_e2e_kernel(kernel, 3, NULL,
                 global_work_size, local_work_size, 0, NULL, NULL));
-            CL_CHECK(clEnqueueReadBuffer(queue, data_device, CL_TRUE, offset,
+            CL_CHECK(backend_ctx->enqueue_e2e_read_buffer(data_device, CL_TRUE, offset,
                 size, data, 0, NULL, NULL));
             CL_CHECK(clReleaseMemObject(data_device));
             return;
@@ -7421,11 +7638,10 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
         size_t local_work_size[] = {1, 1, 1};
 
         cl_event evt;
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
+        CL_CHECK(backend_ctx->enqueue_e2e_kernel(kernel, 3, NULL,
             global_work_size, local_work_size, 0, NULL, &evt));
         CL_CHECK(clWaitForEvents(1, &evt));
-        CL_CHECK(clEnqueueReadBuffer(
-            queue, data_device, CL_TRUE, offset,
+        CL_CHECK(backend_ctx->enqueue_e2e_read_buffer(data_device, CL_TRUE, offset,
             size, data, 0, NULL, NULL));
         CL_CHECK(clReleaseMemObject(data_device));
         return;
@@ -7480,9 +7696,9 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
             size_t local_work_size[] = {1, 1, 1};
 
             cl_event evt;
-            CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+            CL_CHECK(backend_ctx->enqueue_e2e_kernel(kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
             CL_CHECK(clWaitForEvents(1, &evt));
-            CL_CHECK(clEnqueueReadBuffer(queue, buf_unpacked.buffer, CL_TRUE, offset, size, data, 0, NULL, NULL));
+            CL_CHECK(backend_ctx->enqueue_e2e_read_buffer(buf_unpacked.buffer, CL_TRUE, offset, size, data, 0, NULL, NULL));
 
             return;
         }
@@ -7508,11 +7724,10 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
         size_t local_work_size[] = {1, 1, 1};
 
         cl_event evt;
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
+        CL_CHECK(backend_ctx->enqueue_e2e_kernel(kernel, 3, NULL,
             global_work_size, local_work_size, 0, NULL, &evt));
         CL_CHECK(clWaitForEvents(1, &evt));
-        CL_CHECK(clEnqueueReadBuffer(
-            queue, data_device, CL_TRUE, offset,
+        CL_CHECK(backend_ctx->enqueue_e2e_read_buffer(data_device, CL_TRUE, offset,
             size, data, 0, NULL, NULL));
         CL_CHECK(clReleaseMemObject(data_device));
         return;
@@ -7521,8 +7736,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
 
     ggml_tensor_extra_cl * extra = (ggml_tensor_extra_cl *) tensor->extra;
 
-    CL_CHECK(clEnqueueReadBuffer(
-        queue, extra->data_device, CL_TRUE, extra->offset + tensor->view_offs + offset,
+    CL_CHECK(backend_ctx->enqueue_e2e_read_buffer(extra->data_device, CL_TRUE, extra->offset + tensor->view_offs + offset,
         size, data, 0, NULL, NULL));
 
     GGML_UNUSED(buffer);
@@ -7580,9 +7794,7 @@ static bool ggml_backend_opencl_enqueue_tensor_copy(
     }
 
     cl_event event = nullptr;
-    const cl_int err = clEnqueueCopyBuffer(
-            backend_ctx->queue,
-            src_range.buffer,
+    const cl_int err = backend_ctx->enqueue_e2e_copy_buffer(src_range.buffer,
             dst_range.buffer,
             (size_t) src_range.begin,
             (size_t) dst_range.begin,
@@ -7808,9 +8020,7 @@ static bool ggml_backend_opencl_attn_out_direct_scatter(
         };
 
         if (item.kind == scatter_source_kind::opencl) {
-            err = clEnqueueCopyBufferRect(
-                    backend_ctx->queue,
-                    item.subbuffer,
+            err = backend_ctx->enqueue_e2e_copy_buffer_rect(item.subbuffer,
                     dst_subbuffer,
                     src_origin,
                     dst_origin,
@@ -7823,9 +8033,7 @@ static bool ggml_backend_opencl_attn_out_direct_scatter(
                     nullptr,
                     nullptr);
         } else {
-            err = clEnqueueWriteBufferRect(
-                    backend_ctx->queue,
-                    dst_subbuffer,
+            err = backend_ctx->enqueue_e2e_write_buffer_rect(dst_subbuffer,
                     CL_TRUE,
                     dst_origin,
                     src_origin,
@@ -7860,7 +8068,7 @@ static void ggml_backend_opencl_buffer_clear(ggml_backend_buffer_t buffer, uint8
 
     ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
     for (cl_mem buf : ctx->buffer) {
-        CL_CHECK(clEnqueueFillBuffer(queue, buf, &value, sizeof(value), 0, buffer->size, 0, NULL, NULL));
+        CL_CHECK(backend_ctx->enqueue_e2e_fill_buffer(buf, &value, sizeof(value), 0, buffer->size, 0, NULL, NULL));
     }
     CL_CHECK(clFinish(queue));
 }
@@ -8211,6 +8419,11 @@ static ggml_backend_t ggml_backend_opencl_device_init(ggml_backend_dev_t dev, co
     ggml_backend_opencl_context * backend_ctx = ggml_cl2_init(dev);
     // Getting a new reference to the backend, increase ref_count
     backend_ctx->ref_count++;
+    // A context released to ref_count 0 unregistered its collector; restore it.
+    if (ggml_e2e_trace_enabled() && !backend_ctx->e2e_collector_registered) {
+        ggml_e2e_trace_add_collector(&ggml_backend_opencl_context::e2e_collect, backend_ctx);
+        backend_ctx->e2e_collector_registered = true;
+    }
 
     ggml_backend_t backend = new ggml_backend {
         /* .guid      = */ ggml_backend_opencl_guid(),
@@ -8526,8 +8739,8 @@ static void dump_tensor(ggml_backend_t backend, const struct ggml_tensor * tenso
         buf_q = malloc(size_q);
         buf_d = malloc(size_d);
 
-        CL_CHECK(clEnqueueReadBuffer(queue, extra->q, CL_TRUE, 0, size_q, buf_q, 0, NULL, NULL));
-        CL_CHECK(clEnqueueReadBuffer(queue, extra->d, CL_TRUE, 0, size_d, buf_d, 0, NULL, NULL));
+        CL_CHECK(backend_ctx->enqueue_e2e_read_buffer(extra->q, CL_TRUE, 0, size_q, buf_q, 0, NULL, NULL));
+        CL_CHECK(backend_ctx->enqueue_e2e_read_buffer(extra->d, CL_TRUE, 0, size_d, buf_d, 0, NULL, NULL));
         CL_CHECK(clFinish(queue));
     } else if (tensor->type == GGML_TYPE_MXFP4) {
         ggml_tensor_extra_cl_mxfp4 * extra = (ggml_tensor_extra_cl_mxfp4 *) tensor->extra;
@@ -8539,15 +8752,15 @@ static void dump_tensor(ggml_backend_t backend, const struct ggml_tensor * tenso
         buf_q = malloc(size_q);
         buf_d = malloc(size_e);
 
-        CL_CHECK(clEnqueueReadBuffer(queue, extra->q, CL_TRUE, 0, size_q, buf_q, 0, NULL, NULL));
-        CL_CHECK(clEnqueueReadBuffer(queue, extra->e, CL_TRUE, 0, size_e, buf_d, 0, NULL, NULL));
+        CL_CHECK(backend_ctx->enqueue_e2e_read_buffer(extra->q, CL_TRUE, 0, size_q, buf_q, 0, NULL, NULL));
+        CL_CHECK(backend_ctx->enqueue_e2e_read_buffer(extra->e, CL_TRUE, 0, size_e, buf_d, 0, NULL, NULL));
         CL_CHECK(clFinish(queue));
     } else {
         // Read out the tensor from GPU memory.
         ggml_tensor_extra_cl * extra = (ggml_tensor_extra_cl *) tensor->extra;
         GGML_ASSERT(extra);
 
-        CL_CHECK(clEnqueueReadBuffer(queue, extra->data_device, CL_TRUE,
+        CL_CHECK(backend_ctx->enqueue_e2e_read_buffer(extra->data_device, CL_TRUE,
         extra->offset, ggml_nbytes(tensor), buf, 0, NULL, NULL));
         CL_CHECK(clFinish(queue));
     }
@@ -8556,7 +8769,7 @@ static void dump_tensor(ggml_backend_t backend, const struct ggml_tensor * tenso
     ggml_tensor_extra_cl * extra = (ggml_tensor_extra_cl *) tensor->extra;
     GGML_ASSERT(extra);
 
-    CL_CHECK(clEnqueueReadBuffer(queue, extra->data_device, CL_TRUE,
+    CL_CHECK(backend_ctx->enqueue_e2e_read_buffer(extra->data_device, CL_TRUE,
         extra->offset, ggml_nbytes(tensor), buf, 0, NULL, NULL));
     CL_CHECK(clFinish(queue));
 #endif // GGML_OPENCL_SOA_Q

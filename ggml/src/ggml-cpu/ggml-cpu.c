@@ -4,6 +4,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
 #include "ggml-shared-weights.h"
+#include "ggml-e2e-trace.h"
 #include "traits.h"
 #include "ggml-cpu-impl.h"
 #include "ggml-impl.h"
@@ -578,7 +579,9 @@ void ggml_barrier(struct ggml_threadpool * tp) {
     }
 
 #ifdef GGML_USE_OPENMP
+    ggml_e2e_trace_thread_pause();
     #pragma omp barrier
+    ggml_e2e_trace_thread_resume();
 #else
     int n_passed = atomic_load_explicit(&tp->n_barrier_passed, memory_order_relaxed);
 
@@ -595,6 +598,7 @@ void ggml_barrier(struct ggml_threadpool * tp) {
     }
 
     // wait for other threads
+    ggml_e2e_trace_thread_pause();
     while (atomic_load_explicit(&tp->n_barrier_passed, memory_order_relaxed) == n_passed) {
         ggml_thread_cpu_relax();
     }
@@ -606,6 +610,7 @@ void ggml_barrier(struct ggml_threadpool * tp) {
     #else
     atomic_thread_fence(memory_order_seq_cst);
     #endif
+    ggml_e2e_trace_thread_resume();
 #endif
 }
 
@@ -3249,6 +3254,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     const struct ggml_cplan  * cplan  = tp->cplan;
     const bool node_wall_trace = cgraph->trace_graph_id >= 0 &&
         tp->node_wall_trace_start_us != NULL && tp->node_wall_trace_end_us != NULL;
+    const bool e2e_trace = ggml_e2e_trace_active();
     struct ggml_tensor * deferred_profile_node = NULL;
     int deferred_profile_node_n = -1;
     int64_t deferred_profile_t0_us = 0;
@@ -3289,7 +3295,17 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         const bool time_node = profile_node || node_wall_trace;
         const int64_t profile_t0_us = time_node && state->ith == 0 ? ggml_time_us() : 0;
 
+        if (e2e_trace) {
+            const bool transform = node->op == GGML_OP_CPY || node->op == GGML_OP_CONT || node->op == GGML_OP_DUP;
+            ggml_e2e_trace_thread_push(transform ? GGML_E2E_TRANSFORM : GGML_E2E_COMPUTE,
+                    "CPU", node->name);
+        }
         ggml_compute_forward(&params, node);
+        if (e2e_trace) {
+            // The outer node barrier belongs to synchronization, not model work.
+            // Internal barriers pause the same worker scope in ggml_barrier().
+            ggml_e2e_trace_thread_pop();
+        }
         params.prev_node = node;
 
         if (state->ith == 0 && cplan->abort_callback &&

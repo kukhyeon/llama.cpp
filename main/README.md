@@ -326,6 +326,65 @@ The RNG seed is used to initialize the random number generator that influences t
 
 These options help improve the performance and memory usage of the LLaMA models. By adjusting these settings, you can fine-tune the model's behavior to better suit your system's capabilities and achieve optimal performance for your specific use case.
 
+### TriPrefill E2E latency tracing
+
+The `llama-ignite-npu` JSON question runner supports optional CPU/OpenCL/HTP
+operation timelines. Set the environment variable before starting the executable:
+
+```bash
+GGML_E2E_LATENCY_TRACE=1 ./llama-ignite-npu <existing arguments>
+```
+
+The default is off; `GGML_E2E_LATENCY_TRACE=0` explicitly disables it. The CPU and
+hybrid runner scripts also forward this option. Summary and event files default
+to `e2e_latency.csv` and `e2e_latency_events.csv` in the configured output
+directory (the working directory when none is configured). Override them with
+`GGML_E2E_LATENCY_TRACE_PATH` and `GGML_E2E_LATENCY_EVENTS_PATH`. CSV files are
+appended to; use a fresh output directory for each run.
+
+Each request window begins before context reset, tokenization and policy/input
+preparation. A strict prefill-only request ends after its first sample;
+generation requests continue until generation completes. Model loading, warmup,
+inter-request pacing and CSV writing are outside this window. Collection adds
+no backend synchronization or worker barriers. GPU command events are retained
+and their profiling timestamps are queried only after the request window
+closes; HTP timestamps travel in existing responses, whose footer is copied and
+mapped after the window as well. Tracing still adds timestamp, event and buffer
+bookkeeping when enabled.
+
+`model_active_ms` is the union of model-operation execution intervals across all
+workers and backends, so parallel execution is counted once.
+`overhead_ms = e2e_ms - model_active_ms`; `overhead_pct` uses `e2e_ms` as its
+denominator. CPU worker barrier waits and explicit copies/repacking are excluded
+from model intervals. CPU/HTP operation bodies still include internal work such
+as quantization; these are operation wall intervals, rather than pure arithmetic
+cycle counters.
+
+Each category has a raw `*_union_ms` and an exclusive `*_exposed_ms` column.
+Raw category unions can overlap and must not be added. Exposed columns plus
+`unattributed_ms` partition E2E, using this priority: model compute, transform,
+communication, sampling, request preparation, graph preparation, dispatch,
+synchronization. Thus a wait overlapped by model compute contributes no exposed
+overhead for that overlap. These labels describe observed time; they are not a
+prediction of the speedup from removing an operation.
+
+Device clocks are mapped to the host clock using enqueue/response brackets.
+Mapped results have `status=estimated`, with `clock_error_max_us` and
+`overhead_lower_ms`/`overhead_upper_ms`. Missing or uncollected compute events
+produce `status=incomplete` and blank overhead/percentage/bound columns, rather
+than treating missing work as overhead. Uninstrumented phases remain
+`unattributed`. HTP tracing requires rebuilding both the host backend and DSP
+library; an older DSP response is reported as unavailable without changing the
+legacy inference protocol.
+
+The events file uses schema version 2. Bounded GPU/NPU rows also keep the raw
+clock evidence (`raw_clock`, `raw_host_lo_us`, `raw_host_hi_us`, `raw_dev_lo`,
+`raw_dev_hi`, `raw_dev_start`, `raw_dev_end`; OpenCL in ns, QTIMER in ticks), so
+the host/device offset can be re-estimated offline from all brackets of a
+request. Device work registered before submission is counted per backend and
+reflected in `event_count`/`missing_compute_events`; it is no longer written as
+`expected_compute` rows. A file with another header is not appended to.
+
 ### Number of Threads
 
 -   `-t N, --threads N`: Set the number of threads to use during generation. For optimal performance, it is recommended to set this value to the number of physical CPU cores your system has (as opposed to the logical number of cores). Using the correct number of threads can greatly improve performance.

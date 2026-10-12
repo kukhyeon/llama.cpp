@@ -193,6 +193,7 @@ add_library(ggml-base
             ../include/ggml.h
             ../include/ggml-alloc.h
             ../include/ggml-backend.h
+            ../include/ggml-e2e-trace.h
             ../include/ggml-cpp.h
             ../include/ggml-opt.h
             ../include/gguf.h
@@ -200,6 +201,7 @@ add_library(ggml-base
             ggml.cpp
             ggml-alloc.c
             ggml-backend.cpp
+            ggml-e2e-trace.cpp
             ggml-shared-weights.cpp
             ggml-backend-meta.cpp
             ggml-opt.cpp

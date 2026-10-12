@@ -6,6 +6,7 @@
 #include <time.h>
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <mutex>
 #include <thread>
@@ -35,6 +36,7 @@
 
 #define GGML_COMMON_IMPL_CPP
 #include "ggml-backend-impl.h"
+#include "ggml-e2e-trace.h"
 #include "ggml-shared-weights.h"
 #include "ggml-common.h"
 #include "ggml-hexagon.h"
@@ -44,6 +46,7 @@
 #include "htp-ops.h"
 #include "htp_iface.h"
 #include "htp-drv.h"
+#include "e2e-clock.h"
 
 using intvec  = std::vector<int>;
 using uintvec = std::vector<unsigned int>;
@@ -1567,12 +1570,27 @@ static ggml_backend_buffer_type_i ggml_backend_hexagon_repack_buffer_type_interf
 
 // Backend session implementation
 
+static enum ggml_e2e_category ggml_hexagon_e2e_op_category(const ggml_tensor * op) {
+    return op->op == GGML_OP_CPY || op->op == GGML_OP_CONT || op->op == GGML_OP_DUP
+        ? GGML_E2E_TRANSFORM : GGML_E2E_COMPUTE;
+}
+
+static void ggml_hexagon_e2e_copy_name(char * dst, size_t size, const char * src) {
+    size_t n = 0;
+    if (src) {
+        while (n + 1 < size && src[n] != '\0') { ++n; }
+        memcpy(dst, src, n);
+    }
+    dst[n] = '\0';
+}
+
 struct ggml_hexagon_node_wall_trace_meta {
     int query_id = -1;
     int phase = -1;
     int64_t graph_id = -1;
     int split_id = -1;
     int node_index = -1;
+    int e2e_query_id = -1;
     std::string backend;
 };
 
@@ -1621,7 +1639,7 @@ struct ggml_hexagon_opbatch {
         b_vmem_max = max_vmem;
 
         ops.resize(n_ops_max);
-        if (ggml_backend_node_wall_trace_enabled()) {
+        if (ggml_backend_node_wall_trace_enabled() || ggml_e2e_trace_enabled()) {
             trace_ops.resize(n_ops_max);
         }
 
@@ -1822,6 +1840,47 @@ struct ggml_hexagon_opqueue {
     std::vector<opvec>          op_cache;   // per batch op cache
     std::vector<tracevec>       trace_cache;
     std::vector<uint64_t>       start_usec; // per batch start time
+    std::vector<int64_t>        e2e_enqueue_us;
+    std::vector<bool>           e2e_batches;
+    bool                       e2e_capacity;
+
+    // Response footers copied out of reused shared blocks. They are mapped
+    // and recorded by the e2e trace collector after the request window.
+    struct e2e_pending_record {
+        ggml_hexagon_e2e_pending_op op;
+        int                         query_id;
+        ggml_e2e_category           category;
+        char                        backend[32];
+        char                        name[GGML_MAX_NAME];
+    };
+    std::mutex                      e2e_pending_mutex;
+    std::vector<e2e_pending_record> e2e_pending;
+
+    static void e2e_collect(void * user_data) {
+        static_cast<ggml_hexagon_opqueue *>(user_data)->collect_e2e();
+    }
+
+    void collect_e2e() {
+        std::lock_guard<std::mutex> lock(e2e_pending_mutex);
+        for (const e2e_pending_record & p : e2e_pending) {
+            int64_t start_us = 0;
+            int64_t end_us = 0;
+            int64_t error_us = 0;
+            const char * reason = ggml_hexagon_e2e_finalize(&p.op, &start_us, &end_us, &error_us);
+            if (reason != nullptr) {
+                ggml_e2e_trace_missing(p.query_id, p.backend, reason);
+                continue;
+            }
+            const ggml_e2e_raw_clock raw = {
+                GGML_E2E_RAW_CLOCK_QTIMER, p.op.host_lo_us, p.op.host_hi_us,
+                p.op.batch_start_qtimer, p.op.batch_end_qtimer,
+                p.op.op_start_qtimer, p.op.op_end_qtimer,
+            };
+            ggml_e2e_trace_record_raw(p.query_id, p.category, p.backend, p.name,
+                start_us, end_us, error_us, &raw);
+        }
+        e2e_pending.clear();
+    }
 
     ggml_hexagon_opqueue(ggml_hexagon_session *sess, size_t batch_size, size_t depth) {
         size_t n_bufs    = HTP_OP_MAX_BUFS;
@@ -1833,10 +1892,18 @@ struct ggml_hexagon_opqueue {
                        sizeof(htp_op_desc)   * n_ops     +
                        sizeof(htp_prof_desc) * n_ops;
 
+        e2e_capacity = ggml_e2e_trace_enabled();
+        if (e2e_capacity) {
+            shm_blk_size += sizeof(htp_e2e_trace_header) + sizeof(htp_e2e_op_trace) * n_ops;
+            e2e_enqueue_us.resize(depth, 0);
+            e2e_batches.resize(depth, false);
+            e2e_pending.reserve(n_ops * depth);
+        }
+
         shm_buf = new ggml_hexagon_shared_buffer(sess, shm_blk_size * depth, true /* pinned */);
 
         op_cache.resize(depth);
-        if (ggml_backend_node_wall_trace_enabled()) {
+        if (ggml_backend_node_wall_trace_enabled() || e2e_capacity) {
             trace_cache.resize(depth);
         }
         start_usec.resize(depth, 0);
@@ -1848,9 +1915,17 @@ struct ggml_hexagon_opqueue {
             GGML_LOG_INFO("ggml-hex: %s allocated op-queue : batch-size %zu depth %zu shm-size %zu shm-block-size %zu\n",
                     sess->c_name(), batch_size, depth, shm_buf->size, shm_blk_size);
         }
+
+        // Register last, after every allocation that could still fail.
+        if (e2e_capacity) {
+            ggml_e2e_trace_add_collector(&ggml_hexagon_opqueue::e2e_collect, this);
+        }
     }
 
     ~ggml_hexagon_opqueue() {
+        if (e2e_capacity) {
+            ggml_e2e_trace_remove_collector(&ggml_hexagon_opqueue::e2e_collect, this);
+        }
         delete shm_buf;
     }
 
@@ -1862,6 +1937,8 @@ struct ggml_hexagon_opqueue {
         static_assert(sizeof(htp_tensor)      % 8 == 0, "sizeof(htp_tensor) must be multiple of 8");
         static_assert(sizeof(htp_op_desc)     % 8 == 0, "sizeof(htp_op_desc) must be multiple of 8");
         static_assert(sizeof(htp_prof_desc)   % 8 == 0, "sizeof(htp_prof_desc) must be multiple of 8");
+        static_assert(sizeof(htp_e2e_trace_header) % 8 == 0, "timeline header must be aligned");
+        static_assert(sizeof(htp_e2e_op_trace) % 8 == 0, "timeline entries must be aligned");
 
         if (done.empty()) { return false; }
 
@@ -1882,12 +1959,23 @@ struct ggml_hexagon_opqueue {
         const size_t t_size = sizeof(htp_tensor)    * req.n_tensors;
         const size_t o_size = sizeof(htp_op_desc)   * req.n_ops;
         const size_t p_size = sizeof(htp_prof_desc) * req.n_ops;
+        const bool e2e_trace = e2e_capacity && ggml_e2e_trace_active();
+        const size_t e_size = e2e_trace
+            ? sizeof(htp_e2e_trace_header) + sizeof(htp_e2e_op_trace) * req.n_ops
+            : 0;
+        if (e2e_capacity) {
+            e2e_batches[req.id] = e2e_trace;
+            e2e_enqueue_us[req.id] = 0;
+        }
+        if (e2e_trace) {
+            req.flags |= HTP_OPBATCH_FLAGS_E2E_TRACE;
+        }
 
         dbuf.ptr      = shm_buf->base + (req.id * shm_blk_size);
         dbuf.fd       = shm_buf->fd;
         dbuf.flags    = DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER | DSPQUEUE_BUFFER_FLAG_INVALIDATE_RECIPIENT;
         dbuf.offset   = (uint8_t*) dbuf.ptr - (uint8_t*) shm_buf->base;
-        dbuf.size     = b_size + t_size + o_size + p_size;
+        dbuf.size     = b_size + t_size + o_size + p_size + e_size;
 
         GGML_ASSERT(dbuf.size <= shm_blk_size);
 
@@ -1899,6 +1987,10 @@ struct ggml_hexagon_opqueue {
         memcpy(b_ptr, (void *) op_batch->h_bufs.data(), b_size);
         memcpy(t_ptr, (void *) op_batch->h_tens.data(), t_size);
         memcpy(o_ptr, (void *) op_batch->h_ops.data(),  o_size);
+        if (e2e_trace) {
+            // A legacy DSP leaves this zero: never invent missing device times.
+            memset(o_ptr + o_size + p_size, 0, e_size);
+        }
 
         HEX_VERBOSE("ggml-hex: %s op-queue push batch #%u : n-bufs %u n-tensors %u n-ops %u vmem %zu : b-size %zu t-size %zu o-size %zu m-size %zu\n",
                 shm_buf->sess->c_name(), req.id, req.n_bufs, req.n_tensors, req.n_ops, op_batch->b_vmem,
@@ -1923,7 +2015,13 @@ struct ggml_hexagon_opqueue {
         return true;
     }
 
-    void pop(htp_opbatch_rsp rsp, dspqueue_buffer dbuf) {
+    void mark_e2e_enqueue(uint32_t batch_id, int64_t host_us) {
+        if (e2e_capacity && e2e_batches[batch_id]) {
+            e2e_enqueue_us[batch_id] = host_us;
+        }
+    }
+
+    void pop(htp_opbatch_rsp rsp, dspqueue_buffer dbuf, int64_t received_us) {
         GGML_ASSERT(rsp.id < op_cache.size());
 
         done.push(rsp.id);
@@ -1942,6 +2040,54 @@ struct ggml_hexagon_opqueue {
 
         uint8_t * m_ptr = (uint8_t*) dbuf.ptr;
         uint8_t * p_ptr = m_ptr + (b_size + t_size + o_size);
+
+        if (e2e_capacity && e2e_batches[rsp.id]) {
+            // Copy the footer before the shared block is reused. Clock mapping
+            // and event formatting run in collect_e2e() after the request.
+            const auto & traces = trace_cache[rsp.id];
+            const auto & ops = op_cache[rsp.id];
+            const size_t e_size = sizeof(htp_e2e_trace_header) + sizeof(htp_e2e_op_trace) * rsp.n_ops;
+            const htp_e2e_trace_header * header =
+                reinterpret_cast<const htp_e2e_trace_header *>(p_ptr + p_size);
+            const bool payload_valid = rsp.n_ops == traces.size() && rsp.n_ops <= ops.size() &&
+                m_size + e_size <= dbuf.size && m_size + e_size <= shm_blk_size &&
+                header->magic == HTP_E2E_TRACE_MAGIC && header->version == HTP_E2E_TRACE_VERSION &&
+                header->n_ops == rsp.n_ops && header->batch_start_qtimer > 0 &&
+                header->batch_end_qtimer >= header->batch_start_qtimer;
+            const htp_e2e_op_trace * entries = reinterpret_cast<const htp_e2e_op_trace *>(header + 1);
+            const size_t count = std::min(traces.size(), ops.size());
+            std::lock_guard<std::mutex> lock(e2e_pending_mutex);
+            for (size_t i = 0; i < count; ++i) {
+                if (traces[i].e2e_query_id < 0) {
+                    continue;
+                }
+                const char * backend = traces[i].backend.empty() ? shm_buf->sess->c_name() : traces[i].backend.c_str();
+                e2e_pending_record p = {};
+                p.query_id = traces[i].e2e_query_id;
+                p.category = ggml_hexagon_e2e_op_category(ops[i]);
+                ggml_hexagon_e2e_copy_name(p.backend, sizeof(p.backend), backend);
+                ggml_hexagon_e2e_copy_name(p.name, sizeof(p.name), ops[i]->name);
+                p.op.host_lo_us = e2e_enqueue_us[rsp.id];
+                p.op.host_hi_us = received_us;
+                p.op.payload_valid = payload_valid;
+                p.op.status_ok = rsp.status == HTP_STATUS_OK;
+                if (payload_valid) {
+                    p.op.batch_start_qtimer = header->batch_start_qtimer;
+                    p.op.batch_end_qtimer = header->batch_end_qtimer;
+                    p.op.batch_start_us = header->batch_start_us;
+                    p.op.batch_end_us = header->batch_end_us;
+                    p.op.op_start_qtimer = entries[i].start_qtimer;
+                    p.op.op_end_qtimer = entries[i].end_qtimer;
+                    p.op.op_start_us = entries[i].start_us;
+                    p.op.op_end_us = entries[i].end_us;
+                }
+                try {
+                    e2e_pending.push_back(p);
+                } catch (...) {
+                    ggml_e2e_trace_missing(p.query_id, p.backend, "htp_timeline_allocation_failed");
+                }
+            }
+        }
 
         if (opt_profile && rsp.n_ops > 0) {
             auto & ops = op_cache[rsp.id];
@@ -2000,7 +2146,16 @@ void ggml_hexagon_session::flush_pending(bool all) {
 
         // Read response packet from queue
         const int64_t read_t0_us = breakdown ? ggml_time_us() : 0;
-        int err = dspqueue_read(this->queue, &flags, 1, &n_dbufs, &dbuf, sizeof(rsp), &rsp_size, (uint8_t *) &rsp, DSPQUEUE_TIMEOUT);
+        int err;
+        int64_t received_us;
+        {
+            // This may wait for device computation or queue/buffer readiness;
+            // it is synchronization wall time, not a pure data-transfer timer.
+            ggml_e2e_trace_scope e2e_wait(GGML_E2E_WAIT, this->c_name(), "dspqueue_response_wait");
+            err = dspqueue_read(this->queue, &flags, 1, &n_dbufs, &dbuf, sizeof(rsp), &rsp_size, (uint8_t *) &rsp, DSPQUEUE_TIMEOUT);
+            // Anchor before trace bookkeeping can delay response collection.
+            received_us = ggml_e2e_trace_enabled() ? ggml_time_us() : 0;
+        }
         if (breakdown) {
             ggml_backend_op_load_profile_add_backend_timer_us(
                     GGML_BACKEND_OP_LOAD_PROFILE_HTP,
@@ -2029,7 +2184,7 @@ void ggml_hexagon_session::flush_pending(bool all) {
         }
 
         const int64_t pop_t0_us = breakdown ? ggml_time_us() : 0;
-        op_queue->pop(rsp, dbuf);
+        op_queue->pop(rsp, dbuf, received_us);
         if (breakdown) {
             ggml_backend_op_load_profile_add_backend_timer_us(
                     GGML_BACKEND_OP_LOAD_PROFILE_HTP,
@@ -2084,7 +2239,14 @@ void ggml_hexagon_session::flush_batch() {
     HEX_VERBOSE("ggml-hex: %s queue-opbatch: %p size %u\n", this->c_name(), dbuf.ptr, dbuf.size);
 
     const int64_t write_t0_us = breakdown ? ggml_time_us() : 0;
-    int err = dspqueue_write(this->queue, 0, 1, &dbuf, sizeof(req), (const uint8_t*) &req, DSPQUEUE_TIMEOUT);
+    int err;
+    {
+        ggml_e2e_trace_scope e2e_submit(GGML_E2E_COMMUNICATION, this->c_name(), "dspqueue_request_submit");
+        if (req.flags & HTP_OPBATCH_FLAGS_E2E_TRACE) {
+            op_queue->mark_e2e_enqueue(req.id, ggml_time_us());
+        }
+        err = dspqueue_write(this->queue, 0, 1, &dbuf, sizeof(req), (const uint8_t*) &req, DSPQUEUE_TIMEOUT);
+    }
     if (breakdown) {
         ggml_backend_op_load_profile_add_backend_timer_us(
                 GGML_BACKEND_OP_LOAD_PROFILE_HTP,
@@ -2125,6 +2287,19 @@ void ggml_hexagon_session::enqueue_op(
         trace_meta.node_index = graph->trace_node_offset + local_node_index;
         trace_meta.backend = graph->trace_backend ? graph->trace_backend : this->c_name();
         trace_meta_ptr = &trace_meta;
+    }
+    if (!op_batch->trace_ops.empty() && ggml_e2e_trace_active()) {
+        trace_meta.e2e_query_id = ggml_e2e_trace_query_id();
+        if (trace_meta.backend.empty()) {
+            trace_meta.backend = this->c_name();
+        }
+        trace_meta_ptr = &trace_meta;
+    } else if (op_batch->trace_ops.empty() && ggml_e2e_trace_active()) {
+        ggml_e2e_trace_missing(ggml_e2e_trace_query_id(), this->c_name(), "htp_timeline_not_enabled_before_backend_creation");
+    }
+    if (ggml_e2e_trace_active() && ggml_hexagon_e2e_op_category(op) == GGML_E2E_COMPUTE) {
+        ggml_e2e_trace_expect_compute(ggml_e2e_trace_query_id(),
+            trace_meta.backend.empty() ? this->c_name() : trace_meta.backend.c_str());
     }
     op_batch->add_op(opcode, op, trace_meta_ptr);
 
@@ -3113,8 +3288,13 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
         ggml_tensor * n = graph->nodes[i];
         if (op_is_compute(n) && (opt_opstage & HTP_OPSTAGE_QUEUE)) {
             sess->enqueue_op(op_remap_to_htp(n), n, graph, i);
-        } else if (node_wall_trace) {
-            metadata_trace_nodes.push_back(i);
+        } else {
+            if (op_is_compute(n) && ggml_e2e_trace_active()) {
+                ggml_e2e_trace_missing(ggml_e2e_trace_query_id(), sess->c_name(), "htp_operation_queue_disabled");
+            }
+            if (node_wall_trace) {
+                metadata_trace_nodes.push_back(i);
+            }
         }
     }
 

@@ -324,6 +324,7 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-cpu.h
     include/ggml-alloc.h
     include/ggml-backend.h
+    include/ggml-e2e-trace.h
     include/ggml-shared-weights.h
     include/ggml-blas.h
     include/ggml-cann.h

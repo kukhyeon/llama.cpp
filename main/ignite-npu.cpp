@@ -9,6 +9,7 @@
 #include "chat.h"
 
 #include "ggml-backend.h"
+#include "ggml-e2e-trace.h"
 #include "ggml-shared-weights.h"
 
 #include <algorithm>
@@ -721,6 +722,17 @@ int main(int argc, char ** argv) {
     const bool ffn_worker_trace = should_write_ffn_worker_trace_csv();
     const bool any_sched_trace = sched_trace || ffn_worker_trace;
     const bool node_wall_trace = should_write_node_wall_trace_csv();
+    const bool e2e_latency_trace = ggml_e2e_trace_enabled();
+    if (e2e_latency_trace) {
+        const std::string trace_dir = params.output_dir.empty() ? "." : params.output_dir;
+        const std::string summary_path = trace_dir + "/e2e_latency.csv";
+        const std::string events_path = trace_dir + "/e2e_latency_events.csv";
+        const char * summary_override = std::getenv("GGML_E2E_LATENCY_TRACE_PATH");
+        const char * events_override = std::getenv("GGML_E2E_LATENCY_EVENTS_PATH");
+        ggml_e2e_trace_set_paths(summary_override ? summary_override : summary_path.c_str(),
+                events_override ? events_override : events_path.c_str());
+        LOG_INF("E2E latency trace enabled (GGML_E2E_LATENCY_TRACE); no profiling synchronization added\n");
+    }
     ggml_backend_op_load_profile_set_enabled(csv_op_load);
     ggml_backend_op_load_profile_set_breakdown_enabled(csv_op_load_breakdown);
     ggml_backend_op_load_profile_set_ops_from_env(std::getenv("CSV_OP_LOAD_OPS"));
@@ -1487,6 +1499,7 @@ int main(int argc, char ** argv) {
     // the legacy CSV `ttft` column retain their existing meaning.
     double query_sampling_ms = 0.0;
     double query_ttft_e2e_ms = 0.0;
+    int64_t e2e_request_prepare_start_us = 0;
     bool query_first_sample_recorded = false;
 // ------------------------------------------------
 
@@ -1928,11 +1941,27 @@ int main(int argc, char ** argv) {
                 GGML_ASSERT(n_eval <= params.n_batch);
 
                 if (strict_sample_only_completed && generation_started) {
+                    if (e2e_latency_trace) {
+                        ggml_e2e_trace_missing((int) current_question_index, "host", "strict_sample_only_invariant_failed");
+                        ggml_e2e_trace_end_query(ggml_time_us());
+                        ggml_e2e_trace_flush();
+                    }
                     LOG_ERR("strict sample-only invariant violated: generated-token decode was requested\n");
                     return 1;
                 }
 
+                if (e2e_request_prepare_start_us != 0) {
+                    ggml_e2e_trace_record((int) current_question_index, GGML_E2E_REQUEST, "host",
+                            "reset_tokenization_policy_input", e2e_request_prepare_start_us,
+                            ggml_time_us(), 0, GGML_E2E_CLOCK_HOST);
+                    e2e_request_prepare_start_us = 0;
+                }
                 if (llama_decode(ctx, llama_batch_get_one(embd.data(), n_eval))) {
+                    if (e2e_latency_trace) {
+                        ggml_e2e_trace_missing((int) current_question_index, "host", "inference_failed");
+                        ggml_e2e_trace_end_query(ggml_time_us());
+                        ggml_e2e_trace_flush();
+                    }
                     LOG_ERR("%s : failed to eval\n", __func__);
                     return 1;
                 }
@@ -1966,6 +1995,10 @@ int main(int argc, char ** argv) {
                         // existing synchronize path. Complete that work before
                         // printing/flushing the per-query profiling buffers.
                         llama_synchronize(ctx);
+                    }
+                    if (e2e_latency_trace) {
+                        ggml_e2e_trace_end_query(ggml_time_us());
+                        ggml_e2e_trace_flush();
                     }
                     if (output_path_infer != "/inference_stats.csv") {
                         llama_perf_context_print_custom(
@@ -2030,7 +2063,15 @@ int main(int argc, char ** argv) {
             const llama_token id = common_sampler_sample(smpl, ctx, -1);
 
             common_sampler_accept(smpl, id, /* accept_grammar= */ true);
-            const double sample_ms = (ggml_time_us() - t_sample_us) / 1000.0;
+            const int64_t t_sample_end_us = ggml_time_us();
+            const double sample_ms = (t_sample_end_us - t_sample_us) / 1000.0;
+            if (e2e_latency_trace) {
+                ggml_e2e_trace_record((int) current_question_index, GGML_E2E_SAMPLING, "host",
+                        "sample_accept", t_sample_us, t_sample_end_us, 0, GGML_E2E_CLOCK_HOST);
+                // Prefill-only runs use the same first-sample boundary as
+                // ttft_e2e_ms. Generation runs continue through the last token.
+                if (strict_prefill_sample_pending) { ggml_e2e_trace_end_query(t_sample_end_us); }
+            }
             query_sampling_ms += sample_ms;
             if (ig->backend_compute_profile) {
                 ggml_backend_sched_profile_add_sampling_ms(sample_ms);
@@ -2196,6 +2237,7 @@ int main(int argc, char ** argv) {
                     if (query_pacing_enabled || node_wall_trace || csv_load) {
                         llama_synchronize(ctx);
                     }
+                    if (e2e_latency_trace) { ggml_e2e_trace_end_query(ggml_time_us()); }
                     auto inference_end_time = std::chrono::steady_clock::now();
                     auto inference_duration = std::chrono::duration_cast<std::chrono::milliseconds>(inference_end_time - inference_start_time).count();
                     // LOG_INF("Inference time for previous question: %lld ms\n", inference_duration);
@@ -2219,6 +2261,7 @@ int main(int argc, char ** argv) {
                     if (node_wall_trace) {
                         ggml_backend_node_wall_trace_flush();
                     }
+                    if (e2e_latency_trace) { ggml_e2e_trace_flush(); }
                     //check_hardware(device_name);
                     // common_sampler_free(smpl);
                     inference_started = false;
@@ -2395,6 +2438,16 @@ int main(int argc, char ** argv) {
                     query_e2e_start_time = query_pacing_enabled ?
                         query_actual_start : std::chrono::steady_clock::now();
                     current_question_index += 1;
+                    if (e2e_latency_trace) {
+                        // Translate steady_clock's already chosen request
+                        // boundary into ggml_time_us's host clock. In paced
+                        // runs this includes service setup since actual_start.
+                        const auto now = std::chrono::steady_clock::now();
+                        const int64_t elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                now - query_e2e_start_time).count();
+                        e2e_request_prepare_start_us = ggml_time_us() - elapsed_us;
+                        ggml_e2e_trace_begin_query((int) current_question_index, e2e_request_prepare_start_us);
+                    }
                     if (query_pacing_enabled) {
                         query_timing.query_id = current_question_index;
                         query_timing.scheduled_start = query_scheduled_start;
@@ -2581,6 +2634,17 @@ int main(int argc, char ** argv) {
         llama_synchronize(ctx);
     }
 
+    if (e2e_latency_trace && ggml_e2e_trace_active()) {
+        // A normal EOS/token-budget/antiprompt exit need not pass through the
+        // interactive transition above. Close before DVFS, logging and teardown.
+        const bool generation_complete = n_remain == 0 || is_antiprompt ||
+            (!embd.empty() && llama_vocab_is_eog(vocab, embd.back()) && !params.interactive);
+        if (!generation_complete) {
+            ggml_e2e_trace_missing((int) current_question_index, "host", "query_interrupted_before_completion");
+        }
+        ggml_e2e_trace_end_query(ggml_time_us());
+    }
+
     if (route_clock_producer_registered) {
         (void) llama_runtime_route_set_layer_producer(ctx, nullptr, nullptr);
         route_clock_producer_registered = false;
@@ -2614,6 +2678,9 @@ int main(int argc, char ** argv) {
     }
     if (node_wall_trace) {
         ggml_backend_node_wall_trace_flush();
+    }
+    if (e2e_latency_trace) {
+        ggml_e2e_trace_flush();
     }
 
     // Keep query-period logging out of the active schedule: rows are buffered

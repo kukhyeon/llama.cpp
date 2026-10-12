@@ -1,4 +1,5 @@
 #include "ggml-shared-weights.h"
+#include "ggml-e2e-trace.h"
 #include "llama-context.h"
 #include "llama-graph-budget.h"
 
@@ -2846,6 +2847,7 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    ggml_e2e_trace_scope e2e_graph(GGML_E2E_GRAPH, "host", "graph_route_allocation_inputs");
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -3069,6 +3071,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     const bool module_bench_active = llama_module_bench_phase_matches(cparams, lp_is_prefill);
+    e2e_graph.stop();
     const int module_bench_repeat = module_bench_active ? std::max(1, cparams.module_bench_repeat) : 1;
     for (int ir = 0; ir < module_bench_repeat; ++ir) {
         const int64_t t_module_us = module_bench_active ? ggml_time_us() : 0;
@@ -3115,6 +3118,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch & batch_inp) {
+    ggml_e2e_trace_scope e2e_request(GGML_E2E_REQUEST, "host", "encode_bookkeeping");
     GGML_ASSERT((!batch_inp.token && batch_inp.embd) || (batch_inp.token && !batch_inp.embd)); // NOLINT
 
     if (batch_inp.n_tokens == 0) {
@@ -3405,6 +3409,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
+    ggml_e2e_trace_scope e2e_request(GGML_E2E_REQUEST, "host", "decode_bookkeeping");
     GGML_ASSERT((!batch_inp.token && batch_inp.embd) || (batch_inp.token && !batch_inp.embd)); // NOLINT
 
     if (!memory) {

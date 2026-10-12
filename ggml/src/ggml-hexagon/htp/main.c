@@ -722,7 +722,9 @@ static void prep_tensors(struct htp_context *ctx, struct htp_buf_desc *bufs, str
     }
 }
 
-static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, uint32_t idx, struct htp_op_desc * op) {
+static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, uint32_t idx,
+                       struct htp_op_desc * op, struct htp_e2e_op_trace * trace,
+                       uint64_t batch_start_qtimer) {
     memcpy(octx->op_params, op->params, sizeof(octx->op_params));
     octx->flags = op->flags;
     octx->op    = op->opcode;
@@ -753,7 +755,20 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, u
     FARF(HIGH, "prep-dst #%u: data %p size %u : %u:%u:%u:%u", op->dst, (void*) dst->data, dst->size,
         dst->ne[0], dst->ne[1], dst->ne[3], dst->ne[3]);
 
+    // Time the device operation body, excluding the input/output cache flushes.
+    // execute_op() already waits for its worker jobs; no new synchronization.
+    const bool trace_compute = trace != NULL && !(op->flags & HTP_OPFLAGS_SKIP_COMPUTE);
+    const uint64_t start_qtimer = trace_compute ? HAP_perf_get_qtimer_count() : 0;
     const int op_status = execute_op(octx);
+    if (trace_compute) {
+        const uint64_t end_qtimer = HAP_perf_get_qtimer_count();
+        trace->start_qtimer = start_qtimer;
+        trace->end_qtimer = end_qtimer;
+        // Convert elapsed counts, as in the legacy profiler, rather than the
+        // absolute DSP uptime. Each batch is mapped independently on the host.
+        trace->start_us = HAP_perf_qtimer_count_to_us(start_qtimer - batch_start_qtimer);
+        trace->end_us = HAP_perf_qtimer_count_to_us(end_qtimer - batch_start_qtimer);
+    }
     if (octx->op == HTP_OP_MUL_MAT_SRC0_REGION &&
         op_status != HTP_STATUS_OK) {
         FARF(ERROR, "proc-op #%u: region matmul failed with status %d", idx, op_status);
@@ -821,7 +836,13 @@ static void htp_packet_callback(dspqueue_t queue, int error, void * context) {
         const uint32_t o_size = sizeof(struct htp_op_desc)   * n_ops;
         const uint32_t p_size = sizeof(struct htp_prof_desc) * n_ops;
 
-        if (dbuf.size < b_size + t_size + o_size + p_size) {
+        const bool e2e_trace = (req.flags & HTP_OPBATCH_FLAGS_E2E_TRACE) != 0;
+        const uint64_t legacy_size = (uint64_t) b_size + t_size + o_size + p_size;
+        const uint64_t trace_size = e2e_trace
+            ? sizeof(struct htp_e2e_trace_header) + (uint64_t) sizeof(struct htp_e2e_op_trace) * n_ops
+            : 0;
+
+        if (dbuf.size < legacy_size + trace_size) {
             FARF(ERROR, "invalid opbatch memory block size %u", dbuf.size);
             break;
         }
@@ -837,6 +858,18 @@ static void htp_packet_callback(dspqueue_t queue, int error, void * context) {
         struct htp_prof_desc* pds = (struct htp_prof_desc*) m_ptr;
         memset(pds, 0, p_size);
 
+        struct htp_e2e_trace_header * trace_header = NULL;
+        struct htp_e2e_op_trace * op_traces = NULL;
+        if (e2e_trace) {
+            trace_header = (struct htp_e2e_trace_header *) (m_ptr + p_size);
+            op_traces = (struct htp_e2e_op_trace *) (trace_header + 1);
+            memset(trace_header, 0, (size_t) trace_size);
+            trace_header->version = HTP_E2E_TRACE_VERSION;
+            trace_header->n_ops = n_ops;
+            trace_header->batch_start_qtimer = HAP_perf_get_qtimer_count();
+            trace_header->batch_start_us = 0;
+        }
+
         prep_op_bufs(ctx, bufs, n_bufs);
         prep_tensors(ctx, bufs, tens, n_tens);
 
@@ -851,7 +884,8 @@ static void htp_packet_callback(dspqueue_t queue, int error, void * context) {
 
             profile_start(ctx->profiler, &prof);
 
-            const int op_status = proc_op_req(octx, tens, i, &ops[i]);
+            const int op_status = proc_op_req(octx, tens, i, &ops[i], op_traces != NULL ? &op_traces[i] : NULL,
+                                              trace_header != NULL ? trace_header->batch_start_qtimer : 0);
 
             profile_stop(ctx->profiler, &prof);
 
@@ -878,6 +912,13 @@ static void htp_packet_callback(dspqueue_t queue, int error, void * context) {
         rsp.n_bufs    = n_bufs;
         rsp.n_tensors = n_tens;
         rsp.n_ops     = n_ops;
+
+        if (trace_header != NULL) {
+            trace_header->batch_end_qtimer = HAP_perf_get_qtimer_count();
+            trace_header->batch_end_us = HAP_perf_qtimer_count_to_us(
+                trace_header->batch_end_qtimer - trace_header->batch_start_qtimer);
+            trace_header->magic = HTP_E2E_TRACE_MAGIC;
+        }
 
         dbuf.flags = DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER | DSPQUEUE_BUFFER_FLAG_INVALIDATE_RECIPIENT;
 

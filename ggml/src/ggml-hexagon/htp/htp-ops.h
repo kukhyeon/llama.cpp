@@ -166,12 +166,38 @@ struct htp_prof_desc {
     uint32_t pmu[HTP_PROF_PMU_NCNT]; // PMU counters
 };
 
+// Optional timeline footer, appended after the unchanged legacy profile array.
+// Older DSP binaries ignore req.flags and leave the host-zeroed footer untouched.
+// Do not change the legacy request, response or profile descriptor sizes.
+// Raw QTIMER fields are absolute; microseconds are relative to batch start.
+#define HTP_OPBATCH_FLAGS_E2E_TRACE (1U << 0)
+#define HTP_E2E_TRACE_MAGIC        0x45324548U
+#define HTP_E2E_TRACE_VERSION      1U
+
+struct htp_e2e_trace_header {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t n_ops;
+    uint32_t reserved;
+    uint64_t batch_start_qtimer;
+    uint64_t batch_end_qtimer;
+    uint64_t batch_start_us;
+    uint64_t batch_end_us;
+};
+
+struct htp_e2e_op_trace {
+    uint64_t start_qtimer;
+    uint64_t end_qtimer;
+    uint64_t start_us;
+    uint64_t end_us;
+};
+
 struct htp_opbatch_req {
     uint32_t id;          // Batch id
     uint32_t n_bufs;      // Number of buffers
     uint32_t n_tensors;   // Number of tensors
     uint32_t n_ops;       // Number of ops
-    uint32_t flags;       // unused
+    uint32_t flags;       // HTP_OPBATCH_FLAGS_... (optional extension)
     uint32_t pad;         // unused
     // struct htp_buf_desc  bufs[];    -- dspqueue buf 0
     // struct htp_tensor    tensors[]; -- dspqueue buf 0

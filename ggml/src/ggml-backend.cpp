@@ -9,6 +9,7 @@
 #endif
 
 #include "ggml-backend.h"
+#include "ggml-e2e-trace.h"
 #include "ggml-shared-weights.h"
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
@@ -276,6 +277,7 @@ size_t ggml_backend_get_max_size(ggml_backend_t backend) {
 }
 
 void ggml_backend_tensor_set_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    ggml_e2e_trace_scope e2e(GGML_E2E_COMMUNICATION, ggml_backend_name(backend), "host_upload_async_call");
     GGML_ASSERT(backend);
     GGML_ASSERT(tensor);
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
@@ -290,6 +292,7 @@ void ggml_backend_tensor_set_async(ggml_backend_t backend, struct ggml_tensor * 
 }
 
 void ggml_backend_tensor_get_async(ggml_backend_t backend, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    ggml_e2e_trace_scope e2e(GGML_E2E_COMMUNICATION, ggml_backend_name(backend), "host_readback_async_call");
     GGML_ASSERT(backend);
     GGML_ASSERT(tensor);
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
@@ -305,6 +308,7 @@ void ggml_backend_tensor_get_async(ggml_backend_t backend, const struct ggml_ten
 
 void ggml_backend_tensor_set_2d_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size,
             size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    ggml_e2e_trace_scope e2e(GGML_E2E_COMMUNICATION, ggml_backend_name(backend), "host_upload_2d_async_call");
     GGML_ASSERT(backend);
     GGML_ASSERT(tensor);
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
@@ -326,6 +330,7 @@ void ggml_backend_tensor_set_2d_async(ggml_backend_t backend, struct ggml_tensor
 
 void ggml_backend_tensor_get_2d_async(ggml_backend_t backend, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size,
             size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    ggml_e2e_trace_scope e2e(GGML_E2E_COMMUNICATION, ggml_backend_name(backend), "host_readback_2d_async_call");
     GGML_ASSERT(backend);
     GGML_ASSERT(tensor);
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
@@ -346,6 +351,7 @@ void ggml_backend_tensor_get_2d_async(ggml_backend_t backend, const struct ggml_
 }
 
 void ggml_backend_tensor_set(struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    ggml_e2e_trace_scope e2e(GGML_E2E_COMMUNICATION, "host", "tensor_upload_call");
     GGML_ASSERT(tensor);
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
     GGML_ASSERT(buf != NULL && "tensor buffer not set");
@@ -361,6 +367,7 @@ void ggml_backend_tensor_set(struct ggml_tensor * tensor, const void * data, siz
 }
 
 void ggml_backend_tensor_get(const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    ggml_e2e_trace_scope e2e(GGML_E2E_COMMUNICATION, "host", "tensor_readback_call");
     GGML_ASSERT(tensor);
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
     GGML_ASSERT(buf != NULL && "tensor buffer not set");
@@ -377,6 +384,7 @@ void ggml_backend_tensor_get(const struct ggml_tensor * tensor, void * data, siz
 
 void ggml_backend_tensor_set_2d(struct ggml_tensor * tensor, const void * data, size_t offset, size_t size,
             size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    ggml_e2e_trace_scope e2e(GGML_E2E_COMMUNICATION, "host", "tensor_upload_2d_call");
     GGML_ASSERT(tensor);
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
     GGML_ASSERT(buf != NULL && "tensor buffer not set");
@@ -399,6 +407,7 @@ void ggml_backend_tensor_set_2d(struct ggml_tensor * tensor, const void * data, 
 
 void ggml_backend_tensor_get_2d(const struct ggml_tensor * tensor, void * data, size_t offset, size_t size,
             size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    ggml_e2e_trace_scope e2e(GGML_E2E_COMMUNICATION, "host", "tensor_readback_2d_call");
     GGML_ASSERT(tensor);
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
     GGML_ASSERT(buf != NULL && "tensor buffer not set");
@@ -436,6 +445,7 @@ void ggml_backend_tensor_memset(struct ggml_tensor * tensor, uint8_t value, size
 }
 
 void ggml_backend_synchronize(ggml_backend_t backend) {
+    ggml_e2e_trace_scope e2e(GGML_E2E_WAIT, ggml_backend_name(backend), "backend_completion");
     GGML_ASSERT(backend);
     if (backend->iface.synchronize == NULL) {
         return;
@@ -472,6 +482,13 @@ enum ggml_status ggml_backend_graph_compute(ggml_backend_t backend, struct ggml_
 }
 
 enum ggml_status ggml_backend_graph_compute_async(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+    ggml_e2e_trace_scope e2e(GGML_E2E_DISPATCH, ggml_backend_name(backend), "graph_compute_call");
+    if (ggml_e2e_trace_active()) {
+        const char * name = ggml_backend_name(backend);
+        if (strncmp(name, "CPU", 3) && strncmp(name, "OpenCL", 6) && strncmp(name, "HTP", 3)) {
+            ggml_e2e_trace_missing(ggml_e2e_trace_query_id(), name, "backend_kernel_timeline_unsupported");
+        }
+    }
     GGML_ASSERT(backend);
     return backend->iface.graph_compute(backend, cgraph);
 }
@@ -498,7 +515,23 @@ ggml_backend_dev_t ggml_backend_get_device(ggml_backend_t backend) {
 
 // backend copy
 
+// "src->dst" label for e2e copy scopes, built without printf-style parsing.
+static void ggml_backend_e2e_direction(char * out, size_t size, const char * src, const char * dst) {
+    size_t n = 0;
+    for (const char * part : { src, "->", dst }) {
+        for (const char * p = part; p && *p && n + 1 < size; ++p) { out[n++] = *p; }
+    }
+    out[n] = '\0';
+}
+
 void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor * dst) {
+    char direction[96];
+    direction[0] = '\0';
+    if (ggml_e2e_trace_active()) {
+        ggml_backend_e2e_direction(direction, sizeof(direction),
+                ggml_backend_buffer_name(src->buffer), ggml_backend_buffer_name(dst->buffer));
+    }
+    ggml_e2e_trace_scope e2e(GGML_E2E_COMMUNICATION, direction, src->name);
     if (src != dst && ggml_shared_weights_tensor(src)) {
         ggml_shared_weights_log("unexpected_copy", src, "scheduler", -1, 0, 0, dst->name);
         GGML_ABORT("immutable shared HTP weight must be consumed directly: %s", src->name);
@@ -526,6 +559,13 @@ void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor
 }
 
 void ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst) {
+    char direction[96];
+    direction[0] = '\0';
+    if (ggml_e2e_trace_active()) {
+        ggml_backend_e2e_direction(direction, sizeof(direction),
+                ggml_backend_name(backend_src), ggml_backend_name(backend_dst));
+    }
+    ggml_e2e_trace_scope e2e(GGML_E2E_COMMUNICATION, direction, src->name);
     if (src != dst && ggml_shared_weights_tensor(src)) {
         ggml_shared_weights_log("unexpected_copy", src, "scheduler", -1, 0, 0, dst->name);
         GGML_ABORT("shared HTP weight cannot be copied asynchronously: %s", src->name);
@@ -575,6 +615,7 @@ void ggml_backend_event_record(ggml_backend_event_t event, ggml_backend_t backen
 }
 
 void ggml_backend_event_synchronize(ggml_backend_event_t event) {
+    ggml_e2e_trace_scope e2e(GGML_E2E_WAIT, "event", "event_completion");
     GGML_ASSERT(event);
     GGML_ASSERT(event->device->iface.event_synchronize);
 
@@ -582,6 +623,7 @@ void ggml_backend_event_synchronize(ggml_backend_event_t event) {
 }
 
 void ggml_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
+    ggml_e2e_trace_scope e2e(GGML_E2E_DISPATCH, ggml_backend_name(backend), "event_dependency_enqueue");
     GGML_ASSERT(backend);
     GGML_ASSERT(backend->iface.event_wait != NULL);
 
@@ -1367,6 +1409,7 @@ struct ggml_backend_sched_ffn_executor {
         }
 
         void wait(uint64_t ticket, ggml_backend_sched_ffn_worker_timeline * timeline) {
+            ggml_e2e_trace_scope e2e(GGML_E2E_WAIT, backend_name.c_str(), "ffn_worker_completion");
             if (timeline != nullptr) {
                 timeline->collect_begin_us = ggml_time_us();
             }
@@ -7138,6 +7181,7 @@ static uint64_t ggml_backend_sched_reach_layer_checkpoint(
 
 template<bool UseLayerCheckpoints, bool UseRouteCandidates>
 static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sched_t sched) {
+    ggml_e2e_trace_scope e2e_scheduler(GGML_E2E_DISPATCH, "host", "scheduler_execute");
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
@@ -7600,7 +7644,10 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                             request_cpu_prewake();
                         }
                         const int64_t t0_us = ggml_sched_profile_time_us();
-                        async_ok = split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy);
+                        {
+                            ggml_e2e_trace_scope e2e(GGML_E2E_COMMUNICATION, ggml_backend_name(split_backend), input->name);
+                            async_ok = split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy);
+                        }
                         const int64_t t1_us = ggml_sched_profile_time_us();
                         add_copy_us(t1_us - t0_us);
                     }
@@ -8248,6 +8295,7 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                 const int64_t copy_t0_us = ggml_time_us();
                 queued_commit = true;
                 size_t n_queued_outputs = 0;
+                ggml_e2e_trace_scope e2e_commit(GGML_E2E_COMMUNICATION, ggml_backend_name(queued_backend), "profile_output_commit");
                 for (size_t output_index = 0;
                         output_index < variant_outputs.size(); ++output_index) {
                     if (!late_copy[output_index]) {
@@ -9183,7 +9231,10 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                         timeline->collect_order = collect_order++;
                         timeline->collect_begin_us = ggml_time_us();
                     }
-                    workers[worker_index].join();
+                    {
+                        ggml_e2e_trace_scope e2e(GGML_E2E_WAIT, "host", "ffn_worker_join");
+                        workers[worker_index].join();
+                    }
                     if (timeline != nullptr) {
                         timeline->collect_end_us = ggml_time_us();
                     }

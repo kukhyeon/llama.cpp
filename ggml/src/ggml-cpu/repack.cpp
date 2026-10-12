@@ -7,6 +7,7 @@
 #include "ggml-cpu.h"
 #include "ggml-cpu-impl.h"
 #include "ggml-shared-weights.h"
+#include "ggml-e2e-trace.h"
 #include "simd-mappings.h"
 #include "traits.h"
 
@@ -5399,7 +5400,12 @@ bool ggml_cpu_shared_repack_compute(ggml_compute_params * params, ggml_tensor * 
         ggml_barrier(params->threadpool);
     }
     const bool reuse_input = shared_repack_input_reusable(params, op, layout);
-    shared_repack_copy_groups(layout, layout.interleave, packed_data, params->ith, params->nth);
+    {
+        // Scope only the weight-layout transformation. The following native
+        // matmul remains model work, and the existing barrier records its wait.
+        ggml_e2e_trace_scope trace(GGML_E2E_TRANSFORM, "CPU", "shared_weight_repack");
+        shared_repack_copy_groups(layout, layout.interleave, packed_data, params->ith, params->nth);
+    }
     ggml_barrier(params->threadpool);
     if (timing && params->ith == 0) {
         event.repack_us = double(ggml_time_us() - start_us);
