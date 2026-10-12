@@ -447,25 +447,13 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
     ggml_tensor * inpL;
 
     llama_backend_policy_runtime_routes runtime_routes;
-    const bool runtime_layer_routes = runtime_route_candidates && n_tokens > 1 &&
-        llama_backend_policy_resolve_runtime_routes(true, runtime_routes) &&
-        (runtime_routes.mode == "clock" || runtime_routes.mode == "fixed");
-    const bool runtime_ffn_routes = runtime_layer_routes &&
-        std::find(runtime_routes.candidate_kinds.begin(), runtime_routes.candidate_kinds.end(),
-                "ffn_block") != runtime_routes.candidate_kinds.end();
-    const bool runtime_weighted_norm_routes = runtime_layer_routes &&
-        std::find(runtime_routes.candidate_kinds.begin(), runtime_routes.candidate_kinds.end(),
-                "weighted_norm") != runtime_routes.candidate_kinds.end();
-    const bool runtime_attn_qkv_routes = runtime_layer_routes &&
-        cparams.attn_qkv_shards && n_tokens <= 1024 &&
-        (loras == nullptr || loras->empty()) &&
-        std::find(runtime_routes.candidate_kinds.begin(), runtime_routes.candidate_kinds.end(),
-                "attn_qkv_block") != runtime_routes.candidate_kinds.end();
-    const bool runtime_attn_out_routes = runtime_layer_routes &&
-        cparams.attn_out_shards && n_tokens <= 1024 &&
-        (loras == nullptr || loras->empty()) &&
-        std::find(runtime_routes.candidate_kinds.begin(), runtime_routes.candidate_kinds.end(),
-                "attn_out_block") != runtime_routes.candidate_kinds.end();
+    const auto runtime_flags = llm_graph_resolve_runtime_route_flags(
+            runtime_route_candidates, n_tokens, cparams.attn_qkv_shards,
+            cparams.attn_out_shards, loras != nullptr && !loras->empty(), runtime_routes);
+    const bool runtime_ffn_routes = runtime_flags.ffn;
+    const bool runtime_weighted_norm_routes = runtime_flags.weighted_norm;
+    const bool runtime_attn_qkv_routes = runtime_flags.attn_qkv;
+    const bool runtime_attn_out_routes = runtime_flags.attn_out;
     std::vector<std::string> runtime_route_profiles;
     if (runtime_ffn_routes || runtime_weighted_norm_routes ||
             runtime_attn_qkv_routes || runtime_attn_out_routes) {

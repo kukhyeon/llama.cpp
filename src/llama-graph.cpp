@@ -27,6 +27,56 @@
 #include <sstream>
 #include <unordered_set>
 
+llm_graph_runtime_route_flags llm_graph_filter_runtime_route_flags(
+        const llm_graph_runtime_route_flags & available,
+        bool runtime_candidates, uint32_t n_tokens,
+        bool qkv_shards, bool out_shards, bool has_lora) {
+    llm_graph_runtime_route_flags flags;
+    flags.layer = available.layer && runtime_candidates && n_tokens > 1;
+    flags.ffn = flags.layer && available.ffn;
+    flags.weighted_norm = flags.layer && available.weighted_norm;
+    flags.attn_qkv = flags.layer && available.attn_qkv &&
+        qkv_shards && n_tokens <= 1024 && !has_lora;
+    flags.attn_out = flags.layer && available.attn_out &&
+        out_shards && n_tokens <= 1024 && !has_lora;
+    return flags;
+}
+
+llm_graph_runtime_route_flags llm_graph_runtime_route_flags_from_catalog(
+        bool runtime_candidates, uint32_t n_tokens,
+        bool qkv_shards, bool out_shards, bool has_lora,
+        const llama_backend_policy_runtime_routes & routes) {
+    llm_graph_runtime_route_flags available;
+    available.layer = routes.enabled &&
+        (routes.mode == "clock" || routes.mode == "fixed");
+    if (!available.layer) {
+        return available;
+    }
+    const auto wants = [&](const char * kind) {
+        return std::find(routes.candidate_kinds.begin(), routes.candidate_kinds.end(), kind) !=
+            routes.candidate_kinds.end();
+    };
+    available.ffn = wants("ffn_block");
+    available.weighted_norm = wants("weighted_norm");
+    available.attn_qkv = wants("attn_qkv_block");
+    available.attn_out = wants("attn_out_block");
+    return llm_graph_filter_runtime_route_flags(
+            available, runtime_candidates, n_tokens, qkv_shards, out_shards, has_lora);
+}
+
+llm_graph_runtime_route_flags llm_graph_resolve_runtime_route_flags(
+        bool runtime_candidates, uint32_t n_tokens,
+        bool qkv_shards, bool out_shards, bool has_lora,
+        llama_backend_policy_runtime_routes & routes) {
+    routes = {};
+    if (!runtime_candidates || n_tokens <= 1 ||
+            !llama_backend_policy_resolve_runtime_routes(true, routes)) {
+        return {};
+    }
+    return llm_graph_runtime_route_flags_from_catalog(
+            runtime_candidates, n_tokens, qkv_shards, out_shards, has_lora, routes);
+}
+
 // dedup helpers
 
 static ggml_tensor * build_attn_inp_kq_mask(

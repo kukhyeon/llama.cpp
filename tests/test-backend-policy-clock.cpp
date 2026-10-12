@@ -2513,6 +2513,91 @@ bool test_compact_unified_ffn_routes(const char * policy_path) {
     return true;
 }
 
+bool test_ffn_inp_route_node_bound(const char * policy_json) {
+    const auto check_policy = [](const std::string & contents, uint32_t n_layer,
+                                size_t n_backends, bool expected, uint64_t expected_nodes) {
+        temporary_policy_file file("test-backend-policy-ffn-inp-bound.json", contents.c_str());
+        CHECK(llama_backend_policy_load(file.path(), false, true));
+        uint64_t nodes = 123;
+        CHECK(llama_backend_policy_count_ffn_inp_route_nodes(n_layer, n_backends, nodes) == expected);
+        CHECK(nodes == expected_nodes);
+        return true;
+    };
+    CHECK(check_policy(policy_json, 1, 3, true, 2));
+    CHECK(check_policy(policy_json, 1, 1, true, 0));
+    CHECK(check_policy(policy_json, 1, 0, false, 0));
+    CHECK(check_policy(policy_json, UINT32_MAX, 3, false, 0));
+    // This fixture's prebuilt FFN covers only layer zero. The other layer's
+    // norm/FFN nodes must keep the conservative generic allowance.
+    CHECK(check_policy(policy_json, 2, 3, false, 0));
+
+    const auto changed_policy = [&](const char * before, const char * after,
+                                    bool expected = false) {
+        std::string contents = policy_json;
+        const size_t pos = contents.find(before);
+        CHECK(pos != std::string::npos);
+        contents.replace(pos, std::string(before).size(), after);
+        CHECK(check_policy(contents, 1, 3, expected, expected ? 2 : 0));
+        return true;
+    };
+    CHECK(changed_policy("\"strict\": true", "\"strict\": false"));
+    CHECK(changed_policy("\"mode\": \"clock\"", "\"mode\": \"prepare\""));
+    CHECK(changed_policy("\"mode\": \"clock\"", "\"mode\": \"fixed\"", true));
+    CHECK(changed_policy(
+            "\"enabled\": true,\n  \"ffn_clock_switch\"",
+            "\"enabled\": true,\n  \"ops\": {\"enabled\": true, \"rules\": [{\"name\": \"norm\", \"op\": \"RMS_NORM\", \"backend\": \"CPU\"}]},\n  \"ffn_clock_switch\"",
+            true));
+    CHECK(changed_policy("\"weightless_stateless\", ", ""));
+    CHECK(changed_policy("\"weighted_norm\", ", ""));
+    CHECK(changed_policy(
+            "[\"weightless_stateless\", \"weighted_norm\", \"ffn_block\"]",
+            "[\"weightless_stateless\", \"weighted_norm\"]"));
+    CHECK(changed_policy(
+            "\"runtime_routes\": {\n    \"enabled\": true",
+            "\"runtime_routes\": {\n    \"enabled\": false"));
+
+    // Every effective catalog profile is inspected, including inherited
+    // defaults and later overrides. Broad op-only/name-regex rules can reach
+    // more than the one known ffn_inp ADD per layer.
+    CHECK(changed_policy("\"name\": \"ffn_inp\", \"op\": \"ADD\"",
+                         "\"op\": \"ADD\""));
+    CHECK(changed_policy("\"name\": \"ffn_inp\"", "\"name_regex\": \"^ffn_inp\""));
+    CHECK(changed_policy("\"name\": \"ffn_inp\"", "\"name\": \"ffn_*\""));
+    CHECK(changed_policy("\"name\": \"ffn_inp\"", "\"name\": \"unrelated_add\""));
+    CHECK(changed_policy("\"name\": \"ffn_inp\"", "\"name\": \"ffn_inp-0\""));
+    CHECK(changed_policy("\"name\": \"ffn_inp\"",
+                         "\"name\": \"ffn_inp\", \"pattern\": \".*\""));
+    CHECK(changed_policy("\"name\": \"ffn_inp\"",
+                         "\"name\": \"ffn_inp\", \"tensor\": \"ffn_inp-0\""));
+    CHECK(changed_policy(
+            "\"name\": \"ffn_inp\", \"op\": \"ADD\", \"phase\": \"prefill\", \"backend\": \"CPU\"",
+            "\"name\": \"ffn_inp\", \"op\": \"MUL\", \"phase\": \"prefill\", \"backend\": \"CPU\""));
+    CHECK(changed_policy(
+            "\"name\": \"ffn_inp\", \"op\": \"ADD\", \"phase\": \"prefill\", \"backend\": \"CPU\"",
+            "\"name\": \"ffn_inp\", \"op\": \"ADD\", \"phase\": \"decode\", \"backend\": \"CPU\""));
+    CHECK(changed_policy(
+            "\"name\": \"ffn_inp\", \"op\": \"ADD\", \"phase\": \"prefill\", \"backend\": \"CPU\"",
+            "\"name\": \"ffn_inp\", \"op\": \"ADD\", \"layer\": 1, \"backend\": \"CPU\""));
+    CHECK(changed_policy(
+            "\"name\": \"attn_norm\", \"op\": \"MUL\", \"phase\": \"prefill\", \"backend\": \"CPU\"",
+            "\"name\": \"attn_norm\", \"op\": \"MUL\", \"layer\": 1, \"backend\": \"CPU\""));
+    // Unknown primary backends are still bounded: strict preparation either
+    // resolves a concrete supported fallback or fails before making clones.
+    CHECK(changed_policy(
+            "\"name\": \"ffn_inp\", \"op\": \"ADD\", \"phase\": \"prefill\", \"backend\": \"CPU\"",
+            "\"name\": \"ffn_inp\", \"op\": \"ADD\", \"phase\": \"prefill\", \"backend\": \"Unavailable\"",
+            true));
+
+    // Catalog-wide changes invalidate the result independently of the active
+    // clock profile, and failure always overwrites any previous small bound.
+    CHECK(check_policy(policy_json, 1, 3, true, 2));
+    llama_backend_policy_clear();
+    uint64_t nodes = 123;
+    CHECK(!llama_backend_policy_count_ffn_inp_route_nodes(1, 3, nodes));
+    CHECK(nodes == 0);
+    return true;
+}
+
 bool test_attention_topology_equality() {
     llama_backend_policy_attn_qkv_shards qkv;
     qkv.enabled = true;
@@ -2628,7 +2713,8 @@ bool test_policy_revision(const char * valid_path, const char * invalid_path) {
 
 bool test_attention_topology_catalog(
         const char * policy_path, size_t expected_profiles,
-        size_t expected_qkv, size_t expected_out) {
+        size_t expected_qkv, size_t expected_out,
+        bool check_ffn_inp_bound = false) {
     llama_backend_policy_clear();
     // Weighted norm routes require their authored op rules to be enabled even
     // though this test only resolves policy data and executes no graph.
@@ -2639,6 +2725,11 @@ bool test_attention_topology_catalog(
     for (int il = 0; il < 28; ++il) {
         CHECK(llama_backend_policy_count_attn_qkv_topologies(profiles, il, true) == expected_qkv);
         CHECK(llama_backend_policy_count_attn_out_topologies(profiles, il, true) == expected_out);
+    }
+    if (check_ffn_inp_bound) {
+        uint64_t nodes = 0;
+        CHECK(llama_backend_policy_count_ffn_inp_route_nodes(28, 3, nodes));
+        CHECK(nodes == 56);
     }
     llama_backend_policy_clear();
     return true;
@@ -3430,6 +3521,10 @@ int main(int argc, char ** argv) {
             llama_backend_policy_clear();
             return 1;
         }
+        if (!test_ffn_inp_route_node_bound(compact_unified_ffn_route_policy)) {
+            llama_backend_policy_clear();
+            return 1;
+        }
         if (!test_attention_topology_equality() ||
                 !test_inherited_attention_topology_catalog() ||
                 !test_policy_revision(valid_file.path(), invalid_file.path())) {
@@ -3442,7 +3537,7 @@ int main(int argc, char ** argv) {
             throw std::runtime_error("usage: test-backend-policy-clock [--catalog path profiles qkv out]");
         }
         if (argc == 6 && !test_attention_topology_catalog(
-                argv[2], std::stoull(argv[3]), std::stoull(argv[4]), std::stoull(argv[5]))) {
+                argv[2], std::stoull(argv[3]), std::stoull(argv[4]), std::stoull(argv[5]), true)) {
             llama_backend_policy_clear();
             return 1;
         }

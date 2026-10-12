@@ -2834,6 +2834,100 @@ bool llama_backend_policy_match_op_for_profile(
             out);
 }
 
+bool llama_backend_policy_count_ffn_inp_route_nodes(
+        uint32_t n_layer,
+        size_t backend_count,
+        uint64_t & nodes) {
+    std::lock_guard<std::mutex> lock(g_policy_mutex);
+    nodes = 0;
+
+    const auto & routes = g_policy.runtime_routes;
+    if (!g_policy.loaded || !g_policy.enabled || !routes.enabled || !routes.strict ||
+            (routes.mode != "clock" && routes.mode != "fixed") ||
+            !phase_matches(routes.phase, true) || backend_count == 0 ||
+            n_layer > (uint32_t) std::numeric_limits<int>::max()) {
+        return false;
+    }
+    for (const char * kind : { "weightless_stateless", "weighted_norm", "ffn_block" }) {
+        if (std::find(routes.candidate_kinds.begin(), routes.candidate_kinds.end(), kind) ==
+                routes.candidate_kinds.end()) {
+            return false;
+        }
+    }
+    const uint64_t clones_per_layer = backend_count - 1;
+    if (n_layer != 0 && clones_per_layer > std::numeric_limits<uint64_t>::max() / n_layer) {
+        return false;
+    }
+
+    // Only ffn_inp remains in the generic candidate pass when every norm and
+    // FFN block is prebuilt. Reject selectors that could also reach unrelated
+    // nodes, including the tensor/pattern fields ignored by op_rule_matches().
+    const auto exact_semantic_rules = [](const std::vector<policy_rule> & rules) {
+        return std::all_of(rules.begin(), rules.end(), [](const policy_rule & rule) {
+            return rule.tensor.empty() && rule.pattern.empty() && rule.name_regex.empty() &&
+                (rule.name == "ffn_inp" || rule.name == "attn_rms_norm" ||
+                 rule.name == "attn_norm" || rule.name == "ffn_rms_norm" ||
+                 rule.name == "ffn_norm");
+        });
+    };
+    bool have_initial = false;
+    for (const std::string & profile_name : routes.profiles) {
+        const auto it = g_policy.profiles.find(profile_name);
+        if (it == g_policy.profiles.end()) {
+            return false;
+        }
+        // match_op_for_profile() uses this materialized profile's rules only.
+        // Unused root op rules do not participate in route candidate matching.
+        const auto & profile = it->second;
+        const auto & ffn = profile.ffn_parallel;
+        if (!profile.ops_enabled || !exact_semantic_rules(profile.op_rules) ||
+                !ffn.configured || !ffn.enabled || ffn.splits.empty() ||
+                !phase_matches(ffn.phase, true)) {
+            return false;
+        }
+        const bool initial = profile_name == routes.initial_profile;
+        have_initial = have_initial || initial;
+        for (uint32_t il = 0; il < n_layer; ++il) {
+            if (ffn.layer_start != -2 &&
+                    ((int) il < ffn.layer_start ||
+                     (ffn.layer_end != -2 && (int) il > ffn.layer_end))) {
+                return false;
+            }
+            const struct {
+                const char * name;
+                ggml_op op;
+            } norm_ops[] = {
+                { "attn_rms_norm", GGML_OP_RMS_NORM },
+                { "attn_norm", GGML_OP_MUL },
+                { "ffn_rms_norm", GGML_OP_RMS_NORM },
+                { "ffn_norm", GGML_OP_MUL },
+            };
+            llama_backend_policy_match match;
+            for (const auto & norm : norm_ops) {
+                if (!match_op_rules(profile.op_rules, g_policy.fallback_priority,
+                            norm.name, std::string(norm.name) + "-" + std::to_string(il),
+                            norm.op, (int) il, true, match)) {
+                    return false;
+                }
+            }
+            const bool matched = match_op_rules(profile.op_rules, g_policy.fallback_priority,
+                    "ffn_inp", "ffn_inp-" + std::to_string(il), GGML_OP_ADD,
+                    (int) il, true, match);
+            // In strict mode an unsupported initial match fails preparation
+            // before cloning. An unmatched initial rule can leave canonical
+            // placement unspecified and needs the old backend_count bound.
+            if (initial && !matched) {
+                return false;
+            }
+        }
+    }
+    if (!have_initial) {
+        return false;
+    }
+    nodes = clones_per_layer * n_layer;
+    return true;
+}
+
 bool llama_backend_policy_select_runtime_route_profile(
         const char * current_profile,
         bool is_prefill,

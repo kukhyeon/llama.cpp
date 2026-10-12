@@ -245,6 +245,19 @@ bool llama_backend_policy_match_op_for_profile(
         bool is_prefill,
         llama_backend_policy_match & out);
 
+// Bound extra generic weightless nodes for a known Llama graph whose weighted
+// norms and FFN blocks are prebuilt. Accept only strict, active prefill catalogs
+// with exact known semantic op names and full per-layer norm/FFN coverage. The
+// initial profile must match ffn_inp, so its canonical placement is concrete
+// whenever preparation succeeds; at most backend_count - 1 clones remain per
+// layer. Broader/unsupported policies return false and leave nodes at zero so
+// callers retain their conservative bound. Model/build eligibility is checked
+// by the caller; this API does not probe devices or build a graph.
+bool llama_backend_policy_count_ffn_inp_route_nodes(
+        uint32_t n_layer,
+        size_t backend_count,
+        uint64_t & nodes);
+
 // Select the nearest clock-point route from the current route plus its direct
 // successors. Passing no current route selects from the full reachable
 // catalog. Unlike the legacy FFN selector, profiles do not need ffn_parallel.

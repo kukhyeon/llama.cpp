@@ -1,6 +1,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-shared-weights.h"
+#include "llama-backend-policy.h"
 #include "llama-graph.h"
 
 #include "../ggml/src/ggml-backend-impl.h"
@@ -26,6 +27,89 @@ void set_env(const char * name, const char * value) {
 #else
     if (value) { setenv(name, value, 1); } else { unsetenv(name); }
 #endif
+}
+
+void check_route_flags(const llm_graph_runtime_route_flags & flags,
+        bool layer, bool ffn, bool weighted_norm, bool attn_qkv, bool attn_out) {
+    REQUIRE(flags.layer == layer);
+    REQUIRE(flags.ffn == ffn);
+    REQUIRE(flags.weighted_norm == weighted_norm);
+    REQUIRE(flags.attn_qkv == attn_qkv);
+    REQUIRE(flags.attn_out == attn_out);
+}
+
+llm_graph_runtime_route_flags check_cached_route_flags(
+        bool runtime_candidates, uint32_t n_tokens,
+        bool qkv_shards, bool out_shards, bool has_lora,
+        const llama_backend_policy_runtime_routes & routes) {
+    const auto flags = llm_graph_runtime_route_flags_from_catalog(
+            runtime_candidates, n_tokens, qkv_shards, out_shards, has_lora, routes);
+    const auto available = llm_graph_runtime_route_flags_from_catalog(
+            true, 2, true, true, false, routes);
+    check_route_flags(llm_graph_filter_runtime_route_flags(
+            available, runtime_candidates, n_tokens, qkv_shards, out_shards, has_lora),
+            flags.layer, flags.ffn, flags.weighted_norm, flags.attn_qkv, flags.attn_out);
+    return flags;
+}
+
+void run_runtime_route_flags_tests() {
+    llama_backend_policy_runtime_routes routes;
+    routes.enabled = true;
+    routes.candidate_kinds = {
+        "ffn_block", "weighted_norm", "attn_qkv_block", "attn_out_block",
+    };
+    for (const std::string & mode : {std::string("clock"), std::string("fixed")}) {
+        routes.mode = mode;
+        for (uint32_t tokens : {0u, 1u, 2u, 1024u, 1025u}) {
+            const bool layer = tokens > 1;
+            for (bool has_lora : {false, true}) {
+                for (bool qkv_shards : {false, true}) {
+                    for (bool out_shards : {false, true}) {
+                        const auto flags = check_cached_route_flags(
+                                true, tokens, qkv_shards, out_shards, has_lora, routes);
+                        check_route_flags(flags, layer, layer, layer,
+                                layer && tokens <= 1024 && !has_lora && qkv_shards,
+                                layer && tokens <= 1024 && !has_lora && out_shards);
+                    }
+                }
+            }
+            check_route_flags(check_cached_route_flags(
+                    false, tokens, true, true, false, routes), false, false, false, false, false);
+        }
+    }
+    routes.mode = "off";
+    check_route_flags(check_cached_route_flags(
+            true, 512, true, true, false, routes), false, false, false, false, false);
+    routes.mode = "clock";
+    routes.enabled = false;
+    check_route_flags(check_cached_route_flags(
+            true, 512, true, true, false, routes), false, false, false, false, false);
+    routes.enabled = true;
+    for (const std::string & kind : {
+            std::string("ffn_block"), std::string("weighted_norm"),
+            std::string("attn_qkv_block"), std::string("attn_out_block"),
+            std::string("weightless_stateless")}) {
+        routes.candidate_kinds = {kind};
+        check_route_flags(check_cached_route_flags(
+                true, 512, true, true, false, routes), true,
+                kind == "ffn_block", kind == "weighted_norm",
+                kind == "attn_qkv_block", kind == "attn_out_block");
+    }
+    routes.candidate_kinds.clear();
+    check_route_flags(check_cached_route_flags(
+            true, 512, true, true, false, routes), true, false, false, false, false);
+
+    // These cases short-circuit before reading process-global policy state.
+    // A previously populated output catalog must not leak into a fallback.
+    routes.profiles = {"stale"};
+    check_route_flags(llm_graph_resolve_runtime_route_flags(
+            false, 512, true, true, false, routes), false, false, false, false, false);
+    REQUIRE(!routes.enabled && routes.profiles.empty());
+    routes.enabled = true;
+    routes.profiles = {"stale"};
+    check_route_flags(llm_graph_resolve_runtime_route_flags(
+            true, 1, true, true, false, routes), false, false, false, false, false);
+    REQUIRE(!routes.enabled && routes.profiles.empty());
 }
 
 // This backend only answers construction-time capability queries. No tensor
@@ -281,6 +365,7 @@ int main(int argc, char ** argv) {
     set_env("GGML_SHARED_HTP_REPACK", repack_disabled ? "0" : nullptr);
     set_env("GGML_SHARED_WEIGHTS_CSV", nullptr);
     try {
+        run_runtime_route_flags_tests();
         run_tests(repack_disabled);
         std::printf("shared FFN composite graph: PASS (repack %s)\n", repack_disabled ? "disabled" : "default");
         return 0;

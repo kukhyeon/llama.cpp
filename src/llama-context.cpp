@@ -1,5 +1,6 @@
 #include "ggml-shared-weights.h"
 #include "llama-context.h"
+#include "llama-graph-budget.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -4840,9 +4841,12 @@ void llama_context::graph_policy_budget_update() const {
         graph_policy_budget_cache = std::move(next);
         LLAMA_LOG_DEBUG(
                 "%s: revision=%" PRIu64 " cover=%" PRIu64 " multiplier=%" PRIu64
-                " qkv=%" PRIu64 " ffn_fallback=%" PRIu64 " norm=%" PRIu64 " attn_out=%" PRIu64 "\n",
+                " weightless=%" PRIu64 " compact=%d qkv=%" PRIu64
+                " ffn_fallback=%" PRIu64 " norm=%" PRIu64 " attn_out=%" PRIu64 "\n",
                 __func__, revision, graph_policy_budget_cache.cover_nodes,
-                graph_policy_budget_cache.prefill_multiplier, graph_policy_budget_cache.qkv_nodes,
+                graph_policy_budget_cache.prefill_multiplier, graph_policy_budget_cache.weightless_nodes,
+                graph_policy_budget_cache.compact_model && graph_policy_budget_cache.compact_weightless,
+                graph_policy_budget_cache.qkv_nodes,
                 graph_policy_budget_cache.ffn_nodes, graph_policy_budget_cache.weighted_norm_nodes,
                 graph_policy_budget_cache.attn_out_nodes);
         return;
@@ -4850,6 +4854,20 @@ void llama_context::graph_policy_budget_update() const {
 }
 
 void llama_context::graph_policy_budget_compile(graph_policy_budget & next) const {
+    // Limit removal of standalone reserves to the ordinary dense Q8 Llama
+    // builder. The original bound remains available for other model paths.
+    next.compact_model = model.arch == LLM_ARCH_LLAMA &&
+        cparams.module_bench_type == LLAMA_MODULE_BENCH_OFF &&
+        std::all_of(model.layers.begin(), model.layers.end(), [](const auto & layer) {
+            return layer.ffn_gate_inp == nullptr && layer.ffn_up && layer.ffn_gate && layer.ffn_down &&
+                layer.ffn_up->type == GGML_TYPE_Q8_0 &&
+                layer.ffn_gate->type == GGML_TYPE_Q8_0 &&
+                layer.ffn_down->type == GGML_TYPE_Q8_0 &&
+                !layer.ffn_up_b && !layer.ffn_up_s &&
+                !layer.ffn_gate_b && !layer.ffn_gate_s &&
+                !layer.ffn_down_b && !layer.ffn_down_s;
+        });
+
     // A cover-backed FFN processor branch has one up, gate, activation, and
     // down node. Reserve against the connected cover union; this is slightly
     // conservative when an active profile uses only part of that union.
@@ -4865,6 +4883,10 @@ void llama_context::graph_policy_budget_compile(graph_policy_budget & next) cons
         const bool active_runtime_routes =
             llama_backend_policy_resolve_runtime_routes(true, routes) &&
             (routes.mode == "clock" || routes.mode == "fixed");
+        // Cache catalog availability once per revision; per-shape reservation
+        // only filters these flags and does not copy the policy catalog again.
+        next.catalog_routes = llm_graph_runtime_route_flags_from_catalog(
+                active_runtime_routes, 2, true, true, false, routes);
 
         if (active_runtime_routes &&
                 std::find(routes.candidate_kinds.begin(), routes.candidate_kinds.end(),
@@ -4875,6 +4897,11 @@ void llama_context::graph_policy_budget_compile(graph_policy_budget & next) cons
             // entire base graph capacity.
             const uint64_t backend_variants = 1u + backends.size();
             next.prefill_multiplier = backend_variants;
+        }
+
+        if (active_runtime_routes && next.compact_model) {
+            next.compact_weightless = llama_backend_policy_count_ffn_inp_route_nodes(
+                    model.hparams.n_layer, backends.size(), next.weightless_nodes);
         }
 
         if (active_runtime_routes &&
@@ -5187,29 +5214,36 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
     }
 
-    res += budget.cover_nodes;
+    const bool prefill = n_tokens > 1;
+    const bool has_lora = loras && !loras->empty();
+    const bool runtime_candidates = runtime_routes_configured && prefill &&
+        !cparams.pipeline_parallel && cparams.cb_eval == nullptr && !lp_enable &&
+        !llama_module_bench_phase_matches(cparams, prefill);
+    const auto route_flags = llm_graph_filter_runtime_route_flags(
+            budget.catalog_routes, runtime_candidates, n_tokens,
+            cparams.attn_qkv_shards, cparams.attn_out_shards, has_lora);
+    const bool compact = budget.compact_model && budget.compact_weightless &&
+        !has_lora && route_flags.ffn && route_flags.weighted_norm;
 
-    if (cparams.attn_qkv_shards && n_tokens > 1) {
-        // Three lanes x Q/K/V region matmuls, six concat nodes, and room for
-        // optional scale/bias/clamp plus canonical reshapes.  Keep this
-        // separate from the ordinary three-projection reserve so enabling the
-        // experiment cannot exhaust graph metadata on all-layer prefill.
-        constexpr uint64_t nodes_per_qkv_sharded_layer = 24;
-        res += (uint64_t) model.hparams.n_layer * nodes_per_qkv_sharded_layer;
-    }
-
-    if (cparams.attn_out_shards && n_tokens > 1) {
-        // Input-axis mode uses three slices plus region matmuls and an ADD
-        // reduction. Output-axis mode replaces those slices with two CONCAT
-        // joins. This reserve covers either mode plus scale/bias metadata.
-        constexpr uint64_t nodes_per_attn_out_sharded_layer = 16;
-        res += (uint64_t) model.hparams.n_layer * nodes_per_attn_out_sharded_layer;
-    }
-
-    if (n_tokens > 1) {
-        res = res * budget.prefill_multiplier + budget.qkv_nodes + graph_policy_ffn_nodes(n_tokens) +
+    llama_graph_node_budget nodes;
+    // This unchanged model reserve also covers common nodes outside routed
+    // subgraphs, including the three canonical QKV reshapes per layer, input
+    // descriptors, and the node/leaf/hash arrays. Keep the FFN probe margin.
+    nodes.base_nodes = res;
+    nodes.cover_nodes = budget.cover_nodes;
+    nodes.qkv_shard_nodes = cparams.attn_qkv_shards && prefill
+        ? (uint64_t) model.hparams.n_layer * 24u : 0;
+    nodes.attn_out_shard_nodes = cparams.attn_out_shards && prefill
+        ? (uint64_t) model.hparams.n_layer * 16u : 0;
+    nodes.prefill_multiplier = budget.prefill_multiplier;
+    nodes.weightless_nodes = budget.weightless_nodes;
+    if (prefill) {
+        nodes.route_nodes = budget.qkv_nodes + graph_policy_ffn_nodes(n_tokens) +
             budget.weighted_norm_nodes + budget.attn_out_nodes;
     }
+    res = llama_graph_node_capacity(nodes, route_flags, compact, prefill);
+    LLAMA_LOG_DEBUG("%s: n_tokens=%u max_nodes=%" PRIu64 " compact=%d weightless=%" PRIu64 "\n",
+            __func__, n_tokens, res, compact, compact ? budget.weightless_nodes : 0u);
 
     for (const auto & lora : model.loras) {
         res += lora->get_n_nodes();

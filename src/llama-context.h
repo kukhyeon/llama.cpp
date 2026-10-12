@@ -281,6 +281,10 @@ private:
 
         uint64_t cover_nodes = 0;
         uint64_t prefill_multiplier = 1;
+        llm_graph_runtime_route_flags catalog_routes;
+        bool compact_model = false;
+        bool compact_weightless = false;
+        uint64_t weightless_nodes = 0;
         uint64_t qkv_nodes = 0;
         uint64_t ffn_nodes = 0; // full segmented fallback, before shape-specific savings
         uint64_t weighted_norm_nodes = 0;

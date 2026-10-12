@@ -23,6 +23,7 @@ struct llama_model;
 struct llama_backend_policy_ffn_parallel;
 struct llama_backend_policy_attn_qkv_shards;
 struct llama_backend_policy_attn_out_shards;
+struct llama_backend_policy_runtime_routes;
 
 struct llama_memory_context_i;
 
@@ -31,6 +32,33 @@ class llama_kv_cache_iswa_context;
 class llama_memory_recurrent_context;
 class llama_memory_hybrid_context;
 class llama_memory_hybrid_iswa_context;
+
+// Construction and reservation must select the same prebuilt route branches.
+struct llm_graph_runtime_route_flags {
+    bool layer = false;
+    bool ffn = false;
+    bool weighted_norm = false;
+    bool attn_qkv = false;
+    bool attn_out = false;
+};
+
+// Filter cached catalog availability without resolving or copying the policy.
+llm_graph_runtime_route_flags llm_graph_filter_runtime_route_flags(
+        const llm_graph_runtime_route_flags & available,
+        bool runtime_candidates, uint32_t n_tokens,
+        bool qkv_shards, bool out_shards, bool has_lora);
+
+// Pure classification of an already resolved prefill catalog. The resolver
+// below also applies the process-global policy enablement/phase checks.
+llm_graph_runtime_route_flags llm_graph_runtime_route_flags_from_catalog(
+        bool runtime_candidates, uint32_t n_tokens,
+        bool qkv_shards, bool out_shards, bool has_lora,
+        const llama_backend_policy_runtime_routes & routes);
+
+llm_graph_runtime_route_flags llm_graph_resolve_runtime_route_flags(
+        bool runtime_candidates, uint32_t n_tokens,
+        bool qkv_shards, bool out_shards, bool has_lora,
+        llama_backend_policy_runtime_routes & routes);
 
 // Internal graph helper used by the three-lane FFN reduction and its focused
 // regression test. Returns nullptr unless the opt-in is enabled and all inputs
