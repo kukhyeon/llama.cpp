@@ -10,7 +10,7 @@
 #   $5: phase pause in ms
 #   $6: token pause in ms
 #   $7: layer pause in ms
-#   $8: ignite verbose [on|off]
+#   $8: reserved (unused; GPU indices remain $9/$10)
 #   $9: prefill GPU DVFS index
 #   $10: decode GPU DVFS index
 #
@@ -41,11 +41,6 @@
 #   THERMAL_TOLERANCE_KHZ=0
 #   THERMAL_DEBOUNCE=1
 #
-# CSV op load controls:
-#   CSV_OP_LOAD=on|off
-#   CSV_OP_LOAD_OPS=MUL_MAT,MUL_MAT_ID,CONT,SOFT_MAX,SET_ROWS
-#   CSV_OP_LOAD_PATTERNS=Vcur-*,Kcur-*,kq-*,kqv-*
-
 DEV="${DEV:-S25}"
 MODEL="${MODEL:-/data/local/tmp/gguf/qwen-3-1.7b-q4_0.gguf}"
 CPU_P="${1:-15}"
@@ -55,7 +50,6 @@ RAM_D="${4:-9}"
 PHASE_PAUSE_MS="${5:-0}"
 TOKEN_PAUSE_MS="${6:-0}"
 LAYER_PAUSE_MS="${7:-0}"
-IGNITE_VERBOSE="${8:-off}"
 GPU_P="${GPU_P:-${9:--1}}"
 GPU_D="${GPU_D:-${10:--1}}"
 THREADS="${THREADS:-6}"
@@ -77,10 +71,6 @@ THERMAL_PRIME_CPU="${THERMAL_PRIME_CPU:-6}"
 THERMAL_TOLERANCE_KHZ="${THERMAL_TOLERANCE_KHZ:-0}"
 THERMAL_DEBOUNCE="${THERMAL_DEBOUNCE:-1}"
 THERMAL_VERBOSE="${THERMAL_VERBOSE:-1}"
-CSV_OP_LOAD="${CSV_OP_LOAD:-off}"
-CSV_OP_LOAD_OPS="${CSV_OP_LOAD_OPS:-MUL_MAT,MUL_MAT_ID,CONT,SOFT_MAX,SET_ROWS}"
-CSV_OP_LOAD_PATTERNS="${CSV_OP_LOAD_PATTERNS:-}"
-export CSV_OP_LOAD CSV_OP_LOAD_OPS CSV_OP_LOAD_PATTERNS
 
 case "$STAGE_SWITCH" in
     1|on|ON|true|TRUE|yes|YES)
@@ -114,15 +104,6 @@ if [ "$THERMAL_SWITCH_ON" = "1" ] && [ "$STAGE_SWITCH_ON" = "1" ]; then
     echo "[setup] Both THERMAL_SWITCH and STAGE_SWITCH are on; thermal policy config takes precedence."
     STAGE_SWITCH_ON=0
 fi
-
-case "$IGNITE_VERBOSE" in
-    1|on|ON|true|TRUE|yes|YES)
-        IGNITE_VERBOSE_ARG="--ignite-verbose"
-        ;;
-	    *)
-	        IGNITE_VERBOSE_ARG=""
-	        ;;
-esac
 
 case "$BACKEND_POLICY" in
     1|on|ON|true|TRUE|yes|YES)
@@ -167,7 +148,6 @@ echo "[setup] DVFS indices: prefill(cpu=$CPU_P, ram=$RAM_P, gpu=$GPU_P), decode(
 echo "[setup] Phase pause: ${PHASE_PAUSE_MS}ms"
 echo "[setup] Token pause: ${TOKEN_PAUSE_MS}ms"
 echo "[setup] Layer pause: ${LAYER_PAUSE_MS}ms"
-echo "[setup] Ignite verbose: ${IGNITE_VERBOSE}"
 echo "[setup] Runtime: threads=${THREADS}, threads_batch=${THREADS_BATCH}, json=${JSON_PATH}, max_query=${MAX_QUERY_NUMBER}, strict=${STRICT}, strict_limit=${STRICT_LIMIT}, device=${DEVICE}"
 echo "[setup] Backend policy: ${BACKEND_POLICY} (${BACKEND_POLICY_CONFIG}, weights=${BACKEND_POLICY_WEIGHTS}, ops=${BACKEND_POLICY_OPS})"
 if [ "$STAGE_SWITCH_ON" = "1" ]; then
@@ -182,7 +162,6 @@ setenforce 0 || true
 export LD_LIBRARY_PATH=/data/local/tmp/llama.cpp/lib
 export ADSP_LIBRARY_PATH=/data/local/tmp/llama.cpp/lib
 export GGML_HEXAGON_HOSTBUF=1
-export IGNITE_CSV_OP_BREAKDOWN=0
 
 export LLAMA_BACKEND_POLICY_RESIDENCY=0
 export LLAMA_BACKEND_POLICY_STAGE_SWITCH=0
@@ -237,5 +216,4 @@ taskset fe ./bin/llama-ignite-npu \
     --phase-pause "$PHASE_PAUSE_MS" \
 	--token-pause "$TOKEN_PAUSE_MS" \
 	--layer-pause "$LAYER_PAUSE_MS" \
-    ${BACKEND_POLICY_ARGS} \
-	${IGNITE_VERBOSE_ARG}
+    ${BACKEND_POLICY_ARGS}
