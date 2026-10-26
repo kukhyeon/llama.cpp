@@ -56,6 +56,7 @@ endfunction()
 set(GGML_OPENCL_KERNELS
     mul_mat_htp_q8
     repack_htp_q8
+    repack_probe_htp_q8
     add
     add4
     add_id

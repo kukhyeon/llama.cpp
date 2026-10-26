@@ -20,6 +20,7 @@
 #include <atomic>
 #include <limits>
 #include <type_traits>
+#include <vector>
 
 #include "repack.h"
 
@@ -5073,13 +5074,8 @@ bool shared_repack_describe_op(const ggml_tensor * op, shared_repack_layout & l)
     return true;
 }
 
-bool shared_repack_get_layout(const ggml_tensor * op, shared_repack_layout & l) {
-    if (!ggml_shared_weights_repack_enabled() || !op || op->ne[1] < 4 || op->ne[1] > INT32_MAX ||
-            (op->op != GGML_OP_MUL_MAT_SRC0_COMPOSITE && !ggml_shared_weights_tensor(op->src[0])) ||
-            !shared_repack_describe_op(op, l)) {
-        return false;
-    }
-
+// Graph compute and the measurement probe must select the same native layout.
+bool shared_repack_select_traits(shared_repack_layout & l, bool allow_generic) {
 #ifdef GGML_USE_CPU_REPACK
     // Same traits and GEMM/GEMV entry points as CPU_REPACK; only assembly differs.
     if (ggml_cpu_has_neon() && ggml_cpu_has_matmul_int8()) {
@@ -5092,14 +5088,27 @@ bool shared_repack_get_layout(const ggml_tensor * op, shared_repack_layout & l) 
         l.interleave = 4;
     }
 #endif
-    if (!l.traits && (l.is_composite || shared_repack_test_enabled.load(std::memory_order_relaxed))) {
-        // Composite ops also need a portable implementation. Ordinary shared
-        // weights keep their direct FP32 fallback on unsupported architectures.
+    if (!l.traits && allow_generic) {
         static ggml::cpu::repack::tensor_traits<block_q8_0, 4, 4, GGML_TYPE_Q8_0> q8_generic;
         l.traits = &q8_generic;
         l.interleave = 4;
     }
-    if (!l.traits) { return false; }
+    return l.traits != nullptr;
+}
+
+bool shared_repack_get_layout(const ggml_tensor * op, shared_repack_layout & l) {
+    if (!ggml_shared_weights_repack_enabled() || !op || op->ne[1] < 4 || op->ne[1] > INT32_MAX ||
+            (op->op != GGML_OP_MUL_MAT_SRC0_COMPOSITE && !ggml_shared_weights_tensor(op->src[0])) ||
+            !shared_repack_describe_op(op, l)) {
+        return false;
+    }
+
+    // Composite ops also need a portable implementation. Ordinary shared
+    // weights keep their direct FP32 fallback on unsupported architectures.
+    if (!shared_repack_select_traits(l,
+            l.is_composite || shared_repack_test_enabled.load(std::memory_order_relaxed))) {
+        return false;
+    }
 
     const size_t row_bytes = ggml_row_size(GGML_TYPE_Q8_0, l.region.k_size);
     const size_t limit = std::numeric_limits<size_t>::max();
@@ -5317,6 +5326,195 @@ bool shared_repack_input_reusable(const ggml_compute_params * params, const ggml
         previous.activation_bytes == layout.activation_bytes;
 }
 
+// Measurement probe. The read and copy probes visit the HTP source in the same
+// group/block/row order as shared_repack_copy_region; only their stores differ.
+struct shared_repack_probe_rows {
+    const int8_t * quants[4];
+    const char * scales[4];
+};
+
+void shared_repack_probe_group(const ggml_tensor * tensor, const ggml_mul_mat_src0_region_params & r,
+        int64_t group, shared_repack_probe_rows & rows) {
+    for (int row = 0; row < 4; ++row) {
+        const auto * parent_row = static_cast<const int8_t *>(tensor->data) +
+            (r.out_start + group * 4 + row) * tensor->nb[1];
+        rows.quants[row] = parent_row + r.k_start;
+        rows.scales[row] = reinterpret_cast<const char *>(parent_row + tensor->ne[0]) +
+            r.k_start / QK8_0 * sizeof(ggml_half);
+    }
+}
+
+uint64_t shared_repack_probe_read(const ggml_tensor * tensor, const ggml_mul_mat_src0_region_params & r,
+        int ith, int nth) {
+    const int64_t blocks = r.k_size / QK8_0;
+    uint64_t checksum = 0;
+    for (int64_t group = ith; group < r.out_size / 4; group += nth) {
+        shared_repack_probe_rows rows;
+        shared_repack_probe_group(tensor, r, group, rows);
+        for (int64_t block = 0; block < blocks; ++block) {
+            for (int row = 0; row < 4; ++row) {
+                uint16_t scale;
+                uint64_t quants[QK8_0 / sizeof(uint64_t)];
+                memcpy(&scale, rows.scales[row] + block * sizeof(ggml_half), sizeof(scale));
+                memcpy(quants, rows.quants[row] + block * QK8_0, sizeof(quants));
+                checksum += scale ^ quants[0] ^ quants[1] ^ quants[2] ^ quants[3];
+            }
+        }
+    }
+    return checksum;
+}
+
+// Row-major quants followed by row-major scales: the same bytes as the native
+// layout, without its four-row interleave.
+void shared_repack_probe_copy(const ggml_tensor * tensor, const ggml_mul_mat_src0_region_params & r,
+        int8_t * copy_quants, ggml_half * copy_scales, int ith, int nth) {
+    const int64_t blocks = r.k_size / QK8_0;
+    for (int64_t group = ith; group < r.out_size / 4; group += nth) {
+        shared_repack_probe_rows rows;
+        shared_repack_probe_group(tensor, r, group, rows);
+        for (int64_t block = 0; block < blocks; ++block) {
+            for (int row = 0; row < 4; ++row) {
+                const int64_t index = (group * 4 + row) * blocks + block;
+                memcpy(copy_scales + index, rows.scales[row] + block * sizeof(ggml_half), sizeof(ggml_half));
+                memcpy(copy_quants + index * QK8_0, rows.quants[row] + block * QK8_0, QK8_0);
+            }
+        }
+    }
+}
+
+uint64_t shared_repack_probe_evict(const std::vector<uint64_t> & evict, int ith, int nth) {
+    const size_t begin = evict.size() * ith / nth, end = evict.size() * (ith + 1) / nth;
+    uint64_t checksum = 0;
+    for (size_t i = begin; i < end; ++i) { checksum += evict[i]; }
+    return checksum;
+}
+
+// GGML_SHARED_REPACK_BREAKDOWN state of the op being repacked. Worker 0 fills
+// it before the repack's first barrier; the CPU backend repacks one op at a time.
+struct shared_repack_breakdown_state {
+    bool sampled = false;
+    const ggml_tensor * shared = nullptr;     // HTP source of the probed region
+    ggml_mul_mat_src0_region_params region{}; // in the shared tensor's coordinates
+    int part = -1;                            // composite part of `shared`, -1 for a single source
+    double read_us = -1.0, copy_us = -1.0, part_us = -1.0;
+    std::vector<uint64_t> evict;
+};
+shared_repack_breakdown_state shared_repack_breakdown;
+std::atomic<uint64_t> shared_repack_breakdown_sink{0};
+
+bool shared_repack_needs_generic_groups(const shared_repack_layout & l) {
+    return l.is_composite && l.composite.axis == 1 &&
+        (l.composite.size[0] % 4 != 0 || l.composite.size[1] % 4 != 0);
+}
+
+ggml_mul_mat_src0_region_params shared_repack_part_region(const shared_repack_layout & l, int part) {
+    const bool k_axis = l.composite.axis == 0;
+    return {
+        GGML_MUL_MAT_SRC0_REGION_PARAMS_VERSION, 0,
+        k_axis ? l.composite.start[part] : 0,
+        k_axis ? l.composite.size[part] : l.region.k_size,
+        k_axis ? 0 : l.composite.start[part],
+        k_axis ? l.region.out_size : l.composite.size[part],
+    };
+}
+
+// Worker 0 only, before the first barrier.
+void shared_repack_breakdown_prepare(const shared_repack_layout & l) {
+    auto & b = shared_repack_breakdown;
+    b.read_us = b.copy_us = b.part_us = -1.0;
+    b.part = -1;
+    b.shared = nullptr;
+    if (!l.is_composite) {
+        b.shared = l.sources[0].tensor;
+        b.region = l.region;
+    } else {
+        for (int part = 0; part < 2; ++part) {
+            if (l.sources[part].kind == shared_repack_source_kind::htp) {
+                b.part = part;
+                b.shared = l.sources[part].tensor;
+                b.region = shared_repack_part_region(l, part);
+            }
+        }
+    }
+    b.sampled = b.shared != nullptr && b.region.out_size % 4 == 0;
+    b.evict.resize(ggml_shared_weights_breakdown_evict_bytes() / sizeof(uint64_t), 1);
+}
+
+// All workers: evict, read, evict, copy, evict. The copy probe writes the
+// packed scratch, which the real repack overwrites afterwards.
+void shared_repack_breakdown_probe(void * packed, const ggml_compute_params * params) {
+    auto & b = shared_repack_breakdown;
+    const int ith = params->ith, nth = params->nth;
+    uint64_t checksum = shared_repack_probe_evict(b.evict, ith, nth);
+    ggml_barrier(params->threadpool);
+    int64_t start_us = ith == 0 ? ggml_time_us() : 0;
+    checksum += shared_repack_probe_read(b.shared, b.region, ith, nth);
+    ggml_barrier(params->threadpool);
+    if (ith == 0) { b.read_us = double(ggml_time_us() - start_us); }
+    checksum += shared_repack_probe_evict(b.evict, ith, nth);
+    ggml_barrier(params->threadpool);
+    start_us = ith == 0 ? ggml_time_us() : 0;
+    auto * copy_quants = static_cast<int8_t *>(packed);
+    auto * copy_scales = reinterpret_cast<ggml_half *>(copy_quants + b.region.k_size * b.region.out_size);
+    shared_repack_probe_copy(b.shared, b.region, copy_quants, copy_scales, ith, nth);
+    ggml_barrier(params->threadpool);
+    if (ith == 0) { b.copy_us = double(ggml_time_us() - start_us); }
+    checksum += shared_repack_probe_evict(b.evict, ith, nth);
+    ggml_barrier(params->threadpool);
+    shared_repack_breakdown_sink.fetch_add(checksum, std::memory_order_relaxed);
+}
+
+// The sampled real repack: the same per-part copies as shared_repack_copy_regions,
+// with a barrier after each part so the shared part is timed on its own.
+template <int INTERLEAVE>
+void shared_repack_breakdown_copy_parts(const shared_repack_layout & l, void * packed,
+        const ggml_compute_params * params) {
+    int64_t destination_start = 0;
+    for (int part = 0; part < 2; ++part) {
+        const bool k_axis = l.composite.axis == 0;
+        const int64_t start_us = params->ith == 0 ? ggml_time_us() : 0;
+        shared_repack_copy_region<INTERLEAVE>(l.sources[part], shared_repack_part_region(l, part),
+            k_axis ? destination_start : 0, k_axis ? 0 : destination_start,
+            l.region.k_size, packed, params->ith, params->nth);
+        ggml_barrier(params->threadpool);
+        if (params->ith == 0 && part == shared_repack_breakdown.part) {
+            shared_repack_breakdown.part_us = double(ggml_time_us() - start_us);
+        }
+        destination_start += l.composite.size[part];
+    }
+}
+
+void shared_repack_breakdown_copy(const shared_repack_layout & l, void * packed, const ggml_compute_params * params) {
+    if (!l.is_composite || shared_repack_needs_generic_groups(l)) {
+        shared_repack_copy_groups(l, l.interleave, packed, params->ith, params->nth);
+    } else if (l.interleave == 4) {
+        shared_repack_breakdown_copy_parts<4>(l, packed, params);
+    } else {
+        GGML_ASSERT(l.interleave == 8);
+        shared_repack_breakdown_copy_parts<8>(l, packed, params);
+    }
+}
+
+// Worker 0 only, after the final barrier of the repack.
+void shared_repack_breakdown_log(const ggml_shared_weights_repack_event & repack) {
+    const auto & b = shared_repack_breakdown;
+    ggml_shared_weights_repack_event probe = repack;
+    probe.k_start = b.region.k_start;
+    probe.k_size = b.region.k_size;
+    probe.out_start = b.region.out_start;
+    probe.out_size = b.region.out_size;
+    probe.packed_bytes = ggml_row_size(GGML_TYPE_Q8_0, b.region.k_size) * b.region.out_size;
+    probe.composite = false;
+    probe.repack_us = b.read_us;
+    ggml_shared_weights_log_repack_probe(b.shared, "CPU_REPACK", &probe, "read");
+    probe.repack_us = b.copy_us;
+    ggml_shared_weights_log_repack_probe(b.shared, "CPU_REPACK", &probe, "copy");
+    if (b.part >= 0 && b.part_us >= 0) {
+        probe.repack_us = b.part_us;
+        ggml_shared_weights_log_repack_probe(b.shared, "CPU_REPACK", &probe, "repack_shared_part");
+    }
+}
+
 } // namespace
 
 void ggml_cpu_shared_repack_test_mode(bool enabled) {
@@ -5394,23 +5592,44 @@ bool ggml_cpu_shared_repack_compute(ggml_compute_params * params, ggml_tensor * 
     if (timing) {
         if (params->ith == 0) {
             event = ggml_shared_weights_repack_begin(op, "cpu_wall", layout.weight_bytes, layout.work_bytes);
+            shared_repack_breakdown.sampled = false;
+            if (ggml_shared_weights_breakdown_sample()) {
+                shared_repack_breakdown_prepare(layout);
+            }
             start_us = ggml_time_us();
         }
         // Include worker arrival and completion in the repack wall time.
         ggml_barrier(params->threadpool);
+    }
+    // Written by worker 0 before the barrier above.
+    const bool sampled = timing && shared_repack_breakdown.sampled;
+    if (sampled) {
+        // The probes leave every cache cold again, so the real repack below is
+        // timed from a cold start that matches a layer's first use of its weights.
+        shared_repack_breakdown_probe(packed_data, params);
+        if (params->ith == 0) {
+            start_us = ggml_time_us();
+        }
     }
     const bool reuse_input = shared_repack_input_reusable(params, op, layout);
     {
         // Scope only the weight-layout transformation. The following native
         // matmul remains model work, and the existing barrier records its wait.
         ggml_e2e_trace_scope trace(GGML_E2E_TRANSFORM, "CPU", "shared_weight_repack");
-        shared_repack_copy_groups(layout, layout.interleave, packed_data, params->ith, params->nth);
+        if (sampled) {
+            shared_repack_breakdown_copy(layout, packed_data, params);
+        } else {
+            shared_repack_copy_groups(layout, layout.interleave, packed_data, params->ith, params->nth);
+        }
     }
     ggml_barrier(params->threadpool);
     if (timing && params->ith == 0) {
         event.repack_us = double(ggml_time_us() - start_us);
         const ggml_tensor * shared = ggml_shared_weights_tensor(op->src[0]) ? op->src[0] : op->src[2];
         ggml_shared_weights_log_repack(shared, "CPU_REPACK", &event);
+        if (sampled) {
+            shared_repack_breakdown_log(event);
+        }
     }
 
     ggml_tensor weights = *op->src[0];

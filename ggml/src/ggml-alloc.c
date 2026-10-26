@@ -2,6 +2,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml.h"
 #include "ggml-impl.h"
+#include "ggml-shared-weights.h"
 
 #include <assert.h>
 #include <limits.h>
@@ -771,6 +772,21 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
                 if (!ggml_are_same_layout(node, parent)) {
                     AT_PRINTF("not reusing parent %s for %s as layouts are different\n", parent->name, node->name);
                     continue;
+                }
+
+                // Zero-copy activation buffers are read in place by other
+                // backends, so a parent may live in another backend's buffer.
+                // Outputs stay in their own backend's buffer: the scheduler
+                // orders zero-copy accesses by the backend owning the memory.
+                if (ggml_zero_copy_requested_mask() != 0) {
+                    struct ggml_tensor * memory = parent->view_src ? parent->view_src : parent;
+                    const int parent_buffer_id = ggml_gallocr_hash_get(galloc, memory)->buffer_id;
+                    if (parent_buffer_id != buffer_id &&
+                            (ggml_zero_copy_buft_role(galloc->bufts[parent_buffer_id]) >= 0 ||
+                             ggml_zero_copy_buft_role(galloc->bufts[buffer_id]) >= 0)) {
+                        AT_PRINTF("not reusing parent %s for %s across zero-copy buffers\n", parent->name, node->name);
+                        continue;
+                    }
                 }
 
                 struct hash_node * p_hn = ggml_gallocr_hash_get(galloc, parent);

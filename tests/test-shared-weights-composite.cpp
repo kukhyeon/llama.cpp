@@ -13,6 +13,10 @@
 #include <string>
 #include <vector>
 
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
+
 #define REQUIRE(x) do { if (!(x)) { throw std::runtime_error(std::string("line ") + std::to_string(__LINE__) + ": " #x); } } while (0)
 
 struct q8_block { ggml_fp16_t d; int8_t q[32]; };
@@ -242,11 +246,55 @@ static void run_policy_pack_case(ggml_backend_buffer_type_t native_type, int axi
     ggml_free(ctx);
 }
 
-int main() {
+// GGML_SHARED_REPACK_BREAKDOWN=1 samples every composite repack, which then
+// copies its two parts separately: outputs must match the references, and
+// the shared part of each region-path composite must be timed on its own.
+static void check_breakdown_rows(const std::string & path) {
+    ggml_shared_weights_log("validation", nullptr, "test", -1, 0, 0, "flush"); // flushes buffered rows
+    FILE * f = std::fopen(path.c_str(), "r");
+    REQUIRE(f);
+    char line[4096];
+    int repacks = 0, reads = 0, copies = 0, parts = 0;
+    while (std::fgets(line, sizeof(line), f)) {
+        const std::string row = line;
+        if (row.rfind("\"repack\",", 0) == 0) { ++repacks; }
+        if (row.rfind("\"repack_probe\",", 0) == 0) {
+            reads += row.find(",\"read\",") != std::string::npos;
+            copies += row.find(",\"copy\",") != std::string::npos;
+            parts += row.find(",\"repack_shared_part\",") != std::string::npos;
+        }
+    }
+    std::fclose(f);
+    std::remove(path.c_str());
+    // Shared parts whose row count is not a multiple of four are not probed.
+    std::printf("composite repack breakdown: %d repacks, %d read, %d copy, %d shared-part probes\n",
+        repacks, reads, copies, parts);
+    REQUIRE(reads > 0 && reads == copies && reads <= repacks && parts > 0 && parts <= reads);
+    std::printf("PASS composite repack breakdown\n");
+}
+
+int main(int argc, char ** argv) {
+    const bool breakdown = argc == 2 && std::strcmp(argv[1], "--breakdown") == 0;
+    if (argc != 1 && !breakdown) {
+        std::fprintf(stderr, "usage: %s [--breakdown]\n", argv[0]);
+        return 2;
+    }
 #if defined(_WIN32)
     _putenv_s("GGML_SHARED_HTP_WEIGHTS", "1"); _putenv_s("GGML_SHARED_HTP_REPACK", "1");
 #else
     setenv("GGML_SHARED_HTP_WEIGHTS", "1", 1); setenv("GGML_SHARED_HTP_REPACK", "1", 1);
+#endif
+    std::string breakdown_csv;
+#if !defined(_WIN32)
+    if (breakdown) {
+        const char * tmp = std::getenv("TMPDIR");
+        breakdown_csv = std::string(tmp && *tmp ? tmp : "/tmp") + "/test-shared-weights-composite-breakdown-" +
+            std::to_string((long long) getpid()) + ".csv";
+        std::remove(breakdown_csv.c_str());
+        setenv("GGML_SHARED_WEIGHTS_CSV", breakdown_csv.c_str(), 1);
+        setenv("GGML_SHARED_REPACK_BREAKDOWN", "1", 1);
+        setenv("GGML_SHARED_REPACK_BREAKDOWN_EVICT_MB", "1", 1);
+    }
 #endif
     try {
         ggml_backend_load_all();
@@ -292,6 +340,7 @@ int main() {
             }
         }
         force(false); ggml_backend_free(backend);
+        if (breakdown) { check_breakdown_rows(breakdown_csv); }
         std::printf("PASS %d composite cases and %d policy packing cases: packed bytes, native outputs, activation reuse/reset, scheduler and immutable sources\n", cases, policy_cases);
         return 0;
     } catch (const std::exception & error) {

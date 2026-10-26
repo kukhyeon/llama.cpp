@@ -385,6 +385,100 @@ request. Device work registered before submission is counted per backend and
 reflected in `event_count`/`missing_compute_events`; it is no longer written as
 `expected_compute` rows. A file with another header is not appended to.
 
+### Shared-weight repack breakdown
+
+With shared HTP weights and repack timing enabled (`GGML_SHARED_HTP_WEIGHTS=1`,
+`GGML_SHARED_WEIGHTS_CSV=<path>`), on-demand repacks can be sampled during the
+real run to split their time into reading the shared weights and the rest:
+
+```bash
+GGML_SHARED_REPACK_BREAKDOWN=8 GGML_SHARED_REPACK_BREAKDOWN_EVICT_MB=32 ./llama-ignite-npu <existing arguments>
+```
+
+`GGML_SHARED_REPACK_BREAKDOWN=N` samples every N-th repack, counted over all
+backends (default 0 = off). Before a sampled repack, the same shared source
+region is processed twice more by the same backend with the repack's work
+partition: a read-only pass (loads every element the repack loads and keeps a
+checksum) and a copy pass (stores the loaded quants and scales row-major,
+without the native layout). An untimed pass over a separate buffer of
+`GGML_SHARED_REPACK_BREAKDOWN_EVICT_MB` MiB (default 32, 0 disables it) runs
+before the read, the copy and the real repack, so each starts with cold caches.
+
+Each probe appends a `repack_probe` row to the shared-weights CSV after the
+`repack` row of the same operation. `detail` names the probe:
+
+- `read`: the read-only pass (`repack_us` is its time)
+- `copy`: the read plus a row-major store
+- `repack_shared_part`: composite operations only; the shared (HTP-format)
+  part of the repack, whose total `repack` row also includes the native part
+
+The ranges and `packed_bytes` of a probe row describe the shared source region,
+so `read` is the weight-read cost, `copy - read` the store cost and
+`repack - copy` (or `repack_shared_part - copy`) the layout transform cost.
+CPU timings are wall times with all repack threads; OpenCL timings are event
+times. CPU repacks whose shared region has a row count not divisible by four
+are not sampled, and a CPU composite split into such parts has no
+`repack_shared_part` row. The probes and evictions lengthen the run, so use
+this mode only to measure the breakdown.
+
+### Zero-copy activations
+
+`GGML_ACTIVATION_ZERO_COPY` is a bitmask (default 0 = off) that places the
+compute buffer of a backend in Hexagon rpcmem so the other processors read its
+outputs in place instead of through scheduler copies:
+
+| Bit | Compute buffer | Read in place by | OpenCL requirement |
+| --- | --- | --- | --- |
+| 1 | NPU (HTP) | GPU (the CPU already reads it) | `cl_qcom_ext_host_ptr` with ION/DMA-BUF |
+| 2 | GPU (OpenCL) | NPU, CPU | also `cl_qcom_ext_host_ptr_iocoherent` |
+| 4 | CPU | GPU, NPU | also `cl_qcom_ext_host_ptr_iocoherent` |
+
+```bash
+GGML_HEXAGON_HOSTBUF=1 GGML_ACTIVATION_ZERO_COPY=7 ./llama-ignite-npu <existing arguments>
+```
+
+It requires the Hexagon and OpenCL backends, `GGML_HEXAGON_HOSTBUF=1` (the
+default), and an OpenCL base-address alignment of at most 128 bytes. The log
+reports each selected buffer (`... compute buffer: HTP0-ZC-GPU (zero-copy)`) and
+each OpenCL import; unsupported bits print a warning and keep copies. OpenCL
+imports each buffer once (I/O-coherent when available, write-back otherwise);
+an import that exceeds the device limits aborts. The scheduler then copies
+nothing between the selected buffers. Because no copy orders the processors
+any more, it synchronizes an OpenCL producer before another backend reads its
+outputs, an OpenCL reader before the owner may overwrite what it reads, and
+any outstanding OpenCL work at the end of each graph. Inputs read in place by
+parallel FFN/attention branches stay allocated until the last branch of the
+group, and the graph allocator never places an output in place into another
+backend's zero-copy buffer (`test-backend-sched-zero-copy` covers these rules
+with an asynchronous fake GPU).
+Paths that require an OpenCL destination buffer (for example the attention
+output direct scatter) fall back to their regular implementation for GPU-role
+buffers.
+
+Validate it on the device before measuring: compare outputs bitwise with the
+copy path (`GGML_ACTIVATION_ZERO_COPY=0`, for example with the logits hashes
+below), and check in the E2E trace that the copies between the selected buffers
+disappeared.
+
+### Logits hashes
+
+`IGNITE_CSV_LOGITS=1` (default off) appends per-query fingerprints of the
+logits each sampled token was drawn from to `inference_stats.csv`:
+
+- `logits_n_vocab`
+- `logits_first_hash`, `logits_first_argmax`, `logits_first_max`,
+  `logits_first_sum`: the logits of the first sampled token, that is, the
+  prefill output
+- `logits_decode_steps`, `logits_decode_hash`: all later sampled tokens,
+  hashed in order (empty for prefill-only runs)
+
+The hashes are 64-bit FNV-1a over the raw float bits, so two runs that computed
+identical logits have identical hashes, and any numerical difference changes
+them. The first-token argmax, maximum and sum show how large a difference is.
+Hashing a 128K vocabulary takes well under a millisecond per sampled token on
+the host thread; for prefill-only runs it happens after the E2E window, while
+in generation runs it is inside the window.
+
 ### Number of Threads
 
 -   `-t N, --threads N`: Set the number of threads to use during generation. For optimal performance, it is recommended to set this value to the number of physical CPU cores your system has (as opposed to the logical number of cores). Using the correct number of threads can greatly improve performance.

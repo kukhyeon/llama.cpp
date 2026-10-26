@@ -29,6 +29,7 @@
 #include <string>
 #include <cmath>
 #include <map>
+#include <unordered_map>
 #include <memory>
 #include <charconv>
 #include <mutex>
@@ -539,12 +540,19 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_add4_f32;
     bool shared_external_host_ptr = false;
     bool shared_dmabuf_host_ptr = false;
+    // cl_qcom_ext_host_ptr_iocoherent: the GPU snoops CPU caches, which zero-copy
+    // activations need whenever the CPU reads or writes the same buffer.
+    bool zero_copy_iocoherent = false;
     std::mutex shared_import_mutex;
     std::once_flag shared_kernel_once;
     std::shared_ptr<_cl_kernel> shared_kernel;
     std::shared_ptr<_cl_kernel> shared_mm_kernel;
     std::shared_ptr<_cl_kernel> shared_repack_kernel;
     std::shared_ptr<_cl_kernel> shared_native_copy_kernel;
+    // Built only by the measurement probe; graphs never use these kernels.
+    std::once_flag shared_probe_once;
+    std::shared_ptr<_cl_kernel> shared_probe_read_kernel;
+    std::shared_ptr<_cl_kernel> shared_probe_copy_kernel;
     struct native_activation_reuse {
         cl_mem image = nullptr;
         const ggml_tensor * source = nullptr;
@@ -573,6 +581,49 @@ struct ggml_backend_opencl_context {
         std::string node_name;
     };
     std::vector<shared_repack_pending> shared_repack_events;
+    // GGML_SHARED_REPACK_BREAKDOWN probes of sampled repacks, collected with
+    // the repack events above. `part` times the shared part of a composite.
+    struct shared_probe_pending {
+        cl_event read;
+        cl_event copy;
+        cl_event part;
+        ggml_tensor weight;
+        ggml_shared_weights_repack_event timing;
+        std::string node_name;
+    };
+    std::vector<shared_probe_pending> shared_probe_events;
+    ggml_cl_buffer shared_probe_q;
+    ggml_cl_buffer shared_probe_d;
+    ggml_cl_buffer shared_probe_checksums;
+    ggml_cl_buffer shared_probe_evict_src;
+    ggml_cl_buffer shared_probe_evict_dst;
+
+    static double event_us(cl_event event) {
+        cl_ulong start = 0, end = 0;
+        if (event == nullptr ||
+                clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_START, sizeof(start), &start, nullptr) != CL_SUCCESS ||
+                clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_END, sizeof(end), &end, nullptr) != CL_SUCCESS ||
+                end < start) {
+            return -1.0;
+        }
+        return (end - start) / 1000.0;
+    }
+
+    void collect_shared_probe_events() {
+        for (auto & pending : shared_probe_events) {
+            pending.timing.node_name = pending.node_name.c_str();
+            const struct { cl_event event; const char * probe; } probes[] = {
+                {pending.read, "read"}, {pending.copy, "copy"}, {pending.part, "repack_shared_part"},
+            };
+            for (const auto & p : probes) {
+                if (p.event == nullptr) { continue; }
+                pending.timing.repack_us = event_us(p.event);
+                ggml_shared_weights_log_repack_probe(&pending.weight, "OpenCL", &pending.timing, p.probe);
+                CL_CHECK(clReleaseEvent(p.event));
+            }
+        }
+        shared_probe_events.clear();
+    }
 
     void collect_shared_repack_events() {
         // Called only after the backend's existing queue barrier (or teardown).
@@ -597,6 +648,7 @@ struct ggml_backend_opencl_context {
             ggml_shared_weights_log_repack(&pending.weight, "OpenCL", &pending.timing);
         }
         shared_repack_events.clear();
+        collect_shared_probe_events();
     }
     std::once_flag add4_kernel_once;
     std::string add4_compile_opts;
@@ -4004,6 +4056,8 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
     backend_ctx->shared_external_host_ptr =
         (backend_ctx->shared_dmabuf_host_ptr || strstr(ext_buffer, "cl_qcom_ion_host_ptr") != nullptr) &&
         strstr(ext_buffer, "cl_qcom_ext_host_ptr") != nullptr;
+    backend_ctx->zero_copy_iocoherent = backend_ctx->shared_external_host_ptr &&
+        strstr(ext_buffer, "cl_qcom_ext_host_ptr_iocoherent") != nullptr;
     if (ggml_shared_weights_enabled()) {
         GGML_LOG_INFO("ggml_opencl: shared HTP import: %s\n",
             backend_ctx->shared_dmabuf_host_ptr ? "QCOM DMA-BUF" :
@@ -4653,7 +4707,11 @@ static void ggml_backend_opencl_set_tensor_async(ggml_backend_t backend, ggml_te
     // Preserve the historical blocking behavior unless the complete
     // event-protected staging path is explicitly enabled. Some existing
     // callers invoke the async API without consulting device capabilities.
-    if (!ggml_backend_opencl_async_events_enabled()) {
+    // Tensors of zero-copy activation buffers belong to a Hexagon buffer;
+    // its host set_tensor is the only valid write path.
+    if (!ggml_backend_opencl_async_events_enabled() ||
+            ggml_zero_copy_buft_role(ggml_backend_buffer_get_type(
+                tensor->view_src ? tensor->view_src->buffer : tensor->buffer)) >= 0) {
         ggml_backend_synchronize(backend);
         ggml_backend_tensor_set(tensor, data, offset, size);
         return;
@@ -5043,8 +5101,13 @@ static void ggml_cl_concat3(
         const ggml_tensor * src2,
         ggml_tensor * dst);
 
+static void ggml_opencl_bind_zero_copy_graph(ggml_backend_opencl_context * ctx, ggml_cgraph * cgraph);
+
 static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+    if (ggml_zero_copy_requested_mask() != 0) {
+        ggml_opencl_bind_zero_copy_graph(backend_ctx, cgraph);
+    }
     backend_ctx->clear_native_activation();
     backend_ctx->native_activation_graph_active = true;
     struct activation_graph_scope {
@@ -5365,6 +5428,117 @@ static cl_mem ggml_opencl_import_shared_weight(
 
 static bool ggml_backend_opencl_prepare_shared_weight(ggml_backend_dev_t dev, const ggml_tensor * tensor) {
     return ggml_opencl_import_shared_weight(ggml_cl2_init(dev), tensor) != nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// Zero-copy activations (GGML_ACTIVATION_ZERO_COPY). Hexagon allocates the
+// compute buffers of the selected roles in rpcmem; OpenCL imports each buffer
+// once, read-write, and gives the tensors in it an extra that points into the
+// import. Kernels then use them like tensors of an OpenCL buffer.
+
+#ifndef CL_MEM_HOST_IOCOHERENT_QCOM
+#define CL_MEM_HOST_IOCOHERENT_QCOM 0x40A9
+#endif
+
+// Role bits whose rpcmem compute buffers this device can use in place. Reading
+// NPU outputs needs only the import; any role shared with the CPU also needs an
+// I/O-coherent import, because the CPU writes or reads those buffers through
+// its caches without map/unmap. Sub-buffers of an import must keep the device
+// base alignment, so it must not exceed the Hexagon 128-byte tensor alignment.
+static unsigned ggml_backend_opencl_zero_copy_roles(ggml_backend_dev_t dev) {
+    ggml_backend_opencl_context * ctx = dev ? ggml_cl2_init(dev) : nullptr;
+    if (!ctx || !ctx->shared_external_host_ptr || ctx->alignment > 128) {
+        return 0;
+    }
+    unsigned roles = 1u << GGML_ZERO_COPY_NPU;
+    if (ctx->zero_copy_iocoherent) {
+        roles |= (1u << GGML_ZERO_COPY_GPU) | (1u << GGML_ZERO_COPY_CPU);
+    }
+    return roles & ggml_zero_copy_requested_mask();
+}
+
+struct ggml_opencl_zero_copy_buffer {
+    cl_mem mem;
+};
+
+static cl_mem ggml_opencl_zero_copy_import(ggml_backend_opencl_context * ctx, ggml_backend_buffer_t buffer) {
+    // The attachment key differs from the weight imports, which use ctx->context.
+    const void * key = &ctx->zero_copy_iocoherent;
+    std::lock_guard<std::mutex> lock(ctx->shared_import_mutex);
+    if (auto * existing = static_cast<ggml_opencl_zero_copy_buffer *>(ggml_shared_weights_attachment(buffer, key))) {
+        return existing->mem;
+    }
+    const auto * d = ggml_shared_weights_buffer(buffer);
+    GGML_ASSERT(d && d->fd >= 0 && d->base && "zero-copy activation buffer without an exported rpcmem fd");
+    size_t page = 0, padding = 0;
+    cl_ulong max_alloc = 0;
+    CL_CHECK(clGetDeviceInfo(ctx->device, CL_DEVICE_PAGE_SIZE_QCOM, sizeof(page), &page, nullptr));
+    CL_CHECK(clGetDeviceInfo(ctx->device, CL_DEVICE_EXT_MEM_PADDING_IN_BYTES_QCOM, sizeof(padding), &padding, nullptr));
+    CL_CHECK(clGetDeviceInfo(ctx->device, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(max_alloc), &max_alloc, nullptr));
+    if (!page || (uintptr_t) d->base % page || padding > d->allocation_size - d->size || d->size > max_alloc) {
+        GGML_ABORT("zero-copy activations: rpcmem buffer of %zu bytes fails the OpenCL import limits "
+            "(page %zu, padding %zu, max allocation %llu)", d->size, page, padding, (unsigned long long) max_alloc);
+    }
+    struct external_fd_host_ptr {
+        cl_mem_ext_host_ptr ext_host_ptr;
+        int fd;
+        void * hostptr;
+    } external = {};
+    external.ext_host_ptr.allocation_type = ctx->shared_dmabuf_host_ptr ? 0x411D : CL_MEM_ION_HOST_PTR_QCOM;
+    external.ext_host_ptr.host_cache_policy = ctx->zero_copy_iocoherent ?
+        CL_MEM_HOST_IOCOHERENT_QCOM : CL_MEM_HOST_WRITEBACK_QCOM;
+    external.fd = d->fd;
+    external.hostptr = d->base;
+    cl_int err;
+    cl_mem mem = clCreateBuffer(ctx->context,
+        CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR | CL_MEM_EXT_HOST_PTR_QCOM, d->size, &external, &err);
+    if (err != CL_SUCCESS || !mem) {
+        GGML_ABORT("zero-copy activations: rpcmem fd %d OpenCL import failed: %d", d->fd, err);
+    }
+    auto * imported = new ggml_opencl_zero_copy_buffer{mem};
+    ggml_shared_weights_attach(buffer, key, imported, [](void * p) {
+        auto * handle = static_cast<ggml_opencl_zero_copy_buffer *>(p);
+        CL_CHECK(clReleaseMemObject(handle->mem));
+        delete handle;
+    });
+    GGML_LOG_INFO("ggml_opencl: zero-copy import of %s (%zu bytes, %s)\n", ggml_backend_buffer_name(buffer),
+        d->size, ctx->zero_copy_iocoherent ? "I/O coherent" : "write-back");
+    return mem;
+}
+
+// Gives a tensor of a zero-copy activation buffer an OpenCL extra. Views share
+// their parent's extra, as in ggml_backend_opencl_buffer_init_tensor. Extras
+// are refreshed on every use because graphs reuse tensors across allocations.
+static void ggml_opencl_bind_zero_copy_tensor(ggml_backend_opencl_context * ctx, ggml_tensor * tensor) {
+    if (tensor == nullptr) {
+        return;
+    }
+    ggml_tensor * base = tensor->view_src ? tensor->view_src : tensor;
+    if (base->buffer == nullptr || base->data == nullptr || ggml_zero_copy_buft_role(base->buffer->buft) < 0) {
+        return;
+    }
+    static std::mutex mutex;
+    static std::unordered_map<const ggml_tensor *, ggml_tensor_extra_cl> extras;
+    const auto * d = ggml_shared_weights_buffer(base->buffer);
+    GGML_ASSERT(d != nullptr);
+    cl_mem mem = ggml_opencl_zero_copy_import(ctx, base->buffer);
+    std::lock_guard<std::mutex> lock(mutex);
+    ggml_tensor_extra_cl & extra = extras[base];
+    extra.data_device = mem;
+    extra.offset = (const char *) base->data - (const char *) d->base;
+    extra.actual_size = ggml_nbytes(base);
+    base->extra = &extra;
+    tensor->extra = &extra;
+}
+
+static void ggml_opencl_bind_zero_copy_graph(ggml_backend_opencl_context * ctx, ggml_cgraph * cgraph) {
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        ggml_tensor * node = cgraph->nodes[i];
+        ggml_opencl_bind_zero_copy_tensor(ctx, node);
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            ggml_opencl_bind_zero_copy_tensor(ctx, node->src[j]);
+        }
+    }
 }
 
 static const char * ggml_backend_opencl_buffer_type_get_name(ggml_backend_buffer_type_t buffer_type);
@@ -8496,9 +8670,15 @@ static bool ggml_backend_opencl_device_supports_op(ggml_backend_dev_t dev, const
     return ggml_opencl_supports_op(dev, op);
 }
 
+static unsigned ggml_backend_opencl_zero_copy_roles(ggml_backend_dev_t dev);
+
 static bool ggml_backend_opencl_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     if (ggml_shared_weights_is_buft(buft)) {
         return ggml_cl2_init(dev)->shared_external_host_ptr;
+    }
+    const int zero_copy_role = ggml_zero_copy_buft_role(buft);
+    if (zero_copy_role >= 0) {
+        return (ggml_backend_opencl_zero_copy_roles(dev) >> zero_copy_role) & 1u;
     }
     // Check 'dev' and 'buffer_type' are not objects belonging to this backend.
     if (dev->iface.get_name != ggml_backend_opencl_device_get_name ||
@@ -8628,6 +8808,10 @@ static void * ggml_backend_opencl_reg_get_proc_address(ggml_backend_reg_t reg, c
     }
     if (name && strcmp(name, "ggml_backend_prepare_shared_weight") == 0) {
         return reinterpret_cast<void *>(ggml_backend_opencl_prepare_shared_weight);
+    }
+    if (name && strcmp(name, "ggml_backend_zero_copy_roles") == 0) {
+        ggml_backend_zero_copy_roles_t fct = ggml_backend_opencl_zero_copy_roles;
+        return reinterpret_cast<void *>(fct);
     }
     if (name != nullptr && strcmp(name, "ggml_backend_async_flush") == 0) {
         return reinterpret_cast<void *>(ggml_backend_opencl_async_flush);
@@ -12798,6 +12982,78 @@ static void ggml_cl_prepare_shared_kernels(ggml_backend_opencl_context * ctx) {
     });
 }
 
+// A separate program, built on the first sampled repack, keeps the probe
+// kernels out of the graph program and its kernel objects.
+static void ggml_cl_prepare_shared_probe_kernels(ggml_backend_opencl_context * ctx) {
+    std::call_once(ctx->shared_probe_once, [ctx]() {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string source {
+            #include "repack_htp_q8.cl.h"
+            #include "repack_probe_htp_q8.cl.h"
+        };
+#else
+        const std::string source = read_file("repack_htp_q8.cl") + read_file("repack_probe_htp_q8.cl");
+#endif
+        cl_program program = build_program_from_source(ctx->context, ctx->device,
+            source.c_str(), "-cl-std=CL2.0");
+        auto create = [program](const char * name) {
+            cl_int err;
+            cl_kernel kernel = clCreateKernel(program, name, &err);
+            CL_CHECK(err);
+            return std::shared_ptr<_cl_kernel>(kernel, [](cl_kernel k) { clReleaseKernel(k); });
+        };
+        ctx->shared_probe_read_kernel = create("kernel_probe_htp_q8_read");
+        ctx->shared_probe_copy_kernel = create("kernel_probe_htp_q8_copy");
+        CL_CHECK(clReleaseProgram(program));
+    });
+}
+
+// GGML_SHARED_REPACK_BREAKDOWN: enqueue, before a sampled repack of the same
+// shared region, evict -> read probe -> evict -> copy probe -> evict on the
+// graph queue. The final eviction makes the real repack start cold as well.
+static void ggml_cl_shared_breakdown_probe(ggml_backend_opencl_context * ctx, cl_mem weights,
+        cl_ulong weight_offset, int parent_k, cl_ulong weight_stride,
+        int k_start, int k_size, int out_start, int out_size, cl_event * read, cl_event * copy) {
+    ggml_cl_prepare_shared_probe_kernels(ctx);
+    const size_t groups_x = CEIL_DIV((size_t) k_size / 4, 16);
+    const size_t groups_y = CEIL_DIV((size_t) out_size, 16);
+    ctx->shared_probe_q.allocate(ctx->context, (size_t) k_size * out_size);
+    ctx->shared_probe_d.allocate(ctx->context, (size_t) (k_size / 32) * out_size * sizeof(ggml_fp16_t));
+    ctx->shared_probe_checksums.allocate(ctx->context, groups_x * groups_y * sizeof(cl_uint));
+    const size_t evict_bytes = ggml_shared_weights_breakdown_evict_bytes();
+    if (evict_bytes > 0) {
+        ctx->shared_probe_evict_src.allocate(ctx->context, evict_bytes);
+        ctx->shared_probe_evict_dst.allocate(ctx->context, evict_bytes);
+    }
+    auto evict = [&]() {
+        if (evict_bytes > 0) {
+            CL_CHECK(clEnqueueCopyBuffer(ctx->queue, ctx->shared_probe_evict_src.buffer,
+                ctx->shared_probe_evict_dst.buffer, 0, 0, evict_bytes, 0, nullptr, nullptr));
+        }
+    };
+    size_t local[] = {16, 4};
+    size_t global[] = {groups_x * 16, groups_y * 4};
+    for (int probe = 0; probe < 2; ++probe) {
+        cl_kernel kernel = probe == 0 ? ctx->shared_probe_read_kernel.get() : ctx->shared_probe_copy_kernel.get();
+        int arg = 0;
+        auto set = [&](size_t size, const void * value) { CL_CHECK(clSetKernelArg(kernel, arg++, size, value)); };
+        set(sizeof(cl_mem), &weights); set(sizeof(weight_offset), &weight_offset);
+        set(sizeof(parent_k), &parent_k); set(sizeof(weight_stride), &weight_stride);
+        set(sizeof(k_start), &k_start); set(sizeof(k_size), &k_size);
+        set(sizeof(out_start), &out_start); set(sizeof(out_size), &out_size);
+        if (probe == 0) {
+            set(sizeof(cl_mem), &ctx->shared_probe_checksums.buffer);
+        } else {
+            set(sizeof(cl_mem), &ctx->shared_probe_q.buffer);
+            set(sizeof(cl_mem), &ctx->shared_probe_d.buffer);
+        }
+        evict();
+        CL_CHECK(clEnqueueNDRangeKernel(ctx->queue, kernel, 2, nullptr, global, local, 0, nullptr,
+            probe == 0 ? read : copy));
+    }
+    evict();
+}
+
 static void ggml_cl_mul_mat_shared_composite(ggml_backend_t backend, ggml_tensor * dst) {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
     GGML_ASSERT(ggml_opencl_supports_composite(backend->device, dst));
@@ -12820,6 +13076,8 @@ static void ggml_cl_mul_mat_shared_composite(ggml_backend_t backend, ggml_tensor
         q_bytes + d_bytes, q_bytes + d_bytes + activation_bytes); }
     cl_event events[2] = {nullptr, nullptr};
     const ggml_tensor * shared_identity = nullptr;
+    const bool sampled = timing && ggml_shared_weights_breakdown_sample();
+    ggml_backend_opencl_context::shared_probe_pending probe = {nullptr, nullptr, nullptr, {}, measurement, {}};
     int destination_start = 0;
     for (int part = 0; part < 2; ++part) {
         const ggml_tensor * w = dst->src[part == 0 ? 0 : 2];
@@ -12843,6 +13101,16 @@ static void ggml_cl_mul_mat_shared_composite(ggml_backend_t backend, ggml_tensor
             const int parent_k = (int) w->ne[0];
             set(sizeof(cl_mem), &imported->mem); set(sizeof(offset), &offset);
             set(sizeof(parent_k), &parent_k); set(sizeof(stride), &stride);
+            if (sampled) {
+                // Probe kernels are separate objects; this kernel's arguments stay set.
+                ggml_cl_shared_breakdown_probe(ctx, imported->mem, offset, parent_k, stride,
+                    ks, kn, os, on, &probe.read, &probe.copy);
+                probe.weight = *w;
+                probe.timing.k_start = ks; probe.timing.k_size = kn;
+                probe.timing.out_start = os; probe.timing.out_size = on;
+                probe.timing.packed_bytes = ggml_row_size(GGML_TYPE_Q8_0, kn) * on;
+                probe.timing.composite = false;
+            }
         } else {
             auto * extra = static_cast<ggml_tensor_extra_cl_q8_0 *>(w->extra);
             GGML_ASSERT(extra && extra->q && extra->d);
@@ -12856,6 +13124,10 @@ static void ggml_cl_mul_mat_shared_composite(ggml_backend_t backend, ggml_tensor
             size_t local[] = {16, 4};
             size_t global[] = {CEIL_DIV((size_t) kn / 4, 16) * 16, CEIL_DIV((size_t) on, 16) * 4};
             ctx->enqueue_ndrange_kernel(kernel, 2, global, local, dst, timing ? &events[part] : nullptr);
+            if (sampled && events[part] != nullptr) {
+                CL_CHECK(clRetainEvent(events[part]));
+                probe.part = events[part];
+            }
         } else {
             size_t local[] = {64};
             size_t global[] = {CEIL_DIV((size_t) kn / 4 * on, local[0]) * local[0]};
@@ -12867,6 +13139,10 @@ static void ggml_cl_mul_mat_shared_composite(ggml_backend_t backend, ggml_tensor
         GGML_ASSERT(shared_identity);
         ctx->shared_repack_events.push_back({{events[0], events[1]}, 2, *shared_identity, measurement,
             measurement.node_name ? measurement.node_name : dst->name});
+    }
+    if (sampled) {
+        probe.node_name = measurement.node_name ? measurement.node_name : dst->name;
+        ctx->shared_probe_events.push_back(probe);
     }
     const ggml_mul_mat_src0_region_params compact = {GGML_MUL_MAT_SRC0_REGION_PARAMS_VERSION, 0, 0, full_k, 0, full_m};
     ggml_cl_mul_mat_q8_0_f32_adreno_region_buffers(backend, dst->src[1], dst,
@@ -12931,6 +13207,12 @@ static void ggml_cl_mul_mat_shared_htp(
             measurement = ggml_shared_weights_repack_begin(dst, "opencl_event", q_bytes + d_bytes,
                 q_bytes + d_bytes + activation_bytes);
         }
+        ggml_backend_opencl_context::shared_probe_pending probe = {nullptr, nullptr, nullptr, *w, measurement, {}};
+        const bool sampled = timing && ggml_shared_weights_breakdown_sample();
+        if (sampled) {
+            ggml_cl_shared_breakdown_probe(ctx, imported->mem, wo, pk, ws, ks, kn, os, on,
+                &probe.read, &probe.copy);
+        }
         size_t local[] = {16, 4};
         size_t global[] = {CEIL_DIV((size_t) kn / 4, 16) * 16, CEIL_DIV((size_t) on, 16) * 4};
         cl_event event = nullptr;
@@ -12938,6 +13220,11 @@ static void ggml_cl_mul_mat_shared_htp(
         if (timing) {
             ctx->shared_repack_events.push_back({{event, nullptr}, 1, *w, measurement,
                 measurement.node_name ? measurement.node_name : dst->name});
+        }
+        if (sampled) {
+            // The whole repack is the shared region here; its time is the repack row.
+            probe.node_name = measurement.node_name ? measurement.node_name : dst->name;
+            ctx->shared_probe_events.push_back(probe);
         }
         const ggml_mul_mat_src0_region_params compact = {
             GGML_MUL_MAT_SRC0_REGION_PARAMS_VERSION, 0, 0, kn, 0, on};

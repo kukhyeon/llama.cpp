@@ -26,6 +26,9 @@ GGML_API void ggml_shared_weights_unregister_buffer(ggml_backend_buffer_t buffer
 GGML_API const struct ggml_shared_weight_buffer * ggml_shared_weights_buffer(ggml_backend_buffer_t buffer);
 GGML_API bool ggml_shared_weights_tensor(const struct ggml_tensor * tensor);
 GGML_API bool ggml_shared_weights_supports_op(const struct ggml_tensor * op);
+// The buffer registry above also records zero-copy activation buffers (fd and
+// imports). ggml_shared_weights_tensor() stays false for them: their buffer
+// type is a zero-copy activation type, not a shared-weight type.
 
 // Imported handles belong to the allocation, and are released before rpcmem.
 // The caller serializes creation for a given backend context.
@@ -74,6 +77,45 @@ GGML_API void ggml_shared_weights_log_repack(const struct ggml_tensor * weight,
 // Optional single CSV for functional diagnostics and repack timings.
 GGML_API void ggml_shared_weights_log(const char * event, const struct ggml_tensor * tensor,
         const char * backend, int axis, int64_t start, int64_t size, const char * detail);
+
+// In-run repack breakdown (GGML_SHARED_REPACK_BREAKDOWN=N, default 0 = off).
+// Every N-th repack additionally runs a read-only and a copy-only pass over
+// the shared source region, with an untimed cache-evicting pass
+// (GGML_SHARED_REPACK_BREAKDOWN_EVICT_MB, default 32) before the read, the
+// copy and the real repack. It requires the repack timing CSV and changes the
+// timing of the run, so it is a measurement mode only.
+GGML_API int ggml_shared_weights_breakdown_interval(void);
+// Call once per repack; true when this repack is sampled.
+GGML_API bool ggml_shared_weights_breakdown_sample(void);
+GGML_API size_t ggml_shared_weights_breakdown_evict_bytes(void);
+// Writes a "repack_probe" row whose detail names the probe: "read", "copy" or
+// "repack_shared_part" (the shared part of a composite repack). The event's
+// ranges and packed_bytes describe the probed shared region.
+GGML_API void ggml_shared_weights_log_repack_probe(const struct ggml_tensor * weight,
+        const char * backend, const struct ggml_shared_weights_repack_event * event, const char * probe);
+
+// Zero-copy activations (GGML_ACTIVATION_ZERO_COPY bitmask, default 0). A set
+// bit places that backend's compute buffer in Hexagon rpcmem so the other
+// processors read its outputs in place instead of through scheduler copies:
+//   1: NPU outputs, read in place by the GPU (the CPU already reads them)
+//   2: GPU outputs, read in place by the NPU and the CPU
+//   4: CPU outputs, read in place by the GPU and the NPU
+enum ggml_zero_copy_role {
+    GGML_ZERO_COPY_NPU = 0,
+    GGML_ZERO_COPY_GPU = 1,
+    GGML_ZERO_COPY_CPU = 2,
+    GGML_ZERO_COPY_ROLE_COUNT = 3,
+};
+GGML_API unsigned ggml_zero_copy_requested_mask(void);
+GGML_API void ggml_zero_copy_register_buft(ggml_backend_buffer_type_t buft, enum ggml_zero_copy_role role);
+GGML_API void ggml_zero_copy_unregister_buft(ggml_backend_buffer_type_t buft);
+// Role of a zero-copy activation buffer type, or -1 for any other type.
+GGML_API int ggml_zero_copy_buft_role(ggml_backend_buffer_type_t buft);
+// Registry procs: "ggml_backend_zero_copy_buffer_type" (Hexagon) returns the
+// rpcmem compute buffer type for a role, or NULL; "ggml_backend_zero_copy_roles"
+// (OpenCL) returns the role bits whose buffers the device can use in place.
+typedef ggml_backend_buffer_type_t (*ggml_backend_zero_copy_buffer_type_t)(ggml_backend_dev_t device, int role);
+typedef unsigned (*ggml_backend_zero_copy_roles_t)(ggml_backend_dev_t device);
 
 #ifdef __cplusplus
 }

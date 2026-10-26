@@ -28,6 +28,7 @@ struct allocation {
 struct registry {
     std::mutex mutex;
     std::unordered_set<ggml_backend_buffer_type_t> types;
+    std::unordered_map<ggml_backend_buffer_type_t, int> zero_copy_types;
     std::unordered_map<ggml_backend_buffer_t, std::unique_ptr<allocation>> buffers;
     // Timestamp-seeded IDs keep appended CSV runs distinct without recording
     // file descriptors or raw host addresses in diagnostic output.
@@ -131,8 +132,9 @@ void ggml_shared_weights_register_buffer(ggml_backend_buffer_t buffer,
     s.buffers.emplace(buffer, std::move(a));
 }
 void ggml_shared_weights_unregister_buffer(ggml_backend_buffer_t buffer) {
-    if (!ggml_shared_weights_enabled()) { return; }
-    // Imported handles must be released before the physical backing memory.
+    // Zero-copy activation buffers are registered without shared weights, so
+    // look the buffer up unconditionally. Imported handles must be released
+    // before the physical backing memory.
     std::unique_ptr<allocation> retired;
     auto & s = state();
     {
@@ -289,6 +291,14 @@ void ggml_shared_weights_log(const char * event, const ggml_tensor * tensor,
         const char * backend, int axis, int64_t start, int64_t size, const char * detail) {
     shared_weights_log_row(event, tensor, backend, axis, start, size, detail, nullptr);
 }
+void ggml_shared_weights_log_repack_probe(const ggml_tensor * weight, const char * backend,
+        const ggml_shared_weights_repack_event * event, const char * probe) {
+    if (!event || !ggml_shared_weights_timing_enabled()) { return; }
+    const bool k_slice = weight && event->k_size != weight->ne[0];
+    shared_weights_log_row("repack_probe", weight, backend, k_slice ? 0 : 1,
+        k_slice ? event->k_start : event->out_start,
+        k_slice ? event->k_size : event->out_size, probe, event);
+}
 void ggml_shared_weights_log_repack(const ggml_tensor * weight, const char * backend,
         const ggml_shared_weights_repack_event * event) {
     if (!event || !ggml_shared_weights_timing_enabled()) { return; }
@@ -301,4 +311,51 @@ void ggml_shared_weights_log_repack(const ggml_tensor * weight, const char * bac
     shared_weights_log_row("repack", weight, backend, k_slice ? 0 : 1,
         k_slice ? event->k_start : event->out_start,
         k_slice ? event->k_size : event->out_size, "native scratch", event);
+}
+
+int ggml_shared_weights_breakdown_interval(void) {
+    static const int interval = [] {
+        const char * value = std::getenv("GGML_SHARED_REPACK_BREAKDOWN");
+        const long parsed = value ? std::strtol(value, nullptr, 10) : 0;
+        return parsed > 0 && parsed <= INT32_MAX ? (int) parsed : 0;
+    }();
+    return interval;
+}
+bool ggml_shared_weights_breakdown_sample(void) {
+    const int interval = ggml_shared_weights_breakdown_interval();
+    if (interval <= 0 || !ggml_shared_weights_timing_enabled()) { return false; }
+    static std::atomic<uint64_t> repacks {0};
+    return repacks.fetch_add(1, std::memory_order_relaxed) % (uint64_t) interval == 0;
+}
+size_t ggml_shared_weights_breakdown_evict_bytes(void) {
+    static const size_t bytes = [] {
+        const char * value = std::getenv("GGML_SHARED_REPACK_BREAKDOWN_EVICT_MB");
+        const long long parsed = value ? std::strtoll(value, nullptr, 10) : 32;
+        return parsed > 0 ? (size_t) parsed << 20 : (size_t) 0;
+    }();
+    return bytes;
+}
+
+unsigned ggml_zero_copy_requested_mask(void) {
+    static const unsigned mask = [] {
+        const char * value = std::getenv("GGML_ACTIVATION_ZERO_COPY");
+        const unsigned long parsed = value ? std::strtoul(value, nullptr, 0) : 0;
+        return (unsigned) (parsed & ((1u << GGML_ZERO_COPY_ROLE_COUNT) - 1));
+    }();
+    return mask;
+}
+void ggml_zero_copy_register_buft(ggml_backend_buffer_type_t buft, enum ggml_zero_copy_role role) {
+    GGML_ASSERT(buft && role >= 0 && role < GGML_ZERO_COPY_ROLE_COUNT);
+    auto & s = state(); std::lock_guard<std::mutex> lock(s.mutex);
+    s.zero_copy_types[buft] = (int) role;
+}
+void ggml_zero_copy_unregister_buft(ggml_backend_buffer_type_t buft) {
+    auto & s = state(); std::lock_guard<std::mutex> lock(s.mutex);
+    s.zero_copy_types.erase(buft);
+}
+int ggml_zero_copy_buft_role(ggml_backend_buffer_type_t buft) {
+    if (!buft || ggml_zero_copy_requested_mask() == 0) { return -1; }
+    auto & s = state(); std::lock_guard<std::mutex> lock(s.mutex);
+    auto it = s.zero_copy_types.find(buft);
+    return it == s.zero_copy_types.end() ? -1 : it->second;
 }

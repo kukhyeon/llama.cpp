@@ -852,6 +852,9 @@ struct ggml_backend_sched_split {
     int attn_out_direct_scatter_slices;
     int attn_out_direct_scatter_join_count;
     bool contains_transformer_layer;
+    // GGML_ACTIVATION_ZERO_COPY: backends whose compute outputs this split
+    // reads in place, without a scheduler copy (bit per backend id).
+    uint32_t zero_copy_producers;
     struct ggml_tensor * inputs[GGML_SCHED_MAX_SPLIT_INPUTS];
     int n_inputs;
     // graph view of this split
@@ -1100,6 +1103,15 @@ struct ggml_backend_sched {
     size_t input_dependency_count;
     size_t route_dependency_count;
     size_t max_split_inputs;
+
+    // GGML_ACTIVATION_ZERO_COPY bookkeeping. Without scheduler copies nothing
+    // else orders an asynchronous producer before a consumer on another
+    // backend, or a pending asynchronous reader before the owner reuses the
+    // memory it reads. Bits are backend ids.
+    bool zero_copy;
+    uint32_t zero_copy_async_backends;               // graph_compute returns before completion
+    uint32_t zero_copy_dirty;                        // async backends with unsynchronized work
+    uint32_t zero_copy_pending_readers[GGML_SCHED_MAX_BACKENDS]; // per owner: async readers in flight
 
     bool op_offload;
 
@@ -5138,6 +5150,22 @@ struct ggml_backend_sched_route_base_capture {
     std::vector<int> leaf_backend_ids;
 };
 
+// GGML_ACTIVATION_ZERO_COPY: computed tensors (not weights) may be read in place.
+static bool ggml_backend_sched_zero_copy_activation(const struct ggml_tensor * t) {
+    const struct ggml_tensor * base = t->view_src ? t->view_src : t;
+    return !(base->buffer != nullptr && base->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+}
+
+// Backend whose buffer holds the data of t: a view lives in its source's buffer
+// even when the view node itself was assigned to another backend.
+static int ggml_backend_sched_zero_copy_owner(ggml_backend_sched_t sched, struct ggml_tensor * t) {
+    const int owner = t->view_src ? tensor_backend_id(t->view_src) : -1;
+    return owner >= 0 ? owner : tensor_backend_id(t);
+}
+
+static std::vector<std::pair<int, struct ggml_tensor *>> ggml_backend_sched_zero_copy_group_deps(
+        ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+
 static void ggml_backend_sched_split_graph_impl(
         ggml_backend_sched_t sched, struct ggml_cgraph * graph,
         ggml_backend_sched_route_base_capture * route_base) {
@@ -5454,6 +5482,7 @@ static void ggml_backend_sched_split_graph_impl(
         }
         split->i_start = 0;
         split->n_inputs = 0;
+        split->zero_copy_producers = 0;
         split->checkpoint_index_after = -1;
         split->is_ffn_parallel_reduce = false;
         split->has_attn_out_parallel_concat = false;
@@ -5725,6 +5754,7 @@ static void ggml_backend_sched_split_graph_impl(
                 split->backend_id = node_backend_id;
                 split->i_start = i;
                 split->n_inputs = 0;
+                split->zero_copy_producers = 0;
                 split->checkpoint_index_after = -1;
                 split->is_ffn_parallel_reduce = false;
                 split->has_attn_out_parallel_concat = false;
@@ -5847,6 +5877,11 @@ static void ggml_backend_sched_split_graph_impl(
                         }
                     }
                     source_rewrites.push_back({ node, j, src_id, cur_backend_id });
+                } else if (sched->zero_copy && ggml_backend_sched_zero_copy_activation(src)) {
+                    const int owner = ggml_backend_sched_zero_copy_owner(sched, src);
+                    if (owner >= 0 && owner != cur_backend_id) {
+                        split->zero_copy_producers |= 1u << owner;
+                    }
                 }
             }
 
@@ -5937,8 +5972,12 @@ static void ggml_backend_sched_split_graph_impl(
         }
     }
 
+    std::vector<std::pair<int, struct ggml_tensor *>> zero_copy_deps;
+    if (sched->zero_copy) {
+        zero_copy_deps = ggml_backend_sched_zero_copy_group_deps(sched, graph);
+    }
     const size_t tensor_count = sched->copy_tensor_count +
-        sched->input_dependency_count + sched->route_dependency_count;
+        sched->input_dependency_count + sched->route_dependency_count + zero_copy_deps.size();
     GGML_ASSERT(tensor_count <= SIZE_MAX / ggml_tensor_overhead());
     const size_t required_context_buffer_size =
         std::max((size_t) GGML_MEM_ALIGN, tensor_count * ggml_tensor_overhead());
@@ -5990,7 +6029,8 @@ static void ggml_backend_sched_split_graph_impl(
     }
 
     const size_t allocation_nodes = (size_t) graph->n_nodes +
-        sched->input_dependency_count + allocation_copy_nodes + sched->route_dependency_count;
+        sched->input_dependency_count + allocation_copy_nodes + sched->route_dependency_count +
+        zero_copy_deps.size();
     size_t allocation_leafs = graph->n_leafs;
     if (sched->n_copies > 1) {
         if (route_candidate_mode) {
@@ -6149,6 +6189,19 @@ static void ggml_backend_sched_split_graph_impl(
                     graph_copy->nodes[graph_copy->n_nodes++] = lifetime_dep;
                 }
             }
+        }
+
+        // Allocation-only dependencies, like the route outputs above: split
+        // graphs are views of the original graph and never execute them.
+        for (const auto & dep : zero_copy_deps) {
+            if (dep.first != i) {
+                continue;
+            }
+            assert(graph_copy->size > graph_copy->n_nodes);
+            struct ggml_tensor * lifetime_dep = ggml_view_tensor(sched->ctx, dep.second);
+            lifetime_dep->src[0] = dep.second;
+            sched->node_backend_ids[graph_copy->n_nodes] = tensor_backend_id(dep.second);
+            graph_copy->nodes[graph_copy->n_nodes++] = lifetime_dep;
         }
     }
 
@@ -6351,6 +6404,59 @@ static bool ggml_backend_sched_split_ffn_branch_info(
 
     *info = std::move(split_info);
     return true;
+}
+
+// Inputs read in place by parallel branch splits stay allocated until the last
+// branch of their group: a sibling branch on the owning backend runs at the
+// same time and could otherwise reuse their memory while slower siblings still
+// read them. Returns (last split of the group, input) pairs, each input once.
+static std::vector<std::pair<int, struct ggml_tensor *>> ggml_backend_sched_zero_copy_group_deps(
+        ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    std::vector<std::pair<int, struct ggml_tensor *>> deps;
+    const auto branch_info = [sched, graph](int split_id, ggml_backend_sched_ffn_branch_info * info) {
+        struct ggml_backend_sched_split view = sched->splits[split_id];
+        view.graph = ggml_graph_view(graph, view.i_start, view.i_end);
+        return ggml_backend_sched_split_ffn_branch_info(&view, info);
+    };
+    for (int first = 0; first < sched->n_splits;) {
+        ggml_backend_sched_ffn_branch_info head;
+        if (!branch_info(first, &head)) {
+            ++first;
+            continue;
+        }
+        int end = first + 1;
+        uint32_t group_backends = 1u << sched->splits[first].backend_id;
+        for (; end < sched->n_splits; ++end) {
+            ggml_backend_sched_ffn_branch_info cur;
+            if (!branch_info(end, &cur) || cur.kind != head.kind || cur.layer != head.layer) {
+                break;
+            }
+            group_backends |= 1u << sched->splits[end].backend_id;
+        }
+        std::unordered_set<struct ggml_tensor *> seen;
+        for (int split_id = first; split_id < end; ++split_id) {
+            const auto & split = sched->splits[split_id];
+            for (int n = split.i_start; n < split.i_end; ++n) {
+                for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                    struct ggml_tensor * src = graph->nodes[n]->src[j];
+                    if (src == nullptr) {
+                        continue;
+                    }
+                    const int owner = ggml_backend_sched_zero_copy_owner(sched, src);
+                    if (owner < 0 || owner == split.backend_id || ((group_backends >> owner) & 1u) == 0 ||
+                            !ggml_backend_sched_zero_copy_activation(src) ||
+                            !ggml_backend_sched_buffer_supported(sched, src, split.backend_id)) {
+                        continue;
+                    }
+                    if (seen.insert(src).second) {
+                        deps.emplace_back(end - 1, src);
+                    }
+                }
+            }
+        }
+        first = end;
+    }
+    return deps;
 }
 
 static int ggml_backend_sched_collect_parallel_ffn_group(
@@ -7184,6 +7290,53 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
     ggml_e2e_trace_scope e2e_scheduler(GGML_E2E_DISPATCH, "host", "scheduler_execute");
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
+
+    // GGML_ACTIVATION_ZERO_COPY ordering, see ggml_backend_sched::zero_copy.
+    const auto zero_copy_synchronized = [sched](int backend_id) {
+        const uint32_t bit = 1u << backend_id;
+        sched->zero_copy_dirty &= ~bit;
+        for (int owner = 0; owner < sched->n_backends; ++owner) {
+            sched->zero_copy_pending_readers[owner] &= ~bit;
+        }
+    };
+    // Before a split runs: finish pending asynchronous readers of its backend's
+    // buffer (it may overwrite what they read) and unsynchronized asynchronous
+    // producers of its in-place inputs.
+    const auto zero_copy_before_split = [sched, &zero_copy_synchronized](const ggml_backend_sched_split * split) {
+        if (!sched->zero_copy) {
+            return;
+        }
+        const uint32_t self = 1u << split->backend_id;
+        uint32_t wait = sched->zero_copy_pending_readers[split->backend_id] |
+            (split->zero_copy_producers & sched->zero_copy_dirty);
+        wait &= ~self;
+        for (int b = 0; wait != 0; ++b, wait >>= 1) {
+            if (wait & 1u) {
+                ggml_backend_synchronize(sched->backends[b]);
+                zero_copy_synchronized(b);
+            }
+        }
+    };
+    // After a split was submitted. `completed` is true when the caller already
+    // synchronized its backend (parallel workers, serial groups).
+    const auto zero_copy_after_split = [sched, &zero_copy_synchronized](
+            const ggml_backend_sched_split * split, bool completed) {
+        const int b = split->backend_id;
+        if (!sched->zero_copy || ((sched->zero_copy_async_backends >> b) & 1u) == 0) {
+            return;
+        }
+        if (completed) {
+            zero_copy_synchronized(b);
+            return;
+        }
+        sched->zero_copy_dirty |= 1u << b;
+        const uint32_t producers = split->zero_copy_producers & ~(1u << b);
+        for (int owner = 0; owner < sched->n_backends; ++owner) {
+            if ((producers >> owner) & 1u) {
+                sched->zero_copy_pending_readers[owner] |= 1u << b;
+            }
+        }
+    };
 
     if constexpr (UseLayerCheckpoints) {
         GGML_ASSERT(sched->layer_checkpoints != nullptr);
@@ -8811,6 +8964,9 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
             int64_t cpu_idle_before_us[GGML_SCHED_MAX_BACKENDS];
             bool cpu_prewake_requested[GGML_SCHED_MAX_BACKENDS] = {};
             for (int i = 0; i < ffn_group_size; ++i) {
+                zero_copy_before_split(&splits[split_id + i]);
+            }
+            for (int i = 0; i < ffn_group_size; ++i) {
                 cpu_idle_before_us[i] = -1;
                 ggml_backend_sched_trace_io_times * trace_io_times = nullptr;
                 if (trace_enabled) {
@@ -9292,6 +9448,11 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                     }
                 }
             }
+            // Branch workers synchronize their backends; only a lazy OpenCL
+            // branch is still queued after the join.
+            for (int i = 0; i < ffn_group_size; ++i) {
+                zero_copy_after_split(&splits[split_id + i], !(lazy_opencl && i == deferred_sync_i));
+            }
 
             int64_t ffn_prefetch_copy_us = 0;
             bool ffn_prefetch_succeeded = ffn_prefetch_plan.active;
@@ -9655,6 +9816,7 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
         int64_t cpu_idle_before_us = -1;
         bool cpu_prewake_requested = false;
         int prefetched_input_count = 0;
+        zero_copy_before_split(split);
         copy_split_inputs(
                 split,
                 trace_enabled ? &io_times : nullptr,
@@ -9671,6 +9833,7 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                 ggml_backend_sched_qkv_lazy_opencl_drain(sched);
                 return ec;
             }
+            zero_copy_after_split(split, false);
             if constexpr (UseRouteCandidates) {
                 if (route_group_index >= 0 &&
                         split_id + 1 == sched->route_candidates->groups[route_group_index]
@@ -9718,6 +9881,7 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                 ggml_backend_sched_qkv_lazy_opencl_drain(sched);
                 return ec;
             }
+            zero_copy_after_split(split, false);
             record_split_event(split);
             if (trace_graph_id >= 0) {
                 ggml_backend_sched_trace_append_split(
@@ -9764,6 +9928,16 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                 "sched: FFN reduce-input prefetch fallback at graph end: "
                 "the immediate reduce split was not submitted\n");
         ffn_prefetch_pending.clear();
+    }
+    // Callers read outputs and write the next graph's inputs through host
+    // pointers into zero-copy buffers, which nothing orders after queued work.
+    if (sched->zero_copy) {
+        for (int b = 0; b < sched->n_backends; ++b) {
+            if ((sched->zero_copy_dirty >> b) & 1u) {
+                ggml_backend_synchronize(sched->backends[b]);
+                zero_copy_synchronized(b);
+            }
+        }
     }
     return GGML_STATUS_SUCCESS;
 }
@@ -9870,6 +10044,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
         sched->backends[b] = backends[b];
         sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
         GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
+        if (ggml_zero_copy_buft_role(sched->bufts[b]) >= 0) {
+            sched->zero_copy = true;
+        }
+        // OpenCL graph_compute returns after enqueueing; CPU and HTP return
+        // after completion.
+        if (ggml_sched_profile_backend_bucket(backends[b]) == GGML_SCHED_PROFILE_BACKEND_GPU) {
+            sched->zero_copy_async_backends |= 1u << b;
+        }
 
         ggml_backend_dev_t dev = ggml_backend_get_device(backends[b]);
         ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
@@ -10377,6 +10559,8 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
     for (int i = 0; i < sched->n_backends; i++) {
         ggml_backend_synchronize(sched->backends[i]);
     }
+    sched->zero_copy_dirty = 0;
+    memset(sched->zero_copy_pending_readers, 0, sizeof(sched->zero_copy_pending_readers));
     ggml_backend_sched_qkv_lazy_opencl_note_synchronized(sched);
     if (!sched->is_alloc) {
         // if the graph is not already allocated, always use copy 0 after a synchronization

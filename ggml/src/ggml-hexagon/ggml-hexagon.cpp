@@ -175,6 +175,9 @@ struct ggml_hexagon_session {
     ggml_backend_buffer_type buffer_type        = {};
     ggml_backend_buffer_type repack_buffer_type = {};
     ggml_backend_buffer_type shared_buffer_type = {};
+    // GGML_ACTIVATION_ZERO_COPY compute buffers, one per role (NPU, GPU, CPU).
+    // Distinct types keep each backend's compute allocations separate.
+    ggml_backend_buffer_type zero_copy_buffer_types[GGML_ZERO_COPY_ROLE_COUNT] = {};
 
     ggml_hexagon_session(int dev_id, ggml_backend_dev_t dev) noexcept(false);
     ~ggml_hexagon_session() noexcept(true);
@@ -1507,6 +1510,25 @@ static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer(
     }
 }
 
+// Zero-copy compute buffers: ordinary rpcmem compute buffers whose fd is
+// recorded so OpenCL can import them. The guard and import padding stay outside
+// the allocator's range, as for shared weights.
+static ggml_backend_buffer_t ggml_backend_hexagon_zero_copy_buffer_type_alloc_buffer(
+            ggml_backend_buffer_type_t buffer_type, size_t size) {
+    auto sess = static_cast<ggml_backend_hexagon_buffer_type_context *>(buffer_type->context)->sess;
+    try {
+        const size_t usable = size;
+        size += 4 * 1024;  // guard page and external-memory import padding
+        ggml_hexagon_shared_buffer * sbuf = new ggml_hexagon_shared_buffer(sess, size);
+        auto buffer = ggml_backend_buffer_init(buffer_type, ggml_backend_hexagon_buffer_interface, sbuf, usable);
+        ggml_shared_weights_register_buffer(buffer, sbuf->base, usable, size, sbuf->fd);
+        return buffer;
+    } catch (const std::exception & exc) {
+        GGML_LOG_ERROR("ggml-hex: %s failed to allocate buffer context (zero-copy): %s\n", sess->c_name(), exc.what());
+        return nullptr;
+    }
+}
+
 static ggml_backend_buffer_t ggml_backend_hexagon_repack_buffer_type_alloc_buffer(
             ggml_backend_buffer_type_t buffer_type, size_t size) {
     auto sess = static_cast<ggml_backend_hexagon_buffer_type_context *>(buffer_type->context)->sess;
@@ -1553,6 +1575,16 @@ static bool ggml_backend_hexagon_repack_buffer_type_is_host(ggml_backend_buffer_
 static ggml_backend_buffer_type_i ggml_backend_hexagon_buffer_type_interface = {
     /* .get_name         = */ ggml_backend_hexagon_buffer_type_name,
     /* .alloc_buffer     = */ ggml_backend_hexagon_buffer_type_alloc_buffer,
+    /* .get_alignment    = */ ggml_backend_hexagon_buffer_type_get_alignment,
+    /* .get_max_size     = */ ggml_backend_hexagon_buffer_type_get_max_size,
+    /* .get_alloc_size   = */ ggml_backend_hexagon_buffer_type_get_alloc_size,
+    /* .is_host          = */ ggml_backend_hexagon_buffer_type_is_host,
+};
+
+// Same functions as the compute type (so the NPU accepts it) except allocation.
+static ggml_backend_buffer_type_i ggml_backend_hexagon_zero_copy_buffer_type_interface = {
+    /* .get_name         = */ ggml_backend_hexagon_buffer_type_name,
+    /* .alloc_buffer     = */ ggml_backend_hexagon_zero_copy_buffer_type_alloc_buffer,
     /* .get_alignment    = */ ggml_backend_hexagon_buffer_type_get_alignment,
     /* .get_max_size     = */ ggml_backend_hexagon_buffer_type_get_max_size,
     /* .get_alloc_size   = */ ggml_backend_hexagon_buffer_type_get_alloc_size,
@@ -2574,6 +2606,16 @@ ggml_hexagon_session::ggml_hexagon_session(int dev_id, ggml_backend_dev_t dev) n
         shared_buffer_type.iface = ggml_backend_hexagon_repack_buffer_type_interface;
         shared_buffer_type.context = new ggml_backend_hexagon_buffer_type_context(this->name + "-SHARED", this);
         ggml_shared_weights_register_buft(&shared_buffer_type);
+        if (ggml_zero_copy_requested_mask() != 0 && opt_hostbuf) {
+            static const char * suffixes[GGML_ZERO_COPY_ROLE_COUNT] = {"-ZC-NPU", "-ZC-GPU", "-ZC-CPU"};
+            for (int role = 0; role < GGML_ZERO_COPY_ROLE_COUNT; ++role) {
+                auto & type = zero_copy_buffer_types[role];
+                type.device  = dev;
+                type.iface   = ggml_backend_hexagon_zero_copy_buffer_type_interface;
+                type.context = new ggml_backend_hexagon_buffer_type_context(this->name + suffixes[role], this);
+                ggml_zero_copy_register_buft(&type, (ggml_zero_copy_role) role);
+            }
+        }
     } catch (const std::exception & exc) {
         release();
         throw;
@@ -2587,6 +2629,12 @@ ggml_hexagon_session::~ggml_hexagon_session() noexcept(true) {
     delete static_cast<ggml_backend_hexagon_buffer_type_context *>(repack_buffer_type.context);
     ggml_shared_weights_unregister_buft(&shared_buffer_type);
     delete static_cast<ggml_backend_hexagon_buffer_type_context *>(shared_buffer_type.context);
+    for (auto & type : zero_copy_buffer_types) {
+        if (type.context != nullptr) {
+            ggml_zero_copy_unregister_buft(&type);
+            delete static_cast<ggml_backend_hexagon_buffer_type_context *>(type.context);
+        }
+    }
 }
 
 // ** backend interface
@@ -3949,9 +3997,25 @@ static ggml_backend_dev_t ggml_backend_hexagon_reg_get_device(ggml_backend_reg_t
     return &hreg->devices[index];
 }
 
+// GGML_ACTIVATION_ZERO_COPY: the rpcmem compute buffer type for a role, or
+// NULL when that role was not requested.
+static ggml_backend_buffer_type_t ggml_backend_hexagon_zero_copy_buffer_type(ggml_backend_dev_t dev, int role) {
+    if (dev == nullptr || role < 0 || role >= GGML_ZERO_COPY_ROLE_COUNT ||
+            (ggml_zero_copy_requested_mask() & (1u << role)) == 0) {
+        return nullptr;
+    }
+    auto * sess = static_cast<ggml_hexagon_session *>(dev->context);
+    auto & type = sess->zero_copy_buffer_types[role];
+    return type.context != nullptr ? &type : nullptr;
+}
+
 static void * ggml_backend_hexagon_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0 && opt_hostbuf) {
         ggml_backend_dev_get_extra_bufts_t fct = ggml_backend_hexagon_device_get_extra_buffers_type;
+        return (void *) fct;
+    }
+    if (strcmp(name, "ggml_backend_zero_copy_buffer_type") == 0 && opt_hostbuf) {
+        ggml_backend_zero_copy_buffer_type_t fct = ggml_backend_hexagon_zero_copy_buffer_type;
         return (void *) fct;
     }
 

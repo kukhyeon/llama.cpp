@@ -81,6 +81,75 @@ static bool env_flag_enabled(const char * name) {
         std::strcmp(env, "true") == 0 || std::strcmp(env, "TRUE") == 0;
 }
 
+// IGNITE_CSV_LOGITS=1 (default off): per-query fingerprints of the logits each
+// sampled token was drawn from, appended to inference_stats.csv. The hashes
+// cover the raw float bits, so runs that computed identical logits match
+// exactly and any numerical difference changes the hash.
+struct ignite_logits_record {
+    static constexpr uint64_t fnv_offset = 14695981039346656037ULL;
+    static constexpr uint64_t fnv_prime  = 1099511628211ULL;
+
+    int32_t  n_vocab        = 0;
+    bool     first_recorded = false;
+    uint64_t first_hash     = 0;    // logits of the first sampled token (prefill output)
+    int32_t  first_argmax   = -1;
+    float    first_max      = 0.0f;
+    double   first_sum      = 0.0;
+    int32_t  decode_steps   = 0;    // later sampled tokens, chained in order
+    uint64_t decode_hash    = fnv_offset;
+
+    static uint64_t hash(uint64_t h, const float * logits, int32_t n) {
+        for (int32_t i = 0; i < n; ++i) {
+            uint32_t bits;
+            std::memcpy(&bits, &logits[i], sizeof(bits));
+            h = (h ^ bits) * fnv_prime;
+        }
+        return h;
+    }
+
+    void add(const float * logits, int32_t n) {
+        if (logits == nullptr || n <= 0) {
+            return;
+        }
+        n_vocab = n;
+        if (first_recorded) {
+            ++decode_steps;
+            decode_hash = hash(decode_hash, logits, n);
+            return;
+        }
+        first_recorded = true;
+        first_hash = hash(fnv_offset, logits, n);
+        first_argmax = 0;
+        first_max = logits[0];
+        for (int32_t i = 0; i < n; ++i) {
+            first_sum += logits[i];
+            if (logits[i] > first_max) {
+                first_max = logits[i];
+                first_argmax = i;
+            }
+        }
+    }
+};
+
+static const char * ignite_logits_csv_headers =
+    ",logits_n_vocab,logits_first_hash,logits_first_argmax,logits_first_max,logits_first_sum"
+    ",logits_decode_steps,logits_decode_hash";
+
+static void append_logits_csv_values(std::ostream & os, const ignite_logits_record & r) {
+    char first_hash[17] = "", first_argmax[16] = "", first_max[32] = "", first_sum[32] = "", decode_hash[17] = "";
+    if (r.first_recorded) {
+        std::snprintf(first_hash, sizeof(first_hash), "%016llx", (unsigned long long) r.first_hash);
+        std::snprintf(first_argmax, sizeof(first_argmax), "%d", r.first_argmax);
+        std::snprintf(first_max, sizeof(first_max), "%.9g", (double) r.first_max);
+        std::snprintf(first_sum, sizeof(first_sum), "%.17g", r.first_sum);
+    }
+    if (r.decode_steps > 0) {
+        std::snprintf(decode_hash, sizeof(decode_hash), "%016llx", (unsigned long long) r.decode_hash);
+    }
+    os << "," << r.n_vocab << "," << first_hash << "," << first_argmax << "," << first_max
+       << "," << first_sum << "," << r.decode_steps << "," << decode_hash;
+}
+
 struct runtime_route_clock_producer_state {
     const DVFS * dvfs = nullptr;
     S25ClockSnapshot requested_clocks;
@@ -460,7 +529,8 @@ std::tuple<int, double, int, double> llama_perf_context_print_custom(
         const llama_igparams * ig,
         double sampling_ms,
         double ttft_e2e_ms,
-        bool strict_sample_only_completed) {
+        bool strict_sample_only_completed,
+        const ignite_logits_record * logits) {
     const auto data = llama_perf_context(ctx);
     const double t_end_ms = 1e-3 * ggml_time_us();
 
@@ -528,6 +598,9 @@ std::tuple<int, double, int, double> llama_perf_context_print_custom(
             if (should_write_op_breakdown_csv(ig)) {
                 append_profile_csv_op_values(file, prof);
             }
+        }
+        if (logits != nullptr) {
+            append_logits_csv_values(file, *logits);
         }
         file << "\n";
         file.close();
@@ -1131,6 +1204,8 @@ int main(int argc, char ** argv) {
     std::string output_path_load = params.output_dir + "/inference_load.csv";
     std::cout << std::flush << "output_path_load: " << output_path_load << std::endl;
     std::string output_path_ffn_profile = params.output_dir + "/ffn_profile_trace.csv";
+    const bool logits_csv = env_flag_enabled("IGNITE_CSV_LOGITS");
+    ignite_logits_record query_logits;
     auto start_sys_time = std::chrono::system_clock::now();
     std::ofstream file(output_path_infer, std::ios::app);
     if (file.is_open() && output_path_infer!="/inference_stats.csv") {
@@ -1149,6 +1224,9 @@ int main(int argc, char ** argv) {
             if (should_write_op_breakdown_csv(ig)) {
                 append_profile_csv_op_headers(file);
             }
+        }
+        if (logits_csv) {
+            file << ignite_logits_csv_headers;
         }
         file << "\n";
         file.close();
@@ -2008,7 +2086,8 @@ int main(int argc, char ** argv) {
                                 ig,
                                 query_sampling_ms,
                                 query_ttft_e2e_ms,
-                                false);
+                                false,
+                                logits_csv ? &query_logits : nullptr);
                     }
                     if (csv_load && output_path_load != "/inference_load.csv") {
                         llama_op_load_profile_print_custom(output_path_load, current_question_index, start_sys_time, csv_op_load, csv_op_load_breakdown);
@@ -2071,6 +2150,11 @@ int main(int argc, char ** argv) {
                 // Prefill-only runs use the same first-sample boundary as
                 // ttft_e2e_ms. Generation runs continue through the last token.
                 if (strict_prefill_sample_pending) { ggml_e2e_trace_end_query(t_sample_end_us); }
+            }
+            if (logits_csv) {
+                // After the sampling timer and, for prefill-only runs, after
+                // the E2E window; sampling does not modify the logits.
+                query_logits.add(llama_get_logits_ith(ctx, -1), llama_vocab_n_tokens(vocab));
             }
             query_sampling_ms += sample_ms;
             if (ig->backend_compute_profile) {
@@ -2250,7 +2334,8 @@ int main(int argc, char ** argv) {
                                 ig,
                                 query_sampling_ms,
                                 query_ttft_e2e_ms,
-                                strict_sample_only_completed);
+                                strict_sample_only_completed,
+                                logits_csv ? &query_logits : nullptr);
                     }
                     if (csv_load && output_path_load != "/inference_load.csv") {
                         llama_op_load_profile_print_custom(output_path_load, current_question_index, start_sys_time, csv_op_load, csv_op_load_breakdown);
@@ -2510,6 +2595,7 @@ int main(int argc, char ** argv) {
                     query_sampling_ms = 0.0;
                     query_ttft_e2e_ms = 0.0;
                     query_first_sample_recorded = false;
+                    query_logits = {};
                 } else if (current_question_index >= params.max_query_number) {
                     LOG_INF("Reached maximum query number (%d) from %s. Exiting interactive mode.\n", params.max_query_number, json_path.c_str());
                     break;

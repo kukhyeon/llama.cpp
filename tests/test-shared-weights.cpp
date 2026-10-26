@@ -18,6 +18,10 @@
 #include <string>
 #include <vector>
 
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
+
 #define REQUIRE(x) do { if (!(x)) { throw std::runtime_error(#x); } } while (0)
 
 struct q8_block { ggml_fp16_t d; int8_t q[32]; };
@@ -361,11 +365,46 @@ static void verify_model(const char * model_path, const char * policy_path) {
     ggml_shared_weights_log("validation", nullptr, "model", -1, 0, probe.observed.size(), "PASS: every runtime profile observed without model reload");
 }
 
+// GGML_SHARED_REPACK_BREAKDOWN=1 samples every CPU repack: the results must be
+// unchanged, and every sampled repack must log its read and copy probes.
+static void check_breakdown_rows(const std::string & path) {
+    ggml_shared_weights_log("validation", nullptr, "test", -1, 0, 0, "flush"); // flushes buffered rows
+    FILE * f = std::fopen(path.c_str(), "r");
+    REQUIRE(f);
+    char line[4096];
+    int repacks = 0, reads = 0, copies = 0;
+    while (std::fgets(line, sizeof(line), f)) {
+        const std::string row = line;
+        if (row.rfind("\"repack\",", 0) == 0) { ++repacks; }
+        if (row.rfind("\"repack_probe\",", 0) == 0) {
+            reads += row.find(",\"read\",") != std::string::npos;
+            copies += row.find(",\"copy\",") != std::string::npos;
+        }
+    }
+    std::fclose(f);
+    std::remove(path.c_str());
+    REQUIRE(repacks > 0 && reads == repacks && copies == repacks);
+    std::printf("PASS repack breakdown: %d sampled repacks with read/copy probes\n", repacks);
+}
+
 int main(int argc, char ** argv) {
     const bool native = argc == 4 && std::strcmp(argv[1], "--model-native") == 0;
     const bool disabled = argc == 2 && std::strcmp(argv[1], "--disabled") == 0;
-    const bool native_compare = argc == 2 &&
-        (std::strcmp(argv[1], "--native-repack") == 0 || std::strcmp(argv[1], "--device-native") == 0);
+    const bool breakdown = argc == 2 && std::strcmp(argv[1], "--native-repack-breakdown") == 0;
+    const bool native_compare = breakdown || (argc == 2 &&
+        (std::strcmp(argv[1], "--native-repack") == 0 || std::strcmp(argv[1], "--device-native") == 0));
+    std::string breakdown_csv;
+#if !defined(_WIN32)
+    if (breakdown) {
+        const char * tmp = std::getenv("TMPDIR");
+        breakdown_csv = std::string(tmp && *tmp ? tmp : "/tmp") + "/test-shared-weights-breakdown-" +
+            std::to_string((long long) getpid()) + ".csv";
+        std::remove(breakdown_csv.c_str());
+        setenv("GGML_SHARED_WEIGHTS_CSV", breakdown_csv.c_str(), 1);
+        setenv("GGML_SHARED_REPACK_BREAKDOWN", "1", 1);
+        setenv("GGML_SHARED_REPACK_BREAKDOWN_EVICT_MB", "1", 1);
+    }
+#endif
     // Keep the original direct-reader fixture as an independent regression.
 #if defined(_WIN32)
     _putenv_s("GGML_SHARED_HTP_REPACK", native_compare ? "1" : "0");
@@ -442,6 +481,7 @@ int main(int argc, char ** argv) {
             run_case({256, 32, 0, 256, 0, 32, 33, true}, buft, readers, !device, true);
         }
         for (auto backend : backends) { ggml_backend_free(backend); }
+        if (breakdown) { check_breakdown_rows(breakdown_csv); }
         return 0;
     } catch (const std::exception & error) {
         std::fprintf(stderr, "shared weight validation failed: %s\n", error.what());

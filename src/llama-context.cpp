@@ -736,6 +736,71 @@ static ggml_tensor * llama_runtime_route_clone_node(
     return clone;
 }
 
+// GGML_ACTIVATION_ZERO_COPY: place the compute buffers of the requested roles
+// in Hexagon rpcmem so the other processors read those outputs in place. A
+// role is used only when the Hexagon backend provides its buffer type and the
+// OpenCL backend can use that type in place; other roles keep scheduler copies.
+static void llama_zero_copy_compute_bufts(const std::vector<ggml_backend_ptr> & backends,
+        std::vector<ggml_backend_buffer_type_t> & bufts) {
+    const unsigned requested = ggml_zero_copy_requested_mask();
+    if (requested == 0) {
+        return;
+    }
+    ggml_backend_dev_t hexagon = nullptr;
+    ggml_backend_zero_copy_buffer_type_t hexagon_buft = nullptr;
+    unsigned gpu_roles = (1u << GGML_ZERO_COPY_ROLE_COUNT) - 1;
+    bool has_gpu = false;
+    std::vector<ggml_backend_dev_t> gpu_devices;
+    for (const auto & backend : backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (reg == nullptr) {
+            continue;
+        }
+        if (auto fn = (ggml_backend_zero_copy_buffer_type_t) ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_zero_copy_buffer_type")) {
+            hexagon = dev;
+            hexagon_buft = fn;
+        }
+        if (auto fn = (ggml_backend_zero_copy_roles_t) ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_zero_copy_roles")) {
+            gpu_roles &= fn(dev);
+            has_gpu = true;
+            gpu_devices.push_back(dev);
+        }
+    }
+    if (hexagon == nullptr || !has_gpu) {
+        LLAMA_LOG_WARN("%s: GGML_ACTIVATION_ZERO_COPY=%u needs the Hexagon and OpenCL backends; using copies\n",
+            __func__, requested);
+        return;
+    }
+    const unsigned roles = requested & gpu_roles;
+    for (size_t i = 0; i < backends.size(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backends[i].get());
+        int role = -1;
+        if (dev == hexagon) {
+            role = GGML_ZERO_COPY_NPU;
+        } else if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            role = GGML_ZERO_COPY_CPU;
+        } else if (std::find(gpu_devices.begin(), gpu_devices.end(), dev) != gpu_devices.end()) {
+            role = GGML_ZERO_COPY_GPU;
+        }
+        if (role < 0 || ((roles >> role) & 1u) == 0) {
+            continue;
+        }
+        if (ggml_backend_buffer_type_t buft = hexagon_buft(hexagon, role)) {
+            bufts[i] = buft;
+            LLAMA_LOG_INFO("%s: %s compute buffer: %s (zero-copy)\n", __func__,
+                ggml_backend_name(backends[i].get()), ggml_backend_buft_name(buft));
+        }
+    }
+    if (requested & ~roles) {
+        LLAMA_LOG_WARN("%s: GGML_ACTIVATION_ZERO_COPY roles 0x%x unsupported by OpenCL "
+            "(an I/O-coherent import is needed for GPU/CPU roles); they keep copies\n",
+            __func__, requested & ~roles);
+    }
+}
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -1294,6 +1359,7 @@ llama_context::llama_context(
             backend_ptrs.push_back(backend.get());
             backend_buf_exp_size.push_back(0);
         }
+        llama_zero_copy_compute_bufts(backends, backend_buft);
 
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
 
