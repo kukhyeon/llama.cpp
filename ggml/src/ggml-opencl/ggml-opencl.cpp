@@ -443,6 +443,10 @@ struct ggml_backend_opencl_context {
     bool fp16_support;
     bool has_vector_subgroup_broadcast;
     bool disable_fusion;
+    // GGML_OPENCL_FLUSH_AFTER_GRAPH=1 (default off): submit each split's
+    // commands to the GPU as soon as they are enqueued instead of when a later
+    // wait or blocking call flushes the queue.
+    bool flush_after_graph = false;
 
     bool adreno_has_large_buffer;
     bool adreno_use_large_buffer;
@@ -570,6 +574,35 @@ struct ggml_backend_opencl_context {
     // the same in-order queue. No per-tensor/per-policy weight cache.
     ggml_cl_buffer shared_native_q;
     ggml_cl_buffer shared_native_d;
+    // GGML_FFN_REPACK_PREFETCH: native copies made before the matmuls that
+    // read them, keyed by everything the copy reads. The in-order queue runs a
+    // copy after the earlier readers of its slot and before its consumer.
+    struct shared_prefetch_key {
+        const void * weights[2] = {};
+        int64_t params[7] = {};
+        bool composite = false;
+        bool operator==(const shared_prefetch_key & other) const {
+            return weights[0] == other.weights[0] && weights[1] == other.weights[1] &&
+                composite == other.composite && std::equal(params, params + 7, other.params);
+        }
+    };
+    struct shared_prefetch_slot {
+        shared_prefetch_key key;
+        ggml_cl_buffer q;
+        ggml_cl_buffer d;
+        bool valid = false;
+    };
+    static constexpr int shared_prefetch_slot_count = 4;
+    shared_prefetch_slot shared_prefetch_slots[shared_prefetch_slot_count];
+    int shared_prefetch_next = 0;
+    int find_shared_prefetch(const shared_prefetch_key & key) const {
+        for (int i = 0; i < shared_prefetch_slot_count; ++i) {
+            if (shared_prefetch_slots[i].valid && shared_prefetch_slots[i].key == key) {
+                return i;
+            }
+        }
+        return -1;
+    }
     size_t shared_weight_request_bytes = 0;
     size_t shared_activation_request_bytes = 0;
     size_t shared_request_bytes = 0;
@@ -1407,6 +1440,14 @@ struct ggml_backend_opencl_context {
                 if (scratch->buffer) { CL_CHECK(clReleaseMemObject(scratch->buffer)); }
                 scratch->buffer = nullptr;
                 scratch->size = 0;
+            }
+            for (shared_prefetch_slot & slot : shared_prefetch_slots) {
+                for (ggml_cl_buffer * scratch : {&slot.q, &slot.d}) {
+                    if (scratch->buffer) { CL_CHECK(clReleaseMemObject(scratch->buffer)); }
+                    scratch->buffer = nullptr;
+                    scratch->size = 0;
+                }
+                slot.valid = false;
             }
             shared_weight_request_bytes = 0;
             shared_activation_request_bytes = 0;
@@ -4205,6 +4246,16 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
     backend_ctx->disable_fusion = getenv("GGML_OPENCL_DISABLE_FUSION") != nullptr;
+    {
+        const char * value = getenv("GGML_OPENCL_FLUSH_AFTER_GRAPH");
+        backend_ctx->flush_after_graph = value != nullptr && (
+            strcmp(value, "1") == 0 || strcmp(value, "on") == 0 || strcmp(value, "ON") == 0 ||
+            strcmp(value, "yes") == 0 || strcmp(value, "YES") == 0 ||
+            strcmp(value, "true") == 0 || strcmp(value, "TRUE") == 0);
+        if (backend_ctx->flush_after_graph) {
+            GGML_LOG_INFO("ggml_opencl: flushing the queue after every graph_compute\n");
+        }
+    }
 
     // Register last, once the context is fully initialized and owned by dev_ctx.
     if (ggml_e2e_trace_enabled()) {
@@ -5341,6 +5392,10 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                 0,
                 0.0,
                 0.0);
+    }
+
+    if (backend_ctx->flush_after_graph) {
+        CL_CHECK(clFlush(backend_ctx->queue));
     }
 
     if (breakdown) {
@@ -8802,9 +8857,15 @@ static bool ggml_backend_opencl_get_shared_weights_scratch_stats(
     return true;
 }
 
+static int ggml_backend_opencl_shared_repack_prefetch(ggml_backend_t backend, struct ggml_cgraph * graph);
+
 static void * ggml_backend_opencl_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (name && strcmp(name, "ggml_backend_get_shared_weights_scratch_stats") == 0) {
         return reinterpret_cast<void *>(ggml_backend_opencl_get_shared_weights_scratch_stats);
+    }
+    if (name && strcmp(name, "ggml_backend_shared_repack_prefetch") == 0) {
+        ggml_backend_shared_repack_prefetch_t fct = ggml_backend_opencl_shared_repack_prefetch;
+        return reinterpret_cast<void *>(fct);
     }
     if (name && strcmp(name, "ggml_backend_prepare_shared_weight") == 0) {
         return reinterpret_cast<void *>(ggml_backend_opencl_prepare_shared_weight);
@@ -13054,30 +13115,18 @@ static void ggml_cl_shared_breakdown_probe(ggml_backend_opencl_context * ctx, cl
     evict();
 }
 
-static void ggml_cl_mul_mat_shared_composite(ggml_backend_t backend, ggml_tensor * dst) {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-    GGML_ASSERT(ggml_opencl_supports_composite(backend->device, dst));
-    auto * ctx = static_cast<ggml_backend_opencl_context *>(backend->context);
+// Enqueues the native-layout assembly of composite dst's weight into (q_dst,
+// d_dst). events (two entries) receives the part events when not null; probe,
+// when not null, requests the sampled breakdown of the shared part. Returns
+// the shared source.
+static const ggml_tensor * ggml_cl_shared_composite_pack(ggml_backend_opencl_context * ctx,
+        const ggml_tensor * dst, cl_mem q_dst, cl_mem d_dst, cl_event * events,
+        ggml_backend_opencl_context::shared_probe_pending * probe) {
     ggml_mul_mat_src0_composite_params p;
     GGML_ASSERT(ggml_mul_mat_src0_composite_get_params(dst, &p));
-    ggml_cl_prepare_shared_kernels(ctx);
-    const int full_k = (int) dst->src[1]->ne[0], full_m = (int) dst->ne[0], nt = (int) dst->ne[1];
-    const size_t q_bytes = (size_t) full_k * full_m;
-    const size_t d_bytes = q_bytes / 32 * sizeof(ggml_fp16_t);
-    const size_t activation_bytes = nt > 1 ? (size_t) full_k * CEIL_DIV(nt, 8) * 8 * sizeof(ggml_fp16_t) : 0;
-    ctx->shared_native_q.allocate(ctx->context, q_bytes);
-    ctx->shared_native_d.allocate(ctx->context, d_bytes);
-    ctx->shared_weight_request_bytes = std::max(ctx->shared_weight_request_bytes, q_bytes + d_bytes);
-    ctx->shared_activation_request_bytes = std::max(ctx->shared_activation_request_bytes, activation_bytes);
-    ctx->shared_request_bytes = std::max(ctx->shared_request_bytes, q_bytes + d_bytes + activation_bytes);
-    const bool timing = ggml_shared_weights_timing_enabled();
-    ggml_shared_weights_repack_event measurement = {};
-    if (timing) { measurement = ggml_shared_weights_repack_begin(dst, "opencl_event_sum",
-        q_bytes + d_bytes, q_bytes + d_bytes + activation_bytes); }
-    cl_event events[2] = {nullptr, nullptr};
+    const int full_k = (int) dst->src[1]->ne[0], full_m = (int) dst->ne[0];
     const ggml_tensor * shared_identity = nullptr;
-    const bool sampled = timing && ggml_shared_weights_breakdown_sample();
-    ggml_backend_opencl_context::shared_probe_pending probe = {nullptr, nullptr, nullptr, {}, measurement, {}};
     int destination_start = 0;
     for (int part = 0; part < 2; ++part) {
         const ggml_tensor * w = dst->src[part == 0 ? 0 : 2];
@@ -13101,15 +13150,15 @@ static void ggml_cl_mul_mat_shared_composite(ggml_backend_t backend, ggml_tensor
             const int parent_k = (int) w->ne[0];
             set(sizeof(cl_mem), &imported->mem); set(sizeof(offset), &offset);
             set(sizeof(parent_k), &parent_k); set(sizeof(stride), &stride);
-            if (sampled) {
+            if (probe != nullptr) {
                 // Probe kernels are separate objects; this kernel's arguments stay set.
                 ggml_cl_shared_breakdown_probe(ctx, imported->mem, offset, parent_k, stride,
-                    ks, kn, os, on, &probe.read, &probe.copy);
-                probe.weight = *w;
-                probe.timing.k_start = ks; probe.timing.k_size = kn;
-                probe.timing.out_start = os; probe.timing.out_size = on;
-                probe.timing.packed_bytes = ggml_row_size(GGML_TYPE_Q8_0, kn) * on;
-                probe.timing.composite = false;
+                    ks, kn, os, on, &probe->read, &probe->copy);
+                probe->weight = *w;
+                probe->timing.k_start = ks; probe->timing.k_size = kn;
+                probe->timing.out_start = os; probe->timing.out_size = on;
+                probe->timing.packed_bytes = ggml_row_size(GGML_TYPE_Q8_0, kn) * on;
+                probe->timing.composite = false;
             }
         } else {
             auto * extra = static_cast<ggml_tensor_extra_cl_q8_0 *>(w->extra);
@@ -13119,34 +13168,156 @@ static void ggml_cl_mul_mat_shared_composite(ggml_backend_t backend, ggml_tensor
         }
         set(sizeof(ks), &ks); set(sizeof(kn), &kn); set(sizeof(os), &os); set(sizeof(on), &on);
         set(sizeof(full_m), &full_m); set(sizeof(destination_k), &destination_k); set(sizeof(destination_row), &destination_row);
-        set(sizeof(cl_mem), &ctx->shared_native_q.buffer); set(sizeof(cl_mem), &ctx->shared_native_d.buffer);
+        set(sizeof(cl_mem), &q_dst); set(sizeof(cl_mem), &d_dst);
+        cl_event * event = events != nullptr ? &events[part] : nullptr;
         if (htp) {
             size_t local[] = {16, 4};
             size_t global[] = {CEIL_DIV((size_t) kn / 4, 16) * 16, CEIL_DIV((size_t) on, 16) * 4};
-            ctx->enqueue_ndrange_kernel(kernel, 2, global, local, dst, timing ? &events[part] : nullptr);
-            if (sampled && events[part] != nullptr) {
-                CL_CHECK(clRetainEvent(events[part]));
-                probe.part = events[part];
+            ctx->enqueue_ndrange_kernel(kernel, 2, global, local, dst, event);
+            if (probe != nullptr && event != nullptr && *event != nullptr) {
+                CL_CHECK(clRetainEvent(*event));
+                probe->part = *event;
             }
         } else {
             size_t local[] = {64};
             size_t global[] = {CEIL_DIV((size_t) kn / 4 * on, local[0]) * local[0]};
-            ctx->enqueue_ndrange_kernel(kernel, 1, global, local, dst, timing ? &events[part] : nullptr);
+            ctx->enqueue_ndrange_kernel(kernel, 1, global, local, dst, event);
         }
         destination_start += (int) p.size[part];
     }
-    if (timing) {
-        GGML_ASSERT(shared_identity);
-        ctx->shared_repack_events.push_back({{events[0], events[1]}, 2, *shared_identity, measurement,
-            measurement.node_name ? measurement.node_name : dst->name});
+    return shared_identity;
+}
+
+// The region of shared weight w that dst multiplies.
+static ggml_mul_mat_src0_region_params ggml_cl_shared_htp_region(const ggml_tensor * w, const ggml_tensor * dst) {
+    ggml_mul_mat_src0_region_params r = {GGML_MUL_MAT_SRC0_REGION_PARAMS_VERSION, 0, 0, w->ne[0], 0, w->ne[1]};
+    if (dst->op == GGML_OP_MUL_MAT_SRC0_REGION) { GGML_ASSERT(ggml_mul_mat_src0_region_get_params(dst, &r)); }
+    return r;
+}
+
+// The native region kernels require four output rows. Packing resets the
+// physical origins, so an HTP out_start not divisible by four is harmless.
+// Keep the no-repack GEMV for nt=1: converting a whole matrix for one token
+// would discard the bandwidth advantage of the canonical HTP representation.
+static bool ggml_cl_shared_htp_native(const ggml_backend_opencl_context * ctx, const ggml_tensor * dst,
+        const ggml_mul_mat_src0_region_params & r) {
+    return ggml_shared_weights_repack_enabled() && dst->ne[1] > 1 &&
+        ctx->gpu_family == GPU_FAMILY::ADRENO && (r.out_size % 4) == 0;
+}
+
+// Enqueues the native-layout copy of region r of shared weight w into (q_dst, d_dst).
+static void ggml_cl_shared_htp_pack(ggml_backend_opencl_context * ctx, const ggml_opencl_shared_import * imported,
+        const ggml_tensor * w, const ggml_mul_mat_src0_region_params & r, cl_mem q_dst, cl_mem d_dst,
+        const ggml_tensor * dst, cl_event * event) {
+    const auto * d = ggml_shared_weights_buffer(w->buffer);
+    GGML_ASSERT(d);
+    const cl_ulong wo = (const char *) w->data - (const char *) d->base;
+    const cl_ulong ws = w->nb[1];
+    const int pk = w->ne[0], ks = r.k_start, kn = r.k_size, os = r.out_start, on = r.out_size;
+    cl_kernel pack = ctx->shared_repack_kernel.get();
+    int arg = 0;
+    auto set = [&](size_t size, const void * ptr) { CL_CHECK(clSetKernelArg(pack, arg++, size, ptr)); };
+    set(sizeof(cl_mem), &imported->mem); set(sizeof(wo), &wo);
+    set(sizeof(pk), &pk); set(sizeof(ws), &ws);
+    set(sizeof(ks), &ks); set(sizeof(kn), &kn); set(sizeof(os), &os); set(sizeof(on), &on);
+    const int zero = 0;
+    set(sizeof(on), &on); set(sizeof(zero), &zero); set(sizeof(zero), &zero);
+    set(sizeof(cl_mem), &q_dst);
+    set(sizeof(cl_mem), &d_dst);
+    size_t local[] = {16, 4};
+    size_t global[] = {CEIL_DIV((size_t) kn / 4, 16) * 16, CEIL_DIV((size_t) on, 16) * 4};
+    ctx->enqueue_ndrange_kernel(pack, 2, global, local, dst, event);
+}
+
+// GGML_FFN_REPACK_PREFETCH: the slot key of a matmul whose weight takes the
+// native scratch path, with its packed sizes; false for any other op.
+static bool ggml_cl_shared_prefetch_key(ggml_backend_opencl_context * ctx, ggml_backend_dev_t dev,
+        const ggml_tensor * op, ggml_backend_opencl_context::shared_prefetch_key * key,
+        size_t * q_bytes, size_t * d_bytes) {
+    *key = {};
+    if (op->op == GGML_OP_MUL_MAT_SRC0_COMPOSITE) {
+        ggml_mul_mat_src0_composite_params p;
+        if (!ggml_opencl_supports_composite(dev, op) || !ggml_mul_mat_src0_composite_get_params(op, &p)) {
+            return false;
+        }
+        const int64_t full_k = op->src[1]->ne[0], full_m = op->ne[0];
+        *key = {{op->src[0]->data, op->src[2]->data}, {p.axis, p.start[0], p.start[1], p.size[0], p.size[1], full_k, full_m}, true};
+        *q_bytes = (size_t) full_k * full_m;
+        *d_bytes = *q_bytes / 32 * sizeof(ggml_fp16_t);
+        return true;
     }
-    if (sampled) {
-        probe.node_name = measurement.node_name ? measurement.node_name : dst->name;
-        ctx->shared_probe_events.push_back(probe);
+    const ggml_tensor * w = op->src[0];
+    if ((op->op != GGML_OP_MUL_MAT && op->op != GGML_OP_MUL_MAT_SRC0_REGION) ||
+            !ggml_shared_weights_tensor(w) || !ggml_shared_weights_supports_op(op) ||
+            ggml_shared_weights_attachment(w->buffer, ctx->context) == nullptr) {
+        return false;
+    }
+    const ggml_mul_mat_src0_region_params r = ggml_cl_shared_htp_region(w, op);
+    if (!ggml_cl_shared_htp_native(ctx, op, r)) {
+        return false;
+    }
+    *key = {{w->data, nullptr}, {r.k_start, r.k_size, r.out_start, r.out_size, w->ne[0], (int64_t) w->nb[1], 0}, false};
+    *q_bytes = (size_t) r.k_size * r.out_size;
+    *d_bytes = (size_t) (r.k_size / 32) * r.out_size * sizeof(ggml_fp16_t);
+    return true;
+}
+
+// The prefetched native copy of op's weight, or null.
+static const ggml_backend_opencl_context::shared_prefetch_slot * ggml_cl_shared_prefetched(
+        ggml_backend_opencl_context * ctx, ggml_backend_dev_t dev, const ggml_tensor * op) {
+    ggml_backend_opencl_context::shared_prefetch_key key;
+    size_t q_bytes = 0, d_bytes = 0;
+    if (!ggml_cl_shared_prefetch_key(ctx, dev, op, &key, &q_bytes, &d_bytes)) {
+        return nullptr;
+    }
+    const int slot = ctx->find_shared_prefetch(key);
+    return slot >= 0 ? &ctx->shared_prefetch_slots[slot] : nullptr;
+}
+#endif
+
+static void ggml_cl_mul_mat_shared_composite(ggml_backend_t backend, ggml_tensor * dst) {
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+    GGML_ASSERT(ggml_opencl_supports_composite(backend->device, dst));
+    auto * ctx = static_cast<ggml_backend_opencl_context *>(backend->context);
+    ggml_cl_prepare_shared_kernels(ctx);
+    const int full_k = (int) dst->src[1]->ne[0], full_m = (int) dst->ne[0], nt = (int) dst->ne[1];
+    const size_t q_bytes = (size_t) full_k * full_m;
+    const size_t d_bytes = q_bytes / 32 * sizeof(ggml_fp16_t);
+    const size_t activation_bytes = nt > 1 ? (size_t) full_k * CEIL_DIV(nt, 8) * 8 * sizeof(ggml_fp16_t) : 0;
+    ctx->shared_activation_request_bytes = std::max(ctx->shared_activation_request_bytes, activation_bytes);
+    cl_mem q = nullptr, d = nullptr;
+    if (const auto * prefetched = ggml_cl_shared_prefetched(ctx, backend->device, dst)) {
+        q = prefetched->q.buffer;
+        d = prefetched->d.buffer;
+    } else {
+        ctx->shared_native_q.allocate(ctx->context, q_bytes);
+        ctx->shared_native_d.allocate(ctx->context, d_bytes);
+        ctx->shared_weight_request_bytes = std::max(ctx->shared_weight_request_bytes, q_bytes + d_bytes);
+        ctx->shared_request_bytes = std::max(ctx->shared_request_bytes, q_bytes + d_bytes + activation_bytes);
+        const bool timing = ggml_shared_weights_timing_enabled();
+        ggml_shared_weights_repack_event measurement = {};
+        if (timing) { measurement = ggml_shared_weights_repack_begin(dst, "opencl_event_sum",
+            q_bytes + d_bytes, q_bytes + d_bytes + activation_bytes); }
+        cl_event events[2] = {nullptr, nullptr};
+        const bool sampled = timing && ggml_shared_weights_breakdown_sample();
+        ggml_backend_opencl_context::shared_probe_pending probe = {nullptr, nullptr, nullptr, {}, measurement, {}};
+        const ggml_tensor * shared_identity = ggml_cl_shared_composite_pack(ctx, dst,
+            ctx->shared_native_q.buffer, ctx->shared_native_d.buffer, timing ? events : nullptr,
+            sampled ? &probe : nullptr);
+        if (timing) {
+            GGML_ASSERT(shared_identity);
+            ctx->shared_repack_events.push_back({{events[0], events[1]}, 2, *shared_identity, measurement,
+                measurement.node_name ? measurement.node_name : dst->name});
+        }
+        if (sampled) {
+            probe.node_name = measurement.node_name ? measurement.node_name : dst->name;
+            ctx->shared_probe_events.push_back(probe);
+        }
+        q = ctx->shared_native_q.buffer;
+        d = ctx->shared_native_d.buffer;
     }
     const ggml_mul_mat_src0_region_params compact = {GGML_MUL_MAT_SRC0_REGION_PARAMS_VERSION, 0, 0, full_k, 0, full_m};
-    ggml_cl_mul_mat_q8_0_f32_adreno_region_buffers(backend, dst->src[1], dst,
-        ctx->shared_native_q.buffer, ctx->shared_native_d.buffer, full_k, full_m, compact);
+    ggml_cl_mul_mat_q8_0_f32_adreno_region_buffers(backend, dst->src[1], dst, q, d, full_k, full_m, compact);
 #else
     GGML_UNUSED(backend); GGML_UNUSED(dst);
     GGML_ABORT("OpenCL composite weights require Adreno kernels");
@@ -13176,60 +13347,51 @@ static void ggml_cl_mul_mat_shared_htp(
     // one token even when the query contains hundreds of tokens.
     const int nt = dst->ne[1];
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-    // The native region kernels require four output rows. Packing resets the
-    // physical origins, so an HTP out_start not divisible by four is harmless.
-    // Keep the no-repack GEMV for nt=1: converting a whole matrix for one token
-    // would discard the bandwidth advantage of the canonical HTP representation.
-    const bool native = ggml_shared_weights_repack_enabled() && nt > 1 &&
-        ctx->gpu_family == GPU_FAMILY::ADRENO && (on % 4) == 0;
-    if (native) {
+    if (ggml_cl_shared_htp_native(ctx, dst, r)) {
         const size_t q_bytes = (size_t) kn * on;
         const size_t d_bytes = (size_t) (kn / 32) * on * sizeof(ggml_fp16_t);
         const size_t activation_bytes = (size_t) kn * CEIL_DIV(nt, 8) * 8 * sizeof(ggml_fp16_t);
-        ctx->shared_native_q.allocate(ctx->context, q_bytes);
-        ctx->shared_native_d.allocate(ctx->context, d_bytes);
-        ctx->shared_weight_request_bytes = std::max(ctx->shared_weight_request_bytes, q_bytes + d_bytes);
         ctx->shared_activation_request_bytes = std::max(ctx->shared_activation_request_bytes, activation_bytes);
-        ctx->shared_request_bytes = std::max(ctx->shared_request_bytes, q_bytes + d_bytes + activation_bytes);
-        cl_kernel pack = ctx->shared_repack_kernel.get();
-        int arg = 0;
-        auto set = [&](size_t size, const void * ptr) { CL_CHECK(clSetKernelArg(pack, arg++, size, ptr)); };
-        set(sizeof(cl_mem), &imported->mem); set(sizeof(wo), &wo);
-        set(sizeof(pk), &pk); set(sizeof(ws), &ws);
-        set(sizeof(ks), &ks); set(sizeof(kn), &kn); set(sizeof(os), &os); set(sizeof(on), &on);
-        const int zero = 0;
-        set(sizeof(on), &on); set(sizeof(zero), &zero); set(sizeof(zero), &zero);
-        set(sizeof(cl_mem), &ctx->shared_native_q.buffer);
-        set(sizeof(cl_mem), &ctx->shared_native_d.buffer);
-        const bool timing = ggml_shared_weights_timing_enabled();
-        ggml_shared_weights_repack_event measurement = {};
-        if (timing) {
-            measurement = ggml_shared_weights_repack_begin(dst, "opencl_event", q_bytes + d_bytes,
-                q_bytes + d_bytes + activation_bytes);
-        }
-        ggml_backend_opencl_context::shared_probe_pending probe = {nullptr, nullptr, nullptr, *w, measurement, {}};
-        const bool sampled = timing && ggml_shared_weights_breakdown_sample();
-        if (sampled) {
-            ggml_cl_shared_breakdown_probe(ctx, imported->mem, wo, pk, ws, ks, kn, os, on,
-                &probe.read, &probe.copy);
-        }
-        size_t local[] = {16, 4};
-        size_t global[] = {CEIL_DIV((size_t) kn / 4, 16) * 16, CEIL_DIV((size_t) on, 16) * 4};
-        cl_event event = nullptr;
-        ctx->enqueue_ndrange_kernel(pack, 2, global, local, dst, timing ? &event : nullptr);
-        if (timing) {
-            ctx->shared_repack_events.push_back({{event, nullptr}, 1, *w, measurement,
-                measurement.node_name ? measurement.node_name : dst->name});
-        }
-        if (sampled) {
-            // The whole repack is the shared region here; its time is the repack row.
-            probe.node_name = measurement.node_name ? measurement.node_name : dst->name;
-            ctx->shared_probe_events.push_back(probe);
+        cl_mem q = nullptr, qd = nullptr;
+        if (const auto * prefetched = ggml_cl_shared_prefetched(ctx, backend->device, dst)) {
+            q = prefetched->q.buffer;
+            qd = prefetched->d.buffer;
+        } else {
+            ctx->shared_native_q.allocate(ctx->context, q_bytes);
+            ctx->shared_native_d.allocate(ctx->context, d_bytes);
+            ctx->shared_weight_request_bytes = std::max(ctx->shared_weight_request_bytes, q_bytes + d_bytes);
+            ctx->shared_request_bytes = std::max(ctx->shared_request_bytes, q_bytes + d_bytes + activation_bytes);
+            const bool timing = ggml_shared_weights_timing_enabled();
+            ggml_shared_weights_repack_event measurement = {};
+            if (timing) {
+                measurement = ggml_shared_weights_repack_begin(dst, "opencl_event", q_bytes + d_bytes,
+                    q_bytes + d_bytes + activation_bytes);
+            }
+            ggml_backend_opencl_context::shared_probe_pending probe = {nullptr, nullptr, nullptr, *w, measurement, {}};
+            const bool sampled = timing && ggml_shared_weights_breakdown_sample();
+            if (sampled) {
+                // Probe kernels are separate objects and run before the pack below.
+                ggml_cl_shared_breakdown_probe(ctx, imported->mem, wo, pk, ws, ks, kn, os, on,
+                    &probe.read, &probe.copy);
+            }
+            cl_event event = nullptr;
+            ggml_cl_shared_htp_pack(ctx, imported, w, r, ctx->shared_native_q.buffer, ctx->shared_native_d.buffer,
+                dst, timing ? &event : nullptr);
+            if (timing) {
+                ctx->shared_repack_events.push_back({{event, nullptr}, 1, *w, measurement,
+                    measurement.node_name ? measurement.node_name : dst->name});
+            }
+            if (sampled) {
+                // The whole repack is the shared region here; its time is the repack row.
+                probe.node_name = measurement.node_name ? measurement.node_name : dst->name;
+                ctx->shared_probe_events.push_back(probe);
+            }
+            q = ctx->shared_native_q.buffer;
+            qd = ctx->shared_native_d.buffer;
         }
         const ggml_mul_mat_src0_region_params compact = {
             GGML_MUL_MAT_SRC0_REGION_PARAMS_VERSION, 0, 0, kn, 0, on};
-        ggml_cl_mul_mat_q8_0_f32_adreno_region_buffers(backend, x, dst,
-            ctx->shared_native_q.buffer, ctx->shared_native_d.buffer, kn, on, compact);
+        ggml_cl_mul_mat_q8_0_f32_adreno_region_buffers(backend, x, dst, q, qd, kn, on, compact);
         return;
     }
 #endif
@@ -13252,6 +13414,70 @@ static void ggml_cl_mul_mat_shared_htp(
     size_t global[] = {tiled ? ((size_t) on + 31) / 32 * 64 : (size_t) on * 64,
                        tiled ? ((size_t) nt + 31) / 32 : (size_t) nt};
     ctx->enqueue_ndrange_kernel(kernel, 2, global, local, dst);
+}
+
+// Registry proc "ggml_backend_shared_repack_prefetch" (GGML_FFN_REPACK_PREFETCH):
+// enqueue the native copies of the shared weights that graph's matmuls read,
+// and submit them, so the GPU makes them while the caller waits on another
+// device. A later graph_compute of graph on this backend uses the copies.
+static int ggml_backend_opencl_shared_repack_prefetch(ggml_backend_t backend, struct ggml_cgraph * graph) {
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+    if (backend == nullptr || graph == nullptr || !ggml_backend_is_opencl(backend) ||
+            !ggml_shared_weights_repack_enabled()) {
+        return 0;
+    }
+    auto * ctx = static_cast<ggml_backend_opencl_context *>(backend->context);
+    ggml_cl_prepare_shared_kernels(ctx);
+    constexpr int n_slots = ggml_backend_opencl_context::shared_prefetch_slot_count;
+    bool claimed[n_slots] = {};
+    int copies = 0;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * op = graph->nodes[i];
+        ggml_backend_opencl_context::shared_prefetch_key key;
+        size_t q_bytes = 0, d_bytes = 0;
+        if (!ggml_cl_shared_prefetch_key(ctx, backend->device, op, &key, &q_bytes, &d_bytes)) {
+            continue;
+        }
+        const int present = ctx->find_shared_prefetch(key);
+        if (present >= 0) {
+            claimed[present] = true; // still valid: copy nothing
+            continue;
+        }
+        int s = ctx->shared_prefetch_next;
+        for (int tries = 0; claimed[s] && tries < n_slots; ++tries) {
+            s = (s + 1) % n_slots;
+        }
+        if (claimed[s]) {
+            break;
+        }
+        ctx->shared_prefetch_next = (s + 1) % n_slots;
+        claimed[s] = true;
+        auto & slot = ctx->shared_prefetch_slots[s];
+        slot.valid = false;
+        slot.q.allocate(ctx->context, q_bytes);
+        slot.d.allocate(ctx->context, d_bytes);
+        if (key.composite) {
+            (void) ggml_cl_shared_composite_pack(ctx, op, slot.q.buffer, slot.d.buffer, nullptr, nullptr);
+        } else {
+            const ggml_tensor * w = op->src[0];
+            const auto * imported = static_cast<const ggml_opencl_shared_import *>(
+                ggml_shared_weights_attachment(w->buffer, ctx->context));
+            ggml_cl_shared_htp_pack(ctx, imported, w, ggml_cl_shared_htp_region(w, op),
+                slot.q.buffer, slot.d.buffer, op, nullptr);
+        }
+        // Valid from now on: later work on this in-order queue sees the copy.
+        slot.key = key;
+        slot.valid = true;
+        ++copies;
+    }
+    if (copies > 0) {
+        CL_CHECK(clFlush(ctx->queue));
+    }
+    return copies;
+#else
+    GGML_UNUSED(backend); GGML_UNUSED(graph);
+    return 0;
+#endif
 }
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS

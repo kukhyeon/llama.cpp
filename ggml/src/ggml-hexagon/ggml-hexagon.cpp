@@ -3316,12 +3316,17 @@ static inline bool op_is_compute(ggml_tensor *node)
     return !ggml_op_is_empty(node->op) && !ggml_is_empty(node) && (node->flags & GGML_TENSOR_FLAG_COMPUTE);
 }
 
-static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
+// wait=false sends the batch and returns (GGML_HTP_CHAIN_SPLITS): the DSP runs
+// queued requests in order, and the next waiting call collects every response.
+static ggml_status ggml_backend_hexagon_graph_compute_impl(ggml_backend_t backend, ggml_cgraph * graph, bool wait) {
     auto sess = static_cast<ggml_hexagon_session *>(backend->context);
     const bool breakdown = ggml_backend_op_load_profile_breakdown_enabled();
     const int64_t graph_t0_us = breakdown ? ggml_time_us() : 0;
 
-    sess->op_status.store(HTP_STATUS_OK, std::memory_order_relaxed);
+    // A failure of an earlier unwaited graph is reported by the waiting call.
+    if (sess->op_pending.load() == 0) {
+        sess->op_status.store(HTP_STATUS_OK, std::memory_order_relaxed);
+    }
 
     HEX_VERBOSE("ggml-hex: %s graph-compute n_nodes %d\n", sess->c_name(), graph->n_nodes);
 
@@ -3348,7 +3353,11 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
 
     // Wait until all pending ops complete. Append zero-duration metadata rows
     // afterwards so CSV bookkeeping cannot delay the device submission.
-    sess->flush();
+    if (wait) {
+        sess->flush();
+    } else {
+        sess->flush_batch();
+    }
 
     for (const int node_index : metadata_trace_nodes) {
         const ggml_tensor * n = graph->nodes[node_index];
@@ -3380,6 +3389,14 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
     return sess->op_status.load(std::memory_order_relaxed) == HTP_STATUS_OK
         ? GGML_STATUS_SUCCESS
         : GGML_STATUS_FAILED;
+}
+
+static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
+    return ggml_backend_hexagon_graph_compute_impl(backend, graph, true);
+}
+
+static ggml_status ggml_backend_hexagon_graph_compute_nowait(ggml_backend_t backend, ggml_cgraph * graph) {
+    return ggml_backend_hexagon_graph_compute_impl(backend, graph, false);
 }
 
 static void ggml_backend_hexagon_synchronize(ggml_backend_t backend) {
@@ -4016,6 +4033,10 @@ static void * ggml_backend_hexagon_get_proc_address(ggml_backend_reg_t reg, cons
     }
     if (strcmp(name, "ggml_backend_zero_copy_buffer_type") == 0 && opt_hostbuf) {
         ggml_backend_zero_copy_buffer_type_t fct = ggml_backend_hexagon_zero_copy_buffer_type;
+        return (void *) fct;
+    }
+    if (strcmp(name, "ggml_backend_graph_compute_nowait") == 0) {
+        ggml_status (*fct)(ggml_backend_t, ggml_cgraph *) = ggml_backend_hexagon_graph_compute_nowait;
         return (void *) fct;
     }
 

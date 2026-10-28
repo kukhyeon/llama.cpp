@@ -2857,6 +2857,111 @@ static void ggml_thread_cpumask_next(const bool * global_mask, bool * local_mask
     }
 }
 
+// GGML_FFN_REPACK_PREFETCH: a helper thread, not the usual caller, runs graphs
+// as worker 0. Keep it off the pool's cores meanwhile. Worker 0 spins in the
+// graph barriers, so on the core of a pinned secondary worker it keeps that
+// worker off the CPU until the scheduler preempts it. The usual caller is
+// pinned to worker 0's core (see ggml_threadpool_new_impl) and must not wait
+// behind the helper either. Only when the pool covers every CPU the helper may
+// use does it take worker 0's core, which its owner leaves idle meanwhile.
+#if defined(__gnu_linux__) || defined(__ANDROID__)
+struct ggml_threadpool_caller_state {
+    cpu_set_t          mask;
+    bool               mask_saved;
+    int                policy;
+    struct sched_param param;
+    bool               sched_saved;
+};
+
+static int ggml_thread_get_affinity(cpu_set_t * mask) {
+#ifdef __ANDROID__
+    return sched_getaffinity(0, sizeof(*mask), mask) == 0 ? 0 : errno;
+#else
+    return pthread_getaffinity_np(pthread_self(), sizeof(*mask), mask);
+#endif
+}
+
+static int ggml_thread_set_affinity(const cpu_set_t * mask) {
+#ifdef __ANDROID__
+    return sched_setaffinity(0, sizeof(*mask), mask) == 0 ? 0 : errno;
+#else
+    return pthread_setaffinity_np(pthread_self(), sizeof(*mask), mask);
+#endif
+}
+
+struct ggml_threadpool_caller_state * ggml_threadpool_caller_enter(struct ggml_threadpool * threadpool) {
+    if (threadpool == NULL) {
+        return NULL;
+    }
+    bool pool_cpus[GGML_MAX_N_THREADS] = { false };
+    bool pinned = false;
+    for (int j = 0; j < threadpool->n_threads; j++) {
+        for (int cpu = 0; cpu < GGML_MAX_N_THREADS; cpu++) {
+            if (threadpool->workers[j].cpumask[cpu]) {
+                pool_cpus[cpu] = true;
+                pinned = true;
+            }
+        }
+    }
+    const bool apply_prio = threadpool->prio != GGML_SCHED_PRIO_NORMAL;
+    if (!pinned && !apply_prio) {
+        return NULL; // unpinned workers: the OS moves whichever thread waits
+    }
+    struct ggml_threadpool_caller_state * state = calloc(1, sizeof(*state));
+    if (state == NULL) {
+        return NULL;
+    }
+    if (pinned && ggml_thread_get_affinity(&state->mask) == 0) {
+        bool off_pool[GGML_MAX_N_THREADS] = { false };
+        bool any = false;
+        for (int cpu = 0; cpu < GGML_MAX_N_THREADS && cpu < CPU_SETSIZE; cpu++) {
+            if (CPU_ISSET(cpu, &state->mask) && !pool_cpus[cpu]) {
+                off_pool[cpu] = true;
+                any = true;
+            }
+        }
+        const bool * target = any ? off_pool : threadpool->workers[0].cpumask;
+        state->mask_saved = ggml_thread_cpumask_is_valid(target) && ggml_thread_apply_affinity(target);
+    }
+    if (apply_prio && pthread_getschedparam(pthread_self(), &state->policy, &state->param) == 0) {
+        state->sched_saved = ggml_thread_apply_priority(threadpool->prio);
+    }
+    if (!state->mask_saved && !state->sched_saved) {
+        free(state);
+        return NULL;
+    }
+    return state;
+}
+
+void ggml_threadpool_caller_leave(struct ggml_threadpool_caller_state * state) {
+    if (state == NULL) {
+        return;
+    }
+    if (state->mask_saved) {
+        const int err = ggml_thread_set_affinity(&state->mask);
+        if (err != 0) {
+            GGML_LOG_WARN("%s: failed to restore the thread affinity: %s\n", __func__, strerror(err));
+        }
+    }
+    if (state->sched_saved) {
+        const int err = pthread_setschedparam(pthread_self(), state->policy, &state->param);
+        if (err != 0) {
+            GGML_LOG_WARN("%s: failed to restore the thread priority: %s\n", __func__, strerror(err));
+        }
+    }
+    free(state);
+}
+#else
+struct ggml_threadpool_caller_state * ggml_threadpool_caller_enter(struct ggml_threadpool * threadpool) {
+    UNUSED(threadpool);
+    return NULL;
+}
+
+void ggml_threadpool_caller_leave(struct ggml_threadpool_caller_state * state) {
+    UNUSED(state);
+}
+#endif
+
 void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
     if (!threadpool) return;
 
@@ -3271,6 +3376,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         /*.use_ref    =*/ cplan->use_ref,
         /*.prev_node  =*/ NULL,
         /*.shared_repack_skip_quantize =*/ false,
+        /*.shared_repack_cache =*/ cplan->shared_repack_cache,
     };
 
 #ifdef GGML_USE_OPENMP

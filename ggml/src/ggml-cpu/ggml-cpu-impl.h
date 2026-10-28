@@ -31,6 +31,9 @@ struct ggml_compute_params {
     // Execution-local only: never retain activation contents across graphs.
     const struct ggml_tensor * prev_node;
     bool shared_repack_skip_quantize;
+
+    // Weights repacked ahead of their matmul (GGML_FFN_REPACK_PREFETCH), or NULL.
+    struct ggml_cpu_shared_repack_cache * shared_repack_cache;
 };
 
 // Shared HTP Q8 weights use an operation-sized native CPU_REPACK scratch.
@@ -48,6 +51,33 @@ bool ggml_cpu_shared_repack_pack_reference(const struct ggml_tensor * canonical,
         void * dst, size_t capacity);
 bool ggml_cpu_shared_repack_test_source_layout(struct ggml_tensor * tensor, int interleave);
 void ggml_cpu_shared_repack_test_input_stats(uint64_t * prepared, uint64_t * reused, bool reset);
+
+// GGML_FFN_REPACK_PREFETCH. A CPU backend owns one cache. prefetch_begin
+// selects the shared-weight matmuls of a graph whose native copy is not cached
+// yet (at most GGML_CPU_SHARED_REPACK_PREFETCH_SLOTS), prefetch_run makes the
+// copies on the backend's threads (a GGML_OP_CUSTOM callback with the cache as
+// user data), and prefetch_end publishes them. Graph computes on the same
+// backend then use a matching copy instead of repacking.
+#define GGML_CPU_SHARED_REPACK_PREFETCH_SLOTS 4
+struct ggml_cpu_shared_repack_cache * ggml_cpu_shared_repack_cache_new(void);
+void ggml_cpu_shared_repack_cache_free(struct ggml_cpu_shared_repack_cache * cache);
+int  ggml_cpu_shared_repack_prefetch_begin(struct ggml_cpu_shared_repack_cache * cache, const struct ggml_cgraph * graph);
+void ggml_cpu_shared_repack_prefetch_run(struct ggml_tensor * dst, int ith, int nth, void * userdata);
+void ggml_cpu_shared_repack_prefetch_end(struct ggml_cpu_shared_repack_cache * cache, bool success);
+void ggml_cpu_shared_repack_prefetch_stats(const struct ggml_cpu_shared_repack_cache * cache,
+        uint64_t * copies, uint64_t * hits);
+// Test hook: the CPU each thread of the last prefetch_run started on (-1 if
+// unknown), for thread indices below n.
+void ggml_cpu_shared_repack_prefetch_cpus(const struct ggml_cpu_shared_repack_cache * cache, int * cpus, int n);
+
+// Run the calling thread with worker 0's CPU mask and priority (when the pool
+// sets them) until ggml_threadpool_caller_leave restores its own. Returns NULL
+// when nothing changed. Used when a thread other than the usual caller drives
+// the pool, see ggml-cpu.c.
+struct ggml_threadpool;
+struct ggml_threadpool_caller_state;
+struct ggml_threadpool_caller_state * ggml_threadpool_caller_enter(struct ggml_threadpool * threadpool);
+void ggml_threadpool_caller_leave(struct ggml_threadpool_caller_state * state);
 
 
 #if defined(_MSC_VER)

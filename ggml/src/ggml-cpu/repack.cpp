@@ -14,15 +14,22 @@
 #include "arch-fallback.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <cassert>
 #include <cstdio>  // for GGML_ASSERT
+#include <array>
 #include <atomic>
 #include <limits>
+#include <memory>
 #include <type_traits>
 #include <vector>
 
 #include "repack.h"
+
+#if defined(__gnu_linux__) || defined(__ANDROID__)
+#include <sched.h>
+#endif
 
 #if defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Woverlength-strings"
@@ -5577,6 +5584,238 @@ bool ggml_cpu_shared_repack_work_size(const ggml_tensor * op, size_t * size,
     return true;
 }
 
+// GGML_FFN_REPACK_PREFETCH: native-layout copies of shared HTP weights, made
+// before the matmul that reads them runs. A slot is keyed by everything its
+// copy reads, so a hit is valid for any op with the same layout: weights do
+// not change while the backend that owns the cache exists.
+struct ggml_cpu_shared_repack_cache {
+    struct slot {
+        const void * data[2] = {};
+        int kind[2] = {};
+        int interleave = 0;
+        ggml_mul_mat_src0_region_params region = {};
+        ggml_mul_mat_src0_composite_params composite = {};
+        bool is_composite = false;
+        size_t weight_bytes = 0;
+        std::unique_ptr<uint8_t[]> buffer;
+        size_t capacity = 0;
+        uint8_t * packed = nullptr; // shared_repack_alignment-aligned start of the copy
+        bool valid = false;
+        bool pending = false;
+        shared_repack_layout layout = {}; // sources are only valid during a prefetch
+    };
+    std::array<slot, GGML_CPU_SHARED_REPACK_PREFETCH_SLOTS> slots;
+    int next = 0;
+    std::atomic<uint64_t> copies{0};
+    std::atomic<uint64_t> hits{0};
+    // CPU each thread of the last prefetch started on; each thread writes its own.
+    std::array<int, GGML_MAX_N_THREADS> start_cpu{};
+};
+
+namespace {
+
+bool shared_repack_slot_matches(const ggml_cpu_shared_repack_cache::slot & s, const shared_repack_layout & l) {
+    const int n_sources = l.is_composite ? 2 : 1;
+    if (!s.valid || s.is_composite != l.is_composite || s.interleave != l.interleave ||
+            s.weight_bytes != l.weight_bytes ||
+            s.region.k_start != l.region.k_start || s.region.k_size != l.region.k_size ||
+            s.region.out_start != l.region.out_start || s.region.out_size != l.region.out_size) {
+        return false;
+    }
+    if (l.is_composite && (s.composite.axis != l.composite.axis ||
+            s.composite.start[0] != l.composite.start[0] || s.composite.start[1] != l.composite.start[1] ||
+            s.composite.size[0] != l.composite.size[0] || s.composite.size[1] != l.composite.size[1])) {
+        return false;
+    }
+    for (int i = 0; i < n_sources; ++i) {
+        if (s.data[i] != l.sources[i].tensor->data || s.kind[i] != (int) l.sources[i].kind) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void shared_repack_slot_set_key(ggml_cpu_shared_repack_cache::slot & s, const shared_repack_layout & l) {
+    s.data[0] = l.sources[0].tensor->data;
+    s.kind[0] = (int) l.sources[0].kind;
+    s.data[1] = l.is_composite ? l.sources[1].tensor->data : nullptr;
+    s.kind[1] = l.is_composite ? (int) l.sources[1].kind : 0;
+    s.interleave = l.interleave;
+    s.region = l.region;
+    s.composite = l.composite;
+    s.is_composite = l.is_composite;
+    s.weight_bytes = l.weight_bytes;
+}
+
+const uint8_t * shared_repack_cache_find(const ggml_cpu_shared_repack_cache * cache, const shared_repack_layout & l) {
+    if (cache == nullptr) {
+        return nullptr;
+    }
+    for (const auto & s : cache->slots) {
+        if (shared_repack_slot_matches(s, l)) {
+            return s.packed;
+        }
+    }
+    return nullptr;
+}
+
+// Native CPU_REPACK matmul over weights already in `layout`'s native layout.
+bool shared_repack_compute_native(ggml_compute_params * params, ggml_tensor * op,
+        const shared_repack_layout & layout, const void * packed_weights, char * packed_data,
+        size_t alignment_bytes) {
+    const bool reuse_input = shared_repack_input_reusable(params, op, layout);
+    ggml_tensor weights = *op->src[0];
+    weights.ne[0] = layout.region.k_size;
+    weights.ne[1] = layout.region.out_size;
+    weights.nb[0] = ggml_type_size(GGML_TYPE_Q8_0);
+    weights.nb[1] = ggml_row_size(GGML_TYPE_Q8_0, weights.ne[0]);
+    weights.nb[2] = weights.nb[1] * weights.ne[1];
+    weights.nb[3] = weights.nb[2];
+    weights.data = const_cast<void *>(packed_weights);
+    weights.buffer = nullptr;
+    weights.view_src = nullptr;
+    weights.view_offs = 0;
+    weights.extra = layout.traits;
+
+    ggml_tensor native_op = *op;
+    native_op.op = GGML_OP_MUL_MAT;
+    native_op.src[0] = &weights;
+    ggml_compute_params native_params = *params;
+    native_params.wdata = packed_data + layout.activation_offset;
+    native_params.wsize = params->wsize - alignment_bytes - layout.activation_offset;
+    native_params.shared_repack_skip_quantize = reuse_input;
+    if (params->ith == 0 && shared_repack_test_enabled.load(std::memory_order_relaxed)) {
+        (reuse_input ? shared_input_reused : shared_input_prepared).fetch_add(1, std::memory_order_relaxed);
+    }
+    GGML_ASSERT(layout.traits->compute_forward(&native_params, &native_op));
+    return true;
+}
+
+} // namespace
+
+ggml_cpu_shared_repack_cache * ggml_cpu_shared_repack_cache_new(void) {
+    auto * cache = new ggml_cpu_shared_repack_cache;
+    cache->start_cpu.fill(-1);
+    return cache;
+}
+
+void ggml_cpu_shared_repack_cache_free(ggml_cpu_shared_repack_cache * cache) {
+    delete cache;
+}
+
+int ggml_cpu_shared_repack_prefetch_begin(ggml_cpu_shared_repack_cache * cache, const ggml_cgraph * graph) {
+    GGML_ASSERT(cache != nullptr && graph != nullptr);
+    cache->start_cpu.fill(-1);
+    int pending = 0;
+    bool claimed[GGML_CPU_SHARED_REPACK_PREFETCH_SLOTS] = {};
+    for (int i = 0; i < graph->n_nodes && pending < GGML_CPU_SHARED_REPACK_PREFETCH_SLOTS; ++i) {
+        shared_repack_layout layout;
+        if (!shared_repack_get_layout(graph->nodes[i], layout) || !layout.sources[0].tensor->data ||
+                (layout.is_composite && !layout.sources[1].tensor->data)) {
+            continue;
+        }
+        bool present = false;
+        for (int s = 0; s < GGML_CPU_SHARED_REPACK_PREFETCH_SLOTS; ++s) {
+            if (shared_repack_slot_matches(cache->slots[s], layout)) {
+                claimed[s] = true; // still valid: keep it, copy nothing
+                present = true;
+            }
+        }
+        if (present) {
+            continue;
+        }
+        int s = cache->next;
+        for (int tries = 0; claimed[s] && tries < GGML_CPU_SHARED_REPACK_PREFETCH_SLOTS; ++tries) {
+            s = (s + 1) % GGML_CPU_SHARED_REPACK_PREFETCH_SLOTS;
+        }
+        if (claimed[s]) {
+            break;
+        }
+        cache->next = (s + 1) % GGML_CPU_SHARED_REPACK_PREFETCH_SLOTS;
+        claimed[s] = true;
+        auto & slot = cache->slots[s];
+        slot.valid = false;
+        if (slot.capacity < layout.weight_bytes) {
+            slot.buffer.reset(new uint8_t[layout.weight_bytes + shared_repack_alignment - 1]);
+            slot.capacity = layout.weight_bytes;
+            slot.packed = reinterpret_cast<uint8_t *>(GGML_PAD((uintptr_t) slot.buffer.get(), shared_repack_alignment));
+        }
+        slot.layout = layout;
+        slot.pending = true;
+        ++pending;
+    }
+    return pending;
+}
+
+namespace {
+
+int shared_repack_current_cpu() {
+#if defined(__gnu_linux__) || defined(__ANDROID__)
+    return sched_getcpu();
+#else
+    return -1;
+#endif
+}
+
+// GGML_FFN_REPACK_PREFETCH_TRACE_CPU=1 (default off): name each thread's E2E
+// prefetch event after its thread index and the CPU it started on.
+bool shared_repack_prefetch_trace_cpu() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_FFN_REPACK_PREFETCH_TRACE_CPU");
+        return value != nullptr && (std::strcmp(value, "1") == 0 || std::strcmp(value, "on") == 0 ||
+            std::strcmp(value, "ON") == 0 || std::strcmp(value, "yes") == 0 || std::strcmp(value, "YES") == 0 ||
+            std::strcmp(value, "true") == 0 || std::strcmp(value, "TRUE") == 0);
+    }();
+    return enabled;
+}
+
+} // namespace
+
+void ggml_cpu_shared_repack_prefetch_run(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_UNUSED(dst);
+    auto * cache = static_cast<ggml_cpu_shared_repack_cache *>(userdata);
+    const int cpu = shared_repack_current_cpu();
+    if (ith < GGML_MAX_N_THREADS) {
+        cache->start_cpu[ith] = cpu;
+    }
+    char detail[GGML_MAX_NAME] = "shared_weight_prefetch";
+    if (shared_repack_prefetch_trace_cpu()) {
+        snprintf(detail, sizeof(detail), "shared_weight_prefetch ith=%d cpu=%d", ith, cpu);
+    }
+    ggml_e2e_trace_scope trace(GGML_E2E_TRANSFORM, "CPU", detail);
+    for (auto & slot : cache->slots) {
+        if (slot.pending) {
+            shared_repack_copy_groups(slot.layout, slot.layout.interleave, slot.packed, ith, nth);
+        }
+    }
+}
+
+void ggml_cpu_shared_repack_prefetch_end(ggml_cpu_shared_repack_cache * cache, bool success) {
+    for (auto & slot : cache->slots) {
+        if (!slot.pending) {
+            continue;
+        }
+        slot.pending = false;
+        if (success) {
+            shared_repack_slot_set_key(slot, slot.layout);
+            slot.valid = true;
+            cache->copies.fetch_add(1, std::memory_order_relaxed);
+        }
+        slot.layout = {};
+    }
+}
+
+void ggml_cpu_shared_repack_prefetch_cpus(const ggml_cpu_shared_repack_cache * cache, int * cpus, int n) {
+    for (int i = 0; i < n; ++i) {
+        cpus[i] = cache != nullptr && i < GGML_MAX_N_THREADS ? cache->start_cpu[(size_t) i] : -1;
+    }
+}
+
+void ggml_cpu_shared_repack_prefetch_stats(const ggml_cpu_shared_repack_cache * cache, uint64_t * copies, uint64_t * hits) {
+    if (copies) { *copies = cache ? cache->copies.load(std::memory_order_relaxed) : 0; }
+    if (hits) { *hits = cache ? cache->hits.load(std::memory_order_relaxed) : 0; }
+}
+
 bool ggml_cpu_shared_repack_compute(ggml_compute_params * params, ggml_tensor * op) {
     shared_repack_layout layout;
     if (!shared_repack_get_layout(op, layout)) {
@@ -5585,6 +5824,15 @@ bool ggml_cpu_shared_repack_compute(ggml_compute_params * params, ggml_tensor * 
     GGML_ASSERT(params->wdata && params->wsize >= layout.work_bytes);
     auto * packed_data = reinterpret_cast<char *>(GGML_PAD((uintptr_t) params->wdata, shared_repack_alignment));
     const size_t alignment_bytes = packed_data - static_cast<char *>(params->wdata);
+    // The activation area stays at the same work-buffer offset either way, so
+    // reusing the previous op's quantized input does not depend on hits.
+    const uint8_t * prefetched = shared_repack_cache_find(params->shared_repack_cache, layout);
+    if (prefetched != nullptr) {
+        if (params->ith == 0) {
+            params->shared_repack_cache->hits.fetch_add(1, std::memory_order_relaxed);
+        }
+        return shared_repack_compute_native(params, op, layout, prefetched, packed_data, alignment_bytes);
+    }
 
     const bool timing = ggml_shared_weights_timing_enabled();
     ggml_shared_weights_repack_event event{};
@@ -5611,7 +5859,6 @@ bool ggml_cpu_shared_repack_compute(ggml_compute_params * params, ggml_tensor * 
             start_us = ggml_time_us();
         }
     }
-    const bool reuse_input = shared_repack_input_reusable(params, op, layout);
     {
         // Scope only the weight-layout transformation. The following native
         // matmul remains model work, and the existing barrier records its wait.
@@ -5631,32 +5878,7 @@ bool ggml_cpu_shared_repack_compute(ggml_compute_params * params, ggml_tensor * 
             shared_repack_breakdown_log(event);
         }
     }
-
-    ggml_tensor weights = *op->src[0];
-    weights.ne[0] = layout.region.k_size;
-    weights.ne[1] = layout.region.out_size;
-    weights.nb[0] = ggml_type_size(GGML_TYPE_Q8_0);
-    weights.nb[1] = ggml_row_size(GGML_TYPE_Q8_0, weights.ne[0]);
-    weights.nb[2] = weights.nb[1] * weights.ne[1];
-    weights.nb[3] = weights.nb[2];
-    weights.data = packed_data;
-    weights.buffer = nullptr;
-    weights.view_src = nullptr;
-    weights.view_offs = 0;
-    weights.extra = layout.traits;
-
-    ggml_tensor native_op = *op;
-    native_op.op = GGML_OP_MUL_MAT;
-    native_op.src[0] = &weights;
-    ggml_compute_params native_params = *params;
-    native_params.wdata = packed_data + layout.activation_offset;
-    native_params.wsize = params->wsize - alignment_bytes - layout.activation_offset;
-    native_params.shared_repack_skip_quantize = reuse_input;
-    if (params->ith == 0 && shared_repack_test_enabled.load(std::memory_order_relaxed)) {
-        (reuse_input ? shared_input_reused : shared_input_prepared).fetch_add(1, std::memory_order_relaxed);
-    }
-    GGML_ASSERT(layout.traits->compute_forward(&native_params, &native_op));
-    return true;
+    return shared_repack_compute_native(params, op, layout, packed_data, packed_data, alignment_bytes);
 }
 
 static enum ggml_status ggml_backend_cpu_repack_buffer_init_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor) {

@@ -460,6 +460,62 @@ copy path (`GGML_ACTIVATION_ZERO_COPY=0`, for example with the logits hashes
 below), and check in the E2E trace that the copies between the selected buffers
 disappeared.
 
+### OpenCL flush after graph
+
+`GGML_OPENCL_FLUSH_AFTER_GRAPH=1` (default off) makes the OpenCL backend call
+`clFlush` at the end of every `graph_compute`, that is, after the commands of
+each GPU split are enqueued. Without it the driver may hold enqueued commands
+until a later wait or blocking transfer flushes the queue, which shows up as
+GPU start latency before each wait. The flush does not wait for completion, so
+ordering and results are unchanged; its call time is counted as dispatch in
+the E2E trace.
+
+### FFN weight repack prefetch
+
+`GGML_FFN_REPACK_PREFETCH=1` (default off) moves the on-demand repack of the
+shared HTP weights of a layer's FFN branches off the FFN critical path. Before
+a split makes the scheduler wait on a backend that cannot prefetch (the NPU
+attention output), and only splits on that backend run before the next
+parallel FFN group, a helper thread asks the group's CPU and OpenCL backends
+(`ggml_backend_shared_repack_prefetch`) to copy the weights their branches
+multiply into native-layout slots. The OpenCL copies are enqueued and flushed
+first, then the CPU copies run on the CPU backend's threads. The branches then
+skip their repack and use the slots; a slot is keyed by the weight and the
+rectangle it copies, so a mismatch falls back to the on-demand repack.
+
+- The scheduler joins the helper before it uses a prefetching backend again:
+  at the group, at a split on another backend, a split that copies from or
+  waits on a prefetching backend, an alternate route commit, the graph end and
+  error returns. No prefetch starts across a layer checkpoint or while a lazy
+  OpenCL lane is pending.
+- Outputs are bit-identical to the on-demand repack. Slots: 4 per backend (one
+  layer's gate/up/down plus one), each the size of one packed weight.
+- Prefetched matmuls write no `GGML_SHARED_WEIGHTS_REPACK_TIMING` row and are
+  not sampled by `GGML_SHARED_REPACK_BREAKDOWN`; keep the prefetch off for
+  repack measurements. In the E2E trace, CPU copies are `shared_weight_prefetch`
+  (transform) and the join is `repack_prefetch_join` (synchronization).
+- The helper thread drives the CPU backend's thread pool as worker 0. With a
+  pinned pool (`--cpu-strict`), the CPU copies run with the helper moved off
+  the pool's cores (`GGML_FFN_REPACK_PREFETCH_PIN`, default on). Worker 0 spins
+  in the graph barriers; on the core of a pinned worker it kept that worker
+  waiting for a scheduler time slice (several ms per layer before the join).
+  The helper gets its own affinity back afterwards.
+- `GGML_FFN_REPACK_PREFETCH_TRACE_CPU=1` (default off) names each thread's
+  prefetch event `shared_weight_prefetch ith=<thread> cpu=<core>`.
+
+### NPU split chaining
+
+`GGML_HTP_CHAIN_SPLITS=1` (default off) removes the host round trip between
+consecutive splits on the Hexagon backend (in TriPrefill, the attention output,
+FFN input and FFN norm). The scheduler submits a split with
+`ggml_backend_graph_compute_nowait` when the next split it executes runs on
+the same backend and nothing in between can observe the split: the next split
+has no input copies, is not a parallel group, the split is not followed by a
+layer checkpoint, and it does not end a route alternate whose outputs are
+committed. The next split's `graph_compute` then waits for both, so the DSP
+runs the queued requests back to back. A failure of a chained split is
+returned by the waiting call. The last split of a graph always waits.
+
 ### Logits hashes
 
 `IGNITE_CSV_LOGITS=1` (default off) appends per-query fingerprints of the

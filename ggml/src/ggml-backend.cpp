@@ -1019,6 +1019,119 @@ using ggml_backend_cpu_prewake_hold_t = bool (*)(ggml_backend_t backend, uint32_
 using ggml_backend_async_flush_t = void (*)(ggml_backend_t backend);
 using ggml_backend_async_staging_buffer_type_t =
     ggml_backend_buffer_type_t (*)(ggml_backend_t backend);
+// Registry proc "ggml_backend_graph_compute_nowait" (GGML_HTP_CHAIN_SPLITS):
+// submit a graph like graph_compute, but return before it completes. The
+// backend's next graph_compute or synchronize also waits for this work.
+using ggml_backend_graph_compute_nowait_t =
+    enum ggml_status (*)(ggml_backend_t backend, struct ggml_cgraph * cgraph);
+
+// Same trace scope as ggml_backend_graph_compute_async, so the E2E dispatch
+// accounting does not depend on whether a split was chained.
+static enum ggml_status ggml_backend_graph_compute_nowait(ggml_backend_t backend,
+        struct ggml_cgraph * cgraph, ggml_backend_graph_compute_nowait_t fn) {
+    ggml_e2e_trace_scope e2e(GGML_E2E_DISPATCH, ggml_backend_name(backend), "graph_compute_call");
+    return fn(backend, cgraph);
+}
+
+// GGML_FFN_REPACK_PREFETCH: a helper thread runs the backends'
+// "ggml_backend_shared_repack_prefetch" procs for the branches of an upcoming
+// parallel FFN group while the scheduler thread waits on another device. The
+// scheduler joins it before it uses any of those backends again.
+struct ggml_backend_sched_repack_prefetcher {
+    struct item {
+        ggml_backend_t backend;
+        ggml_backend_shared_repack_prefetch_t fn;
+        struct ggml_cgraph * graph;
+    };
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::thread thread;
+    item items[GGML_SCHED_MAX_BACKENDS];
+    int n_items = 0;
+    bool has_work = false;
+    bool stopping = false;
+
+    // Scheduler-thread state of the submitted, not yet joined, prefetch.
+    bool pending = false;
+    uint32_t targets = 0;        // backend ids the helper may be using
+    int trigger_backend_id = -1; // the only backend the scheduler may use meanwhile
+    int group_split_id = -1;     // first split of the group the copies are for
+    int copies = 0;              // weights copied by the last prefetch
+
+    // Started after every member above is initialized.
+    ggml_backend_sched_repack_prefetcher() {
+        thread = std::thread(&ggml_backend_sched_repack_prefetcher::run, this);
+    }
+
+    ~ggml_backend_sched_repack_prefetcher() {
+        join();
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stopping = true;
+        }
+        cv.notify_all();
+        thread.join();
+    }
+
+    void run() {
+        std::unique_lock<std::mutex> lock(mutex);
+        while (true) {
+            cv.wait(lock, [&] { return has_work || stopping; });
+            if (!has_work) {
+                return;
+            }
+            const int n = n_items;
+            lock.unlock();
+            int done = 0;
+            for (int i = 0; i < n; ++i) {
+                // A failed prefetch only leaves the repack to the matmul.
+                try {
+                    done += items[i].fn(items[i].backend, items[i].graph);
+                } catch (const std::exception & error) {
+                    GGML_LOG_ERROR("%s: %s weight prefetch failed: %s\n", __func__,
+                        ggml_backend_name(items[i].backend), error.what());
+                }
+            }
+            lock.lock();
+            copies = done;
+            has_work = false;
+            cv.notify_all();
+        }
+    }
+
+    void submit(const item * work, int n, uint32_t target_mask, int trigger_backend, int group_split) {
+        GGML_ASSERT(!pending && n > 0 && n <= GGML_SCHED_MAX_BACKENDS);
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            std::copy(work, work + n, items);
+            n_items = n;
+            has_work = true;
+        }
+        cv.notify_all();
+        pending = true;
+        targets = target_mask;
+        trigger_backend_id = trigger_backend;
+        group_split_id = group_split;
+    }
+
+    void join() {
+        if (!pending) {
+            return;
+        }
+        {
+            ggml_e2e_trace_scope e2e(GGML_E2E_WAIT, "host", "repack_prefetch_join");
+            std::unique_lock<std::mutex> lock(mutex);
+            cv.wait(lock, [&] { return !has_work; });
+        }
+        GGML_LOG_DEBUG("sched: FFN repack prefetch for group split %d joined: %d weights copied\n",
+            group_split_id, copies);
+        pending = false;
+        targets = 0;
+        trigger_backend_id = -1;
+        group_split_id = -1;
+    }
+};
 
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
@@ -1083,6 +1196,10 @@ struct ggml_backend_sched {
     ggml_backend_async_flush_t async_flush_fns[GGML_SCHED_MAX_BACKENDS];
     ggml_backend_async_staging_buffer_type_t async_staging_buft_fns[GGML_SCHED_MAX_BACKENDS];
     ggml_backend_attn_out_direct_scatter_t attn_out_direct_scatter_fns[GGML_SCHED_MAX_BACKENDS];
+    // GGML_HTP_CHAIN_SPLITS: set only for backends that provide the proc.
+    ggml_backend_graph_compute_nowait_t graph_compute_nowait_fns[GGML_SCHED_MAX_BACKENDS];
+    // GGML_FFN_REPACK_PREFETCH: set only for backends that provide the proc.
+    ggml_backend_shared_repack_prefetch_t repack_prefetch_fns[GGML_SCHED_MAX_BACKENDS];
     bool attn_out_defer_opencl_sync;
     bool attn_out_direct_scatter;
     bool qkv_lazy_opencl_sync;
@@ -1093,6 +1210,7 @@ struct ggml_backend_sched {
     // Non-trivial worker state is owned separately because this scheduler is
     // allocated with calloc/free.
     ggml_backend_sched_ffn_executor * ffn_device_executor;
+    ggml_backend_sched_repack_prefetcher * repack_prefetcher;
     ggml_backend_sched_layer_checkpoint_state * layer_checkpoints;
     ggml_backend_sched_route_candidate_state * route_candidates;
     ggml_backend_sched_qkv_lazy_opencl_state * qkv_lazy_opencl;
@@ -1720,6 +1838,26 @@ static bool ggml_backend_sched_qkv_prefetch_reduce_inputs_enabled() {
     GGML_LOG_WARN(
             "%s: invalid GGML_QKV_PREFETCH_REDUCE_INPUTS='%s'; using the atomic late QKV commit\n",
             __func__, value);
+    return false;
+}
+
+// Opt-in scheduler feature flag (default off); `fallback` describes the off behavior.
+static bool ggml_backend_sched_opt_in_enabled(const char * name, const char * fallback) {
+    const char * value = getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return false;
+    }
+    if (strcmp(value, "1") == 0 || strcmp(value, "on") == 0 || strcmp(value, "ON") == 0 ||
+            strcmp(value, "true") == 0 || strcmp(value, "TRUE") == 0 ||
+            strcmp(value, "yes") == 0 || strcmp(value, "YES") == 0) {
+        return true;
+    }
+    if (strcmp(value, "0") == 0 || strcmp(value, "off") == 0 || strcmp(value, "OFF") == 0 ||
+            strcmp(value, "false") == 0 || strcmp(value, "FALSE") == 0 ||
+            strcmp(value, "no") == 0 || strcmp(value, "NO") == 0) {
+        return false;
+    }
+    GGML_LOG_WARN("%s: invalid %s='%s'; %s\n", __func__, name, value, fallback);
     return false;
 }
 
@@ -8212,7 +8350,8 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
             int64_t * dt_us,
             bool sync_after,
             ggml_backend_sched_ffn_worker_timeline * timeline,
-            ggml_backend_async_flush_t flush_after_submit = nullptr) {
+            ggml_backend_async_flush_t flush_after_submit = nullptr,
+            bool nowait = false) {
         ggml_backend_t split_backend = sched->backends[split->backend_id];
         ggml_backend_set_n_threads_t set_n_threads = ffn_reduce_set_n_threads(split);
         const int64_t t0_us = ggml_time_us();
@@ -8226,7 +8365,10 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                     set_n_threads,
                     sched->ffn_parallel_reduce_threads,
                     sched->cpu_threads);
-            ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            ec = nowait
+                ? ggml_backend_graph_compute_nowait(split_backend, &split->graph,
+                    sched->graph_compute_nowait_fns[split->backend_id])
+                : ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (timeline != nullptr) {
                 timeline->graph_compute_return_us = ggml_time_us();
             }
@@ -8714,6 +8856,154 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
         return true;
     };
 
+    // The next split this loop executes after split_id, skipping inactive route
+    // alternates, or -1 at the graph end. Valid until the active plan changes.
+    auto next_executed_split = [&](int split_id) {
+        for (int next = split_id + 1; next < sched->n_splits; ++next) {
+            if constexpr (UseRouteCandidates) {
+                const int group_index = sched->route_candidates->split_to_group[next];
+                bool plan_miss = false;
+                if (group_index >= 0 && sched->route_candidates->split_to_variant[next] !=
+                        route_selected_variant(group_index, &plan_miss)) {
+                    continue;
+                }
+            }
+            return next;
+        }
+        return -1;
+    };
+
+    // GGML_HTP_CHAIN_SPLITS: submit a split without waiting when the next split
+    // runs on the same backend and nothing in between can observe this split's
+    // work: no input copies, no parallel group, no layer checkpoint (it may
+    // change the plan) and no route commit (it may copy the outputs). The next
+    // split's graph_compute then waits for both, so the device runs them back
+    // to back instead of returning to the host after each one.
+    auto chain_without_wait = [&](int split_id, int route_group_index, int route_variant_index) {
+        const struct ggml_backend_sched_split * split = &splits[split_id];
+        if (sched->graph_compute_nowait_fns[split->backend_id] == nullptr || sched->callback_eval ||
+                split->checkpoint_index_after >= 0) {
+            return false;
+        }
+        if constexpr (UseRouteCandidates) {
+            if (route_group_index >= 0) {
+                const auto & group = sched->route_candidates->groups[route_group_index];
+                if (split_id + 1 == group.variants[route_variant_index].split_end &&
+                        route_variant_index != group.canonical_variant_index) {
+                    return false;
+                }
+            }
+        } else {
+            GGML_UNUSED(route_group_index);
+            GGML_UNUSED(route_variant_index);
+        }
+        const int next = next_executed_split(split_id);
+        if (next < 0 || splits[next].backend_id != split->backend_id || splits[next].n_inputs != 0) {
+            return false;
+        }
+        std::vector<ggml_backend_sched_ffn_branch_info> infos;
+        return ggml_backend_sched_collect_parallel_ffn_group(splits, sched->n_splits, next, true, &infos) == 0;
+    };
+
+    // GGML_FFN_REPACK_PREFETCH, see ggml_backend_sched_repack_prefetcher. A
+    // prefetch never outlives this graph run, including its error returns.
+    ggml_backend_sched_repack_prefetcher * prefetcher = sched->repack_prefetcher;
+    struct prefetch_join_on_exit {
+        ggml_backend_sched_repack_prefetcher * prefetcher;
+        ~prefetch_join_on_exit() {
+            if (prefetcher != nullptr) {
+                prefetcher->join();
+            }
+        }
+    } prefetch_exit_join { prefetcher };
+
+    // Whether the scheduler must join the prefetch before it processes a split:
+    // the split is the group the copies are for (or later), runs on another
+    // backend than the one that started the prefetch, or copies from or waits
+    // on a backend the helper may be using.
+    auto prefetch_must_join = [&](int split_id, const struct ggml_backend_sched_split * split) {
+        if (split_id >= prefetcher->group_split_id || split->backend_id != prefetcher->trigger_backend_id ||
+                (sched->qkv_lazy_opencl != nullptr && sched->qkv_lazy_opencl->pending.active)) {
+            return true;
+        }
+        for (int input_id = 0; input_id < split->n_inputs; ++input_id) {
+            const int input_backend_id = tensor_backend_id(split->inputs[input_id]);
+            if (input_backend_id >= 0 && ((prefetcher->targets >> input_backend_id) & 1u)) {
+                return true;
+            }
+        }
+        if (sched->zero_copy) {
+            const uint32_t wait = (sched->zero_copy_pending_readers[split->backend_id] |
+                (split->zero_copy_producers & sched->zero_copy_dirty)) & ~(1u << split->backend_id);
+            if ((wait & prefetcher->targets) != 0) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    // Before split_id makes the scheduler wait on its backend: if only splits
+    // on that backend run before the next parallel FFN group, start copying the
+    // group's weights on its other backends (GPU first, it only enqueues).
+    auto start_repack_prefetch = [&](int split_id) {
+        const struct ggml_backend_sched_split * split = &splits[split_id];
+        if (prefetcher == nullptr || prefetcher->pending || sched->callback_eval ||
+                sched->repack_prefetch_fns[split->backend_id] != nullptr) {
+            return;
+        }
+        // A lazy OpenCL lane is still owned by the scheduler thread.
+        if (sched->qkv_lazy_opencl != nullptr && sched->qkv_lazy_opencl->pending.active) {
+            return;
+        }
+        const struct ggml_backend_sched_split * before = split;
+        for (int next = next_executed_split(split_id); next >= 0; next = next_executed_split(next)) {
+            if (before->checkpoint_index_after >= 0) {
+                return; // the plan, and so the group, may change first
+            }
+            int scan_end = sched->n_splits;
+            if constexpr (UseRouteCandidates) {
+                const int group_index = sched->route_candidates->split_to_group[next];
+                if (group_index >= 0) {
+                    scan_end = sched->route_candidates->groups[group_index]
+                        .variants[sched->route_candidates->split_to_variant[next]].split_end;
+                }
+            }
+            std::vector<ggml_backend_sched_ffn_branch_info> infos;
+            const int group_size = ggml_backend_sched_collect_parallel_ffn_group(splits, scan_end, next, false, &infos);
+            if (group_size > 0) {
+                if (infos[0].kind != "ffn") {
+                    return;
+                }
+                ggml_backend_sched_repack_prefetcher::item items[GGML_SCHED_MAX_BACKENDS];
+                int n_items = 0;
+                uint32_t targets = 0;
+                for (int pass = 0; pass < 2; ++pass) {
+                    for (int i = 0; i < group_size; ++i) {
+                        struct ggml_backend_sched_split * branch = &splits[next + i];
+                        ggml_backend_t backend = sched->backends[branch->backend_id];
+                        const bool gpu = ggml_sched_profile_backend_bucket(backend) == GGML_SCHED_PROFILE_BACKEND_GPU;
+                        if (sched->repack_prefetch_fns[branch->backend_id] == nullptr || gpu != (pass == 0) ||
+                                ((targets >> branch->backend_id) & 1u)) {
+                            continue;
+                        }
+                        items[n_items++] = { backend, sched->repack_prefetch_fns[branch->backend_id], &branch->graph };
+                        targets |= 1u << branch->backend_id;
+                    }
+                }
+                if (n_items > 0) {
+                    prefetcher->submit(items, n_items, targets, split->backend_id, next);
+                    GGML_LOG_DEBUG("sched: FFN repack prefetch layer %d: %d branch%s from split %d for group split %d\n",
+                        infos[0].layer, n_items, n_items == 1 ? "" : "es", split_id, next);
+                }
+                return;
+            }
+            if (splits[next].backend_id != split->backend_id) {
+                return;
+            }
+            before = &splits[next];
+        }
+    };
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
 
@@ -8756,6 +9046,10 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                         route_variant_index == route_group.canonical_variant_index
                             ? "canonical" : "alternate");
             }
+        }
+
+        if (prefetcher != nullptr && prefetcher->pending && prefetch_must_join(split_id, split)) {
+            prefetcher->join();
         }
 
         bool lazy_opencl_consumer = false;
@@ -9828,7 +10122,9 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
 
         if (!sched->callback_eval) {
             int64_t dt_us = 0;
-            enum ggml_status ec = compute_split_no_callback(split, &dt_us, false, nullptr);
+            start_repack_prefetch(split_id);
+            const bool chained = chain_without_wait(split_id, route_group_index, route_variant_index);
+            enum ggml_status ec = compute_split_no_callback(split, &dt_us, false, nullptr, nullptr, chained);
             if (ec != GGML_STATUS_SUCCESS) {
                 ggml_backend_sched_qkv_lazy_opencl_drain(sched);
                 return ec;
@@ -9838,6 +10134,12 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                 if (route_group_index >= 0 &&
                         split_id + 1 == sched->route_candidates->groups[route_group_index]
                             .variants[route_variant_index].split_end) {
+                    // An alternate commit copies outputs, possibly between the
+                    // backends the prefetch helper uses.
+                    if (prefetcher != nullptr && route_variant_index !=
+                            sched->route_candidates->groups[route_group_index].canonical_variant_index) {
+                        prefetcher->join();
+                    }
                     commit_route_alternate(
                             route_group_index,
                             route_variant_index,
@@ -9868,7 +10170,7 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                             ? prefetched_input_count > 0
                                 ? "sync_wall_prefetched_inputs"
                                 : "sync_wall"
-                            : "async_submit",
+                            : chained ? "chained_submit" : "async_submit",
                         cpu_idle_before_us,
                         cpu_prewake_requested);
             }
@@ -9917,6 +10219,9 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
         }
     }
 
+    if (prefetcher != nullptr) {
+        prefetcher->join();
+    }
     if (sched->qkv_lazy_opencl != nullptr &&
             sched->qkv_lazy_opencl->pending.active) {
         GGML_LOG_DEBUG(
@@ -10006,6 +10311,11 @@ ggml_backend_sched_t ggml_backend_sched_new(
         ggml_backend_sched_ffn_prefetch_reduce_inputs_enabled();
     sched->qkv_prefetch_reduce_inputs =
         ggml_backend_sched_qkv_prefetch_reduce_inputs_enabled();
+    const bool htp_chain_splits = ggml_backend_sched_opt_in_enabled(
+            "GGML_HTP_CHAIN_SPLITS", "waiting for every NPU split");
+    const bool ffn_repack_prefetch = ggml_backend_sched_opt_in_enabled(
+            "GGML_FFN_REPACK_PREFETCH", "repacking FFN weights on demand");
+    int repack_prefetch_backend_count = 0;
     sched->cpu_graph_prewake_hold_us = ggml_backend_sched_cpu_graph_prewake_hold_us();
     sched->cpu_graph_prewake_idle_us = sched->cpu_graph_prewake_hold_us > 0
         ? ggml_backend_sched_cpu_graph_prewake_idle_us()
@@ -10067,6 +10377,19 @@ ggml_backend_sched_t ggml_backend_sched_new(
                 ggml_backend_reg_get_proc_address(
                         reg, "ggml_backend_attn_out_direct_scatter");
             async_flush_backend_count += sched->async_flush_fns[b] != nullptr ? 1 : 0;
+            if (ffn_repack_prefetch) {
+                sched->repack_prefetch_fns[b] = (ggml_backend_shared_repack_prefetch_t)
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_shared_repack_prefetch");
+                repack_prefetch_backend_count += sched->repack_prefetch_fns[b] != nullptr ? 1 : 0;
+            }
+            if (htp_chain_splits) {
+                sched->graph_compute_nowait_fns[b] = (ggml_backend_graph_compute_nowait_t)
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_graph_compute_nowait");
+                if (sched->graph_compute_nowait_fns[b] != nullptr) {
+                    GGML_LOG_INFO("%s: %s chains consecutive splits without waiting (GGML_HTP_CHAIN_SPLITS)\n",
+                        __func__, ggml_backend_name(backends[b]));
+                }
+            }
         }
 
         if (sched->cpu_graph_prewake_hold_us > 0) {
@@ -10118,6 +10441,21 @@ ggml_backend_sched_t ggml_backend_sched_new(
                     "%s: attention-output direct scatter enabled (%d compatible backend%s)\n",
                     __func__, compatible_backends,
                     compatible_backends == 1 ? "" : "s");
+        }
+    }
+
+    if (ffn_repack_prefetch) {
+        if (repack_prefetch_backend_count == 0) {
+            GGML_LOG_WARN("%s: GGML_FFN_REPACK_PREFETCH: no backend can prefetch shared weights\n", __func__);
+        } else {
+            try {
+                sched->repack_prefetcher = new ggml_backend_sched_repack_prefetcher();
+                GGML_LOG_INFO("%s: FFN weight repack prefetch enabled (%d backend%s)\n", __func__,
+                        repack_prefetch_backend_count, repack_prefetch_backend_count == 1 ? "" : "s");
+            } catch (const std::exception & error) {
+                GGML_LOG_ERROR("%s: FFN repack prefetch helper failed to start: %s\n", __func__, error.what());
+                sched->repack_prefetcher = nullptr;
+            }
         }
     }
 
@@ -10227,6 +10565,8 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
 
     // Stop persistent workers before releasing backend events, graphs, or
     // buffers they may reference.
+    delete sched->repack_prefetcher;
+    sched->repack_prefetcher = nullptr;
     delete sched->ffn_device_executor;
     sched->ffn_device_executor = nullptr;
     ggml_backend_sched_qkv_lazy_opencl_free_state(sched);

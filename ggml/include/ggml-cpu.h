@@ -22,6 +22,9 @@ extern "C" {
 
         // use only reference implementations
         bool use_ref;
+
+        // weights repacked ahead of their matmul by the CPU backend, or NULL
+        struct ggml_cpu_shared_repack_cache * shared_repack_cache;
     };
 
     // numa strategies

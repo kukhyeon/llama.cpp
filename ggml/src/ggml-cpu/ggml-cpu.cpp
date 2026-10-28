@@ -112,6 +112,9 @@ struct ggml_backend_cpu_context {
     ggml_shared_weights_scratch_stats shared_scratch{};
     size_t shared_plan_capacity = 0;
     bool shared_work_used = false;
+
+    // GGML_FFN_REPACK_PREFETCH copies; slot buffers are allocated on first use.
+    ggml_cpu_shared_repack_cache * shared_repack_cache = nullptr;
 };
 
 // Workspace is shared with ordinary CPU operations. Report its actual retained
@@ -154,6 +157,7 @@ static const char * ggml_backend_cpu_get_name(ggml_backend_t backend) {
 
 static void ggml_backend_cpu_free(ggml_backend_t backend) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
+    ggml_cpu_shared_repack_cache_free(cpu_ctx->shared_repack_cache);
     delete[] cpu_ctx->work_data;
     delete cpu_ctx;
     delete backend;
@@ -189,6 +193,7 @@ static ggml_backend_graph_plan_t ggml_backend_cpu_graph_plan_create(ggml_backend
     cpu_plan->cplan.abort_callback      = cpu_ctx->abort_callback;
     cpu_plan->cplan.abort_callback_data = cpu_ctx->abort_callback_data;
     cpu_plan->cplan.use_ref             = cpu_ctx->use_ref;
+    cpu_plan->cplan.shared_repack_cache = cpu_ctx->shared_repack_cache;
 
     return cpu_plan;
 }
@@ -235,8 +240,75 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
     cplan.abort_callback      = cpu_ctx->abort_callback;
     cplan.abort_callback_data = cpu_ctx->abort_callback_data;
     cplan.use_ref             = cpu_ctx->use_ref;
+    cplan.shared_repack_cache = cpu_ctx->shared_repack_cache;
 
     return ggml_graph_compute(cgraph, &cplan);
+}
+
+// GGML_FFN_REPACK_PREFETCH_PIN=0 lets the prefetching thread keep its own CPU
+// placement (default: worker 0's, see ggml_threadpool_caller_enter).
+static bool ggml_backend_cpu_prefetch_pin_enabled() {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_FFN_REPACK_PREFETCH_PIN");
+        return value == nullptr || !(strcmp(value, "0") == 0 || strcmp(value, "off") == 0 ||
+            strcmp(value, "OFF") == 0 || strcmp(value, "no") == 0 || strcmp(value, "NO") == 0 ||
+            strcmp(value, "false") == 0 || strcmp(value, "FALSE") == 0);
+    }();
+    return enabled;
+}
+
+// Registry proc "ggml_backend_shared_repack_prefetch" (GGML_FFN_REPACK_PREFETCH):
+// copy the shared HTP weights of graph's matmuls into this backend's native
+// layout now, on its threads, so that computing graph later skips the repack.
+// The caller must not use the backend concurrently. Returns the number of
+// copies made.
+static int ggml_backend_cpu_shared_repack_prefetch(ggml_backend_t backend, struct ggml_cgraph * graph) {
+    if (!ggml_backend_is_cpu(backend) || graph == nullptr || !ggml_shared_weights_repack_enabled()) {
+        return 0;
+    }
+    auto * cpu_ctx = static_cast<ggml_backend_cpu_context *>(backend->context);
+    int n_copies = 0;
+    enum ggml_status status = GGML_STATUS_FAILED;
+    try {
+        n_copies = ggml_cpu_shared_repack_prefetch_begin(cpu_ctx->shared_repack_cache, graph);
+        if (n_copies == 0) {
+            return 0;
+        }
+        // One custom node; every thread copies its row groups of each pending slot.
+        const size_t mem_size = ggml_tensor_overhead() + ggml_graph_overhead_custom(1, false);
+        std::vector<uint8_t> mem(mem_size);
+        const ggml_init_params params = { mem_size, mem.data(), true };
+        ggml_context * ctx = ggml_init(params);
+        ggml_tensor * node = ggml_custom_4d(ctx, GGML_TYPE_I8, 1, 1, 1, 1, nullptr, 0,
+            ggml_cpu_shared_repack_prefetch_run, GGML_N_TASKS_MAX, cpu_ctx->shared_repack_cache);
+        ggml_set_name(node, "shared_weight_prefetch");
+        ggml_cgraph * prefetch = ggml_new_graph_custom(ctx, 1, false);
+        ggml_build_forward_expand(prefetch, node);
+        // The caller (the scheduler's helper thread) drives the pool as worker
+        // 0, normally the core of the scheduler thread: take worker 0's CPU
+        // mask and priority so it never shares a core with a pinned worker.
+        ggml_threadpool_caller_state * caller = ggml_backend_cpu_prefetch_pin_enabled()
+            ? ggml_threadpool_caller_enter(cpu_ctx->threadpool) : nullptr;
+        status = ggml_backend_cpu_graph_compute(backend, prefetch);
+        ggml_threadpool_caller_leave(caller);
+        ggml_free(ctx);
+    } catch (const std::exception & error) {
+        GGML_LOG_ERROR("%s: %s\n", __func__, error.what()); // e.g. a slot allocation
+    }
+    ggml_cpu_shared_repack_prefetch_end(cpu_ctx->shared_repack_cache, status == GGML_STATUS_SUCCESS);
+    return status == GGML_STATUS_SUCCESS ? n_copies : 0;
+}
+
+// Test hook: copies made and matmuls that used one.
+static void ggml_backend_cpu_shared_repack_prefetch_stats(ggml_backend_t backend, uint64_t * copies, uint64_t * hits) {
+    const auto * cpu_ctx = static_cast<const ggml_backend_cpu_context *>(backend->context);
+    ggml_cpu_shared_repack_prefetch_stats(cpu_ctx->shared_repack_cache, copies, hits);
+}
+
+// Test hook: the CPU each thread of the last prefetch started on.
+static void ggml_backend_cpu_shared_repack_prefetch_cpus(ggml_backend_t backend, int * cpus, int n) {
+    const auto * cpu_ctx = static_cast<const ggml_backend_cpu_context *>(backend->context);
+    ggml_cpu_shared_repack_prefetch_cpus(cpu_ctx->shared_repack_cache, cpus, n);
 }
 
 static const struct ggml_backend_i ggml_backend_cpu_i = {
@@ -279,6 +351,7 @@ ggml_backend_t ggml_backend_cpu_init(void) {
     ctx->abort_callback      = NULL;
     ctx->abort_callback_data = NULL;
     ctx->use_ref             = false;
+    ctx->shared_repack_cache = ggml_cpu_shared_repack_cache_new();
 
     ggml_backend_t cpu_backend = new ggml_backend {
         /* .guid    = */ ggml_backend_cpu_guid(),
@@ -749,6 +822,16 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (strcmp(name, "ggml_backend_cpu_shared_repack_test_input_stats") == 0) {
         return (void *)ggml_cpu_shared_repack_test_input_stats;
+    }
+    if (strcmp(name, "ggml_backend_shared_repack_prefetch") == 0) {
+        ggml_backend_shared_repack_prefetch_t fct = ggml_backend_cpu_shared_repack_prefetch;
+        return (void *)fct;
+    }
+    if (strcmp(name, "ggml_backend_cpu_shared_repack_prefetch_stats") == 0) {
+        return (void *)ggml_backend_cpu_shared_repack_prefetch_stats;
+    }
+    if (strcmp(name, "ggml_backend_cpu_shared_repack_prefetch_cpus") == 0) {
+        return (void *)ggml_backend_cpu_shared_repack_prefetch_cpus;
     }
     if (strcmp(name, "ggml_backend_set_n_threads") == 0) {
         ggml_backend_set_n_threads_t fct = ggml_backend_cpu_set_n_threads;

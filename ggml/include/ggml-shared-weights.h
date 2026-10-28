@@ -117,6 +117,15 @@ GGML_API int ggml_zero_copy_buft_role(ggml_backend_buffer_type_t buft);
 typedef ggml_backend_buffer_type_t (*ggml_backend_zero_copy_buffer_type_t)(ggml_backend_dev_t device, int role);
 typedef unsigned (*ggml_backend_zero_copy_roles_t)(ggml_backend_dev_t device);
 
+// Registry proc "ggml_backend_shared_repack_prefetch" (CPU and OpenCL,
+// GGML_FFN_REPACK_PREFETCH): start repacking the shared HTP weights that the
+// matmuls of `graph` read into backend-owned slots, so that computing `graph`
+// on this backend later skips its on-demand repack. Only the backend's work
+// queue orders the copy before that compute; the caller must not use the
+// backend from another thread meanwhile. Returns the number of weights
+// prefetched (0 when nothing applies).
+typedef int (*ggml_backend_shared_repack_prefetch_t)(ggml_backend_t backend, struct ggml_cgraph * graph);
+
 #ifdef __cplusplus
 }
 #endif
